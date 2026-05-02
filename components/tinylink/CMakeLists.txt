@@ -13,6 +13,8 @@ idf_component_register(
         "src/register.c"
         "src/mapreq.c"
         "src/wg_dataplane.c"
+        "src/wg_proto.c"
+        "src/wg_handshake.c"
         "src/tmp117.c"
         "src/telemetry.c"
         "src/crypto/blake2s.c"
