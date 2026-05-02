@@ -12,6 +12,7 @@
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_netif_net_stack.h"
+#include "lwip/def.h"     /* lwip_htonl */
 #include "lwip/netif.h"
 
 #include "wg_netif.h"
@@ -74,10 +75,14 @@ esp_err_t wg_lwip_attach(uint32_t local_ip_be, uint16_t mtu)
         .if_desc   = "wg",
         .route_prio = 5,
     };
-    /* Static IP, /32 (each tailnet node owns a single host route). */
+    /* Static IP. Netmask /10 (255.192.0.0) covers the entire CGNAT
+     * tailnet range 100.64.0.0/10 so lwIP routes peer traffic via this
+     * netif by subnet-match — without us having to make WG the default
+     * netif. Default stays on WiFi so the control plane long-poll over
+     * HTTPS keeps working even before NAT traversal lands. */
     esp_netif_ip_info_t ip = {0};
     ip.ip.addr      = local_ip_be;
-    ip.netmask.addr = 0xFFFFFFFFu;
+    ip.netmask.addr = lwip_htonl(0xFFC00000UL);  /* 255.192.0.0 = /10 */
     ip.gw.addr      = 0;
     base.ip_info    = &ip;
 
@@ -125,9 +130,14 @@ esp_err_t wg_lwip_attach(uint32_t local_ip_be, uint16_t mtu)
     wg_netif_set_rx_callback(wg_rx_inject, s_netif);
 
     /* Bring the netif up so lwIP starts routing the tunnel CIDR
-     * through it. */
+     * through it. We deliberately do NOT call esp_netif_set_default_netif
+     * here — that would steal *all* outbound traffic (including HTTPS to
+     * the control plane) into the WG tunnel, which is fatal as long as
+     * the tunnel can't actually carry packets (no DISCO/STUN/DERP yet).
+     * The /10 netmask above gives lwIP the subnet-match it needs to
+     * route the 100.64.0.0/10 tailnet through this netif while leaving
+     * the default route on WiFi. */
     esp_netif_action_start(s_netif, NULL, 0, NULL);
-    esp_netif_set_default_netif(s_netif);
 
     ESP_LOGI(TAG, "WG netif up: ip=%u.%u.%u.%u/32 mtu=%u",
              (unsigned)((local_ip_be      ) & 0xFF),

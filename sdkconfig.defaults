@@ -86,8 +86,14 @@ CONFIG_MBEDTLS_POLY1305_C=y
 
 # ---- App task stacks ---------------------------------------------------------
 # Bigger main stack: TLS + Noise IK + JSON construction is much heavier than
-# the M1-WG bringup that this replaces.
-CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384
+# the M1-WG bringup that this replaces. Verified on-device 2026-05-02:
+# the boot-time mbedtls cert-chain verification + ECDSA + Noise IK init
+# in tinylink_register peaks at ~14 KiB; bumped from 16 K to 24 K to give
+# margin. The long-poll task in tinylink.c::tinylink_long_poll_start
+# also xTaskCreate's at 24 KiB to absorb the same workload — bug from
+# 8 K manifested as random LoadProhibited / Double exception / fake
+# heap-corruption asserts.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=24576
 
 # esp_timer dispatch task stack. mbedtls / lwIP timer callbacks (e.g.
 # session ticket lifetime, sntp, peer-cert cleanup) routed through here

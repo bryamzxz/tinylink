@@ -10,6 +10,8 @@
 
 #ifdef ESP_PLATFORM
 #include "esp_log.h"
+#include "esp_heap_caps.h"
+#include "esp_system.h"
 #include "sdkconfig.h"
 #include "h2_client.h"
 #endif
@@ -29,11 +31,13 @@ static const char *TAG = "mapreq";
  * before we'd need streaming. */
 #define RESPONSE_BUF_SZ  32768
 /* MapResponse JSON is structurally dense: a 19 KiB body parses to
- * ~3500 tokens (~1 token / 5 bytes). 4500 leaves headroom; at
- * sizeof(jsmntok_t)=16 the table is 72 KiB, so the response buffer
- * MUST be shrunk via realloc before parsing or DRAM blows up.
- * mapreq_fetch_once does that explicitly. */
-#define MAX_TOKENS       4500
+ * ~3500 tokens (~1 token / 5 bytes). 3500 + 12% headroom = 3920;
+ * round to 3920 → 62.7 KiB BSS table at sizeof(jsmntok_t)=16. The
+ * companion Tailscale-on-ESP32 protocol artifact recommends a 20 KiB
+ * parse budget assuming SAX-style streaming, but we use jsmn (DOM-
+ * style) which needs the full token table. 62 KiB is the smallest we
+ * can go without truncating real netmaps observed on-device. */
+#define MAX_TOKENS       3920
 
 /* ------------------------------ helpers ----------------------------------- */
 
@@ -378,16 +382,20 @@ esp_err_t mapresp_parse(const char *json, size_t json_len, tl_netmap_t *out)
     if (json == NULL || out == NULL) return ESP_ERR_INVALID_ARG;
     tl_netmap_clear(out);
 
-    /* Token budget heap-allocated: at sizeof(jsmntok_t)=16 the table
-     * is MAX_TOKENS * 16 bytes (= 64 KiB at MAX_TOKENS=4096). Keeping
-     * it in BSS overflows DRAM; allocate per-parse and free on exit. */
-    jsmntok_t *toks = malloc(sizeof(jsmntok_t) * MAX_TOKENS);
-    if (toks == NULL) return ESP_ERR_NO_MEM;
+    /* Token budget in BSS. MAX_TOKENS * sizeof(jsmntok_t) = 4500 * 16
+     * = 72 KiB. Putting this in BSS instead of malloc'ing per parse:
+     * (a) avoids heap fragmentation — after two TLS handshakes (register
+     * + long-poll) the heap's largest_free_block dropped to ~68 KiB,
+     * smaller than the alloc, and mapresp_parse started failing with
+     * ESP_ERR_NO_MEM; (b) makes the cost a constant we can budget for
+     * at link time instead of a runtime mystery. We have ~110 KiB of
+     * free DRAM at boot before WiFi/TLS bring-up, so 72 KiB resident
+     * fits cleanly. */
+    static jsmntok_t toks[MAX_TOKENS];
     jsmn_parser p;
     jsmn_init(&p);
     int n = jsmn_parse(&p, json, json_len, toks, MAX_TOKENS);
     if (n < 1 || !tok_is_obj(&toks[0])) {
-        free(toks);
         return ESP_ERR_INVALID_RESPONSE;
     }
 
@@ -406,7 +414,6 @@ esp_err_t mapresp_parse(const char *json, size_t json_len, tl_netmap_t *out)
         }
         next = skip_value(toks, val_idx);
     }
-    free(toks);
     return ESP_OK;
 }
 
@@ -592,9 +599,12 @@ static void stream_dispatch(stream_state_t *s)
      * and skipped — the upstream server only sends incrementals to
      * clients that opt in via capability flags we don't advertise. */
     static tl_netmap_t nm;  /* ~1 KiB; reused across messages */
-    if (mapresp_parse((const char *)s->body_buf, s->body_have, &nm) != ESP_OK) {
-        ESP_LOGW(TAG, "MapResponse parse failed (size=%u)",
-                 (unsigned)s->body_have);
+    esp_err_t pe = mapresp_parse((const char *)s->body_buf, s->body_have, &nm);
+    if (pe != ESP_OK) {
+        ESP_LOGW(TAG, "MapResponse parse failed (size=%u err=0x%x free_heap=%u largest_block=%u)",
+                 (unsigned)s->body_have, (unsigned)pe,
+                 (unsigned)esp_get_free_heap_size(),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
         return;
     }
     if (!nm.have_self && nm.n_peers == 0) {
