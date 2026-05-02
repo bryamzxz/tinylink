@@ -17,6 +17,7 @@
 #include "mapreq.h"
 #include "netmap.h"
 #include "register.h"
+#include "telemetry.h"
 #include "ts2021_client.h"
 #include "wg_dataplane.h"
 
@@ -182,4 +183,13 @@ esp_err_t tinylink_long_poll_start(void)
         return ESP_ERR_NO_MEM;
     }
     return ESP_OK;
+}
+
+esp_err_t tinylink_telemetry_start(void)
+{
+    /* No s_initialized check — telemetry doesn't depend on tinylink
+     * identities, only on a working WG netif (which the caller has
+     * brought up via tinylink_dataplane_start). The compile-time
+     * disable in telemetry.c collapses this to a no-op. */
+    return telemetry_start();
 }

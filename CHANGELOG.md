@@ -8,6 +8,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **M3 first cut: TMP117 telemetry over UDP-through-WG.**
+  - New `tmp117.{c,h}`: I²C driver using IDF v5.5
+    `driver/i2c_master.h`. Reset-default CONFIG (continuous, AVG=8) is
+    fine, so we only read TEMP_RESULT (and DEVICE_ID at init for a
+    fast-fail wiring check). Result is reported in milli-°C using the
+    documented 7.8125 m°C/LSB scale.
+  - New `telemetry.{c,h}`: 4 KiB-stack FreeRTOS task `tinylink_tlm`
+    that periodically reads the sensor and emits a JSON datagram
+    `{"host","seq","temp_c"}` to `CONFIG_TINYLINK_TELEMETRY_DEST`
+    over UDP. The socket binds to the default route, which is the WG
+    netif once `tinylink_dataplane_start()` has run, so packets reach
+    the home peer end-to-end.
+  - New Kconfig submenu `Telemetry (M3)` exposes I²C pin selection,
+    sensor address, sample period, destination IP:port, and a
+    compile-time enable/disable so boards without a TMP117 still
+    build and run.
+  - New public API `tinylink_telemetry_start()`; `main.c` calls it
+    after the long-poll task is up.
+  - Build size: `tinylink.bin` 0x118d10 → 0x11e890 (+22 KiB).
+
 - **M2 long-poll MapRequest stream.**
   - `h2_client` now exposes `h2_post_json_stream(...)` that invokes a
     per-chunk callback; the one-shot `h2_post_json` and the streaming

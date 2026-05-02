@@ -81,6 +81,18 @@ esp_err_t tinylink_dataplane_start(void);
  */
 esp_err_t tinylink_long_poll_start(void);
 
+/* M3 first cut — spawn the TMP117 telemetry task. The task initializes
+ * the I²C bus + sensor, then sends one JSON datagram per
+ * `CONFIG_TINYLINK_TELEMETRY_PERIOD_MS` to the configured destination
+ * over UDP. The destination is expected to be reachable through the
+ * WireGuard netif (usually a `100.x.y.z` tailnet address on the home
+ * peer).
+ *
+ * If `CONFIG_TINYLINK_TELEMETRY_ENABLE=n` the call is a no-op so
+ * boards that ship without a TMP117 still build and run.
+ */
+esp_err_t tinylink_telemetry_start(void);
+
 const char *tinylink_version_string(void);
 
 #ifdef __cplusplus

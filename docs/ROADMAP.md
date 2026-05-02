@@ -15,8 +15,8 @@ Go implementation, which is the authoritative reference for wire format.
 | #  | Name                                          | Status   | Targeted release | Estimate |
 |----|-----------------------------------------------|----------|------------------|----------|
 | M1 | ts2021 control plane (register only)          | done     | v0.1             | 2-3 wk   |
-| M2 | MapRequest streaming + WireGuard data plane   | current  | v0.2             | 2-3 wk   |
-| M3 | DISCO P2P discovery + TMP117 telemetry        | pending  | v0.3             | 1-2 wk   |
+| M2 | MapRequest streaming + WireGuard data plane   | done     | v0.2             | 2-3 wk   |
+| M3 | DISCO P2P discovery + TMP117 telemetry        | current  | v0.3             | 1-2 wk   |
 | M4 | STUN minimal binding                          | pending  | v0.4             | 0.5 wk   |
 | M5 | DERP relay fallback + reconnection            | pending  | v0.5             | 1-2 wk   |
 | M6 | Production hardening (NVS, secure boot, OTA)  | pending  | v0.6             | ongoing  |
@@ -140,7 +140,26 @@ ES: Mismo contenido, en español a futuro.
 
 ## M3 — DISCO + TMP117 telemetry
 
-EN: NaCl-box DISCO ping/pong on the WG UDP socket (multiplexed by first
+**Step 1 (landed in `feat(m3): TMP117 driver + UDP telemetry`):**
+- TMP117 driver under `components/tinylink/src/tmp117.{c,h}` using
+  IDF v5.5's `driver/i2c_master.h`. Reset-default config (continuous,
+  AVG=8, ~1 s conversion) is left as-is, so we never write
+  CONFIGURATION; we read TEMP_RESULT and convert via the documented
+  7.8125 m°C/LSB scale.
+- DEVICE_ID probe at `tmp117_init` — wrong wiring or address fails
+  fast.
+- `telemetry.c` spawns a 4 KiB-stack FreeRTOS task `tinylink_tlm` that
+  reads the TMP117 every `CONFIG_TINYLINK_TELEMETRY_PERIOD_MS` and
+  pushes a JSON datagram to `CONFIG_TINYLINK_TELEMETRY_DEST` over
+  UDP. The destination is expected to be a 100.x.y.z tailnet address
+  reachable through the WG netif.
+- Public API `tinylink_telemetry_start()`; main.c invokes it after
+  the long-poll task is running. Compile-time disable
+  `CONFIG_TINYLINK_TELEMETRY_ENABLE=n` collapses the call to a no-op
+  for boards without a TMP117.
+
+**Step 2 (next commit, "feat(m3): DISCO + UDP demuxer"):**
+NaCl-box DISCO ping/pong on the WG UDP socket (multiplexed by first
 byte: WG types 1-4, DISCO `0x54 0x53 0xF0 0x9F 0x92 0xAC` = "TS💬",
 STUN `0x00 0x01`). Only message types 0x01 (Ping), 0x02 (Pong),
 0x03 (CallMeMaybe) are required. Drop 0x04-0x09 (peer-relay) on receive,
@@ -150,10 +169,8 @@ Path probing collapses to one address: send Ping to last-known endpoint
 on startup, mark "up" on first valid Pong, heartbeat every 2 s. ~150 LoC
 versus ~1500 in the real implementation.
 
-Re-introduce the TMP117 driver (continuous mode, 8-sample averaging) and
-the FreeRTOS telemetry task that the original M1 sketched.
-
-ES: idem.
+Requires the deferred `wireguardif.c` patch from M2 step 3 so DISCO
+and WG can share the UDP socket.
 
 ## M4 — STUN
 

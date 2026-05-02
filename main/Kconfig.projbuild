@@ -31,4 +31,56 @@ menu "tinylink application"
             MachineAuthorized=false (e.g. waiting for the operator to approve
             the node in the admin panel).
 
+    menu "Telemetry (M3)"
+
+        config TINYLINK_TELEMETRY_ENABLE
+            bool "Enable TMP117 telemetry task"
+            default y
+            help
+                Spawn a FreeRTOS task that reads the TMP117 over I²C and
+                pushes JSON samples over UDP to the home peer through the
+                WireGuard netif. Disable for boards that ship without the
+                sensor — the rest of the stack stays up.
+
+        config TINYLINK_I2C_SDA_GPIO
+            int "I²C SDA GPIO"
+            depends on TINYLINK_TELEMETRY_ENABLE
+            default 21
+            range 0 39
+            help
+                Freenove ESP32-WROOM-32E DevKit default. Override for other
+                boards.
+
+        config TINYLINK_I2C_SCL_GPIO
+            int "I²C SCL GPIO"
+            depends on TINYLINK_TELEMETRY_ENABLE
+            default 22
+            range 0 39
+
+        config TINYLINK_TMP117_I2C_ADDR
+            hex "TMP117 7-bit I²C address"
+            depends on TINYLINK_TELEMETRY_ENABLE
+            default 0x48
+            range 0x48 0x4B
+            help
+                The TMP117 supports addresses 0x48..0x4B selected by ADD0
+                strapping. 0x48 is the default for ADD0 tied to GND.
+
+        config TINYLINK_TELEMETRY_PERIOD_MS
+            int "Telemetry sample period (ms)"
+            depends on TINYLINK_TELEMETRY_ENABLE
+            default 5000
+            range 500 600000
+
+        config TINYLINK_TELEMETRY_DEST
+            string "Telemetry UDP destination (host:port)"
+            depends on TINYLINK_TELEMETRY_ENABLE
+            default "100.64.0.1:9000"
+            help
+                IP:port to send JSON samples to. The IP must be reachable
+                through the WireGuard netif — typically the home peer's
+                tailnet 100.x address. Override per deployment.
+
+    endmenu
+
 endmenu
