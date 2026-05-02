@@ -31,11 +31,13 @@ static const char *TAG = "mapreq";
  * before we'd need streaming. */
 #define RESPONSE_BUF_SZ  32768
 /* MapResponse JSON is structurally dense: a 19 KiB body parses to
- * ~3500 tokens (~1 token / 5 bytes). 4500 leaves headroom; at
- * sizeof(jsmntok_t)=16 the table is 72 KiB, so the response buffer
- * MUST be shrunk via realloc before parsing or DRAM blows up.
- * mapreq_fetch_once does that explicitly. */
-#define MAX_TOKENS       4500
+ * ~3500 tokens (~1 token / 5 bytes). 3500 + 12% headroom = 3920;
+ * round to 3920 → 62.7 KiB BSS table at sizeof(jsmntok_t)=16. The
+ * companion Tailscale-on-ESP32 protocol artifact recommends a 20 KiB
+ * parse budget assuming SAX-style streaming, but we use jsmn (DOM-
+ * style) which needs the full token table. 62 KiB is the smallest we
+ * can go without truncating real netmaps observed on-device. */
+#define MAX_TOKENS       3920
 
 /* ------------------------------ helpers ----------------------------------- */
 
