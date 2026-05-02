@@ -12,15 +12,19 @@
 
 #include "curve25519.h"
 
+#include <stddef.h>
 #include <stdint.h>
 #include <string.h>
 
+#ifdef ESP_PLATFORM
 #include "esp_random.h"
+#else
+/* Host build: tests must provide their own esp_fill_random definition. */
+extern void esp_fill_random(void *buf, size_t len);
+#endif
 
 typedef int64_t gf[16];
 
-static const gf gf_0   = {0};
-static const gf gf_1   = {1};
 static const gf gf_121665 = {0xDB41, 1};
 
 static void car25519(gf o)

@@ -47,3 +47,7 @@ logs/
 # OS
 .DS_Store
 Thumbs.db
+
+# Compiled host-side test binaries
+tools/test/test_blake2s
+tools/test/test_curve25519
