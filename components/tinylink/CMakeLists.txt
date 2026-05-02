@@ -12,6 +12,7 @@ idf_component_register(
         "src/h2_client.c"
         "src/register.c"
         "src/mapreq.c"
+        "src/wg_dataplane.c"
         "src/crypto/blake2s.c"
         "src/crypto/curve25519.c"
         "src/crypto/hkdf_blake2s.c"
@@ -31,4 +32,5 @@ idf_component_register(
         json
     PRIV_REQUIRES
         espressif__nghttp
+        trombik__esp_wireguard
 )

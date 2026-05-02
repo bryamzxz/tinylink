@@ -8,6 +8,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **M2 first-cut data plane: WireGuard via `trombik/esp_wireguard`.**
+  - Added `trombik/esp_wireguard@0.9.0` (BSD-3) as a managed component
+    in `main/idf_component.yml`.
+  - New `wg_dataplane.{c,h}` shim translates `tl_netmap_t` →
+    `wireguard_config_t`: base64-encodes the device NodePrivate and the
+    peer's NodePublic, splits `Node.Addresses[0]` into local IP +
+    netmask, splits `Peers[0].Endpoints[0]` into host + port, then
+    drives `esp_wireguard_init` + `esp_wireguard_connect`. 25-second
+    persistent keepalive is enabled until DISCO takes over keepalive
+    duty in M3.
+  - New public API `tinylink_dataplane_start()` opens a fresh ts2021
+    channel, calls `mapreq_fetch_once()`, and brings up the WG netif
+    against the first peer announced. `main.c` invokes it after
+    `tinylink_register()` succeeds.
+  - The `wireguardif.c` UDP-socket-sharing patch (so DISCO/STUN can
+    multiplex on the WG socket) is intentionally deferred to M3 — until
+    DISCO actually needs the same socket, the upstream
+    `udp_bind(IP_ADDR_ANY, port)` is fine.
+  - Build size: `tinylink.bin` 0x111a50 → 0x1182e0 (+25 KiB).
+
 - **M2 scaffolding: `MapRequest` + `MapResponse` parser.**
   - Vendored `jsmn` (single-header zero-alloc tokenizer, MIT, ~350 LoC)
     at `components/tinylink/src/jsmn.h`.

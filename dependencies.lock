@@ -13,9 +13,17 @@ dependencies:
     source:
       type: idf
     version: 5.5.4
+  trombik/esp_wireguard:
+    component_hash: 06b514516c241f27493b7589d3d4a79f424713609891168e4e65f529f1980922
+    dependencies: []
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 0.9.0
 direct_dependencies:
 - espressif/nghttp
 - idf
-manifest_hash: bd4cf41893c9dd938c8aa1df8ee86601b5b4b08ef1677e37efa8b90c134e8ff7
+- trombik/esp_wireguard
+manifest_hash: 73680b7716329f4f7af597cfdc67f82c88497a38dd0e31561baaa1a67a828b26
 target: esp32
 version: 2.0.0

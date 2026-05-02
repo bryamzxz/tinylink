@@ -53,6 +53,22 @@ esp_err_t tinylink_register(void);
  * identities are stable from tinylink_init() onward. */
 esp_err_t tinylink_get_keys(tinylink_keys_t *out);
 
+/* M2 — fetch one MapResponse from the control plane and bring up the
+ * WireGuard data plane against the first peer it announces. Internally:
+ *   1. Open a fresh ts2021 Noise channel.
+ *   2. POST /machine/map with `Stream:false`; parse the single
+ *      MapResponse.
+ *   3. Translate the netmap into a `wireguard_config_t` and call
+ *      `esp_wireguard_init` + `esp_wireguard_connect`.
+ *
+ * Returns ESP_OK once the WG netif is up. Note: this only means the
+ * device is *trying* to handshake; whether the peer is reachable is a
+ * separate poll via the underlying `esp_wireguardif_peer_is_up`. The
+ * long-poll `Stream:true` form, which keeps the netmap fresh, lands
+ * with the M3 DISCO loop.
+ */
+esp_err_t tinylink_dataplane_start(void);
+
 const char *tinylink_version_string(void);
 
 #ifdef __cplusplus

@@ -10,8 +10,11 @@
 
 #include "control_key.h"
 #include "keys.h"
+#include "mapreq.h"
+#include "netmap.h"
 #include "register.h"
 #include "ts2021_client.h"
+#include "wg_dataplane.h"
 
 #define STR_HELPER(x) #x
 #define STR(x) STR_HELPER(x)
@@ -95,4 +98,35 @@ esp_err_t tinylink_register(void)
     /* Best-effort scrub of the auth key in stack memory. */
     memset(auth_key, 0, sizeof(auth_key));
     return err;
+}
+
+esp_err_t tinylink_dataplane_start(void)
+{
+    if (!s_initialized) return ESP_ERR_INVALID_STATE;
+
+    /* Open a fresh ts2021 channel for /machine/map. The control plane
+     * is happy to serve a non-stream MapRequest on a new connection;
+     * keeping register and map on separate connections also keeps the
+     * register flow's auth-key scrubbing simple. */
+    ts2021_conn_t conn;
+    esp_err_t err = ts2021_connect(&conn, s_keys.machine_priv,
+                                   s_keys.machine_pub, s_control_pub);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "ts2021_connect (map) failed: 0x%x", err);
+        return err;
+    }
+
+    static tl_netmap_t netmap;  /* ~1 KiB; stash in BSS, not the stack. */
+    err = mapreq_fetch_once(&conn, &s_keys, &netmap);
+    ts2021_close(&conn);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "mapreq_fetch_once failed: 0x%x", err);
+        return err;
+    }
+    ESP_LOGI(TAG, "netmap: self.id=%llu peers=%u derp_regions=%u",
+             (unsigned long long)netmap.self_id,
+             (unsigned)netmap.n_peers,
+             (unsigned)netmap.n_derp_regions);
+
+    return wg_dataplane_start(&s_keys, &netmap);
 }

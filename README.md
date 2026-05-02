@@ -5,12 +5,15 @@ written in pure C on **ESP-IDF v5.5.x**.
 
 ## Status
 
-**Pre-alpha — Milestone 1 complete, Milestone 2 in progress.** M1 lands
-the ts2021 control plane (Noise IK + register, wire format verified
-against upstream in commit `2717ab7`). M2 is starting on the data
-plane: a `MapRequest` emitter and `jsmn`-based `MapResponse` parser
-have landed; the WireGuard component (lift of `trombik/esp_wireguard`
-+ demuxer patch) is the next piece.
+**Pre-alpha — Milestone 1 complete, Milestone 2 first-cut data plane
+landed.** M1 lands the ts2021 control plane (Noise IK + register,
+wire format verified against upstream in commit `2717ab7`). M2 step 1
+landed the `MapRequest` emitter and the `jsmn`-based `MapResponse`
+parser; M2 step 2 (this commit) lifts `trombik/esp_wireguard` as a
+managed component and wires it: after register, the device fetches
+one MapResponse, picks `peers[0]`, and brings up the WG netif against
+its endpoint. The long-poll (`Stream:true`) loop and the
+DISCO/STUN-aware UDP demuxer follow in M3.
 
 Not production-ready. Not affiliated with Tailscale Inc. The Tailscale
 name and logo are trademarks of Tailscale Inc.; this project is a
@@ -54,14 +57,15 @@ single-peer, ~600 KiB flash.
   `controlplane.tailscale.com`. The device generates Curve25519 identities
   on first boot, fetches and pins the control plane public key, and
   registers via `POST /machine/register`.
-- **MapRequest + WireGuard data plane** (Milestone 2, in progress): the
-  Noise channel already runs HTTP/2 via nghttp2 from M1, so M2 reuses
-  it for `POST /machine/map`. A jsmn-based parser extracts only the
-  fields the data plane needs (self/peer addresses, peer endpoints,
-  DERP map). The data plane lifts `trombik/esp_wireguard` with a
-  ~50-line patch to `wireguardif.c` so packets are injected from a
-  demuxer task instead of via `udp_bind` — that lets the same UDP
-  socket multiplex DISCO/STUN later.
+- **MapRequest + WireGuard data plane** (Milestone 2, first cut
+  landed): the Noise channel already runs HTTP/2 via nghttp2 from M1,
+  so M2 reuses it for `POST /machine/map`. A jsmn-based parser
+  extracts only the fields the data plane needs (self/peer addresses,
+  peer endpoints, DERP map). The data plane lifts
+  `trombik/esp_wireguard` (BSD-3) as a managed component and a thin
+  shim translates `tl_netmap_t → wireguard_config_t`. The
+  multiplexed-UDP-socket patch on `wireguardif.c` (so DISCO/STUN can
+  share the WG socket) lands in M3 when DISCO actually needs it.
 - **DISCO** (Milestone 3): NaCl-box over the same UDP socket as WireGuard,
   alongside the TMP117 driver and UDP telemetry task.
 - **DERP** (Milestone 5): TLS relay fallback.

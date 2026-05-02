@@ -1,11 +1,16 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Bryam (bryamzxz)
 //
-// tinylink Milestone 1 entrypoint: register the device with the Tailscale
-// control plane via ts2021. There is no data plane in M1 — the device
-// will appear in https://login.tailscale.com/admin/machines as an online
-// node, but pings to it will not work until M2 lands the WireGuard data
-// plane derived from MapResponse.
+// tinylink M1 + M2 entrypoint:
+//   1. WiFi up.
+//   2. tinylink_init() — load/generate Curve25519 identities and pin the
+//      control plane public key.
+//   3. tinylink_register() — POST /machine/register; retry slow on
+//      MachineAuthorized=false until the operator approves the node.
+//   4. tinylink_dataplane_start() — fetch one MapResponse and bring up
+//      the WireGuard netif against the home peer it announces. The
+//      long-lived `Stream:true` MapRequest loop and DISCO/STUN follow
+//      in M3.
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -55,13 +60,20 @@ static esp_err_t bringup(void)
     for (;;) {
         err = tinylink_register();
         if (err == ESP_OK) {
-            ESP_LOGI(TAG, "node registered, idle waiting for M2 (MapRequest)");
+            ESP_LOGI(TAG, "node registered");
             break;
         }
         ESP_LOGW(TAG, "register attempt failed: 0x%x — retrying in %d ms",
                  err, CONFIG_TINYLINK_REGISTER_RETRY_MS);
         vTaskDelay(pdMS_TO_TICKS(CONFIG_TINYLINK_REGISTER_RETRY_MS));
     }
+
+    err = tinylink_dataplane_start();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "dataplane bringup failed: 0x%x", err);
+        return err;
+    }
+    ESP_LOGI(TAG, "data plane up — idle until M3 (DISCO + telemetry)");
     return ESP_OK;
 }
 

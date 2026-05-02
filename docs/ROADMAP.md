@@ -99,17 +99,24 @@ zstd by not advertising support (saves ~30 KB flash).
 - Host-side KAT in `tools/test/test_mapresp.c` parses a stub modeled
   on a real one-peer MapResponse and checks each extracted field.
 
-**Step 2 (next commit, "feat(m2): WireGuard data plane via trombik"):**
-Lift `trombik/esp_wireguard` (active port of `smartalock/wireguard-lwip`,
-~3500 LoC C, BSD-3) as the data-plane component [research §B]. Patch
-~50 lines in `wireguardif.c` to accept packets injected from a demuxer
-task rather than `udp_bind(IP_ADDR_ANY, port)` so the same UDP socket
-can multiplex DISCO/STUN later.
+**Step 2 (landed in `feat(m2): WireGuard data plane via trombik`):**
+- Lifted `trombik/esp_wireguard@0.9.0` (BSD-3) as a managed component.
+- `components/tinylink/src/wg_dataplane.{c,h}` is a thin shim that
+  translates the parsed netmap into the `wireguard_config_t` the
+  upstream component expects. Single-peer (`peers[0]`), v4-only,
+  25-second persistent keepalive until DISCO takes over.
+- New public API `tinylink_dataplane_start()` opens a fresh ts2021
+  channel, drives one `mapreq_fetch_once()`, and brings up the WG
+  netif. `main.c` calls it after register succeeds.
 
-**Step 3:** swap `Stream:false` for `Stream:true` and run the parser
-in a long-poll loop driven by an `app_task` FreeRTOS task; integrate
-with the WG bringup so peer endpoint changes update the WG peer in
-place.
+**Step 3 (deferred to M3, alongside DISCO):**
+- Swap `Stream:false` for `Stream:true`; run the parser in a long-poll
+  loop driven by an `app_task` FreeRTOS task; update the WG peer
+  endpoint in place when MapResponse churns.
+- Patch ~50 lines in upstream `wireguardif.c` to accept packets
+  injected from a demuxer task rather than via `udp_bind(IP_ADDR_ANY,
+  port)`, so DISCO/STUN can share the WG UDP socket. Until DISCO
+  actually arrives, the bare bind is fine.
 
 Cookie reply (WG message type 3, XChaCha20-Poly1305) is intentionally
 **dropped on receive** and `mac2 = 0^16` always on send — saves ~1-2 KB
