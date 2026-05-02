@@ -21,6 +21,13 @@ int hmac_blake2s(uint8_t out[HKDF_BLAKE2S_HASHLEN],
                  const uint8_t *key, size_t key_len,
                  const uint8_t *data, size_t data_len);
 
+/* Noise §4.3 HKDF — single output. Equivalent to the first 32 bytes of
+ * noise_hkdf2 / noise_hkdf3. Used by WG's KDF1(c, x) calls (e.g. when
+ * mixing only the chaining-key, no key material). */
+int noise_hkdf1(const uint8_t ck[HKDF_BLAKE2S_HASHLEN],
+                const uint8_t *input, size_t input_len,
+                uint8_t out1[HKDF_BLAKE2S_HASHLEN]);
+
 /* Noise §4.3 HKDF — two outputs. ck' goes in out1, k goes in out2. */
 int noise_hkdf2(const uint8_t ck[HKDF_BLAKE2S_HASHLEN],
                 const uint8_t *input, size_t input_len,

@@ -17,7 +17,8 @@ CRYPTO  := ../../components/tinylink/src/crypto
 TL_SRC  := ../../components/tinylink/src
 
 TARGETS := test_blake2s test_curve25519 test_mapresp \
-           test_chacha20 test_poly1305 test_chacha20poly1305
+           test_chacha20 test_poly1305 test_chacha20poly1305 \
+           test_hkdf_noise test_wg_handshake test_wg_transport
 
 all: $(TARGETS)
 
@@ -51,11 +52,49 @@ test_chacha20poly1305: test_chacha20poly1305.c \
 	$(CC) $(CFLAGS) -I$(CRYPTO) -o $@ test_chacha20poly1305.c \
 	    $(CRYPTO)/chacha20poly1305.c $(CRYPTO)/chacha20.c $(CRYPTO)/poly1305_donna.c
 
+# Cross-consistency KAT for HKDF-BLAKE2s / Noise §4.3 KDFs.
+test_hkdf_noise: test_hkdf_noise.c \
+                $(CRYPTO)/hkdf_blake2s.c $(CRYPTO)/hkdf_blake2s.h \
+                $(CRYPTO)/blake2s.c $(CRYPTO)/blake2s.h
+	$(CC) $(CFLAGS) -I$(CRYPTO) -o $@ test_hkdf_noise.c \
+	    $(CRYPTO)/hkdf_blake2s.c $(CRYPTO)/blake2s.c
+
+# WG handshake initiator (step 3a). Pulls in the crypto stack +
+# wg_proto.c + wg_handshake.c. Uses host fallback for time(2) /
+# clock_gettime(2) — the ESP_PLATFORM branches in wg_proto.c are
+# guarded out at compile time.
+test_wg_handshake: test_wg_handshake.c \
+                  $(TL_SRC)/wg_handshake.c $(TL_SRC)/wg_handshake.h \
+                  $(TL_SRC)/wg_proto.c $(TL_SRC)/wg_proto.h \
+                  $(CRYPTO)/blake2s.c $(CRYPTO)/curve25519.c \
+                  $(CRYPTO)/hkdf_blake2s.c $(CRYPTO)/chacha20.c \
+                  $(CRYPTO)/poly1305_donna.c $(CRYPTO)/chacha20poly1305.c
+	$(CC) $(CFLAGS) -I$(TL_SRC) -I$(CRYPTO) -o $@ test_wg_handshake.c \
+	    $(TL_SRC)/wg_handshake.c $(TL_SRC)/wg_proto.c \
+	    $(CRYPTO)/blake2s.c $(CRYPTO)/curve25519.c \
+	    $(CRYPTO)/hkdf_blake2s.c $(CRYPTO)/chacha20.c \
+	    $(CRYPTO)/poly1305_donna.c $(CRYPTO)/chacha20poly1305.c
+
+# WG transport (data plane) — encrypt/decrypt + RFC 6479 anti-replay.
+test_wg_transport: test_wg_transport.c \
+                  $(TL_SRC)/wg_transport.c $(TL_SRC)/wg_transport.h \
+                  $(TL_SRC)/wg_proto.c $(TL_SRC)/wg_proto.h \
+                  $(CRYPTO)/blake2s.c $(CRYPTO)/hkdf_blake2s.c \
+                  $(CRYPTO)/chacha20.c $(CRYPTO)/poly1305_donna.c \
+                  $(CRYPTO)/chacha20poly1305.c
+	$(CC) $(CFLAGS) -I$(TL_SRC) -I$(CRYPTO) -o $@ test_wg_transport.c \
+	    $(TL_SRC)/wg_transport.c $(TL_SRC)/wg_proto.c \
+	    $(CRYPTO)/blake2s.c $(CRYPTO)/hkdf_blake2s.c \
+	    $(CRYPTO)/chacha20.c $(CRYPTO)/poly1305_donna.c \
+	    $(CRYPTO)/chacha20poly1305.c
+
 .PHONY: test test_blake2s.run test_curve25519.run test_mapresp.run \
-        test_chacha20.run test_poly1305.run test_chacha20poly1305.run clean
+        test_chacha20.run test_poly1305.run test_chacha20poly1305.run \
+        test_hkdf_noise.run test_wg_handshake.run test_wg_transport.run clean
 
 test: test_blake2s.run test_curve25519.run test_mapresp.run \
-      test_chacha20.run test_poly1305.run test_chacha20poly1305.run
+      test_chacha20.run test_poly1305.run test_chacha20poly1305.run \
+      test_hkdf_noise.run test_wg_handshake.run test_wg_transport.run
 
 test_blake2s.run: test_blake2s
 	./test_blake2s
@@ -74,6 +113,15 @@ test_poly1305.run: test_poly1305
 
 test_chacha20poly1305.run: test_chacha20poly1305
 	./test_chacha20poly1305
+
+test_hkdf_noise.run: test_hkdf_noise
+	./test_hkdf_noise
+
+test_wg_handshake.run: test_wg_handshake
+	./test_wg_handshake
+
+test_wg_transport.run: test_wg_transport
+	./test_wg_transport
 
 clean:
 	rm -f $(TARGETS)
