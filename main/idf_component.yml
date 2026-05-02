@@ -3,14 +3,15 @@
 #
 # tinylink managed-component dependencies.
 #
-# trombik/esp_wireguard is the active port of smartalock/wireguard-lwip
-# (BSD-3, ESP-IDF native, ~3500 LoC). It owns the WG data plane in M2.
-# Picked over droscy/esp_wireguard because the latter has known build
-# breaks under IDF v5.5 with TCPIP_CORE_LOCKING enabled (research
-# artifact §B note); trombik works as-is under our sdkconfig.
+# trombik/esp_wireguard was the M2 dataplane; removed 2026-05-02 in
+# Option C step 6 after first HW boot crashed in
+# esp_netif_internal_dhcpc_cb (its lwIP-direct netif registration is
+# incompatible with the IDF v5.5 DHCP-client callback wiring).
+# Replaced by the native tinylink_wg stack (components/tinylink/src/
+# wg_netif.c + wg_lwip.c + wg_proto.c + wg_handshake.c + wg_transport.c
+# + the host-KAT'd ChaCha20-Poly1305 crypto). 110 host KATs across the
+# vendored crypto + protocol layers.
 
 dependencies:
   idf:
     version: ">=5.5,<5.6"
-  trombik/esp_wireguard:
-    version: "0.9.0"

@@ -1,59 +1,33 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Bryam (bryamzxz)
+//
+// WireGuard dataplane bring-up. Replaced the trombik/esp_wireguard
+// shim with the native tinylink_wg stack on 2026-05-02 after the
+// trombik path crashed in esp_netif_internal_dhcpc_cb on the first
+// real-hardware boot under ESP-IDF v5.5 (Option C step 6).
 
 #ifdef ESP_PLATFORM
 
 #include "wg_dataplane.h"
 
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "esp_log.h"
+#include "lwip/inet.h"
+#include "lwip/sockets.h"
 
-#include "esp_wireguard.h"
+#include "wg_lwip.h"
+#include "wg_netif.h"
 
 static const char *TAG = "wg";
 
-static bool              s_started;
-static wireguard_config_t s_cfg;
-static wireguard_ctx_t   s_ctx;
+static bool     s_started;
+static char     s_endpoint_host[64];   /* string form of last applied endpoint */
+static uint16_t s_endpoint_port;
 
-/* Static backing storage for the strings the trombik config points at —
- * the library copies them into its peer struct on init, but it's
- * cleaner to keep a stable copy than to rely on lifetime. */
-static char s_priv_b64[64];
-static char s_pub_b64[64];
-static char s_allowed_ip[16];   /* "100.64.0.7" */
-static char s_allowed_mask[16]; /* "255.255.255.255" */
-static char s_endpoint_host[64];
-
-static const char b64_alphabet[] =
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-static int b64_encode(const uint8_t *in, size_t in_len,
-                      char *out, size_t out_size)
-{
-    size_t needed = ((in_len + 2) / 3) * 4 + 1;
-    if (needed > out_size) return -1;
-
-    size_t o = 0;
-    for (size_t i = 0; i < in_len; i += 3) {
-        uint32_t v = (uint32_t)in[i] << 16;
-        if (i + 1 < in_len) v |= (uint32_t)in[i + 1] << 8;
-        if (i + 2 < in_len) v |= (uint32_t)in[i + 2];
-        out[o++] = b64_alphabet[(v >> 18) & 0x3F];
-        out[o++] = b64_alphabet[(v >> 12) & 0x3F];
-        out[o++] = (i + 1 < in_len) ? b64_alphabet[(v >> 6) & 0x3F] : '=';
-        out[o++] = (i + 2 < in_len) ? b64_alphabet[v & 0x3F]        : '=';
-    }
-    out[o] = '\0';
-    return (int)o;
-}
-
-/* Parse "1.2.3.4/32" → host out + numeric prefix length. Caller-side
- * Tailscale CIDRs are always /32 in the v4 case (each node is a /32
- * host route), but we still parse defensively. */
+/* Parse "1.2.3.4/32" → host out + numeric prefix length. Tailscale
+ * always assigns each node a /32 host route, but parse defensively. */
 static int parse_cidr(const char *cidr, char *host_out, size_t host_size,
                       int *prefix_out)
 {
@@ -68,7 +42,7 @@ static int parse_cidr(const char *cidr, char *host_out, size_t host_size,
     return 0;
 }
 
-/* "ip:port" → ip out + port out. v6 was already filtered upstream. */
+/* "ip:port" → ip out + port out. v6 was filtered upstream. */
 static int parse_endpoint(const char *ep, char *host_out, size_t host_size,
                           int *port_out)
 {
@@ -83,50 +57,38 @@ static int parse_endpoint(const char *ep, char *host_out, size_t host_size,
     return 0;
 }
 
-static void prefix_to_mask(int prefix, char *out, size_t out_size)
-{
-    /* Always /32 for Tailscale v4, but keep the math honest. */
-    uint32_t mask = (prefix == 0) ? 0 : (0xFFFFFFFFu << (32 - prefix));
-    snprintf(out, out_size, "%u.%u.%u.%u",
-             (unsigned)((mask >> 24) & 0xFF),
-             (unsigned)((mask >> 16) & 0xFF),
-             (unsigned)((mask >>  8) & 0xFF),
-             (unsigned)( mask        & 0xFF));
-}
-
 esp_err_t wg_dataplane_start(const tinylink_keys_t *keys,
                              const tl_netmap_t *nm)
 {
     if (keys == NULL || nm == NULL) return ESP_ERR_INVALID_ARG;
     if (s_started) return ESP_ERR_INVALID_STATE;
     if (nm->n_peers == 0) {
-        ESP_LOGE(TAG, "no peers in netmap — nothing to bring up");
+        ESP_LOGE(TAG, "no peers in netmap");
         return ESP_ERR_INVALID_STATE;
     }
     if (nm->n_self_addresses == 0) {
-        ESP_LOGE(TAG, "self has no v4 address — control plane did not assign one?");
+        ESP_LOGE(TAG, "self has no v4 address");
         return ESP_ERR_INVALID_STATE;
     }
     const tl_peer_t *peer = &nm->peers[0];
     if (peer->n_endpoints == 0) {
-        ESP_LOGE(TAG, "peer has no v4 endpoint — DERP-only path is M5 work");
+        ESP_LOGE(TAG, "peer has no v4 endpoint — DERP-only path is M5");
         return ESP_ERR_NOT_SUPPORTED;
     }
 
-    /* Encode keys (raw 32 B → 44-char base64). */
-    if (b64_encode(keys->node_priv, 32, s_priv_b64, sizeof(s_priv_b64)) < 0 ||
-        b64_encode(peer->node_pub,  32, s_pub_b64,  sizeof(s_pub_b64))  < 0) {
-        return ESP_ERR_INVALID_SIZE;
-    }
-
-    /* Local v4 + mask. */
-    int prefix = 32;
+    /* Local v4 (tunnel side). */
+    char self_ip_str[16];
+    int  self_prefix = 32;
     if (parse_cidr(nm->self_addresses[0].str,
-                   s_allowed_ip, sizeof(s_allowed_ip), &prefix) != 0) {
+                   self_ip_str, sizeof(self_ip_str), &self_prefix) != 0) {
         ESP_LOGE(TAG, "self CIDR malformed: %s", nm->self_addresses[0].str);
         return ESP_ERR_INVALID_ARG;
     }
-    prefix_to_mask(prefix, s_allowed_mask, sizeof(s_allowed_mask));
+    uint32_t local_ip_be = 0;
+    if (inet_pton(AF_INET, self_ip_str, &local_ip_be) != 1) {
+        ESP_LOGE(TAG, "inet_pton(%s) failed", self_ip_str);
+        return ESP_ERR_INVALID_ARG;
+    }
 
     /* Peer endpoint. */
     int port = 41641;
@@ -135,45 +97,63 @@ esp_err_t wg_dataplane_start(const tinylink_keys_t *keys,
         ESP_LOGE(TAG, "peer endpoint malformed: %s", peer->endpoints[0].str);
         return ESP_ERR_INVALID_ARG;
     }
+    uint32_t peer_v4_be = 0;
+    if (inet_pton(AF_INET, s_endpoint_host, &peer_v4_be) != 1) {
+        ESP_LOGE(TAG, "inet_pton peer(%s) failed", s_endpoint_host);
+        return ESP_ERR_INVALID_ARG;
+    }
+    s_endpoint_port = (uint16_t)port;
 
-    s_cfg = (wireguard_config_t)ESP_WIREGUARD_CONFIG_DEFAULT();
-    s_cfg.private_key     = s_priv_b64;
-    s_cfg.public_key      = s_pub_b64;
-    s_cfg.allowed_ip      = s_allowed_ip;
-    s_cfg.allowed_ip_mask = s_allowed_mask;
-    s_cfg.endpoint        = s_endpoint_host;
-    s_cfg.port            = port;
-    /* Tailscale's keepalive is normally driven by DISCO. Until DISCO is
-     * up in M3, ask the WG layer to send a 25 s keepalive so NAT
-     * mappings stay open. */
-    s_cfg.persistent_keepalive = 25;
-
-    esp_err_t err = esp_wireguard_init(&s_cfg, &s_ctx);
+    /* 1) WG protocol engine (UDP socket + handshake state machine). */
+    struct wg_netif_local_config local = {0};
+    memcpy(local.static_priv, keys->node_priv, WG_KEY_LEN);
+    memcpy(local.static_pub,  keys->node_pub,  WG_KEY_LEN);
+    local.bind_port = 0;  /* let the kernel pick an ephemeral source port */
+    esp_err_t err = wg_netif_init(&local);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "esp_wireguard_init: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "wg_netif_init: %s", esp_err_to_name(err));
         return err;
     }
-    err = esp_wireguard_connect(&s_ctx);
+
+    struct wg_netif_peer_config peer_cfg = {0};
+    memcpy(peer_cfg.peer_static_pub, peer->node_pub, WG_KEY_LEN);
+    peer_cfg.peer_endpoint_v4_be = peer_v4_be;
+    peer_cfg.peer_endpoint_port  = s_endpoint_port;
+    err = wg_netif_start(&peer_cfg);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "esp_wireguard_connect: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "wg_netif_start: %s", esp_err_to_name(err));
+        wg_netif_stop();
         return err;
     }
+
+    /* 2) lwIP integration. WG_LWIP_MTU = 1280 (the WG default). The
+     * 40-byte WG transport header doesn't need MSS clamp here — lwIP
+     * will path-MTU per its own rules once we tell it our MTU. */
+    err = wg_lwip_attach(local_ip_be, /*mtu=*/1280);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "wg_lwip_attach: %s", esp_err_to_name(err));
+        wg_netif_stop();
+        return err;
+    }
+
     s_started = true;
-    ESP_LOGI(TAG, "WG bringup: self=%s/%d peer-endpoint=%s:%d",
-             s_allowed_ip, prefix, s_endpoint_host, port);
+    ESP_LOGI(TAG, "WG bringup (tinylink_wg): self=%s/%d peer=%s:%u",
+             self_ip_str, self_prefix,
+             s_endpoint_host, (unsigned)s_endpoint_port);
     return ESP_OK;
 }
 
 esp_err_t wg_dataplane_peer_is_up(void)
 {
     if (!s_started) return ESP_ERR_INVALID_STATE;
-    return esp_wireguardif_peer_is_up(&s_ctx);
+    return wg_netif_is_up() ? ESP_OK : ESP_ERR_INVALID_STATE;
 }
 
 void wg_dataplane_stop(void)
 {
     if (!s_started) return;
-    esp_wireguard_disconnect(&s_ctx);
+    wg_lwip_detach();
+    wg_netif_stop();
     s_started = false;
 }
 
@@ -182,36 +162,39 @@ esp_err_t wg_dataplane_update_peer(const tinylink_keys_t *keys,
 {
     if (keys == NULL || nm == NULL) return ESP_ERR_INVALID_ARG;
     if (nm->n_peers == 0 || nm->peers[0].n_endpoints == 0) {
-        return ESP_OK;  /* nothing to act on */
+        return ESP_OK;
+    }
+
+    /* Parse the new endpoint and compare with what we have. */
+    char  new_host[64];
+    int   new_port = 0;
+    if (parse_endpoint(nm->peers[0].endpoints[0].str,
+                       new_host, sizeof(new_host), &new_port) != 0) {
+        return ESP_OK;  /* malformed; leave the live session alone */
     }
     if (s_started &&
-        strncmp(s_endpoint_host, nm->peers[0].endpoints[0].str,
-                strlen(s_endpoint_host)) == 0) {
-        /* Cheap pre-check: if the host portion matches what we last
-         * configured, assume the full endpoint did too. The full
-         * compare happens after a successful re-parse below. */
-        char new_host[64];
-        int  new_port = 0;
-        const char *colon = strchr(nm->peers[0].endpoints[0].str, ':');
-        if (colon != NULL) {
-            size_t hlen = (size_t)(colon - nm->peers[0].endpoints[0].str);
-            if (hlen < sizeof(new_host)) {
-                memcpy(new_host, nm->peers[0].endpoints[0].str, hlen);
-                new_host[hlen] = '\0';
-                new_port = atoi(colon + 1);
-                if (strcmp(new_host, s_endpoint_host) == 0 &&
-                    new_port == s_cfg.port) {
-                    return ESP_OK;  /* unchanged */
-                }
-            }
-        }
+        strcmp(new_host, s_endpoint_host) == 0 &&
+        (uint16_t)new_port == s_endpoint_port) {
+        return ESP_OK;  /* unchanged */
     }
-    /* Endpoint changed (or first call) — tear down and bring back up. */
+
+    /* Endpoint changed. With tinylink_wg, roaming does NOT require a
+     * fresh handshake — we just point the UDP socket at the new
+     * sockaddr. The transport keys remain valid. */
     if (s_started) {
-        ESP_LOGI(TAG, "peer endpoint changed → reconnecting WG");
-        esp_wireguard_disconnect(&s_ctx);
-        s_started = false;
+        uint32_t v4_be = 0;
+        if (inet_pton(AF_INET, new_host, &v4_be) != 1) {
+            return ESP_ERR_INVALID_ARG;
+        }
+        ESP_LOGI(TAG, "peer endpoint changed: %s:%u → %s:%d",
+                 s_endpoint_host, (unsigned)s_endpoint_port,
+                 new_host, new_port);
+        memcpy(s_endpoint_host, new_host, sizeof(s_endpoint_host));
+        s_endpoint_port = (uint16_t)new_port;
+        return wg_netif_update_peer_endpoint(v4_be, (uint16_t)new_port);
     }
+
+    /* Not started yet — go through the full bring-up. */
     return wg_dataplane_start(keys, nm);
 }
 
