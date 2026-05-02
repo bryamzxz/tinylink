@@ -56,6 +56,23 @@ int hmac_blake2s(uint8_t out[HKDF_BLAKE2S_HASHLEN],
     return 0;
 }
 
+int noise_hkdf1(const uint8_t ck[HKDF_BLAKE2S_HASHLEN],
+                const uint8_t *input, size_t input_len,
+                uint8_t out1[HKDF_BLAKE2S_HASHLEN])
+{
+    uint8_t temp_key[HKDF_BLAKE2S_HASHLEN];
+    uint8_t one = 0x01;
+
+    if (hmac_blake2s(temp_key, ck, HKDF_BLAKE2S_HASHLEN,
+                     input, input_len) != 0) return -1;
+    if (hmac_blake2s(out1, temp_key, HKDF_BLAKE2S_HASHLEN, &one, 1) != 0) {
+        memset(temp_key, 0, sizeof(temp_key));
+        return -1;
+    }
+    memset(temp_key, 0, sizeof(temp_key));
+    return 0;
+}
+
 int noise_hkdf2(const uint8_t ck[HKDF_BLAKE2S_HASHLEN],
                 const uint8_t *input, size_t input_len,
                 uint8_t out1[HKDF_BLAKE2S_HASHLEN],

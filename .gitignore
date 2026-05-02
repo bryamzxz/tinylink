@@ -55,3 +55,4 @@ tools/test/test_mapresp
 tools/test/test_chacha20
 tools/test/test_poly1305
 tools/test/test_chacha20poly1305
+tools/test/test_hkdf_noise

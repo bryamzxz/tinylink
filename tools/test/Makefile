@@ -17,7 +17,8 @@ CRYPTO  := ../../components/tinylink/src/crypto
 TL_SRC  := ../../components/tinylink/src
 
 TARGETS := test_blake2s test_curve25519 test_mapresp \
-           test_chacha20 test_poly1305 test_chacha20poly1305
+           test_chacha20 test_poly1305 test_chacha20poly1305 \
+           test_hkdf_noise
 
 all: $(TARGETS)
 
@@ -51,11 +52,20 @@ test_chacha20poly1305: test_chacha20poly1305.c \
 	$(CC) $(CFLAGS) -I$(CRYPTO) -o $@ test_chacha20poly1305.c \
 	    $(CRYPTO)/chacha20poly1305.c $(CRYPTO)/chacha20.c $(CRYPTO)/poly1305_donna.c
 
+# Cross-consistency KAT for HKDF-BLAKE2s / Noise §4.3 KDFs.
+test_hkdf_noise: test_hkdf_noise.c \
+                $(CRYPTO)/hkdf_blake2s.c $(CRYPTO)/hkdf_blake2s.h \
+                $(CRYPTO)/blake2s.c $(CRYPTO)/blake2s.h
+	$(CC) $(CFLAGS) -I$(CRYPTO) -o $@ test_hkdf_noise.c \
+	    $(CRYPTO)/hkdf_blake2s.c $(CRYPTO)/blake2s.c
+
 .PHONY: test test_blake2s.run test_curve25519.run test_mapresp.run \
-        test_chacha20.run test_poly1305.run test_chacha20poly1305.run clean
+        test_chacha20.run test_poly1305.run test_chacha20poly1305.run \
+        test_hkdf_noise.run clean
 
 test: test_blake2s.run test_curve25519.run test_mapresp.run \
-      test_chacha20.run test_poly1305.run test_chacha20poly1305.run
+      test_chacha20.run test_poly1305.run test_chacha20poly1305.run \
+      test_hkdf_noise.run
 
 test_blake2s.run: test_blake2s
 	./test_blake2s
@@ -74,6 +84,9 @@ test_poly1305.run: test_poly1305
 
 test_chacha20poly1305.run: test_chacha20poly1305
 	./test_chacha20poly1305
+
+test_hkdf_noise.run: test_hkdf_noise
+	./test_hkdf_noise
 
 clean:
 	rm -f $(TARGETS)
