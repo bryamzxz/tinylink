@@ -78,10 +78,14 @@ static esp_err_t build_request_body(const tinylink_keys_t *keys,
         return ESP_ERR_NO_MEM;
     }
 
-    /* Version here is the Noise transport CapabilityVersion, not a marketing
-     * version; upstream pins 1 on the wire and the server gates new features
-     * off the Hostinfo block instead. */
-    cJSON_AddNumberToObject(root, "Version", 1);
+    /* Version here is the Tailscale CapabilityVersion. Production
+     * clients use tailcfg.CurrentCapabilityVersion (= 138 as of
+     * 2026-05-02 per /home/bryam/dev/tailscale/tailcfg/tailcfg.go).
+     * M1 had hardcoded 1 — the server treated our request as a
+     * legacy client and silently dropped the connection after
+     * sending SETTINGS, observed as a 31s TLS-read timeout on
+     * first hardware boot. */
+    cJSON_AddNumberToObject(root, "Version", 138);
     cJSON_AddStringToObject(root, "NodeKey", node_key_hex);
     cJSON_AddStringToObject(root, "OldNodeKey", old_node_key);
     cJSON_AddStringToObject(root, "NLKey", nl_key_zero);

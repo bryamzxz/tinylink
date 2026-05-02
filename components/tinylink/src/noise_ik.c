@@ -47,13 +47,27 @@ static esp_err_t mix_key(noise_ik_state_t *st,
     return ESP_OK;
 }
 
-/* Build the 12-byte ChaCha20-Poly1305 nonce from a 64-bit counter
- * (Noise §5.1: 4 zero bytes, then LE64 counter). */
+/* Build the 12-byte ChaCha20-Poly1305 nonce from a 64-bit counter.
+ *
+ * IMPORTANT: tinylink uses this with the Tailscale ts2021 transport,
+ * not pure Noise. Tailscale's controlbase/conn.go encodes the
+ * 8-byte counter portion as BIG-ENDIAN (see `nonce.Increment` in
+ * upstream: `binary.BigEndian.PutUint64(n[4:], …)`), deviating from
+ * the Noise spec's little-endian. The handshake's per-message AEADs
+ * always run with n=0 (each MixKey resets the counter) so the
+ * endianness doesn't matter there; on the transport path n>0
+ * happens immediately on the second record and a LE encoding makes
+ * the AEAD auth-fail with -86. We follow Tailscale and emit BE.
+ *
+ * Discovered 2026-05-02 on first hardware boot: first transport
+ * record decrypted (n=0, both encodings produce all-zero counter
+ * bytes), second one failed. Hex dumps confirmed the nonce
+ * mismatch at counter=1. */
 static void noise_nonce(uint8_t out[12], uint64_t n)
 {
     memset(out, 0, 4);
     for (int i = 0; i < 8; i++) {
-        out[4 + i] = (uint8_t)((n >> (8 * i)) & 0xFF);
+        out[4 + i] = (uint8_t)((n >> (8 * (7 - i))) & 0xFF);
     }
 }
 
