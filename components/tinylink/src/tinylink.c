@@ -35,6 +35,30 @@ static tinylink_keys_t s_keys;
 static uint8_t         s_control_pub[32];
 static bool            s_initialized;
 
+/* Persistent ts2021/Noise channel to the control plane, mirroring
+ * upstream's controlclient.Direct.noiseClient (one client reused for
+ * register, map and map-stream). Avoids the heap-corruption assert we
+ * hit when ts2021_close+ts2021_connect cycles ran back-to-back, AND
+ * saves a Noise IK + TLS handshake on every long-poll reconnect. */
+static ts2021_conn_t   s_conn;
+static bool            s_conn_open;
+
+static esp_err_t ensure_control_conn(void)
+{
+    if (s_conn_open) return ESP_OK;
+    esp_err_t err = ts2021_connect(&s_conn, s_keys.machine_priv,
+                                   s_keys.machine_pub, s_control_pub);
+    if (err == ESP_OK) s_conn_open = true;
+    return err;
+}
+
+static void drop_control_conn(void)
+{
+    if (!s_conn_open) return;
+    ts2021_close(&s_conn);
+    s_conn_open = false;
+}
+
 const char *tinylink_version_string(void)
 {
     return k_version;
@@ -89,63 +113,78 @@ esp_err_t tinylink_register(void)
     esp_err_t err = read_auth_key(auth_key, sizeof(auth_key));
     if (err != ESP_OK) return err;
 
-    ts2021_conn_t conn;
-    err = ts2021_connect(&conn, s_keys.machine_priv, s_keys.machine_pub,
-                         s_control_pub);
+    err = ensure_control_conn();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "ts2021_connect failed: 0x%x", err);
+        memset(auth_key, 0, sizeof(auth_key));
         return err;
     }
 
-    err = register_emit(&conn, &s_keys, auth_key);
-    ts2021_close(&conn);
+    err = register_emit(&s_conn, &s_keys, auth_key);
 
     /* Best-effort scrub of the auth key in stack memory. */
     memset(auth_key, 0, sizeof(auth_key));
+
+    /* Drop the conn after register. Reusing the same ts2021 channel for
+     * /machine/map fails because our h2_drive_request creates+destroys
+     * a fresh nghttp2 session per request, and the GOAWAY emitted on
+     * the first session_del causes the SECOND submit to land on a
+     * half-closed transport (server returns HTTP 0).
+     *
+     * Until h2_client is refactored to keep ONE persistent nghttp2
+     * session per ts2021 conn (matching upstream's go-http2 behavior),
+     * the safe pattern is one ts2021 conn per request. The 24 KiB
+     * long-poll stack now absorbs the second handshake without
+     * blowing — see tinylink_long_poll_start. */
+    drop_control_conn();
     return err;
 }
 
 esp_err_t tinylink_dataplane_start(void)
 {
-    if (!s_initialized) return ESP_ERR_INVALID_STATE;
-
-    /* Open a fresh ts2021 channel for /machine/map. The control plane
-     * is happy to serve a non-stream MapRequest on a new connection;
-     * keeping register and map on separate connections also keeps the
-     * register flow's auth-key scrubbing simple. */
-    ts2021_conn_t conn;
-    esp_err_t err = ts2021_connect(&conn, s_keys.machine_priv,
-                                   s_keys.machine_pub, s_control_pub);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "ts2021_connect (map) failed: 0x%x", err);
-        return err;
-    }
-
-    static tl_netmap_t netmap;  /* ~1 KiB; stash in BSS, not the stack. */
-    err = mapreq_fetch_once(&conn, &s_keys, &netmap);
-    ts2021_close(&conn);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "mapreq_fetch_once failed: 0x%x", err);
-        return err;
-    }
-    ESP_LOGI(TAG, "netmap: self.id=%llu peers=%u derp_regions=%u",
-             (unsigned long long)netmap.self_id,
-             (unsigned)netmap.n_peers,
-             (unsigned)netmap.n_derp_regions);
-
-    return wg_dataplane_start(&s_keys, &netmap);
+    /* Mirrors upstream's controlclient.Direct: there is NO separate
+     * "fetch one MapResponse, then start streaming" call. The streaming
+     * /machine/map request itself delivers the initial netmap as its
+     * first frame and subsequent updates as follow-up frames on the same
+     * stream. So this entry point now only validates state — the actual
+     * WG bring-up happens inside long_poll_handler on the first netmap
+     * the stream emits. Kept in the API for backward compatibility with
+     * the boot sequence in main.c. */
+    return s_initialized ? ESP_OK : ESP_ERR_INVALID_STATE;
 }
 
 /* ---- long-poll MapRequest task ----------------------------------------- */
 
+static bool s_dataplane_started;
+
 static esp_err_t long_poll_handler(const tl_netmap_t *nm, void *ctx)
 {
     (void)ctx;
-    ESP_LOGI(TAG, "stream MapResponse: peers=%u derp_regions=%u",
+    if (!s_dataplane_started) {
+        ESP_LOGI(TAG, "netmap (initial): self.id=%llu peers=%u derp_regions=%u",
+                 (unsigned long long)nm->self_id,
+                 (unsigned)nm->n_peers,
+                 (unsigned)nm->n_derp_regions);
+        esp_err_t err = wg_dataplane_start(&s_keys, nm);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "wg_dataplane_start failed: 0x%x", err);
+            return err;
+        }
+        s_dataplane_started = true;
+        /* Now that the WG netif is up and the 100.64.0.0/10 route
+         * exists, it's safe to start telemetry (it sendto's to a
+         * 100.64.0.1 address that would otherwise punt into the WiFi
+         * default route). */
+        esp_err_t terr = telemetry_start();
+        if (terr != ESP_OK) {
+            ESP_LOGW(TAG, "telemetry_start failed: 0x%x — continuing", terr);
+        }
+        return ESP_OK;
+    }
+    ESP_LOGI(TAG, "netmap (update): peers=%u derp_regions=%u",
              (unsigned)nm->n_peers, (unsigned)nm->n_derp_regions);
-    /* No-op the call when the new netmap drops the peer (rare server
-     * push during a tailnet reconfigure) — wg_dataplane_update_peer
-     * already guards on n_peers==0. */
+    /* wg_dataplane_update_peer already guards on n_peers==0 (rare server
+     * push during a tailnet reconfigure). */
     return wg_dataplane_update_peer(&s_keys, nm);
 }
 
@@ -154,13 +193,14 @@ static void long_poll_task(void *arg)
     (void)arg;
     ESP_LOGI(TAG, "long-poll task: starting");
     for (;;) {
-        ts2021_conn_t conn;
-        esp_err_t err = ts2021_connect(&conn, s_keys.machine_priv,
-                                       s_keys.machine_pub, s_control_pub);
+        esp_err_t err = ensure_control_conn();
         if (err == ESP_OK) {
-            err = mapreq_run_stream(&conn, &s_keys, long_poll_handler, NULL);
-            ts2021_close(&conn);
+            err = mapreq_run_stream(&s_conn, &s_keys, long_poll_handler, NULL);
+            /* Stream ended: either the server closed it (idle / ping
+             * failure / restart) or our side errored. Drop the conn so
+             * the next iteration brings up a fresh one. */
             ESP_LOGW(TAG, "long-poll stream ended: 0x%x — reconnecting", err);
+            drop_control_conn();
         } else {
             ESP_LOGW(TAG, "long-poll connect failed: 0x%x — backing off", err);
         }
@@ -171,13 +211,15 @@ static void long_poll_task(void *arg)
 esp_err_t tinylink_long_poll_start(void)
 {
     if (!s_initialized) return ESP_ERR_INVALID_STATE;
-    /* 8 KiB stack matches research §J's `control_task` budget. The
-     * stream parser keeps its body buffer in BSS, so this stack only
-     * holds one ts2021_conn_t (~10 KiB transient during handshake)
-     * plus jsmn token buffer (~16 KiB during parse). The token buffer
-     * is `static` inside `mapresp_parse`, so it lives in BSS too. */
+    /* 24 KiB stack — same budget as CONFIG_ESP_MAIN_TASK_STACK_SIZE.
+     * The earlier 8 KiB note was wrong: ts2021_connect builds an
+     * mbedtls TLS handshake (cert chain verification, ECDSA, X.509
+     * parsing, ~12 KiB peak) PLUS our Noise IK init (~2 KiB) on the
+     * task stack. Running this in 8 KiB blew the stack and looked
+     * like random heap corruption / alignment / load-prohibited
+     * panics depending on what the overflow happened to overwrite. */
     BaseType_t ok = xTaskCreate(long_poll_task, "tinylink_lp",
-                                8192, NULL, tskIDLE_PRIORITY + 4, NULL);
+                                24576, NULL, tskIDLE_PRIORITY + 4, NULL);
     if (ok != pdPASS) {
         ESP_LOGE(TAG, "xTaskCreate(long_poll) failed");
         return ESP_ERR_NO_MEM;
@@ -187,9 +229,10 @@ esp_err_t tinylink_long_poll_start(void)
 
 esp_err_t tinylink_telemetry_start(void)
 {
-    /* No s_initialized check — telemetry doesn't depend on tinylink
-     * identities, only on a working WG netif (which the caller has
-     * brought up via tinylink_dataplane_start). The compile-time
-     * disable in telemetry.c collapses this to a no-op. */
-    return telemetry_start();
+    /* Telemetry now starts implicitly from the long-poll handler the
+     * first time the control plane delivers a netmap (so we don't
+     * sendto a 100.64.x.y destination before the WG netif exists).
+     * This entry point is a no-op kept for boot-sequence backward
+     * compatibility with main.c. */
+    return ESP_OK;
 }
