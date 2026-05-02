@@ -24,6 +24,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Noise IK state machine (`Noise_IK_25519_ChaChaPoly_BLAKE2s`).
   - ts2021 client: TLS to control plane, HTTP/1.1 Upgrade, framed Noise
     transport records.
+  - HTTP/2 client over the Noise channel via nghttp2
+    (`espressif/nghttp`), with HPACK dynamic-table disabled.
   - Control plane public key bootstrap with NVS pinning.
   - `RegisterRequest` builder + response parser.
 - `tools/credentials.csv.example` simplified to the M1 set

@@ -9,6 +9,7 @@ idf_component_register(
         "src/json_helpers.c"
         "src/noise_ik.c"
         "src/ts2021_client.c"
+        "src/h2_client.c"
         "src/register.c"
         "src/crypto/blake2s.c"
         "src/crypto/curve25519.c"
@@ -26,4 +27,6 @@ idf_component_register(
         esp_http_client
         mbedtls
         json
+    PRIV_REQUIRES
+        espressif__nghttp
 )

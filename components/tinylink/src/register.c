@@ -11,6 +11,7 @@
 
 #include "cJSON.h"
 
+#include "h2_client.h"
 #include "json_helpers.h"
 #include "ts2021_client.h"
 
@@ -151,39 +152,29 @@ esp_err_t register_emit(ts2021_conn_t *conn,
                                        body, sizeof(body), &body_len);
     if (err != ESP_OK) return err;
 
-    /* HTTP/1.1 request line + headers + body, as one Noise record. M2 will
-     * upgrade the inner protocol to HTTP/2 (see ts2021_client.h). */
-    char req[REQUEST_BUF + 256];
-    int n = snprintf(req, sizeof(req),
-        "POST /machine/register HTTP/1.1\r\n"
-        "Host: %s\r\n"
-        "Content-Type: application/json\r\n"
-        "Content-Length: %d\r\n"
-        "\r\n%s",
-        CONFIG_TINYLINK_CONTROL_HOST, body_len, body);
-    if (n <= 0 || n >= (int)sizeof(req)) return ESP_ERR_INVALID_SIZE;
-
-    if (ts2021_send(conn, (const uint8_t *)req, (size_t)n) != ESP_OK) {
-        return ESP_FAIL;
-    }
-    ESP_LOGI(TAG, "/machine/register sent (%d bytes JSON)", body_len);
-
-    uint8_t resp[RESPONSE_BUF];
+    /* HTTP/2 POST over the Noise channel. The control plane runs
+     * http2.Server.ServeConn after the Upgrade and rejects HTTP/1.1
+     * inside Noise with PROTOCOL_ERROR. */
+    static uint8_t resp[RESPONSE_BUF];
     size_t  resp_len = 0;
-    if (ts2021_recv(conn, resp, sizeof(resp) - 1, &resp_len) != ESP_OK) {
-        return ESP_FAIL;
+    int     status   = 0;
+    err = h2_post_json(conn, "/machine/register",
+                       CONFIG_TINYLINK_CONTROL_HOST,
+                       (const uint8_t *)body, (size_t)body_len,
+                       &status, resp, sizeof(resp) - 1, &resp_len);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "h2_post_json failed: 0x%x", err);
+        return err;
     }
     resp[resp_len] = '\0';
-
-    /* Find body after CRLFCRLF. */
-    const char *body_start = strstr((const char *)resp, "\r\n\r\n");
-    if (body_start == NULL) {
-        ESP_LOGE(TAG, "register response missing CRLFCRLF");
+    ESP_LOGI(TAG, "/machine/register status=%d body=%u bytes",
+             status, (unsigned)resp_len);
+    if (status != 200) {
+        ESP_LOGE(TAG, "control plane returned HTTP %d", status);
         return ESP_FAIL;
     }
-    body_start += 4;
 
-    cJSON *root = cJSON_Parse(body_start);
+    cJSON *root = cJSON_Parse((const char *)resp);
     if (root == NULL) {
         ESP_LOGE(TAG, "register response did not parse as JSON");
         return ESP_ERR_INVALID_RESPONSE;

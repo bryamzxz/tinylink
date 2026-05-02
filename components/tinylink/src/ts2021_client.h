@@ -5,27 +5,19 @@
 // Noise IK handshake, then ChaCha20-Poly1305 framed records carrying the
 // inner control-plane traffic (HTTP/2 in the canonical Tailscale client).
 //
-// SCOPE NOTE — KNOWN GAP
-// ----------------------
-// M1 implements: TLS connect, HTTP Upgrade, Noise IK handshake (msg1/msg2),
-// transport encrypt/decrypt of length-prefixed records, and an HTTP/1.1
-// request/response round-trip inside the Noise channel.
+// LAYERING
+// --------
+// This file owns: TLS connect, HTTP Upgrade, Noise IK handshake, and
+// length-prefixed Noise transport records (ts2021_send / ts2021_recv).
 //
-// PROBLEM: the Tailscale control plane *requires HTTP/2* over the Noise
-// channel for /machine/register (per the protocol research artifact §A:
-// "the server insists on HTTP/2 over the Noise channel"). The HTTP/1.1
-// path shipped today will be rejected by `controlplane.tailscale.com`
-// and most likely also by any current Headscale.
+// HTTP/2 framing on top of those records lives in h2_client.c, which
+// uses nghttp2 (espressif/nghttp managed component). Tailscale's control
+// plane runs http2.Server.ServeConn after the Upgrade and rejects
+// HTTP/1.1, so /machine/register must go via h2_post_json() and not
+// ts2021_send() directly with raw HTTP/1.1 bytes.
 //
-// To make M1 actually work end-to-end, the inner protocol must be
-// HTTP/2 via nghttp2 (espressif/nghttp managed component). The framing
-// helpers (ts2021_send / ts2021_recv) are stream-agnostic so the swap
-// is additive: an nghttp2 callback layer wraps ts2021_send for outgoing
-// frame chunks and ts2021_recv for incoming, with the existing handshake
-// and Noise transport untouched.
-//
-// This nghttp2 wiring is the next thing to land before flashing onto a
-// real device and expecting a successful register.
+// In M2, the same h2_client will host the long-lived /machine/map
+// stream; the framing here doesn't change.
 //
 // TS2021_VERIFY tags throughout mark spots where the exact wire format
 // needs to be cross-checked against tailscale/control/ts2021/*.go and

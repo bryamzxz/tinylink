@@ -55,12 +55,12 @@ status online, an assigned `100.x.y.z`. Pings to it will not work yet —
 M1 has no data plane.
 
 **Known gaps in the current scaffolding** (see follow-up tasks):
-- nghttp2 is not yet wired; `register.c` sends HTTP/1.1 which the
-  production server rejects.
 - The NodeKeyChallenge response in `ts2021_client.c:process_early_noise`
   signs the base64 challenge string; the correct flow is open-then-
-  re-encrypt against the control plane DiscoKey.
-- All vendored crypto is unvalidated against test vectors.
+  re-encrypt against the control plane DiscoKey
+  (`tailscale/control/controlclient/direct.go:1159-1239`).
+- All vendored crypto is unvalidated against test vectors (RFC 7693
+  BLAKE2s, RFC 7748 X25519, RFC 8439 ChaCha20-Poly1305, Salsa20).
 
 ## M2 — MapRequest + WireGuard data plane
 

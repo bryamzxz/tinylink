@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 Bryam (bryamzxz)
 
-description: "tinylink core: protocol primitives shared across milestones."
-version: "0.0.1"
+description: "tinylink core: ts2021, Noise IK, vendored crypto, H2 over Noise."
+version: "0.1.0"
 url: "https://github.com/bryamzxz/tinylink"
 license: "MIT"
 
 dependencies:
   idf:
     version: ">=5.5,<5.6"
+  espressif/nghttp:
+    version: "*"

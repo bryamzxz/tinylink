@@ -67,11 +67,12 @@ MixHash'd before message 1 — see upstream commit `1b7380a`
 "control/noise: include the protocol version in the Noise prologue".
 
 After the upgrade and the EarlyNoise message, **the inner protocol is
-HTTP/2** (per `tailscale/control/ts2021/`). The tinylink M1 implementation
-in `components/tinylink/src/ts2021_client.c` currently sends the
-`/machine/register` request as HTTP/1.1, which the production server
-rejects. This is a known M1 gap — the next thing to land is nghttp2
-integration on top of `ts2021_send` / `ts2021_recv`.
+HTTP/2** (per `tailscale/control/ts2021/`). tinylink wraps
+`ts2021_send` / `ts2021_recv` with nghttp2 (espressif/nghttp managed
+component) in `components/tinylink/src/h2_client.c`. SETTINGS sent by
+the client disable HPACK dynamic-table indexing
+(`SETTINGS_HEADER_TABLE_SIZE = 0`) and server push
+(`SETTINGS_ENABLE_PUSH = 0`) for one-shot request semantics.
 
 After the upgrade the connection carries:
 
