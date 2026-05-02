@@ -19,7 +19,7 @@ TL_SRC  := ../../components/tinylink/src
 TARGETS := test_blake2s test_curve25519 test_mapresp \
            test_chacha20 test_poly1305 test_chacha20poly1305 \
            test_hkdf_noise test_wg_handshake test_wg_transport \
-           test_wg_demux
+           test_wg_demux test_disco
 
 all: $(TARGETS)
 
@@ -80,6 +80,21 @@ test_wg_handshake: test_wg_handshake.c \
 test_wg_demux: test_wg_demux.c $(TL_SRC)/wg_demux.c $(TL_SRC)/wg_demux.h
 	$(CC) $(CFLAGS) -I$(TL_SRC) -o $@ test_wg_demux.c $(TL_SRC)/wg_demux.c
 
+# DISCO codec (Tailscale magicsock NAT-traversal messages). Pulls in the
+# nacl_box wrapper, which on-target depends on mbedtls poly1305; on host
+# we satisfy that single symbol with host_mbedtls_shim.c using the
+# in-tree poly1305-donna.
+test_disco: test_disco.c \
+            $(TL_SRC)/disco.c $(TL_SRC)/disco.h \
+            $(CRYPTO)/nacl_box.c $(CRYPTO)/nacl_box.h \
+            $(CRYPTO)/curve25519.c $(CRYPTO)/salsa20.c \
+            $(CRYPTO)/poly1305_donna.c host_mbedtls_shim.c \
+            host_include/mbedtls/poly1305.h
+	$(CC) $(CFLAGS) -I$(TL_SRC) -I$(CRYPTO) -Ihost_include -o $@ \
+	    test_disco.c $(TL_SRC)/disco.c \
+	    $(CRYPTO)/nacl_box.c $(CRYPTO)/curve25519.c $(CRYPTO)/salsa20.c \
+	    $(CRYPTO)/poly1305_donna.c host_mbedtls_shim.c
+
 # WG transport (data plane) — encrypt/decrypt + RFC 6479 anti-replay.
 test_wg_transport: test_wg_transport.c \
                   $(TL_SRC)/wg_transport.c $(TL_SRC)/wg_transport.h \
@@ -96,12 +111,12 @@ test_wg_transport: test_wg_transport.c \
 .PHONY: test test_blake2s.run test_curve25519.run test_mapresp.run \
         test_chacha20.run test_poly1305.run test_chacha20poly1305.run \
         test_hkdf_noise.run test_wg_handshake.run test_wg_transport.run \
-        test_wg_demux.run clean
+        test_wg_demux.run test_disco.run clean
 
 test: test_blake2s.run test_curve25519.run test_mapresp.run \
       test_chacha20.run test_poly1305.run test_chacha20poly1305.run \
       test_hkdf_noise.run test_wg_handshake.run test_wg_transport.run \
-      test_wg_demux.run
+      test_wg_demux.run test_disco.run
 
 test_blake2s.run: test_blake2s
 	./test_blake2s
@@ -132,6 +147,9 @@ test_wg_transport.run: test_wg_transport
 
 test_wg_demux.run: test_wg_demux
 	./test_wg_demux
+
+test_disco.run: test_disco
+	./test_disco
 
 clean:
 	rm -f $(TARGETS)

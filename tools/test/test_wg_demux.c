@@ -75,37 +75,34 @@ int main(void) {
                        WG_DEMUX_DISCARD);
     }
 
-    /* DISCO v1: magic = 01 05 fe 16 76 46 90 80, plus 32+24+16 = at
-     * least 80 bytes total before payload. */
+    /* DISCO v1: magic = "TS💬" = 54 53 f0 9f 92 ac, plus
+     * senderPub(32) + nonce(24) + tag(16) + type+ver(2) = 80 bytes
+     * minimum for a packet that could possibly parse. */
     {
-        const uint8_t magic[8] = {0x01,0x05,0xfe,0x16,0x76,0x46,0x90,0x80};
+        const uint8_t magic[6] = {0x54,0x53,0xf0,0x9f,0x92,0xac};
         uint8_t buf[80] = {0};
-        memcpy(buf, magic, 8);
+        memcpy(buf, magic, 6);
         fails += check("disco/min-80", wg_demux_classify(buf, 80),
                        WG_DEMUX_DISCO);
-        /* Just the magic alone is too short. */
-        fails += check("disco/magic-only", wg_demux_classify(buf, 8),
+        /* 79 bytes — one byte short of the parseable minimum. */
+        fails += check("disco/short-79", wg_demux_classify(buf, 79),
+                       WG_DEMUX_DISCARD);
+        /* Just the magic alone is way too short. */
+        fails += check("disco/magic-only", wg_demux_classify(buf, 6),
                        WG_DEMUX_DISCARD);
     }
 
-    /* Critical collision: DISCO and MessageInitiation both start with
-     * 0x01. A 148-byte buffer starting with the DISCO magic must
-     * classify as DISCO, not as init. */
+    /* Anti-spoof: a 148-byte buffer whose first byte is 0x54 (the
+     * DISCO magic's first byte) but whose magic doesn't fully match
+     * is NOT DISCO — and isn't a WG type either, so it's discard.
+     * Confirms we don't latch onto partial magic. */
     {
-        const uint8_t magic[8] = {0x01,0x05,0xfe,0x16,0x76,0x46,0x90,0x80};
         uint8_t buf[148] = {0};
-        memcpy(buf, magic, 8);
-        fails += check("collision/disco-148", wg_demux_classify(buf, 148),
-                       WG_DEMUX_DISCO);
-    }
-    {
-        /* And conversely: 148-byte buffer starting with 0x01 but NOT
-         * the DISCO magic is init. */
-        uint8_t buf[148] = {0};
-        buf[0] = 0x01;
-        buf[1] = 0xFF;  /* differs from DISCO byte 1 = 0x05 */
-        fails += check("collision/init-148", wg_demux_classify(buf, 148),
-                       WG_DEMUX_HANDSHAKE_INIT);
+        buf[0] = 0x54;  /* matches DISCO byte 0 */
+        buf[1] = 0xFF;  /* differs from DISCO byte 1 = 0x53 */
+        fails += check("disco/partial-magic-discard",
+                       wg_demux_classify(buf, 148),
+                       WG_DEMUX_DISCARD);
     }
 
     /* Empty / NULL input. */
