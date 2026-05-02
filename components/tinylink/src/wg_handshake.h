@@ -69,6 +69,28 @@ int wg_handshake_create_initiation(struct wg_handshake_state *st,
                                    uint32_t local_index,
                                    struct wg_msg_initiation *msg);
 
+/* Process a 92-byte MessageResponse from the responder. Validates
+ * type, receiver_index against the local_index we picked, decrypts
+ * the empty AEAD payload (the tag check is the actual handshake
+ * authentication), derives transport keys via KDF2(C, ""), and
+ * writes them into *send_key / *recv_key. Also returns the
+ * responder's sender_index in *out_remote_index for transport-layer
+ * routing.
+ *
+ *   send_key — encrypts our outbound transport packets (initiator → responder).
+ *   recv_key — decrypts inbound transport packets (responder → initiator).
+ *
+ * Returns 0 on success, -1 on validation or decrypt failure. On
+ * failure no transport keys are leaked. After a successful return,
+ * the handshake state still holds long-term identity but its live
+ * Noise material is no longer needed — the caller should eventually
+ * scrub it. */
+int wg_handshake_process_response(struct wg_handshake_state *st,
+                                  const struct wg_msg_response *msg,
+                                  uint8_t send_key[WG_KEY_LEN],
+                                  uint8_t recv_key[WG_KEY_LEN],
+                                  uint32_t *out_remote_index);
+
 /* Wipe sensitive material in the state. Call after transport keys have
  * been split, or on abort. */
 void wg_handshake_scrub(struct wg_handshake_state *st);

@@ -17,6 +17,7 @@
  * lets us inject a fixed ephemeral keypair and timestamp.
  */
 
+#include <stddef.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -26,7 +27,9 @@
 #include "wg_handshake.h"
 
 #include "crypto/blake2s.h"
+#include "crypto/chacha20poly1305.h"
 #include "crypto/curve25519.h"
+#include "crypto/hkdf_blake2s.h"
 
 /* Host-side stub for esp_fill_random. curve25519.c uses it internally
  * for ephemeral keygen on-target; off-target we ship our own. A
@@ -221,10 +224,275 @@ static void test_create_initiation_shape(void) {
     wg_handshake_scrub(&st);
 }
 
+/* --- Simulated responder for end-to-end tests --------------------- */
+
+/* Replays the responder side of Noise IKpsk2 starting from a received
+ * MessageInitiation, so we can validate that the initiator's processing
+ * of the resulting MessageResponse derives matching transport keys.
+ * Roughly mirrors WireGuard whitepaper §5.4.4. Test-only code. */
+struct sim_responder {
+    /* Identity. */
+    uint8_t  static_priv[32];
+    uint8_t  static_pub[32];
+
+    /* Outputs after process_initiation + create_response. */
+    uint8_t  initiator_static_pub_recovered[32];
+    uint32_t remote_sender_index;
+    uint8_t  send_key[32];   /* responder-side: encrypts resp→init */
+    uint8_t  recv_key[32];   /* responder-side: decrypts init→resp */
+
+    /* Live Noise state (mirrors the initiator's chain_key/hash exactly). */
+    uint8_t  chain_key[32];
+    uint8_t  hash[32];
+};
+
+static int sim_resp_process_initiation_and_build_response(
+        struct sim_responder *r,
+        const struct wg_msg_initiation *init_msg,
+        struct wg_msg_response *out_resp,
+        uint32_t responder_sender_index,
+        const uint8_t preshared_key[32])
+{
+    uint8_t key[32];
+    uint8_t dh[32];
+    uint8_t timestamp_recovered[WG_TAI64N_LEN];
+    uint8_t nonce[CHACHA20POLY1305_NONCE_LEN] = {0};
+
+    /* --- Mirror initiator's prefix mixing (§5.4.3 lines 1–3). --- */
+    memcpy(r->chain_key, wg_initial_chain_key(), 32);
+    memcpy(r->hash,      wg_initial_hash(),      32);
+    wg_mix_hash(r->hash, r->static_pub, 32);
+
+    /* Initiator-ephemeral mixed in (line 4–5). */
+    wg_mix_chain_only(r->chain_key, init_msg->ephemeral, 32);
+    wg_mix_hash(r->hash, init_msg->ephemeral, 32);
+
+    /* DH(S_priv_responder, E_pub_initiator) → (C, k). */
+    if (curve25519_dh(dh, r->static_priv, init_msg->ephemeral) != 0) return -1;
+    {
+        uint8_t new_ck[32];
+        noise_hkdf2(r->chain_key, dh, 32, new_ck, key);
+        memcpy(r->chain_key, new_ck, 32);
+    }
+
+    /* Decrypt encrypted_static into Spub_initiator. */
+    if (chacha20poly1305_decrypt(r->initiator_static_pub_recovered,
+                                 init_msg->encrypted_static,
+                                 sizeof(init_msg->encrypted_static),
+                                 r->hash, 32, key, nonce) != 0) {
+        return -2;
+    }
+    wg_mix_hash(r->hash, init_msg->encrypted_static,
+                sizeof(init_msg->encrypted_static));
+
+    /* (C, k) = KDF2(C, DH(S_priv_responder, S_pub_initiator)). */
+    if (curve25519_dh(dh, r->static_priv,
+                      r->initiator_static_pub_recovered) != 0) return -3;
+    {
+        uint8_t new_ck[32];
+        noise_hkdf2(r->chain_key, dh, 32, new_ck, key);
+        memcpy(r->chain_key, new_ck, 32);
+    }
+
+    /* Decrypt encrypted_timestamp. We don't enforce monotonicity in
+     * this test — just need to verify the tag. */
+    if (chacha20poly1305_decrypt(timestamp_recovered,
+                                 init_msg->encrypted_timestamp,
+                                 sizeof(init_msg->encrypted_timestamp),
+                                 r->hash, 32, key, nonce) != 0) {
+        return -4;
+    }
+    wg_mix_hash(r->hash, init_msg->encrypted_timestamp,
+                sizeof(init_msg->encrypted_timestamp));
+
+    r->remote_sender_index = init_msg->sender_index;
+
+    /* --- Build MessageResponse (§5.4.4). --- */
+    uint8_t e_priv[32], e_pub[32];
+    if (curve25519_keypair(e_priv, e_pub) != 0) return -5;
+
+    memset(out_resp, 0, sizeof(*out_resp));
+    memcpy(out_resp->ephemeral, e_pub, 32);
+
+    /* C = KDF1(C, E_pub_responder), H = H(H || E_pub_responder). */
+    wg_mix_chain_only(r->chain_key, e_pub, 32);
+    wg_mix_hash(r->hash, e_pub, 32);
+
+    /* C = KDF1(C, DH(E_priv_resp, E_pub_init)). */
+    if (curve25519_dh(dh, e_priv, init_msg->ephemeral) != 0) return -6;
+    wg_mix_chain_only(r->chain_key, dh, 32);
+
+    /* C = KDF1(C, DH(E_priv_resp, S_pub_init)). */
+    if (curve25519_dh(dh, e_priv,
+                      r->initiator_static_pub_recovered) != 0) return -7;
+    wg_mix_chain_only(r->chain_key, dh, 32);
+
+    /* (C, T, K) = KDF3(C, PSK). H = H(H || T). */
+    {
+        uint8_t new_ck[32], tau[32];
+        noise_hkdf3(r->chain_key, preshared_key, 32, new_ck, tau, key);
+        memcpy(r->chain_key, new_ck, 32);
+        wg_mix_hash(r->hash, tau, 32);
+    }
+
+    /* AEAD-encrypt empty payload. The 16-byte tag is encrypted_nothing. */
+    chacha20poly1305_encrypt(out_resp->encrypted_nothing,
+                             NULL, 0,
+                             r->hash, 32,
+                             key, nonce);
+    wg_mix_hash(r->hash, out_resp->encrypted_nothing,
+                sizeof(out_resp->encrypted_nothing));
+
+    /* Header. */
+    out_resp->message_type   = WG_MSG_RESPONSE;
+    out_resp->sender_index   = responder_sender_index;
+    out_resp->receiver_index = init_msg->sender_index;
+
+    /* mac1 over msg up to mac1 field, keyed with
+     * BLAKE2s(LABEL_MAC1 || S_pub_initiator). */
+    uint8_t mac1_key[32];
+    wg_mac1_key(mac1_key, r->initiator_static_pub_recovered);
+    wg_keyed_mac16(out_resp->mac1, mac1_key,
+                   (const uint8_t *)out_resp,
+                   offsetof(struct wg_msg_response, mac1));
+
+    /* (T_init→resp, T_resp→init) = KDF2(C, ""). On responder's side:
+     *   send_key = T_resp→init = second slot.
+     *   recv_key = T_init→resp = first slot. */
+    noise_hkdf2(r->chain_key, NULL, 0, r->recv_key, r->send_key);
+
+    /* Scrub. */
+    memset(key, 0, sizeof(key));
+    memset(dh, 0, sizeof(dh));
+    memset(timestamp_recovered, 0, sizeof(timestamp_recovered));
+    memset(e_priv, 0, sizeof(e_priv));
+    memset(mac1_key, 0, sizeof(mac1_key));
+    return 0;
+}
+
+static void test_full_handshake_roundtrip(void) {
+    /* Build identities for both ends. */
+    uint8_t init_priv[32], init_pub[32];
+    uint8_t resp_priv[32], resp_pub[32];
+    if (curve25519_keypair(init_priv, init_pub) != 0 ||
+        curve25519_keypair(resp_priv, resp_pub) != 0) {
+        printf("[full/keypairs] FAIL\n"); fails++; return;
+    }
+    uint8_t psk[32] = {0};
+
+    /* Initiator builds MessageInitiation. */
+    struct wg_handshake_state ist;
+    if (wg_handshake_init(&ist, init_priv, init_pub, resp_pub, psk) != 0) {
+        printf("[full/init-handshake-init] FAIL\n"); fails++; return;
+    }
+    struct wg_msg_initiation init_msg;
+    if (wg_handshake_create_initiation(&ist, 0xCAFEBABE, &init_msg) != 0) {
+        printf("[full/init-create] FAIL\n"); fails++; return;
+    }
+
+    /* Simulated responder processes and builds MessageResponse. */
+    struct sim_responder rsim;
+    memcpy(rsim.static_priv, resp_priv, 32);
+    memcpy(rsim.static_pub,  resp_pub,  32);
+    struct wg_msg_response resp_msg;
+    int rc = sim_resp_process_initiation_and_build_response(
+                &rsim, &init_msg, &resp_msg, 0xFEEDF00D, psk);
+    if (rc != 0) {
+        printf("[full/sim-responder] FAIL: rc=%d\n", rc); fails++; return;
+    }
+    /* Sanity: responder should have recovered initiator's static pub. */
+    fails += check("full/spub-recovered",
+                   rsim.initiator_static_pub_recovered, init_pub, 32);
+
+    /* Initiator processes the response and derives transport keys. */
+    uint8_t init_send[32], init_recv[32];
+    uint32_t remote_idx = 0;
+    if (wg_handshake_process_response(&ist, &resp_msg, init_send,
+                                      init_recv, &remote_idx) != 0) {
+        printf("[full/process-response] FAIL\n"); fails++; return;
+    }
+    if (remote_idx != 0xFEEDF00D) {
+        printf("[full/remote-index] FAIL\n"); fails++;
+    } else { printf("[full/remote-index] OK\n"); }
+
+    /* The whole point of the handshake: both sides agree on transport
+     * keys, with init→resp and resp→init crossed. */
+    fails += check("full/init-send==resp-recv", init_send, rsim.recv_key, 32);
+    fails += check("full/init-recv==resp-send", init_recv, rsim.send_key, 32);
+
+    /* Tamper detection: flip a bit in the responder's encrypted_nothing
+     * tag. Initiator must reject. */
+    {
+        struct wg_handshake_state ist2;
+        wg_handshake_init(&ist2, init_priv, init_pub, resp_pub, psk);
+        struct wg_msg_initiation init_msg2;
+        wg_handshake_create_initiation(&ist2, 0xCAFEBABE, &init_msg2);
+
+        struct sim_responder rsim2;
+        memcpy(rsim2.static_priv, resp_priv, 32);
+        memcpy(rsim2.static_pub,  resp_pub,  32);
+        struct wg_msg_response resp_msg2;
+        sim_resp_process_initiation_and_build_response(
+            &rsim2, &init_msg2, &resp_msg2, 0xFEEDF00D, psk);
+        resp_msg2.encrypted_nothing[0] ^= 0x01;
+
+        uint8_t s[32], r[32]; uint32_t ri;
+        if (wg_handshake_process_response(&ist2, &resp_msg2, s, r, &ri) == 0) {
+            printf("[full/tamper-tag] FAIL: accepted bad tag\n"); fails++;
+        } else { printf("[full/tamper-tag] OK\n"); }
+    }
+
+    /* Tamper detection: wrong receiver_index. Initiator must reject
+     * before doing any crypto. */
+    {
+        struct wg_handshake_state ist3;
+        wg_handshake_init(&ist3, init_priv, init_pub, resp_pub, psk);
+        struct wg_msg_initiation init_msg3;
+        wg_handshake_create_initiation(&ist3, 0xCAFEBABE, &init_msg3);
+
+        struct sim_responder rsim3;
+        memcpy(rsim3.static_priv, resp_priv, 32);
+        memcpy(rsim3.static_pub,  resp_pub,  32);
+        struct wg_msg_response resp_msg3;
+        sim_resp_process_initiation_and_build_response(
+            &rsim3, &init_msg3, &resp_msg3, 0xFEEDF00D, psk);
+        resp_msg3.receiver_index = 0xDEAD0000;
+
+        uint8_t s[32], r[32]; uint32_t ri;
+        if (wg_handshake_process_response(&ist3, &resp_msg3, s, r, &ri) == 0) {
+            printf("[full/wrong-receiver-index] FAIL: accepted\n"); fails++;
+        } else { printf("[full/wrong-receiver-index] OK\n"); }
+    }
+
+    /* Tamper detection: wrong message_type. */
+    {
+        struct wg_handshake_state ist4;
+        wg_handshake_init(&ist4, init_priv, init_pub, resp_pub, psk);
+        struct wg_msg_initiation init_msg4;
+        wg_handshake_create_initiation(&ist4, 0xCAFEBABE, &init_msg4);
+
+        struct sim_responder rsim4;
+        memcpy(rsim4.static_priv, resp_priv, 32);
+        memcpy(rsim4.static_pub,  resp_pub,  32);
+        struct wg_msg_response resp_msg4;
+        sim_resp_process_initiation_and_build_response(
+            &rsim4, &init_msg4, &resp_msg4, 0xFEEDF00D, psk);
+        resp_msg4.message_type = WG_MSG_INITIATION;
+
+        uint8_t s[32], r[32]; uint32_t ri;
+        if (wg_handshake_process_response(&ist4, &resp_msg4, s, r, &ri) == 0) {
+            printf("[full/wrong-msg-type] FAIL: accepted\n"); fails++;
+        } else { printf("[full/wrong-msg-type] OK\n"); }
+    }
+
+    wg_handshake_scrub(&ist);
+}
+
 int main(void) {
     test_initial_constants();
     test_mac1_key();
     test_create_initiation_shape();
+    test_full_handshake_roundtrip();
     if (fails == 0) printf("\nALL OK\n");
     return fails ? 1 : 0;
 }
