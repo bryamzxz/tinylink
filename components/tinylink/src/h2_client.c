@@ -42,6 +42,18 @@ typedef struct {
     size_t   recv_buf_len;
     size_t   recv_buf_off;
 
+    /* One-shot permission token for recv_cb to do a (potentially
+     * blocking) network read. The drive loop sets this true before
+     * each session_recv; recv_cb consumes it on the first refill and
+     * returns NGHTTP2_ERR_WOULDBLOCK on subsequent refills, so
+     * session_recv unwinds and the loop can flush queued frames
+     * (notably SETTINGS_ACK) via session_send. Without this, a single
+     * session_recv would call recv_cb twice — once draining the
+     * residual SETTINGS, then a second time blocking on the network
+     * waiting for frames the server won't send until we ACK. That
+     * deadlocks until the server's idle timeout (~31 s) closes us. */
+    bool     may_refill;
+
     int32_t  stream_id;
     bool     stream_closed;
     int      stream_error;
@@ -71,26 +83,46 @@ static ssize_t send_cb(nghttp2_session *session, const uint8_t *data,
 }
 
 /* Network -> nghttp2. nghttp2 wants up to `length` bytes; we keep a
- * small ring of decrypted Noise plaintext and refill it on demand. */
+ * small ring of decrypted Noise plaintext and refill it on demand.
+ *
+ * Cooperative non-blocking: refilling from the network is gated on
+ * r->may_refill. The drive loop grants exactly one refill per outer
+ * iteration. After we use the budget, subsequent calls return
+ * WOULDBLOCK so session_recv unwinds and queued outbound frames
+ * (e.g. SETTINGS_ACK) get a chance to flush via session_send. */
 static ssize_t recv_cb(nghttp2_session *session, uint8_t *buf,
                        size_t length, int flags, void *user_data)
 {
     (void)session; (void)flags;
     h2_req_t *r = (h2_req_t *)user_data;
 
-    if (r->recv_buf_off >= r->recv_buf_len) {
-        size_t got = 0;
-        if (ts2021_recv(r->ts2021, r->recv_buf, sizeof(r->recv_buf),
-                        &got) != ESP_OK) {
-            return NGHTTP2_ERR_CALLBACK_FAILURE;
-        }
-        r->recv_buf_len = got;
-        r->recv_buf_off = 0;
+    /* Drain any plaintext already buffered from a prior refill. */
+    if (r->recv_buf_off < r->recv_buf_len) {
+        size_t avail = r->recv_buf_len - r->recv_buf_off;
+        size_t take = (length < avail) ? length : avail;
+        memcpy(buf, r->recv_buf + r->recv_buf_off, take);
+        r->recv_buf_off += take;
+        return (ssize_t)take;
     }
-    size_t avail = r->recv_buf_len - r->recv_buf_off;
-    size_t take = (length < avail) ? length : avail;
-    memcpy(buf, r->recv_buf + r->recv_buf_off, take);
-    r->recv_buf_off += take;
+
+    if (!r->may_refill) {
+        return NGHTTP2_ERR_WOULDBLOCK;
+    }
+    r->may_refill = false;
+
+    size_t got = 0;
+    if (ts2021_recv(r->ts2021, r->recv_buf, sizeof(r->recv_buf),
+                    &got) != ESP_OK) {
+        return NGHTTP2_ERR_CALLBACK_FAILURE;
+    }
+    r->recv_buf_len = got;
+    r->recv_buf_off = 0;
+    if (got == 0) {
+        return NGHTTP2_ERR_WOULDBLOCK;
+    }
+    size_t take = (length < got) ? length : got;
+    memcpy(buf, r->recv_buf, take);
+    r->recv_buf_off = take;
     return (ssize_t)take;
 }
 
@@ -257,8 +289,12 @@ static esp_err_t h2_drive_request(h2_req_t *r,
     r->stream_id = stream_id;
 
     /* Drive send/recv until the stream closes or the streaming callback
-     * asks us to stop. nghttp2_session_send drains the outbound queue
-     * (via send_cb); _recv pulls one frame in (via recv_cb). */
+     * asks us to stop. Each iteration: drain outbound (so any queued
+     * SETTINGS_ACK / WINDOW_UPDATE / etc. is flushed), then grant one
+     * refill budget to recv_cb and pull frames in. The cooperative
+     * WOULDBLOCK gate keeps session_recv from blocking on a network
+     * read while there's pending outbound that the server is waiting
+     * for. */
     while (!r->stream_closed && !r->cb_stop) {
         if (nghttp2_session_want_write(session)) {
             rc = nghttp2_session_send(session);
@@ -269,6 +305,7 @@ static esp_err_t h2_drive_request(h2_req_t *r,
             }
         }
         if (!r->stream_closed && nghttp2_session_want_read(session)) {
+            r->may_refill = true;
             rc = nghttp2_session_recv(session);
             if (rc != 0) {
                 ESP_LOGE(TAG, "session_recv: %d", rc);
