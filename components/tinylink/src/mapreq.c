@@ -22,8 +22,18 @@ static const char *TAG = "mapreq";
 #endif
 
 #define REQUEST_BUF_SZ   2048
-#define RESPONSE_BUF_SZ  16384  /* a bare /machine/map for one peer fits well under */
-#define MAX_TOKENS       1024
+/* Real Tailscale MapResponse for a small tailnet (sensor + home peer)
+ * comfortably exceeds 16 KiB once DERP map + DNSConfig + the peer's
+ * Hostinfo are folded in. Observed 16383-byte truncation on first HW
+ * boot 2026-05-02. 48 KiB gives us headroom for a handful of peers
+ * before we'd need streaming. */
+#define RESPONSE_BUF_SZ  32768
+/* MapResponse JSON is structurally dense: a 19 KiB body parses to
+ * ~3500 tokens (~1 token / 5 bytes). 4500 leaves headroom; at
+ * sizeof(jsmntok_t)=16 the table is 72 KiB, so the response buffer
+ * MUST be shrunk via realloc before parsing or DRAM blows up.
+ * mapreq_fetch_once does that explicitly. */
+#define MAX_TOKENS       4500
 
 /* ------------------------------ helpers ----------------------------------- */
 
@@ -368,15 +378,16 @@ esp_err_t mapresp_parse(const char *json, size_t json_len, tl_netmap_t *out)
     if (json == NULL || out == NULL) return ESP_ERR_INVALID_ARG;
     tl_netmap_clear(out);
 
-    /* Token budget: a one-peer + minimal-DERP MapResponse runs ~120 tokens,
-     * a 4-peer / 4-region one peaks around ~600. 1024 leaves headroom and
-     * still costs only ~16 KiB at sizeof(jsmntok_t)=16 — comparable to the
-     * response buffer itself, and freed as soon as parsing returns. */
-    static jsmntok_t toks[MAX_TOKENS];
+    /* Token budget heap-allocated: at sizeof(jsmntok_t)=16 the table
+     * is MAX_TOKENS * 16 bytes (= 64 KiB at MAX_TOKENS=4096). Keeping
+     * it in BSS overflows DRAM; allocate per-parse and free on exit. */
+    jsmntok_t *toks = malloc(sizeof(jsmntok_t) * MAX_TOKENS);
+    if (toks == NULL) return ESP_ERR_NO_MEM;
     jsmn_parser p;
     jsmn_init(&p);
     int n = jsmn_parse(&p, json, json_len, toks, MAX_TOKENS);
     if (n < 1 || !tok_is_obj(&toks[0])) {
+        free(toks);
         return ESP_ERR_INVALID_RESPONSE;
     }
 
@@ -395,6 +406,7 @@ esp_err_t mapresp_parse(const char *json, size_t json_len, tl_netmap_t *out)
         }
         next = skip_value(toks, val_idx);
     }
+    free(toks);
     return ESP_OK;
 }
 
@@ -429,9 +441,21 @@ static int build_request_body(const tinylink_keys_t *keys,
     memcpy(disco_key_hex, "discokey:", 9);
     hex_encode(keys->disco_pub, 32, disco_key_hex + 9);
 
+    /* Version is the Tailscale CapabilityVersion. Same as RegisterRequest:
+     * production clients use tailcfg.CurrentCapabilityVersion (138 as of
+     * 2026-05-02). M1 hardcoded 1 here too — server rejects a v1
+     * MapRequest with HTTP 422 because the response shape it would have
+     * to emit is no longer wire-compatible with anything that old. */
+    /* Compress="" tells the server we cannot decode zstd (we don't link
+     * a zstd library). Field is omitzero in upstream Go so omitting it
+     * is equivalent in the wire JSON, BUT — first hardware run on
+     * 2026-05-02 saw the server reply with non-JSON bytes when the
+     * field was missing, suggesting the control plane treats "absent"
+     * as "client supports our default compression". Send the explicit
+     * empty string. */
     int n = snprintf(out, out_size,
         "{"
-        "\"Version\":1,"
+        "\"Version\":138,"
         "\"Compress\":\"\","
         "\"NodeKey\":\"%s\","
         "\"DiscoKey\":\"%s\","
@@ -453,29 +477,77 @@ esp_err_t mapreq_fetch_once(ts2021_conn_t *conn,
         return ESP_ERR_INVALID_ARG;
     }
 
-    static char    body[REQUEST_BUF_SZ];
-    int body_len = build_request_body(keys, false, body, sizeof(body));
-    if (body_len < 0) return ESP_ERR_INVALID_SIZE;
+    /* Buffers heap-allocated: response can be ~32 KiB + tokens table
+     * is sizeof(jsmntok_t) * MAX_TOKENS = 64 KiB. Keeping these in BSS
+     * overflows the 168 KiB DRAM segment once esp_main_task and the
+     * WiFi/lwIP/mbedtls stacks have taken their share. */
+    char    *body = malloc(REQUEST_BUF_SZ);
+    uint8_t *resp = malloc(RESPONSE_BUF_SZ);
+    if (body == NULL || resp == NULL) {
+        free(body); free(resp);
+        return ESP_ERR_NO_MEM;
+    }
 
-    static uint8_t resp[RESPONSE_BUF_SZ];
+    int body_len = build_request_body(keys, false, body, REQUEST_BUF_SZ);
+    if (body_len < 0) {
+        free(body); free(resp);
+        return ESP_ERR_INVALID_SIZE;
+    }
+
     size_t  resp_len = 0;
     int     status = 0;
     esp_err_t err = h2_post_json(conn, "/machine/map",
                                  CONFIG_TINYLINK_CONTROL_HOST,
                                  (const uint8_t *)body, (size_t)body_len,
-                                 &status, resp, sizeof(resp) - 1, &resp_len);
+                                 &status, resp, RESPONSE_BUF_SZ - 1, &resp_len);
+    free(body);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "h2_post_json failed: 0x%x", err);
+        free(resp);
         return err;
     }
     resp[resp_len] = '\0';
     ESP_LOGI(TAG, "/machine/map status=%d body=%u bytes",
              status, (unsigned)resp_len);
     if (status != 200) {
-        ESP_LOGE(TAG, "control plane returned HTTP %d", status);
+        ESP_LOGE(TAG, "control plane returned HTTP %d: %.*s",
+                 status, (int)(resp_len > 200 ? 200 : resp_len),
+                 (const char *)resp);
+        free(resp);
         return ESP_FAIL;
     }
-    return mapresp_parse((const char *)resp, resp_len, out);
+
+    /* Even for non-streaming MapResponse, the control plane frames the
+     * body as `LE32 length || JSON`. Verified on real HW 2026-05-02:
+     * first 4 bytes were `51 4b 00 00` = 19281, matching the JSON
+     * length right after. Strip the prefix before parsing. (Upstream
+     * Go reads it in controlclient/direct.go as part of its standard
+     * stream framing whether Stream is true or not.) */
+    if (resp_len < 4) {
+        ESP_LOGE(TAG, "MapResponse too short: %u bytes", (unsigned)resp_len);
+        free(resp);
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    uint32_t framed_len = (uint32_t)resp[0]
+                        | ((uint32_t)resp[1] <<  8)
+                        | ((uint32_t)resp[2] << 16)
+                        | ((uint32_t)resp[3] << 24);
+    if (framed_len + 4 > resp_len) {
+        ESP_LOGE(TAG, "MapResponse framing: declared %u + 4 > received %u",
+                 (unsigned)framed_len, (unsigned)resp_len);
+        free(resp);
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    /* Shrink down to actual JSON size before parsing — mapresp_parse
+     * allocates a ~72 KiB token table; keeping the full 32 KiB
+     * response alongside risks DRAM exhaustion. */
+    memmove(resp, resp + 4, framed_len);
+    resp[framed_len] = '\0';
+    uint8_t *trimmed = realloc(resp, framed_len + 1);
+    if (trimmed != NULL) resp = trimmed;
+    err = mapresp_parse((const char *)resp, framed_len, out);
+    free(resp);
+    return err;
 }
 
 /* ---- streaming reader ----------------------------------------------------
