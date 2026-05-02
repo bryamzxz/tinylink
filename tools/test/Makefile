@@ -16,7 +16,8 @@ CRYPTO  := ../../components/tinylink/src/crypto
 
 TL_SRC  := ../../components/tinylink/src
 
-TARGETS := test_blake2s test_curve25519 test_mapresp
+TARGETS := test_blake2s test_curve25519 test_mapresp \
+           test_chacha20 test_poly1305 test_chacha20poly1305
 
 all: $(TARGETS)
 
@@ -32,9 +33,29 @@ test_curve25519: test_curve25519.c $(CRYPTO)/curve25519.c $(CRYPTO)/curve25519.h
 test_mapresp: test_mapresp.c $(TL_SRC)/mapreq.c $(TL_SRC)/netmap.h $(TL_SRC)/jsmn.h
 	$(CC) $(CFLAGS) -I$(TL_SRC) -o $@ test_mapresp.c $(TL_SRC)/mapreq.c
 
-.PHONY: test test_blake2s.run test_curve25519.run test_mapresp.run clean
+# RFC 8439 §2.4.2 — ChaCha20 keystream KAT.
+test_chacha20: test_chacha20.c $(CRYPTO)/chacha20.c $(CRYPTO)/chacha20.h
+	$(CC) $(CFLAGS) -I$(CRYPTO) -o $@ test_chacha20.c $(CRYPTO)/chacha20.c
 
-test: test_blake2s.run test_curve25519.run test_mapresp.run
+# RFC 8439 §2.5.2 — poly1305-donna one-time-MAC KAT.
+test_poly1305: test_poly1305.c $(CRYPTO)/poly1305_donna.c $(CRYPTO)/poly1305_donna.h $(CRYPTO)/poly1305_donna_32.h
+	$(CC) $(CFLAGS) -I$(CRYPTO) -o $@ test_poly1305.c $(CRYPTO)/poly1305_donna.c
+
+# RFC 8439 §2.8.2 — AEAD construction KAT. This is the security-critical
+# glue (pad16, length encoding, constant-time tag verify) that lives in
+# our own wrapper, not in the lifted primitives.
+test_chacha20poly1305: test_chacha20poly1305.c \
+                      $(CRYPTO)/chacha20poly1305.c $(CRYPTO)/chacha20poly1305.h \
+                      $(CRYPTO)/chacha20.c $(CRYPTO)/chacha20.h \
+                      $(CRYPTO)/poly1305_donna.c $(CRYPTO)/poly1305_donna.h $(CRYPTO)/poly1305_donna_32.h
+	$(CC) $(CFLAGS) -I$(CRYPTO) -o $@ test_chacha20poly1305.c \
+	    $(CRYPTO)/chacha20poly1305.c $(CRYPTO)/chacha20.c $(CRYPTO)/poly1305_donna.c
+
+.PHONY: test test_blake2s.run test_curve25519.run test_mapresp.run \
+        test_chacha20.run test_poly1305.run test_chacha20poly1305.run clean
+
+test: test_blake2s.run test_curve25519.run test_mapresp.run \
+      test_chacha20.run test_poly1305.run test_chacha20poly1305.run
 
 test_blake2s.run: test_blake2s
 	./test_blake2s
@@ -44,6 +65,15 @@ test_curve25519.run: test_curve25519
 
 test_mapresp.run: test_mapresp
 	./test_mapresp
+
+test_chacha20.run: test_chacha20
+	./test_chacha20
+
+test_poly1305.run: test_poly1305
+	./test_poly1305
+
+test_chacha20poly1305.run: test_chacha20poly1305
+	./test_chacha20poly1305
 
 clean:
 	rm -f $(TARGETS)

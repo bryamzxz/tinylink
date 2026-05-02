@@ -20,6 +20,9 @@ idf_component_register(
         "src/crypto/hkdf_blake2s.c"
         "src/crypto/salsa20.c"
         "src/crypto/nacl_box.c"
+        "src/crypto/chacha20.c"
+        "src/crypto/poly1305_donna.c"
+        "src/crypto/chacha20poly1305.c"
     INCLUDE_DIRS
         "include"
     PRIV_INCLUDE_DIRS
