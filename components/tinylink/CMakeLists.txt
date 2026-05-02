@@ -16,6 +16,8 @@ idf_component_register(
         "src/wg_proto.c"
         "src/wg_handshake.c"
         "src/wg_transport.c"
+        "src/wg_demux.c"
+        "src/wg_netif.c"
         "src/tmp117.c"
         "src/telemetry.c"
         "src/crypto/blake2s.c"

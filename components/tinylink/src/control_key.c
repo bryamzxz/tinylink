@@ -18,7 +18,13 @@ static const char *TAG = "ctrl_key";
 
 #define NS         "tl_pin"
 #define KEY_PIN    "control_pub"
-#define KEY_PREFIX "nlpub:"
+/* Tailscale's /key?v=<n> returns OverTLSPublicKeyResponse JSON whose
+ * `publicKey` field is a key.MachinePublic — serialized as the prefix
+ * "mkey:" followed by 64 hex chars (32 raw bytes). M1 originally had
+ * "nlpub:" which is the Network Lock prefix, a different concept; on
+ * the official control plane the actual prefix gives 69 total chars
+ * (5+64), not 70 (6+64), so the parser rejected it. */
+#define KEY_PREFIX "mkey:"
 #define KEY_HEX_LEN 64
 #define KEY_PATH   "/key?v=100"
 #define BODY_MAX   512

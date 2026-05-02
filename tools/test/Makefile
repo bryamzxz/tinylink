@@ -18,7 +18,8 @@ TL_SRC  := ../../components/tinylink/src
 
 TARGETS := test_blake2s test_curve25519 test_mapresp \
            test_chacha20 test_poly1305 test_chacha20poly1305 \
-           test_hkdf_noise test_wg_handshake test_wg_transport
+           test_hkdf_noise test_wg_handshake test_wg_transport \
+           test_wg_demux
 
 all: $(TARGETS)
 
@@ -75,6 +76,10 @@ test_wg_handshake: test_wg_handshake.c \
 	    $(CRYPTO)/hkdf_blake2s.c $(CRYPTO)/chacha20.c \
 	    $(CRYPTO)/poly1305_donna.c $(CRYPTO)/chacha20poly1305.c
 
+# WG datagram classifier (UDP demuxer dispatch logic).
+test_wg_demux: test_wg_demux.c $(TL_SRC)/wg_demux.c $(TL_SRC)/wg_demux.h
+	$(CC) $(CFLAGS) -I$(TL_SRC) -o $@ test_wg_demux.c $(TL_SRC)/wg_demux.c
+
 # WG transport (data plane) — encrypt/decrypt + RFC 6479 anti-replay.
 test_wg_transport: test_wg_transport.c \
                   $(TL_SRC)/wg_transport.c $(TL_SRC)/wg_transport.h \
@@ -90,11 +95,13 @@ test_wg_transport: test_wg_transport.c \
 
 .PHONY: test test_blake2s.run test_curve25519.run test_mapresp.run \
         test_chacha20.run test_poly1305.run test_chacha20poly1305.run \
-        test_hkdf_noise.run test_wg_handshake.run test_wg_transport.run clean
+        test_hkdf_noise.run test_wg_handshake.run test_wg_transport.run \
+        test_wg_demux.run clean
 
 test: test_blake2s.run test_curve25519.run test_mapresp.run \
       test_chacha20.run test_poly1305.run test_chacha20poly1305.run \
-      test_hkdf_noise.run test_wg_handshake.run test_wg_transport.run
+      test_hkdf_noise.run test_wg_handshake.run test_wg_transport.run \
+      test_wg_demux.run
 
 test_blake2s.run: test_blake2s
 	./test_blake2s
@@ -122,6 +129,9 @@ test_wg_handshake.run: test_wg_handshake
 
 test_wg_transport.run: test_wg_transport
 	./test_wg_transport
+
+test_wg_demux.run: test_wg_demux
+	./test_wg_demux
 
 clean:
 	rm -f $(TARGETS)
