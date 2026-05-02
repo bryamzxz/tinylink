@@ -1,0 +1,54 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Bryam (bryamzxz)
+#
+# Build matrix for tinylink. Treats warnings as errors so the pre-alpha
+# tree stays clean while the code surface is small.
+
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  idf-build:
+    name: idf-build (${{ matrix.target }}, ESP-IDF ${{ matrix.idf_version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [esp32]
+        idf_version: ["v5.5"]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: ESP-IDF build
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: ${{ matrix.idf_version }}
+          target: ${{ matrix.target }}
+          path: "."
+          command: |
+            idf.py set-target ${{ matrix.target }} && \
+            idf.py build
+
+      - name: Upload build artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tinylink-${{ matrix.target }}-${{ matrix.idf_version }}
+          path: |
+            build/*.bin
+            build/*.elf
+            build/*.map
+            build/bootloader/bootloader.bin
+            build/partition_table/partition-table.bin
+          if-no-files-found: warn
+          retention-days: 7

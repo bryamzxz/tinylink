@@ -1,0 +1,54 @@
+# Security Policy
+
+## Supported versions
+
+tinylink is pre-alpha. Until v0.1.0 ships there is no notion of a "supported
+release line"; only `main` receives fixes.
+
+| Version  | Supported          |
+|----------|--------------------|
+| `main`   | yes                |
+| `< 0.1`  | no (pre-release)   |
+
+## Reporting a vulnerability
+
+**Please do not file public GitHub issues for security bugs.**
+
+Email: `security@bryamzxz.dev` (or open a [GitHub private vulnerability report](https://docs.github.com/en/code-security/security-advisories/guidance-on-reporting-and-writing-information-about-vulnerabilities/privately-reporting-a-security-vulnerability)
+on this repository).
+
+Please include:
+
+1. A description of the issue and the affected component.
+2. Reproduction steps, including IDF version and target.
+3. Impact assessment (what an attacker can do with this).
+4. Suggested mitigation, if any.
+
+I will acknowledge receipt within **72 hours** and aim to ship a fix or a
+public advisory within **90 days** of the report. If you need a faster
+disclosure timeline (e.g. active exploitation), say so in the report.
+
+## Scope
+
+In scope:
+
+- Memory-safety bugs in tinylink C code (this repository).
+- Cryptographic protocol mistakes (Noise IK transcript, DISCO box, WireGuard
+  message handling, KDF chain).
+- Provisioning / NVS handling that leaks long-term keys.
+- Defaults that downgrade security (e.g. accepting unauthenticated peers).
+
+Out of scope:
+
+- Bugs in upstream dependencies (`droscy/esp_wireguard`, `mbedtls`, `nghttp2`,
+  ESP-IDF). Please report those upstream; we will track and pull in fixes.
+- Side-channel attacks requiring physical access beyond what the threat model
+  in [`docs/SECURITY-MODEL.md`](docs/SECURITY-MODEL.md) covers.
+- Findings that depend on the user disabling NVS encryption or flash
+  encryption.
+
+## Cryptographic primitives
+
+See [`docs/SECURITY-MODEL.md`](docs/SECURITY-MODEL.md) for the rationale behind
+the primitive choices, including why Curve25519 is vendored from constant-time
+"donna" rather than taken from mbedTLS.

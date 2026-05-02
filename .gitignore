@@ -1,0 +1,49 @@
+# ESP-IDF build artifacts
+build/
+build_*/
+sdkconfig
+sdkconfig.old
+sdkconfig.ci
+
+# Managed components are restored from idf_component.yml + dependencies.lock
+managed_components/
+
+# Note: dependencies.lock IS committed for reproducible builds.
+# Note: sdkconfig.defaults* ARE committed.
+
+# ESP-IDF flash output
+*.bin
+*.elf
+*.map
+*.hex
+
+# But keep the partitions.csv and example binaries explicitly listed below
+!partitions.csv
+
+# Provisioning artifacts (contain secrets)
+nvs_partition.bin
+secrets.csv
+*.creds
+tools/credentials.csv
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db

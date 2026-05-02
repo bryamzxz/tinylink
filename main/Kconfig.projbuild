@@ -1,0 +1,56 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Bryam (bryamzxz)
+
+menu "tinylink application"
+
+    config TINYLINK_DEVICE_HOSTNAME
+        string "Device hostname"
+        default "sensor-cali"
+        help
+            Hostname advertised to DHCP and used as the device identifier in
+            telemetry payloads. Should be a short, DNS-safe label.
+
+    config TINYLINK_TMP117_I2C_PORT
+        int "TMP117 I2C port"
+        default 0
+        range 0 1
+        help
+            ESP-IDF I2C port number used for the TMP117 temperature sensor.
+
+    config TINYLINK_TMP117_SDA_GPIO
+        int "TMP117 SDA GPIO"
+        default 21
+        range 0 39
+        help
+            GPIO pin connected to the TMP117 SDA line.
+
+    config TINYLINK_TMP117_SCL_GPIO
+        int "TMP117 SCL GPIO"
+        default 22
+        range 0 39
+        help
+            GPIO pin connected to the TMP117 SCL line.
+
+    config TINYLINK_TMP117_I2C_ADDR
+        hex "TMP117 I2C address"
+        default 0x48
+        range 0x48 0x4B
+        help
+            7-bit I2C address of the TMP117 (ADD0 strapping). 0x48 by default.
+
+    config TINYLINK_TELEMETRY_INTERVAL_MS
+        int "Telemetry interval (ms)"
+        default 30000
+        range 1000 3600000
+        help
+            How often the telemetry task reads the sensor and emits a UDP
+            datagram to the WireGuard peer.
+
+    config TINYLINK_TELEMETRY_UDP_PORT
+        int "Telemetry UDP destination port"
+        default 9999
+        range 1 65535
+        help
+            UDP port on the WireGuard peer that receives telemetry datagrams.
+
+endmenu

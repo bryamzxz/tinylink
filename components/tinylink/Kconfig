@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Bryam (bryamzxz)
+
+menu "tinylink core"
+
+    config TINYLINK_LOG_LEVEL
+        int "Default log level for tinylink core"
+        default 3
+        range 0 5
+        help
+            Maps to esp_log levels: 0=NONE, 1=ERROR, 2=WARN, 3=INFO,
+            4=DEBUG, 5=VERBOSE.
+
+endmenu

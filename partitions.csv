@@ -1,0 +1,19 @@
+# tinylink partition table for ESP32-WROOM-32E (4 MB flash)
+#
+# Layout assumes the second-stage bootloader sits at 0x1000 and the partition
+# table at 0x8000 (ESP-IDF defaults). The first usable application offset is
+# 0x10000 = 64 KiB. Everything below leaves a small gap for phy_init and
+# encrypted NVS, then splits the remaining flash into two 1.5 MiB OTA slots
+# with a dedicated encrypted credentials NVS region for provisioning data.
+#
+# Total budgeted: 0x10000 (reserved) + 0x6000 + 0x2000 + 0x1000
+#               + 0x180000 + 0x180000 + 0x4000 = 0x33B000 (~3.23 MiB).
+# Free tail: ~0xC5000 (~788 KiB) reserved for future spiffs/coredump growth.
+#
+# Name,        Type, SubType,  Offset,   Size,     Flags
+nvs,           data, nvs,      0x10000,  0x6000,
+otadata,       data, ota,      0x16000,  0x2000,
+phy_init,      data, phy,      0x18000,  0x1000,
+ota_0,         app,  ota_0,    0x20000,  0x180000,
+ota_1,         app,  ota_1,    0x1A0000, 0x180000,
+nvs_creds,     data, nvs,      0x320000, 0x4000,    encrypted

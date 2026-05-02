@@ -1,0 +1,68 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Bryam (bryamzxz)
+#
+# tinylink default sdkconfig — common to all ESP32 variants.
+# Per-target overrides live in sdkconfig.defaults.<target>.
+#
+# Hardening + tuning baseline for ESP-IDF v5.5.x.
+
+# ---- Target / partition table ------------------------------------------------
+CONFIG_IDF_TARGET="esp32"
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_PARTITION_TABLE_OFFSET=0x8000
+
+# ---- WiFi tuning (single-STA, low memory) ------------------------------------
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=8
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=16
+CONFIG_ESP_WIFI_TX_BUFFER_TYPE=1
+CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=16
+CONFIG_ESP_WIFI_AMPDU_TX_ENABLED=y
+CONFIG_ESP_WIFI_AMPDU_RX_ENABLED=y
+CONFIG_ESP_WIFI_NVS_ENABLED=y
+
+# ---- Power management --------------------------------------------------------
+CONFIG_PM_ENABLE=y
+CONFIG_FREERTOS_USE_TICKLESS_IDLE=y
+
+# ---- mbedTLS minimal config (TLS + crypto for ts2021/DERP) -------------------
+CONFIG_MBEDTLS_HARDWARE_AES=y
+CONFIG_MBEDTLS_HARDWARE_SHA=y
+CONFIG_MBEDTLS_HARDWARE_MPI=y
+CONFIG_MBEDTLS_CHACHAPOLY_C=y
+CONFIG_MBEDTLS_HKDF_C=y
+CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
+CONFIG_MBEDTLS_DYNAMIC_FREE_CA_CERT=y
+CONFIG_MBEDTLS_SSL_KEEP_PEER_CERTIFICATE=n
+CONFIG_MBEDTLS_SSL_MAX_CONTENT_LEN=4096
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
+CONFIG_MBEDTLS_CLIENT_SSL_SESSION_TICKETS=y
+
+# ---- lwIP tunings ------------------------------------------------------------
+# CRITICAL: TCPIP core locking MUST stay enabled. droscy/esp_wireguard requires
+# it. The original trombik/esp_wireguard breaks here in IDF >= 5.3 because
+# core locking is the IDF default.
+CONFIG_LWIP_TCPIP_CORE_LOCKING=y
+CONFIG_LWIP_DHCP_DOES_ARP_CHECK=n
+CONFIG_LWIP_TCP_SACK_OUT=n
+CONFIG_LWIP_TCP_MSS=1440
+
+# ---- NVS encryption ----------------------------------------------------------
+CONFIG_NVS_ENCRYPTION=y
+
+# ---- Logging -----------------------------------------------------------------
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+CONFIG_LOG_COLORS=y
+CONFIG_LOG_TIMESTAMP_SOURCE_RTOS=y
+
+# ---- FreeRTOS ----------------------------------------------------------------
+CONFIG_FREERTOS_HZ=1000
+CONFIG_FREERTOS_USE_TRACE_FACILITY=y
+CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS=y
+
+# ---- WireGuard (droscy/esp_wireguard) ----------------------------------------
+CONFIG_WIREGUARD_MAX_PEERS=1
+CONFIG_WIREGUARD_X25519_IMPL_DEFAULT=y
+
+# ---- App task stacks ---------------------------------------------------------
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=4096

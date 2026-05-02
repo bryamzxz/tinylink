@@ -1,0 +1,13 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Bryam (bryamzxz)
+#
+# Component manager manifest for the tinylink top-level "main" component.
+# Pinning droscy/esp_wireguard explicitly because the original
+# trombik/esp_wireguard fork is abandoned and breaks against ESP-IDF >= 5.3
+# default CONFIG_LWIP_TCPIP_CORE_LOCKING=y.
+
+dependencies:
+  idf:
+    version: ">=5.5,<5.6"
+  droscy/esp_wireguard:
+    version: "^0.4.4"

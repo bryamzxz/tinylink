@@ -1,0 +1,9 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Bryam (bryamzxz)
+#
+# WROOM-32E specific overrides. Picked up automatically by ESP-IDF when
+# IDF_TARGET=esp32.
+
+CONFIG_ESP32_DEFAULT_CPU_FREQ_240=y
+CONFIG_ESP32_REV_MIN_3=y
+CONFIG_ESP32_XTAL_FREQ_40=y
