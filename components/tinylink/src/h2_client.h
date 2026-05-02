@@ -39,6 +39,26 @@ esp_err_t h2_post_json(ts2021_conn_t *conn,
                        uint8_t *response_buf, size_t response_buf_size,
                        size_t *response_len);
 
+/* Streaming variant: every DATA frame chunk is delivered to `cb` as it
+ * arrives. The function blocks until the stream closes (server EOF, our
+ * watchdog timeout in a future revision, or `cb` returns a negative
+ * value). The status is set once headers have been received, before the
+ * first chunk is delivered.
+ *
+ * Used by the M2 long-poll MapRequest loop: the body is a single
+ * MapRequest with `Stream:true`, and the response is a sequence of
+ * length-prefixed MapResponse JSON objects that the caller demuxes in
+ * its callback.
+ */
+typedef int (*h2_data_callback)(const uint8_t *buf, size_t len, void *ctx);
+
+esp_err_t h2_post_json_stream(ts2021_conn_t *conn,
+                              const char *path,
+                              const char *authority,
+                              const uint8_t *body, size_t body_len,
+                              int *status_out,
+                              h2_data_callback cb, void *cb_ctx);
+
 #ifdef __cplusplus
 }
 #endif

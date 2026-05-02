@@ -5,8 +5,12 @@
 
 #include <string.h>
 
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
 #include "esp_log.h"
 #include "nvs.h"
+#include "sdkconfig.h"
 
 #include "control_key.h"
 #include "keys.h"
@@ -129,4 +133,53 @@ esp_err_t tinylink_dataplane_start(void)
              (unsigned)netmap.n_derp_regions);
 
     return wg_dataplane_start(&s_keys, &netmap);
+}
+
+/* ---- long-poll MapRequest task ----------------------------------------- */
+
+static esp_err_t long_poll_handler(const tl_netmap_t *nm, void *ctx)
+{
+    (void)ctx;
+    ESP_LOGI(TAG, "stream MapResponse: peers=%u derp_regions=%u",
+             (unsigned)nm->n_peers, (unsigned)nm->n_derp_regions);
+    /* No-op the call when the new netmap drops the peer (rare server
+     * push during a tailnet reconfigure) — wg_dataplane_update_peer
+     * already guards on n_peers==0. */
+    return wg_dataplane_update_peer(&s_keys, nm);
+}
+
+static void long_poll_task(void *arg)
+{
+    (void)arg;
+    ESP_LOGI(TAG, "long-poll task: starting");
+    for (;;) {
+        ts2021_conn_t conn;
+        esp_err_t err = ts2021_connect(&conn, s_keys.machine_priv,
+                                       s_keys.machine_pub, s_control_pub);
+        if (err == ESP_OK) {
+            err = mapreq_run_stream(&conn, &s_keys, long_poll_handler, NULL);
+            ts2021_close(&conn);
+            ESP_LOGW(TAG, "long-poll stream ended: 0x%x — reconnecting", err);
+        } else {
+            ESP_LOGW(TAG, "long-poll connect failed: 0x%x — backing off", err);
+        }
+        vTaskDelay(pdMS_TO_TICKS(CONFIG_TINYLINK_REGISTER_RETRY_MS));
+    }
+}
+
+esp_err_t tinylink_long_poll_start(void)
+{
+    if (!s_initialized) return ESP_ERR_INVALID_STATE;
+    /* 8 KiB stack matches research §J's `control_task` budget. The
+     * stream parser keeps its body buffer in BSS, so this stack only
+     * holds one ts2021_conn_t (~10 KiB transient during handshake)
+     * plus jsmn token buffer (~16 KiB during parse). The token buffer
+     * is `static` inside `mapresp_parse`, so it lives in BSS too. */
+    BaseType_t ok = xTaskCreate(long_poll_task, "tinylink_lp",
+                                8192, NULL, tskIDLE_PRIORITY + 4, NULL);
+    if (ok != pdPASS) {
+        ESP_LOGE(TAG, "xTaskCreate(long_poll) failed");
+        return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
 }

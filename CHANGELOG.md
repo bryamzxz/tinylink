@@ -8,6 +8,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **M2 long-poll MapRequest stream.**
+  - `h2_client` now exposes `h2_post_json_stream(...)` that invokes a
+    per-chunk callback; the one-shot `h2_post_json` and the streaming
+    variant share an internal driver.
+  - `mapreq_run_stream()` POSTs `/machine/map` with `Stream:true` and
+    walks the upstream `LE32 size || body` framing
+    (`tailscale/control/controlclient/direct.go:~1248`). KeepAlive
+    messages are absorbed; non-KeepAlive messages are parsed into a
+    `tl_netmap_t` and dispatched to a caller-supplied handler.
+  - `wg_dataplane_update_peer()` compares the new endpoint against the
+    currently-configured one and reconnects WG only if it changed.
+  - New public API `tinylink_long_poll_start()` spawns an 8 KiB-stack
+    FreeRTOS task `tinylink_lp` that drives the loop indefinitely and
+    reconnects (with the existing `CONFIG_TINYLINK_REGISTER_RETRY_MS`
+    backoff) on stream EOF or transport error. `main.c` invokes it
+    after the data plane is up.
+  - Build size: `tinylink.bin` 0x1182e0 → 0x118d10 (+2.6 KiB).
+
 - **M2 first-cut data plane: WireGuard via `trombik/esp_wireguard`.**
   - Added `trombik/esp_wireguard@0.9.0` (BSD-3) as a managed component
     in `main/idf_component.yml`.

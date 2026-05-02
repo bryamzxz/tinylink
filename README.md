@@ -5,15 +5,16 @@ written in pure C on **ESP-IDF v5.5.x**.
 
 ## Status
 
-**Pre-alpha — Milestone 1 complete, Milestone 2 first-cut data plane
+**Pre-alpha — Milestone 1 complete, Milestone 2 substantially
 landed.** M1 lands the ts2021 control plane (Noise IK + register,
-wire format verified against upstream in commit `2717ab7`). M2 step 1
-landed the `MapRequest` emitter and the `jsmn`-based `MapResponse`
-parser; M2 step 2 (this commit) lifts `trombik/esp_wireguard` as a
-managed component and wires it: after register, the device fetches
-one MapResponse, picks `peers[0]`, and brings up the WG netif against
-its endpoint. The long-poll (`Stream:true`) loop and the
-DISCO/STUN-aware UDP demuxer follow in M3.
+wire format verified against upstream in commit `2717ab7`). M2 has
+landed in three steps: (1) the `MapRequest` emitter and `jsmn`-based
+`MapResponse` parser, (2) `trombik/esp_wireguard` lift + the data
+plane bringup against `peers[0]`, and (3) the long-poll
+(`Stream:true`) loop in a dedicated FreeRTOS task that keeps the
+netmap fresh and updates the WG peer endpoint when the control plane
+hands us a new one. M3 (DISCO + TMP117 + UDP demuxer for socket
+sharing) is next.
 
 Not production-ready. Not affiliated with Tailscale Inc. The Tailscale
 name and logo are trademarks of Tailscale Inc.; this project is a

@@ -42,6 +42,21 @@ esp_err_t wg_dataplane_peer_is_up(void);
 /* Tear down. Safe to call even if start() was never called. */
 void wg_dataplane_stop(void);
 
+/* Hot-path update: the long-poll MapRequest loop calls this when the
+ * peer's endpoint changes between MapResponses. tinylink reuses
+ * peers[0] (single-peer model) and only acts on a real change to
+ * `peer->endpoints[0]`; same-endpoint calls are no-ops.
+ *
+ * For now this tears down the WG netif and brings it back up against
+ * the new endpoint. trombik/esp_wireguard does not expose a stable
+ * "update peer" entry point, so a reconnect is the cleanest option.
+ * Frequency in practice is "rare" — magicsock-equivalent endpoint
+ * churn after DISCO lands in M3 will replace this with a less
+ * disruptive update.
+ */
+esp_err_t wg_dataplane_update_peer(const tinylink_keys_t *keys,
+                                   const tl_netmap_t *nm);
+
 #ifdef __cplusplus
 }
 #endif

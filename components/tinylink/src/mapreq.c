@@ -412,7 +412,13 @@ static void hex_encode(const uint8_t *in, size_t len, char *out)
     out[2 * len] = '\0';
 }
 
+/* MapRequest body builder. `stream=false` → the server returns one
+ * MapResponse and closes; `stream=true` → long-poll, see
+ * `mapreq_run_stream` for the framing format. `Compress:""` disables
+ * zstd (we don't link it). Hostinfo is intentionally minimal; the
+ * server treats it as informational once we're already registered. */
 static int build_request_body(const tinylink_keys_t *keys,
+                              bool stream,
                               char *out, size_t out_size)
 {
     char node_key_hex[8 + 64 + 1];
@@ -420,24 +426,20 @@ static int build_request_body(const tinylink_keys_t *keys,
 
     memcpy(node_key_hex, "nodekey:", 8);
     hex_encode(keys->node_pub, 32, node_key_hex + 8);
-
     memcpy(disco_key_hex, "discokey:", 9);
     hex_encode(keys->disco_pub, 32, disco_key_hex + 9);
 
-    /* MapRequest with Stream:false → server returns one MapResponse and
-     * closes. Compress:"" disables zstd (we don't link zstd). Hostinfo is
-     * intentionally minimal; the server treats it as informational when
-     * we're already registered. */
     int n = snprintf(out, out_size,
         "{"
         "\"Version\":1,"
         "\"Compress\":\"\","
         "\"NodeKey\":\"%s\","
         "\"DiscoKey\":\"%s\","
-        "\"Stream\":false,"
+        "\"Stream\":%s,"
         "\"Hostinfo\":{\"OS\":\"esp32\",\"Hostname\":\"%s\",\"IPNVersion\":\"0.1.0-tinylink\"}"
         "}",
         node_key_hex, disco_key_hex,
+        stream ? "true" : "false",
         CONFIG_TINYLINK_DEVICE_HOSTNAME);
     if (n < 0 || (size_t)n >= out_size) return -1;
     return n;
@@ -452,7 +454,7 @@ esp_err_t mapreq_fetch_once(ts2021_conn_t *conn,
     }
 
     static char    body[REQUEST_BUF_SZ];
-    int body_len = build_request_body(keys, body, sizeof(body));
+    int body_len = build_request_body(keys, false, body, sizeof(body));
     if (body_len < 0) return ESP_ERR_INVALID_SIZE;
 
     static uint8_t resp[RESPONSE_BUF_SZ];
@@ -474,6 +476,149 @@ esp_err_t mapreq_fetch_once(ts2021_conn_t *conn,
         return ESP_FAIL;
     }
     return mapresp_parse((const char *)resp, resp_len, out);
+}
+
+/* ---- streaming reader ----------------------------------------------------
+ *
+ * The control plane frames each MapResponse as `LE32 size || body`
+ * (verified against `tailscale/control/controlclient/direct.go:~1248`).
+ * We accumulate header bytes, then `size` body bytes, dispatch, repeat.
+ * The body buffer is in BSS (large enough for one MapResponse plus
+ * slack); it is reused across messages.
+ *
+ * The chunk callback feeds bytes into this state machine; nghttp2 may
+ * deliver partial / multiple messages per DATA frame.
+ */
+
+typedef enum {
+    STREAM_WANT_HDR,
+    STREAM_WANT_BODY,
+} stream_phase_t;
+
+typedef struct {
+    stream_phase_t phase;
+    uint8_t        hdr[4];
+    size_t         hdr_have;
+    uint32_t       body_size;
+    size_t         body_have;
+    /* `body_buf` and `body_cap` come from the caller's BSS. */
+    uint8_t       *body_buf;
+    size_t         body_cap;
+    /* Higher-level callback fired once per assembled MapResponse. */
+    mapreq_handler_t on_netmap;
+    void            *handler_ctx;
+} stream_state_t;
+
+static void stream_dispatch(stream_state_t *s)
+{
+    /* Parse the assembled body. KeepAlive messages set `KeepAlive:true`
+     * with no peer data — `mapresp_parse` will leave `have_self=false`
+     * and `n_peers=0`, which is safe to recognize.
+     *
+     * For the M2 long-poll first cut, only full netmaps trigger the
+     * handler. Partial/incremental updates beyond KeepAlive are logged
+     * and skipped — the upstream server only sends incrementals to
+     * clients that opt in via capability flags we don't advertise. */
+    static tl_netmap_t nm;  /* ~1 KiB; reused across messages */
+    if (mapresp_parse((const char *)s->body_buf, s->body_have, &nm) != ESP_OK) {
+        ESP_LOGW(TAG, "MapResponse parse failed (size=%u)",
+                 (unsigned)s->body_have);
+        return;
+    }
+    if (!nm.have_self && nm.n_peers == 0) {
+        /* KeepAlive (or empty incremental). Nothing actionable. */
+        ESP_LOGD(TAG, "KeepAlive (%u bytes)", (unsigned)s->body_have);
+        return;
+    }
+    if (s->on_netmap != NULL) {
+        s->on_netmap(&nm, s->handler_ctx);
+    }
+}
+
+static int stream_chunk_cb(const uint8_t *data, size_t len, void *ctx)
+{
+    stream_state_t *s = (stream_state_t *)ctx;
+    size_t off = 0;
+    while (off < len) {
+        if (s->phase == STREAM_WANT_HDR) {
+            size_t need = 4 - s->hdr_have;
+            size_t take = (len - off < need) ? (len - off) : need;
+            memcpy(s->hdr + s->hdr_have, data + off, take);
+            s->hdr_have += take;
+            off += take;
+            if (s->hdr_have == 4) {
+                /* LE32 size — see `direct.go` watchdog loop. */
+                s->body_size = ((uint32_t)s->hdr[0])       |
+                               ((uint32_t)s->hdr[1] <<  8) |
+                               ((uint32_t)s->hdr[2] << 16) |
+                               ((uint32_t)s->hdr[3] << 24);
+                if (s->body_size > s->body_cap) {
+                    ESP_LOGE(TAG, "MapResponse too large: %u > %u",
+                             (unsigned)s->body_size, (unsigned)s->body_cap);
+                    return -1;
+                }
+                s->body_have = 0;
+                s->phase = STREAM_WANT_BODY;
+            }
+        } else { /* STREAM_WANT_BODY */
+            size_t need = s->body_size - s->body_have;
+            size_t take = (len - off < need) ? (len - off) : need;
+            memcpy(s->body_buf + s->body_have, data + off, take);
+            s->body_have += take;
+            off += take;
+            if (s->body_have == s->body_size) {
+                stream_dispatch(s);
+                s->phase = STREAM_WANT_HDR;
+                s->hdr_have = 0;
+                s->body_size = 0;
+                s->body_have = 0;
+            }
+        }
+    }
+    return 0;
+}
+
+esp_err_t mapreq_run_stream(ts2021_conn_t *conn,
+                            const tinylink_keys_t *keys,
+                            mapreq_handler_t on_netmap, void *ctx)
+{
+    if (conn == NULL || keys == NULL || on_netmap == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    static char body[REQUEST_BUF_SZ];
+    int body_len = build_request_body(keys, true, body, sizeof(body));
+    if (body_len < 0) return ESP_ERR_INVALID_SIZE;
+
+    /* Body buffer for one assembled MapResponse. 16 KiB matches the
+     * non-stream RESPONSE_BUF_SZ — enough headroom for a 4-peer netmap
+     * with a few DERP regions. Sized statically so the stream task
+     * stack stays small. */
+    static uint8_t body_buf[RESPONSE_BUF_SZ];
+    stream_state_t s = {
+        .phase       = STREAM_WANT_HDR,
+        .body_buf    = body_buf,
+        .body_cap    = sizeof(body_buf),
+        .on_netmap   = on_netmap,
+        .handler_ctx = ctx,
+    };
+
+    int status = 0;
+    esp_err_t err = h2_post_json_stream(conn, "/machine/map",
+                                        CONFIG_TINYLINK_CONTROL_HOST,
+                                        (const uint8_t *)body,
+                                        (size_t)body_len,
+                                        &status, stream_chunk_cb, &s);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "h2_post_json_stream failed: 0x%x", err);
+        return err;
+    }
+    if (status != 200) {
+        ESP_LOGE(TAG, "/machine/map (stream) returned HTTP %d", status);
+        return ESP_FAIL;
+    }
+    ESP_LOGI(TAG, "/machine/map stream closed cleanly");
+    return ESP_OK;
 }
 
 #endif /* ESP_PLATFORM */

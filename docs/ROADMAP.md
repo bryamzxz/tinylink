@@ -109,10 +109,23 @@ zstd by not advertising support (saves ~30 KB flash).
   channel, drives one `mapreq_fetch_once()`, and brings up the WG
   netif. `main.c` calls it after register succeeds.
 
-**Step 3 (deferred to M3, alongside DISCO):**
-- Swap `Stream:false` for `Stream:true`; run the parser in a long-poll
-  loop driven by an `app_task` FreeRTOS task; update the WG peer
-  endpoint in place when MapResponse churns.
+**Step 3 (landed in `feat(m2): long-poll MapRequest stream`):**
+- `h2_client` grew a streaming variant (`h2_post_json_stream`) that
+  invokes a per-DATA-frame callback instead of buffering the whole
+  body. Common request setup is shared with the one-shot variant.
+- `mapreq_run_stream()` POSTs `/machine/map` with `Stream:true`. The
+  reply is a sequence of `LE32 size || body` frames (verified against
+  `tailscale/control/controlclient/direct.go:~1248`); the chunk
+  callback feeds bytes into a tiny state machine that emits one
+  parsed `tl_netmap_t` per non-KeepAlive message.
+- New public API `tinylink_long_poll_start()` spawns a dedicated
+  8 KiB-stack FreeRTOS task (`tinylink_lp`) that runs the long-poll
+  loop and reconnects on stream EOF or transport error. Each
+  MapResponse fires `wg_dataplane_update_peer()`, which compares the
+  new endpoint to the active one and reconnects WG only if it
+  changed.
+
+**Deferred to M3 (alongside DISCO):**
 - Patch ~50 lines in upstream `wireguardif.c` to accept packets
   injected from a demuxer task rather than via `udp_bind(IP_ADDR_ANY,
   port)`, so DISCO/STUN can share the WG UDP socket. Until DISCO

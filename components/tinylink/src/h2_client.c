@@ -14,7 +14,9 @@ static const char *TAG = "h2";
 
 #define RECV_BUF_LEN  TS2021_RECORD_PLAINTEXT_MAX
 
-/* Per-request state passed via session user_data. */
+/* Per-request state passed via session user_data. Either response
+ * accumulation (`resp_buf`) is used, or a streaming callback (`cb`),
+ * not both. */
 typedef struct {
     ts2021_conn_t *ts2021;
 
@@ -23,12 +25,17 @@ typedef struct {
     size_t         req_body_len;
     size_t         req_body_off;
 
-    /* Response collection. */
+    /* Response collection (one-shot mode). */
     int      status;
     uint8_t *resp_buf;
     size_t   resp_cap;
     size_t   resp_len;
     bool     resp_overflow;
+
+    /* Streaming mode. */
+    h2_data_callback cb;
+    void            *cb_ctx;
+    bool             cb_stop;     /* set if cb returned <0 */
 
     /* Plaintext receive buffer (decrypted Noise record byte stream). */
     uint8_t  recv_buf[RECV_BUF_LEN];
@@ -138,6 +145,14 @@ static int data_chunk_cb(nghttp2_session *session, uint8_t flags,
     (void)session; (void)flags; (void)stream_id;
     h2_req_t *r = (h2_req_t *)user_data;
 
+    if (r->cb != NULL) {
+        int rc = r->cb(data, len, r->cb_ctx);
+        if (rc < 0) {
+            r->cb_stop = true;
+        }
+        return 0;
+    }
+
     if (r->resp_len + len > r->resp_cap) {
         size_t take = r->resp_cap - r->resp_len;
         if (take > 0) {
@@ -176,29 +191,14 @@ static nghttp2_nv mknv(const char *name, const char *value)
     return nv;
 }
 
-esp_err_t h2_post_json(ts2021_conn_t *conn,
-                       const char *path,
-                       const char *authority,
-                       const uint8_t *body, size_t body_len,
-                       int *status_out,
-                       uint8_t *response_buf, size_t response_buf_size,
-                       size_t *response_len)
+/* Shared driver: build the session, fire the request, pump send/recv
+ * until either the stream closes or the streaming callback signaled
+ * stop. Caller fills `r->resp_buf` (one-shot) or `r->cb`/`r->cb_ctx`
+ * (streaming) ahead of the call. */
+static esp_err_t h2_drive_request(h2_req_t *r,
+                                  const char *path, const char *authority,
+                                  size_t body_len)
 {
-    if (conn == NULL || path == NULL || authority == NULL ||
-        response_buf == NULL || response_len == NULL ||
-        status_out == NULL) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    h2_req_t r = {
-        .ts2021       = conn,
-        .req_body     = body,
-        .req_body_len = body_len,
-        .resp_buf     = response_buf,
-        .resp_cap     = response_buf_size,
-        .stream_id    = -1,
-    };
-
     nghttp2_session_callbacks *cbs = NULL;
     if (nghttp2_session_callbacks_new(&cbs) != 0) return ESP_ERR_NO_MEM;
     nghttp2_session_callbacks_set_send_callback(cbs, send_cb);
@@ -208,7 +208,7 @@ esp_err_t h2_post_json(ts2021_conn_t *conn,
     nghttp2_session_callbacks_set_on_stream_close_callback(cbs, stream_close_cb);
 
     nghttp2_session *session = NULL;
-    int rc = nghttp2_session_client_new(&session, cbs, &r);
+    int rc = nghttp2_session_client_new(&session, cbs, r);
     nghttp2_session_callbacks_del(cbs);
     if (rc != 0) {
         ESP_LOGE(TAG, "session_client_new: %d", rc);
@@ -248,19 +248,18 @@ esp_err_t h2_post_json(ts2021_conn_t *conn,
     int32_t stream_id = nghttp2_submit_request(session, NULL,
                                                hdrs,
                                                sizeof(hdrs) / sizeof(hdrs[0]),
-                                               &dp, &r);
+                                               &dp, r);
     if (stream_id < 0) {
         ESP_LOGE(TAG, "submit_request: %d", stream_id);
         nghttp2_session_del(session);
         return ESP_FAIL;
     }
-    r.stream_id = stream_id;
+    r->stream_id = stream_id;
 
-    /* Drive send/recv until the stream closes. nghttp2_session_send drains
-     * the outbound queue (via send_cb); _recv pulls one frame in (via
-     * recv_cb). We stop when either the stream is closed OR there's no
-     * more I/O to do. */
-    while (!r.stream_closed) {
+    /* Drive send/recv until the stream closes or the streaming callback
+     * asks us to stop. nghttp2_session_send drains the outbound queue
+     * (via send_cb); _recv pulls one frame in (via recv_cb). */
+    while (!r->stream_closed && !r->cb_stop) {
         if (nghttp2_session_want_write(session)) {
             rc = nghttp2_session_send(session);
             if (rc != 0) {
@@ -269,7 +268,7 @@ esp_err_t h2_post_json(ts2021_conn_t *conn,
                 return ESP_FAIL;
             }
         }
-        if (!r.stream_closed && nghttp2_session_want_read(session)) {
+        if (!r->stream_closed && nghttp2_session_want_read(session)) {
             rc = nghttp2_session_recv(session);
             if (rc != 0) {
                 ESP_LOGE(TAG, "session_recv: %d", rc);
@@ -285,13 +284,70 @@ esp_err_t h2_post_json(ts2021_conn_t *conn,
 
     nghttp2_session_del(session);
 
-    if (r.resp_overflow) {
-        ESP_LOGW(TAG, "response truncated (status=%d)", r.status);
+    if (r->resp_overflow) {
+        ESP_LOGW(TAG, "response truncated (status=%d)", r->status);
     }
-    if (r.stream_error != 0) {
-        ESP_LOGW(TAG, "stream closed with error 0x%x", r.stream_error);
+    if (r->stream_error != 0) {
+        ESP_LOGW(TAG, "stream closed with error 0x%x", r->stream_error);
     }
-    *status_out = r.status;
+    return ESP_OK;
+}
+
+esp_err_t h2_post_json(ts2021_conn_t *conn,
+                       const char *path,
+                       const char *authority,
+                       const uint8_t *body, size_t body_len,
+                       int *status_out,
+                       uint8_t *response_buf, size_t response_buf_size,
+                       size_t *response_len)
+{
+    if (conn == NULL || path == NULL || authority == NULL ||
+        response_buf == NULL || response_len == NULL ||
+        status_out == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    h2_req_t r = {
+        .ts2021       = conn,
+        .req_body     = body,
+        .req_body_len = body_len,
+        .resp_buf     = response_buf,
+        .resp_cap     = response_buf_size,
+        .stream_id    = -1,
+    };
+
+    esp_err_t err = h2_drive_request(&r, path, authority, body_len);
+    if (err != ESP_OK) return err;
+
+    *status_out   = r.status;
     *response_len = r.resp_len;
+    return ESP_OK;
+}
+
+esp_err_t h2_post_json_stream(ts2021_conn_t *conn,
+                              const char *path,
+                              const char *authority,
+                              const uint8_t *body, size_t body_len,
+                              int *status_out,
+                              h2_data_callback cb, void *cb_ctx)
+{
+    if (conn == NULL || path == NULL || authority == NULL ||
+        cb == NULL || status_out == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    h2_req_t r = {
+        .ts2021       = conn,
+        .req_body     = body,
+        .req_body_len = body_len,
+        .cb           = cb,
+        .cb_ctx       = cb_ctx,
+        .stream_id    = -1,
+    };
+
+    esp_err_t err = h2_drive_request(&r, path, authority, body_len);
+    if (err != ESP_OK) return err;
+
+    *status_out = r.status;
     return ESP_OK;
 }

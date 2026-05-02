@@ -69,6 +69,18 @@ esp_err_t tinylink_get_keys(tinylink_keys_t *out);
  */
 esp_err_t tinylink_dataplane_start(void);
 
+/* Spawn the long-poll MapRequest task. After this returns ESP_OK a
+ * dedicated FreeRTOS task is running `POST /machine/map` with
+ * `Stream:true`; each non-KeepAlive MapResponse refreshes the in-memory
+ * netmap and (if the peer endpoint moved) reconfigures the WG peer.
+ *
+ * The task supervises its own ts2021 connection: on stream EOF or
+ * transport error, it closes the connection, sleeps the configured
+ * retry backoff, and re-opens. Callable only after a successful
+ * `tinylink_dataplane_start()` so the WG netif already exists.
+ */
+esp_err_t tinylink_long_poll_start(void);
+
 const char *tinylink_version_string(void);
 
 #ifdef __cplusplus

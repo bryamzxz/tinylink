@@ -177,4 +177,42 @@ void wg_dataplane_stop(void)
     s_started = false;
 }
 
+esp_err_t wg_dataplane_update_peer(const tinylink_keys_t *keys,
+                                   const tl_netmap_t *nm)
+{
+    if (keys == NULL || nm == NULL) return ESP_ERR_INVALID_ARG;
+    if (nm->n_peers == 0 || nm->peers[0].n_endpoints == 0) {
+        return ESP_OK;  /* nothing to act on */
+    }
+    if (s_started &&
+        strncmp(s_endpoint_host, nm->peers[0].endpoints[0].str,
+                strlen(s_endpoint_host)) == 0) {
+        /* Cheap pre-check: if the host portion matches what we last
+         * configured, assume the full endpoint did too. The full
+         * compare happens after a successful re-parse below. */
+        char new_host[64];
+        int  new_port = 0;
+        const char *colon = strchr(nm->peers[0].endpoints[0].str, ':');
+        if (colon != NULL) {
+            size_t hlen = (size_t)(colon - nm->peers[0].endpoints[0].str);
+            if (hlen < sizeof(new_host)) {
+                memcpy(new_host, nm->peers[0].endpoints[0].str, hlen);
+                new_host[hlen] = '\0';
+                new_port = atoi(colon + 1);
+                if (strcmp(new_host, s_endpoint_host) == 0 &&
+                    new_port == s_cfg.port) {
+                    return ESP_OK;  /* unchanged */
+                }
+            }
+        }
+    }
+    /* Endpoint changed (or first call) — tear down and bring back up. */
+    if (s_started) {
+        ESP_LOGI(TAG, "peer endpoint changed → reconnecting WG");
+        esp_wireguard_disconnect(&s_ctx);
+        s_started = false;
+    }
+    return wg_dataplane_start(keys, nm);
+}
+
 #endif /* ESP_PLATFORM */

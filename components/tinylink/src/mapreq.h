@@ -45,6 +45,22 @@ extern "C" {
 esp_err_t mapreq_fetch_once(ts2021_conn_t *conn,
                             const tinylink_keys_t *keys,
                             tl_netmap_t *out);
+
+/* Long-poll variant. POSTs `/machine/map` with `Stream:true`; the server
+ * replies with a sequence of length-prefixed (LE32) MapResponse JSON
+ * objects on the same HTTP/2 stream and keeps the connection open. The
+ * function blocks for the lifetime of the stream and invokes `on_netmap`
+ * once per non-KeepAlive MapResponse, with a parsed `tl_netmap_t`.
+ * Server-initiated `KeepAlive:true` messages are silently absorbed.
+ *
+ * Returns when the stream closes (server EOF or transport error). The
+ * caller is expected to retry on a slow cadence.
+ */
+typedef esp_err_t (*mapreq_handler_t)(const tl_netmap_t *nm, void *ctx);
+
+esp_err_t mapreq_run_stream(ts2021_conn_t *conn,
+                            const tinylink_keys_t *keys,
+                            mapreq_handler_t on_netmap, void *ctx);
 #endif
 
 /* Internal — exposed for host-side KAT. Parses the JSON body of one

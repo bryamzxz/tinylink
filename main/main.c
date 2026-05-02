@@ -73,7 +73,12 @@ static esp_err_t bringup(void)
         ESP_LOGE(TAG, "dataplane bringup failed: 0x%x", err);
         return err;
     }
-    ESP_LOGI(TAG, "data plane up — idle until M3 (DISCO + telemetry)");
+    err = tinylink_long_poll_start();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "long-poll start failed: 0x%x", err);
+        return err;
+    }
+    ESP_LOGI(TAG, "data plane up + map long-poll running — idle until M3");
     return ESP_OK;
 }
 
