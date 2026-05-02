@@ -20,6 +20,7 @@ idf_component_register(
         "include"
     PRIV_INCLUDE_DIRS
         "src"
+        "src/crypto"
     REQUIRES
         nvs_flash
         esp_event

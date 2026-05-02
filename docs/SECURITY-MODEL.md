@@ -33,6 +33,7 @@ We **do not** defend against:
 | MachineKey      | Noise IK static (ts2021)      | NVS `tl_keys/machine` (32 B)   |
 | NodeKey         | WireGuard static (M2+)        | NVS `tl_keys/node` (32 B)      |
 | DiscoKey        | NaCl-box (DISCO, M3+)         | NVS `tl_keys/disco` (32 B)     |
+| NLKey           | TKA / network-lock signing    | currently sent as 32 zero bytes (`"nlpub:" + 64 zeros`) — TKA is disabled in M1 and the server tolerates a zero NLKey. M6 hardening swaps in real Ed25519 NLPrivate generation and NVS persistence. |
 | Tailscale auth key (`tskey-auth-…`) | one-time register | NVS `tl_creds/auth_key` (str)  |
 | WiFi PSK        | local network association     | NVS `tl_creds/wifi_pass` (str) |
 | Pinned control plane pub | TOFU pin               | NVS `tl_pin/control_pub` (32 B)|

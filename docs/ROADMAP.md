@@ -33,17 +33,25 @@ EN: The device:
 2. Bootstraps the control plane public key via `GET /key?v=100`, pins it
    in NVS namespace `tl_pin`. Compile-in fallback pin recommended for
    production (M6).
-3. Opens TLS to `controlplane.tailscale.com:443`, sends an HTTP Upgrade
-   request (`Upgrade: tailscale-control-protocol`) whose body carries
-   Noise IK message 1. Prologue is the single byte `0x01` (protocol
-   version) per upstream commit `1b7380a`.
-4. Reads the 101 Switching Protocols response and Noise IK message 2,
-   completing the handshake.
-5. Consumes the EarlyNoise frame containing a NodeKeyChallenge,
-   opens it with NodeKey priv via NaCl-box, and re-encrypts the response
-   per `tailscale/control/controlclient/direct.go:1159-1239`.
+3. Opens TLS to `controlplane.tailscale.com:443`, sends `POST /ts2021`
+   with `Upgrade: tailscale-control-protocol`, `Connection: upgrade`,
+   `Content-Length: 0`, and the 101-byte Noise IK initiation frame
+   base64-encoded in `X-Tailscale-Handshake`. The Noise prologue is the
+   string `"Tailscale Control Protocol v1"` (per
+   `tailscale/control/controlbase/handshake.go`).
+4. Reads the 101 Switching Protocols response and the controlbase
+   `type=2` response frame containing Noise IK msg2, completing the
+   handshake.
+5. Drains the optional EarlyPayload sentinel (`"\xff\xff\xffTS"` + BE32
+   length + JSON of `tailcfg.EarlyNoise`). Its only field is
+   `NodeKeyChallenge`, but the upstream Tailscale client never responds
+   to it in production (`SealToChallenge` from `types/key/chal.go` is
+   only referenced from tests), so tinylink discards it as well.
 6. Sends `POST /machine/register` (HTTP/2 inside the Noise channel via
-   nghttp2) with the auth key from NVS and the NodeKeySignature.
+   nghttp2) with the auth key from NVS. `Version` on the wire is `1`
+   (the Noise transport `CapabilityVersion`); `NLKey` is sent as
+   `"nlpub:" + 64 zeros` until M6 hardening adds real Ed25519
+   NLPrivate generation.
 7. Reads the response. On `MachineAuthorized=true` the device is registered
    and idle; on `false` it retries on a slow cadence.
 
@@ -55,12 +63,16 @@ status online, an assigned `100.x.y.z`. Pings to it will not work yet —
 M1 has no data plane.
 
 **Known gaps in the current scaffolding** (see follow-up tasks):
-- The NodeKeyChallenge response in `ts2021_client.c:process_early_noise`
-  signs the base64 challenge string; the correct flow is open-then-
-  re-encrypt against the control plane DiscoKey
-  (`tailscale/control/controlclient/direct.go:1159-1239`).
-- All vendored crypto is unvalidated against test vectors (RFC 7693
-  BLAKE2s, RFC 7748 X25519, RFC 8439 ChaCha20-Poly1305, Salsa20).
+- `NodeKeyChallenge` is intentionally not implemented. The upstream
+  Tailscale client defines `SealToChallenge` / `ChallengePrivate.OpenFrom`
+  in `types/key/chal.go` but never calls them outside tests, so the
+  EarlyPayload reaches no caller in production. tinylink mirrors that
+  behavior by draining and discarding the sentinel.
+- `NLKey` is sent as 32 zero bytes until M6 hardening lands real
+  Ed25519 NLPrivate generation; this is tolerated because TKA is off.
+- The vendored crypto only has host-side KATs for BLAKE2s and X25519
+  today (commit `358297f`). ChaCha20-Poly1305 / Salsa20 / Poly1305 KATs
+  are still pending.
 
 ## M2 — MapRequest + WireGuard data plane
 

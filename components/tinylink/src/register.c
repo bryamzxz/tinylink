@@ -39,38 +39,14 @@ static void format_keyed_hex(char *out, const char *prefix,
     hex_encode(key, 32, out + plen);
 }
 
-static int base64_encode(const uint8_t *in, size_t in_len,
-                         char *out, size_t out_size)
-{
-    static const char b64[] =
-        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    size_t needed = ((in_len + 2) / 3) * 4 + 1;
-    if (needed > out_size) return -1;
-
-    size_t o = 0;
-    for (size_t i = 0; i < in_len; i += 3) {
-        uint32_t v = (uint32_t)in[i] << 16;
-        if (i + 1 < in_len) v |= (uint32_t)in[i + 1] << 8;
-        if (i + 2 < in_len) v |= (uint32_t)in[i + 2];
-        out[o++] = b64[(v >> 18) & 0x3F];
-        out[o++] = b64[(v >> 12) & 0x3F];
-        out[o++] = (i + 1 < in_len) ? b64[(v >> 6) & 0x3F] : '=';
-        out[o++] = (i + 2 < in_len) ? b64[v & 0x3F]        : '=';
-    }
-    out[o] = '\0';
-    return 0;
-}
-
 static esp_err_t build_request_body(const tinylink_keys_t *keys,
                                     const char *auth_key,
-                                    const uint8_t *node_key_signature,
-                                    size_t node_key_signature_len,
                                     char *out, size_t out_size,
                                     int *out_len)
 {
     char node_key_hex[8 + 64 + 1];
     char old_node_key[8 + 64 + 1];
-    char node_key_sig_b64[512] = {0};
+    char nl_key_zero[6 + 64 + 1];
 
     format_keyed_hex(node_key_hex, "nodekey:", keys->node_pub);
     /* OldNodeKey is all zeros on first registration. */
@@ -78,12 +54,12 @@ static esp_err_t build_request_body(const tinylink_keys_t *keys,
     memset(old_node_key + 8, '0', 64);
     old_node_key[8 + 64] = '\0';
 
-    if (node_key_signature_len > 0) {
-        if (base64_encode(node_key_signature, node_key_signature_len,
-                          node_key_sig_b64, sizeof(node_key_sig_b64)) != 0) {
-            return ESP_ERR_INVALID_SIZE;
-        }
-    }
+    /* NLKey is required (no `omitempty` upstream). M1 has no TKA, so an
+     * all-zero Ed25519 public key is tolerated. Real NLPrivate generation
+     * lands in M6 hardening. */
+    memcpy(nl_key_zero, "nlpub:", 6);
+    memset(nl_key_zero + 6, '0', 64);
+    nl_key_zero[6 + 64] = '\0';
 
     /* RFC3339 timestamp from the current wall clock. If time isn't synced
      * we still send something monotonic-ish; the control plane will reject
@@ -102,16 +78,17 @@ static esp_err_t build_request_body(const tinylink_keys_t *keys,
         return ESP_ERR_NO_MEM;
     }
 
-    cJSON_AddNumberToObject(root, "Version", 100);
+    /* Version here is the Noise transport CapabilityVersion, not a marketing
+     * version; upstream pins 1 on the wire and the server gates new features
+     * off the Hostinfo block instead. */
+    cJSON_AddNumberToObject(root, "Version", 1);
     cJSON_AddStringToObject(root, "NodeKey", node_key_hex);
     cJSON_AddStringToObject(root, "OldNodeKey", old_node_key);
+    cJSON_AddStringToObject(root, "NLKey", nl_key_zero);
     cJSON_AddStringToObject(root, "Followup", "");
     cJSON_AddStringToObject(root, "Timestamp", ts);
     cJSON_AddStringToObject(root, "Expiry", "0001-01-01T00:00:00Z");
     cJSON_AddBoolToObject(root, "Ephemeral", false);
-    if (node_key_signature_len > 0) {
-        cJSON_AddStringToObject(root, "NodeKeySignature", node_key_sig_b64);
-    }
 
     cJSON_AddStringToObject(hostinfo, "OS", "esp32");
     cJSON_AddStringToObject(hostinfo, "Hostname", CONFIG_TINYLINK_DEVICE_HOSTNAME);
@@ -147,8 +124,6 @@ esp_err_t register_emit(ts2021_conn_t *conn,
     char  body[REQUEST_BUF];
     int   body_len = 0;
     esp_err_t err = build_request_body(keys, auth_key,
-                                       conn->node_key_signature,
-                                       conn->node_key_signature_len,
                                        body, sizeof(body), &body_len);
     if (err != ESP_OK) return err;
 

@@ -83,7 +83,7 @@ esp_err_t tinylink_register(void)
 
     ts2021_conn_t conn;
     err = ts2021_connect(&conn, s_keys.machine_priv, s_keys.machine_pub,
-                         s_control_pub, s_keys.node_priv);
+                         s_control_pub);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "ts2021_connect failed: 0x%x", err);
         return err;

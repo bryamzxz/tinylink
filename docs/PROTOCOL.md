@@ -54,42 +54,51 @@ honest. None of it is official Tailscale documentation — see the published
 ## ts2021 (M1)
 
 The control connection is TLS to `controlplane.tailscale.com`. The HTTP
-request is a `POST /ts2021` with `Upgrade: tailscale-control-protocol`
-(token confirmed in `control/ts2021/server.go` upstream — the shorter
-"ts2021" form is the URL path, not the upgrade token). The request body
-is a single ts2021 frame
-(`version(1) || type=HANDSHAKE(1) || BE16 length || Noise IK msg1`).
-The server replies `101 Switching Protocols` and switches to the same
-framing for all subsequent traffic.
+request is `POST /ts2021` with `Upgrade: tailscale-control-protocol`,
+`Connection: upgrade`, and `Content-Length: 0`. The Noise IK initiation
+bytes do **not** travel in the request body — they ride in an
+`X-Tailscale-Handshake: <base64>` header, per
+`tailscale/control/controlhttp/client.go` and
+`controlhttpcommon.HandshakeHeaderName`. The server replies
+`101 Switching Protocols`, after which the same TLS connection carries
+controlbase frames.
 
-The Noise IK prologue is a single byte `0x01` (the protocol version),
-MixHash'd before message 1 — see upstream commit `1b7380a`
-"control/noise: include the protocol version in the Noise prologue".
+Two distinct frame layouts (see `tailscale/control/controlbase/messages.go`):
 
-After the upgrade and the EarlyNoise message, **the inner protocol is
-HTTP/2** (per `tailscale/control/ts2021/`). tinylink wraps
+- **Initiation frame** (5-byte header + 96-byte Noise msg1):
+  `BE16 protocolVersion || type(1) || BE16 payloadLen`. The base64 of
+  the full 101 bytes is what goes in `X-Tailscale-Handshake`.
+- **All later frames** (3-byte header):
+  `type(1) || BE16 payloadLen`.
+
+Frame types: `1=initiation`, `2=response`, `3=error`, `4=record`. The
+post-handshake records (`type=4`) carry ChaCha20-Poly1305 ciphertext
+authenticated under the Noise transport keys. `maxMessageSize=4096`,
+giving a plaintext cap of `4096 − 3 − 16 = 4077`.
+
+The Noise IK prologue is the **string**
+`"Tailscale Control Protocol v1"` (prefix `"Tailscale Control Protocol v"`
++ decimal protocol version, per `controlbase/handshake.go:protocolVersionPrologue`).
+The earlier note in this doc that called the prologue "the single byte
+`0x01`" was wrong; that byte appears in the cleartext init header, not
+in the Noise prologue.
+
+After the upgrade and the optional EarlyPayload, the inner protocol is
+**HTTP/2** (per `tailscale/control/ts2021/`). tinylink wraps
 `ts2021_send` / `ts2021_recv` with nghttp2 (espressif/nghttp managed
 component) in `components/tinylink/src/h2_client.c`. SETTINGS sent by
 the client disable HPACK dynamic-table indexing
 (`SETTINGS_HEADER_TABLE_SIZE = 0`) and server push
 (`SETTINGS_ENABLE_PUSH = 0`) for one-shot request semantics.
 
-After the upgrade the connection carries:
-
-- `version(1) || type=HANDSHAKE(1) || BE16 length || Noise IK msg2`
-  (responder's reply).
-- Optional EarlyNoise frame: `version(1) || type=RECORD(2) || BE16 length
-  || ChaChaPoly(noise_recv_key, JSON)`. JSON has a `NodeKeyChallenge`
-  field; we sign it with the NodeKey via NaCl-box and stash the result
-  for `RegisterRequest`.
-- All further traffic is HTTP/1.1 (M1) or HTTP/2 (M2+) wrapped in
-  `type=RECORD(2)` frames.
-
-`TS2021_VERIFY` markers in `components/tinylink/src/ts2021_client.c` flag
-the spots where the exact wire format needs to be cross-checked against
-`tailscale/control/ts2021/types.go`,
-`tailscale/control/ts2021/server.go`, and
-`tailscale/control/controlclient/direct.go`.
+After `read_msg2` the connection optionally carries an EarlyPayload
+sentinel — `"\xff\xff\xffTS"` (5 B) + `BE32 length` + JSON-encoded
+`tailcfg.EarlyNoise` (per `tailscale/control/ts2021/conn.go`,
+`hdrLen=9`). Its only field is `NodeKeyChallenge`. The current upstream
+client reads it but no caller of `GetEarlyPayload` exists in production
+(`SealToChallenge` / `OpenFrom` from `types/key/chal.go` are referenced
+only in tests). tinylink therefore **drains and discards** the
+EarlyPayload bytes and starts the HTTP/2 stream from whatever follows.
 
 ## /machine/register (M1)
 
@@ -97,9 +106,10 @@ JSON body, fields used today:
 
 | Field               | Notes                                              |
 |---------------------|----------------------------------------------------|
-| `Version`           | `100` — our IPN/MapRequest schema version.         |
+| `Version`           | `1` — Noise transport `CapabilityVersion` (upstream pins this on the wire; feature gating is keyed on `Hostinfo`, not `Version`). |
 | `NodeKey`           | `"nodekey:" + 64-hex` of NodeKey public.           |
 | `OldNodeKey`        | `"nodekey:" + 64 zeros` on first registration.     |
+| `NLKey`             | `"nlpub:" + 64 zeros` for M1 (TKA disabled). Real Ed25519 NLPrivate generation lands in M6 hardening. The field has no `omitempty` upstream, so it must be present. |
 | `Hostinfo.OS`       | `"esp32"`.                                         |
 | `Hostinfo.Hostname` | from `CONFIG_TINYLINK_DEVICE_HOSTNAME`.            |
 | `Hostinfo.IPNVersion` | `"0.1.0-tinylink"`.                              |
@@ -107,7 +117,11 @@ JSON body, fields used today:
 | `Timestamp`         | RFC3339 from the device clock.                     |
 | `Expiry`            | `"0001-01-01T00:00:00Z"` (no expiry).              |
 | `Ephemeral`         | `false`.                                           |
-| `NodeKeySignature`  | base64 of the NaCl-box-signed NodeKeyChallenge.    |
+
+`NodeKeySignature` is intentionally omitted: upstream only sets it for
+TKA-wrapped pre-auth flows, which tinylink does not implement. The
+EarlyPayload `NodeKeyChallenge` is also ignored — the Tailscale client
+itself never responds to it in production code.
 
 Response fields used today:
 

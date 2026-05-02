@@ -6,8 +6,12 @@
 #
 # Hardening + tuning baseline for ESP-IDF v5.5.x.
 
-# ---- Target / partition table ------------------------------------------------
+# ---- Target / flash / partition table ----------------------------------------
+# partitions.csv places ota_1 at 0x320000 + a 0x4000 nvs_creds region, so flash
+# must be ≥ 4 MB (ESP32-WROOM-32E and friends ship with 4 MB).
 CONFIG_IDF_TARGET="esp32"
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="4MB"
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 CONFIG_PARTITION_TABLE_OFFSET=0x8000
@@ -29,6 +33,7 @@ CONFIG_FREERTOS_USE_TICKLESS_IDLE=y
 CONFIG_MBEDTLS_HARDWARE_AES=y
 CONFIG_MBEDTLS_HARDWARE_SHA=y
 CONFIG_MBEDTLS_HARDWARE_MPI=y
+CONFIG_MBEDTLS_CHACHA20_C=y
 CONFIG_MBEDTLS_CHACHAPOLY_C=y
 CONFIG_MBEDTLS_HKDF_C=y
 CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
