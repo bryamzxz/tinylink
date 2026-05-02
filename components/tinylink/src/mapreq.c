@@ -408,6 +408,15 @@ esp_err_t mapresp_parse(const char *json, size_t json_len, tl_netmap_t *out)
             parse_node_obj(json, toks, val_idx, out);
         } else if (tok_eq(json, key, "Peers") && tok_is_arr(&toks[val_idx])) {
             parse_peers_arr(json, toks, val_idx, out);
+        } else if (tok_eq(json, key, "PeersChanged") && tok_is_arr(&toks[val_idx])) {
+            /* Stream-mode delta-add. The control plane sends the full peer
+             * list in PeersChanged on the first MapResponse instead of
+             * Peers (verified on-device 2026-05-02 via field-substring
+             * scan: first frame has PeersChanged=1, Peers=0). Subsequent
+             * updates carry only the changed peers. For our M2 first cut
+             * we treat PeersChanged identically to Peers — replace the
+             * full peer list. PeersRemoved is not yet honored. */
+            parse_peers_arr(json, toks, val_idx, out);
         } else if (tok_eq(json, key, "DERPMap") &&
                    tok_is_obj(&toks[val_idx])) {
             parse_derp_map(json, toks, val_idx, out);
@@ -598,6 +607,40 @@ static void stream_dispatch(stream_state_t *s)
      * handler. Partial/incremental updates beyond KeepAlive are logged
      * and skipped — the upstream server only sends incrementals to
      * clients that opt in via capability flags we don't advertise. */
+    /* DIAGNÓSTICO 2026-05-02 (per upstream investigation): inspect the
+     * first 16 bytes + key field substrings to distinguish:
+     *   - 0x7B '{'             → JSON plain
+     *   - 0x28 0xB5 0x2F 0xFD  → zstd magic (server compressed despite our
+     *                            Compress="" — cliente Go siempre manda
+     *                            "zstd", server puede ignorar Compress="")
+     *   - other                → unknown framing */
+    {
+        const uint8_t *b = s->body_buf;
+        size_t n = s->body_have;
+        size_t hn = n < 16 ? n : 16;
+        char hex[16*3 + 1] = {0};
+        for (size_t i = 0; i < hn; i++) {
+            snprintf(hex + i*3, 4, "%02x ", b[i]);
+        }
+        bool has_peers       = false, has_peers_changed = false;
+        bool has_keepalive   = false, has_node          = false;
+        bool has_peers_patch = false, has_peers_removed = false;
+        if (n >= 9) {
+            for (size_t i = 0; i + 7 < n; i++) {
+                if (!has_peers       && memcmp(b+i, "\"Peers\"", 7) == 0)             has_peers = true;
+                if (!has_keepalive   && i + 11 < n && memcmp(b+i, "\"KeepAlive\"", 11) == 0) has_keepalive = true;
+                if (!has_node        && memcmp(b+i, "\"Node\"", 6) == 0)              has_node = true;
+                if (!has_peers_changed && i + 14 < n && memcmp(b+i, "\"PeersChanged\"", 14) == 0) has_peers_changed = true;
+                if (!has_peers_patch   && i + 19 < n && memcmp(b+i, "\"PeersChangedPatch\"", 19) == 0) has_peers_patch = true;
+                if (!has_peers_removed && i + 14 < n && memcmp(b+i, "\"PeersRemoved\"", 14) == 0) has_peers_removed = true;
+            }
+        }
+        ESP_LOGI(TAG, "frame[%u] hex: %s", (unsigned)n, hex);
+        ESP_LOGI(TAG, "frame fields: Node=%d Peers=%d PeersChanged=%d PeersChangedPatch=%d PeersRemoved=%d KeepAlive=%d",
+                 has_node, has_peers, has_peers_changed,
+                 has_peers_patch, has_peers_removed, has_keepalive);
+    }
+
     static tl_netmap_t nm;  /* ~1 KiB; reused across messages */
     esp_err_t pe = mapresp_parse((const char *)s->body_buf, s->body_have, &nm);
     if (pe != ESP_OK) {
