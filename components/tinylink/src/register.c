@@ -61,15 +61,6 @@ static esp_err_t build_request_body(const tinylink_keys_t *keys,
     memset(nl_key_zero + 6, '0', 64);
     nl_key_zero[6 + 64] = '\0';
 
-    /* RFC3339 timestamp from the current wall clock. If time isn't synced
-     * we still send something monotonic-ish; the control plane will reject
-     * if the skew is too large. */
-    char ts[40];
-    time_t now = time(NULL);
-    struct tm tm_utc;
-    gmtime_r(&now, &tm_utc);
-    strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%SZ", &tm_utc);
-
     cJSON *root = cJSON_CreateObject();
     cJSON *hostinfo = cJSON_CreateObject();
     cJSON *auth = cJSON_CreateObject();
@@ -90,9 +81,14 @@ static esp_err_t build_request_body(const tinylink_keys_t *keys,
     cJSON_AddStringToObject(root, "OldNodeKey", old_node_key);
     cJSON_AddStringToObject(root, "NLKey", nl_key_zero);
     cJSON_AddStringToObject(root, "Followup", "");
-    cJSON_AddStringToObject(root, "Timestamp", ts);
     cJSON_AddStringToObject(root, "Expiry", "0001-01-01T00:00:00Z");
-    cJSON_AddBoolToObject(root, "Ephemeral", false);
+    /* Notes per upstream tailcfg.go::RegisterRequest:
+     *   - Timestamp / SignatureType / Signature / DeviceCert all carry
+     *     `json:",omitempty"` and are only populated for SignatureV1
+     *     (machine identity certificates). M1 uses SignatureNone, so
+     *     none of these fields should appear in the JSON.
+     *   - Ephemeral is `bool, omitempty`: omitted when false. We are
+     *     not ephemeral. */
 
     cJSON_AddStringToObject(hostinfo, "OS", "esp32");
     cJSON_AddStringToObject(hostinfo, "Hostname", CONFIG_TINYLINK_DEVICE_HOSTNAME);
