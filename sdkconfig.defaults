@@ -36,8 +36,14 @@ CONFIG_MBEDTLS_HARDWARE_MPI=y
 CONFIG_MBEDTLS_CHACHA20_C=y
 CONFIG_MBEDTLS_CHACHAPOLY_C=y
 CONFIG_MBEDTLS_HKDF_C=y
-CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
-CONFIG_MBEDTLS_DYNAMIC_FREE_CA_CERT=y
+# CONFIG_MBEDTLS_DYNAMIC_BUFFER previously =y to save RAM, but on first
+# HW boot 2026-05-02 it corrupted the TX-buffer pointer in mbedtls
+# during the first ts2021_send → esp_tls_conn_write call (crash in
+# heap_caps_free of an already-freed pointer). Feature is known to
+# misbehave when combined with session tickets. We have RAM headroom;
+# turn it off.
+CONFIG_MBEDTLS_DYNAMIC_BUFFER=n
+CONFIG_MBEDTLS_DYNAMIC_FREE_CA_CERT=n
 CONFIG_MBEDTLS_SSL_KEEP_PEER_CERTIFICATE=n
 CONFIG_MBEDTLS_SSL_MAX_CONTENT_LEN=4096
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
@@ -76,4 +82,12 @@ CONFIG_MBEDTLS_POLY1305_C=y
 # ---- App task stacks ---------------------------------------------------------
 # Bigger main stack: TLS + Noise IK + JSON construction is much heavier than
 # the M1-WG bringup that this replaces.
-CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384
+
+# esp_timer dispatch task stack. mbedtls / lwIP timer callbacks (e.g.
+# session ticket lifetime, sntp, peer-cert cleanup) routed through here
+# blow past the 3584-byte default once TLS to controlplane.tailscale.com
+# is up. Observed on first HW boot 2026-05-02: panic with EXCCAUSE 0x1c
+# (LoadStoreError) immediately after the control-key fetch path,
+# classic stack-overflow corruption. 6144 gives ~2x headroom.
+CONFIG_ESP_TIMER_TASK_STACK_SIZE=6144
