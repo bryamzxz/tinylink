@@ -5,54 +5,128 @@ document is the *cleanroom* reference we use to keep our implementation
 honest. None of it is official Tailscale documentation — see the published
 `tailscale/tailscale` repo for ground truth.
 
-## Layered view
+## Authoritative references
+
+- Tailscale upstream Go source — the wire-format ground truth. Specific
+  files cited throughout this doc and inline in the C source via
+  `TS2021_VERIFY` comments.
+- Out-of-tree research artifact maintained by the project owner at
+  `/home/bryam/Descargas/compass_artifact_*.md`, which indexes the
+  upstream files, gives memory/flash budgets, and lists the
+  minimum-viable subset for a single-peer ESP32. Cited as
+  `[research §X]`.
+
+## Layered view (M1 + later)
 
 ```
-   App: TMP117 telemetry (UDP, JSON)         ← M1
+   App: TMP117 telemetry (UDP, JSON)         ← M3
    ────────────────────────────────────────
-   ts2021: Noise IK + HTTP/2 inside TLS       ← M2 (control plane)
-   MapResponse: protobuf                      ← M3
-   DISCO: NaCl-box on WG UDP socket           ← M4
-   DERP: TLS relay                            ← M5
+   MapResponse: protobuf (long-lived stream) ← M2
+   HTTP/2 inside Noise (nghttp2)             ← M2
    ────────────────────────────────────────
-   WireGuard data plane (droscy/esp_wireguard) ← M1 baseline
+   /machine/register: HTTP/1.1 inside Noise  ← M1 (current)
+   ts2021: Noise IK + HTTP Upgrade in TLS    ← M1
+   ────────────────────────────────────────
+   DISCO: NaCl-box on WG UDP socket          ← M3
+   WireGuard data plane (droscy/esp_wireguard)← M2
    UDP / IPv4
    WiFi STA
 ```
 
 ## Cryptographic primitive table
 
-| Primitive           | Used by         | Source              | Why                                |
-|---------------------|-----------------|---------------------|------------------------------------|
-| ChaCha20-Poly1305   | WG, Noise, DERP | mbedTLS (HW-accel)  | ESP32 has accelerator; same impl   |
-| Curve25519 (X25519) | WG, Noise IK    | vendored donna      | constant-time scalarmult required  |
-| BLAKE2s             | Noise IK        | vendored            | small, simple, no IDF builtin      |
-| HKDF                | Noise IK, WG    | mbedTLS             | already linked for TLS             |
-| NaCl-box            | DISCO           | vendored            | tiny dep; DISCO is exactly nacl-box|
-| TLS 1.2/1.3         | ts2021, DERP    | mbedTLS             | already linked                     |
+| Primitive           | Used by             | Source              | Why                                |
+|---------------------|---------------------|---------------------|------------------------------------|
+| ChaCha20-Poly1305   | Noise IK, WG, DERP  | mbedTLS (HW-accel)  | ESP32 has accelerator; same impl   |
+| Curve25519 (X25519) | Noise IK, WG        | vendored placeholder | constant-time required (see below) |
+| BLAKE2s             | Noise IK            | vendored RFC 7693   | small, simple, no IDF builtin      |
+| HMAC-BLAKE2s + HKDF | Noise IK            | vendored            | Noise §4.3 KDF                     |
+| TLS 1.2/1.3         | ts2021, DERP        | mbedTLS             | already linked                     |
+| Salsa20 / XSalsa20  | NaCl-box (DISCO)    | vendored            | tiny dep                           |
+| Poly1305            | NaCl-box auth tag   | mbedTLS             | already linked                     |
 
-The vendored `donna` is mandatory: mbedTLS's Curve25519 path is variable-time
-in the relevant code paths and we do not want long-term keys to leak through
-timing channels on a sensor sitting on an LAN. See `SECURITY-MODEL.md`.
+> The `curve25519.c` shipped today is **TweetNaCl-derived, not constant-time
+> donna**. It is *designed* to be constant-time but is not as carefully
+> audited as the canonical donna implementation. For production use, swap
+> with `trombik/esp_wireguard`'s `src/crypto/x25519.c`. See
+> [`SECURITY-MODEL.md`](SECURITY-MODEL.md).
 
-## ts2021 (M2)
+## ts2021 (M1)
 
-The control connection is HTTP/2 over TLS to `controlplane.tailscale.com`,
-and inside that, a Noise_IK_25519_ChaChaPoly_BLAKE2s session frames the
-control-plane RPCs. Our implementation only needs the IK initiator role —
-we never act as the responder.
+The control connection is TLS to `controlplane.tailscale.com`. The HTTP
+request is a `POST /ts2021` with `Upgrade: tailscale-control-protocol`
+(token confirmed in `control/ts2021/server.go` upstream — the shorter
+"ts2021" form is the URL path, not the upgrade token). The request body
+is a single ts2021 frame
+(`version(1) || type=HANDSHAKE(1) || BE16 length || Noise IK msg1`).
+The server replies `101 Switching Protocols` and switches to the same
+framing for all subsequent traffic.
 
-## MapResponse (M3)
+The Noise IK prologue is a single byte `0x01` (the protocol version),
+MixHash'd before message 1 — see upstream commit `1b7380a`
+"control/noise: include the protocol version in the Noise prologue".
 
-Protobuf-framed, length-delimited, streamed over the open HTTP/2 stream.
-We will decode only the fields we strictly need (peer list, derp map,
-self-node info). Packet-filter / ACL fields are **not** enforced on-device.
+After the upgrade and the EarlyNoise message, **the inner protocol is
+HTTP/2** (per `tailscale/control/ts2021/`). The tinylink M1 implementation
+in `components/tinylink/src/ts2021_client.c` currently sends the
+`/machine/register` request as HTTP/1.1, which the production server
+rejects. This is a known M1 gap — the next thing to land is nghttp2
+integration on top of `ts2021_send` / `ts2021_recv`.
 
-## DISCO (M4)
+After the upgrade the connection carries:
+
+- `version(1) || type=HANDSHAKE(1) || BE16 length || Noise IK msg2`
+  (responder's reply).
+- Optional EarlyNoise frame: `version(1) || type=RECORD(2) || BE16 length
+  || ChaChaPoly(noise_recv_key, JSON)`. JSON has a `NodeKeyChallenge`
+  field; we sign it with the NodeKey via NaCl-box and stash the result
+  for `RegisterRequest`.
+- All further traffic is HTTP/1.1 (M1) or HTTP/2 (M2+) wrapped in
+  `type=RECORD(2)` frames.
+
+`TS2021_VERIFY` markers in `components/tinylink/src/ts2021_client.c` flag
+the spots where the exact wire format needs to be cross-checked against
+`tailscale/control/ts2021/types.go`,
+`tailscale/control/ts2021/server.go`, and
+`tailscale/control/controlclient/direct.go`.
+
+## /machine/register (M1)
+
+JSON body, fields used today:
+
+| Field               | Notes                                              |
+|---------------------|----------------------------------------------------|
+| `Version`           | `100` — our IPN/MapRequest schema version.         |
+| `NodeKey`           | `"nodekey:" + 64-hex` of NodeKey public.           |
+| `OldNodeKey`        | `"nodekey:" + 64 zeros` on first registration.     |
+| `Hostinfo.OS`       | `"esp32"`.                                         |
+| `Hostinfo.Hostname` | from `CONFIG_TINYLINK_DEVICE_HOSTNAME`.            |
+| `Hostinfo.IPNVersion` | `"0.1.0-tinylink"`.                              |
+| `Auth.AuthKey`      | `tskey-auth-...` from NVS `tl_creds/auth_key`.     |
+| `Timestamp`         | RFC3339 from the device clock.                     |
+| `Expiry`            | `"0001-01-01T00:00:00Z"` (no expiry).              |
+| `Ephemeral`         | `false`.                                           |
+| `NodeKeySignature`  | base64 of the NaCl-box-signed NodeKeyChallenge.    |
+
+Response fields used today:
+
+| Field                | Notes                                              |
+|----------------------|----------------------------------------------------|
+| `MachineAuthorized`  | `true` → registered. `false` → operator must approve. |
+| `Error`              | non-empty on hard failure.                         |
+
+## MapResponse (M2)
+
+Protobuf-framed, length-delimited, streamed over a long-lived HTTP/2
+stream. tinylink will decode only the fields it needs (peer list, derp
+map, self-node info). Packet-filter / ACL fields are **not** enforced
+on-device.
+
+## DISCO (M3)
 
 UDP datagrams piggy-back on the same socket WireGuard uses. Each datagram
-is a NaCl-box with the static DISCO key derived during ts2021. The first
-valid pong upgrades a peer from "DERP-relayed" to "direct".
+is a NaCl-box with the static DISCO key. The first valid pong upgrades a
+peer from "DERP-relayed" to "direct".
 
 ## DERP (M5)
 

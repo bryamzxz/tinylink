@@ -3,53 +3,96 @@
 
 #include "tinylink.h"
 
+#include <string.h>
+
+#include "esp_log.h"
+#include "nvs.h"
+
+#include "control_key.h"
+#include "keys.h"
+#include "register.h"
+#include "ts2021_client.h"
+
 #define STR_HELPER(x) #x
 #define STR(x) STR_HELPER(x)
+
+static const char *TAG = "tinylink";
 
 static const char k_version[] =
     STR(TINYLINK_VERSION_MAJOR) "."
     STR(TINYLINK_VERSION_MINOR) "."
     STR(TINYLINK_VERSION_PATCH);
 
+static tinylink_keys_t s_keys;
+static uint8_t         s_control_pub[32];
+static bool            s_initialized;
+
 const char *tinylink_version_string(void)
 {
     return k_version;
 }
 
-/* M2 — ts2021 Noise IK handshake. TODO. */
-esp_err_t tinylink_ts2021_handshake(tinylink_ts2021_ctx_t *ctx)
+esp_err_t tinylink_init(void)
 {
-    (void)ctx;
-    return ESP_ERR_NOT_SUPPORTED;
+    esp_err_t err = keys_load_or_generate(&s_keys);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "keys_load_or_generate failed: 0x%x", err);
+        return err;
+    }
+    err = control_key_get(s_control_pub);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "control_key_get failed: 0x%x", err);
+        return err;
+    }
+    s_initialized = true;
+    return ESP_OK;
 }
 
-/* M3 — MapResponse parser. TODO. */
-esp_err_t tinylink_map_response_parse(const uint8_t *buf, size_t len,
-                                      tinylink_map_response_t *out)
+esp_err_t tinylink_get_keys(tinylink_keys_t *out)
 {
-    (void)buf;
-    (void)len;
-    (void)out;
-    return ESP_ERR_NOT_SUPPORTED;
+    if (out == NULL) return ESP_ERR_INVALID_ARG;
+    if (!s_initialized) return ESP_ERR_INVALID_STATE;
+    memcpy(out, &s_keys, sizeof(*out));
+    return ESP_OK;
 }
 
-/* M4 — DISCO ping over WG UDP socket. TODO. */
-esp_err_t tinylink_disco_send_ping(tinylink_disco_ctx_t *ctx)
+static esp_err_t read_auth_key(char *out, size_t out_size)
 {
-    (void)ctx;
-    return ESP_ERR_NOT_SUPPORTED;
+    nvs_handle_t h;
+    esp_err_t err = nvs_open("tl_creds", NVS_READONLY, &h);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "nvs_open(tl_creds) failed: 0x%x", err);
+        return err;
+    }
+    size_t len = out_size;
+    err = nvs_get_str(h, "auth_key", out, &len);
+    nvs_close(h);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "auth_key missing from NVS: 0x%x", err);
+    }
+    return err;
 }
 
-/* M5 — DERP relay fallback. TODO. */
-esp_err_t tinylink_derp_connect(tinylink_derp_ctx_t *ctx, const char *region)
+esp_err_t tinylink_register(void)
 {
-    (void)ctx;
-    (void)region;
-    return ESP_ERR_NOT_SUPPORTED;
-}
+    if (!s_initialized) return ESP_ERR_INVALID_STATE;
 
-/* M6 — production hardening hooks. TODO. */
-esp_err_t tinylink_harden_apply_defaults(void)
-{
-    return ESP_ERR_NOT_SUPPORTED;
+    char auth_key[128];
+    esp_err_t err = read_auth_key(auth_key, sizeof(auth_key));
+    if (err != ESP_OK) return err;
+
+    ts2021_conn_t conn;
+    err = ts2021_connect(&conn, s_keys.machine_priv, s_keys.machine_pub,
+                         s_control_pub, s_keys.node_priv);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "ts2021_connect failed: 0x%x", err);
+        return err;
+    }
+
+    err = register_emit(&conn, &s_keys, auth_key);
+    ts2021_close(&conn);
+
+    /* Best-effort scrub of the auth key in stack memory. */
+    memset(auth_key, 0, sizeof(auth_key));
+    return err;
 }

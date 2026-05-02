@@ -6,9 +6,6 @@ idf_component_register(
         "main.c"
         "app_nvs.c"
         "app_wifi.c"
-        "app_wireguard.c"
-        "app_sensor.c"
-        "app_telemetry.c"
     INCLUDE_DIRS
         "."
     REQUIRES
@@ -16,7 +13,5 @@ idf_component_register(
         esp_netif
         esp_wifi
         esp_event
-        driver
-        lwip
         tinylink
 )

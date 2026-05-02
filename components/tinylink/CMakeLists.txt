@@ -4,8 +4,26 @@
 idf_component_register(
     SRCS
         "src/tinylink.c"
+        "src/keys.c"
+        "src/control_key.c"
+        "src/json_helpers.c"
+        "src/noise_ik.c"
+        "src/ts2021_client.c"
+        "src/register.c"
+        "src/crypto/blake2s.c"
+        "src/crypto/curve25519.c"
+        "src/crypto/hkdf_blake2s.c"
+        "src/crypto/salsa20.c"
+        "src/crypto/nacl_box.c"
     INCLUDE_DIRS
         "include"
+    PRIV_INCLUDE_DIRS
+        "src"
     REQUIRES
-        esp_common
+        nvs_flash
+        esp_event
+        esp-tls
+        esp_http_client
+        mbedtls
+        json
 )

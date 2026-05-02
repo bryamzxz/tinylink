@@ -1,9 +1,14 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Bryam (bryamzxz)
 //
-// tinylink Milestone 1 entrypoint.
-// State machine: NVS -> netif/event-loop (in app_wifi) -> WiFi STA ->
-//                WireGuard (static peer) -> TMP117 -> UDP telemetry task.
+// tinylink Milestone 1 entrypoint: register the device with the Tailscale
+// control plane via ts2021. There is no data plane in M1 — the device
+// will appear in https://login.tailscale.com/admin/machines as an online
+// node, but pings to it will not work until M2 lands the WireGuard data
+// plane derived from MapResponse.
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 #include "esp_err.h"
 #include "esp_log.h"
@@ -11,15 +16,11 @@
 #include "tinylink.h"
 
 #include "app_nvs.h"
-#include "app_sensor.h"
-#include "app_telemetry.h"
 #include "app_wifi.h"
-#include "app_wireguard.h"
 
 static const char *TAG = "tinylink";
 
 #define WIFI_TIMEOUT_MS 30000
-#define WG_TIMEOUT_MS   30000
 
 static esp_err_t bringup(void)
 {
@@ -43,35 +44,24 @@ static esp_err_t bringup(void)
         return err;
     }
 
-    err = app_wireguard_start();
+    err = tinylink_init();
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "wireguard start failed: 0x%x", err);
-        return err;
-    }
-    err = app_wireguard_wait_up(WG_TIMEOUT_MS);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "wireguard peer did not come up within %d ms",
-                 WG_TIMEOUT_MS);
+        ESP_LOGE(TAG, "tinylink_init failed: 0x%x", err);
         return err;
     }
 
-    err = app_sensor_init();
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "sensor init failed: 0x%x", err);
-        return err;
+    /* Register loop: control plane may answer MachineAuthorized=false until
+     * the operator approves the new node. Retry on a slow cadence. */
+    for (;;) {
+        err = tinylink_register();
+        if (err == ESP_OK) {
+            ESP_LOGI(TAG, "node registered, idle waiting for M2 (MapRequest)");
+            break;
+        }
+        ESP_LOGW(TAG, "register attempt failed: 0x%x — retrying in %d ms",
+                 err, CONFIG_TINYLINK_REGISTER_RETRY_MS);
+        vTaskDelay(pdMS_TO_TICKS(CONFIG_TINYLINK_REGISTER_RETRY_MS));
     }
-
-    app_wireguard_peer_info_t peer;
-    err = app_wireguard_get_peer(&peer);
-    if (err != ESP_OK) return err;
-
-    err = app_telemetry_start(peer.allowed_ip);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "telemetry start failed: 0x%x", err);
-        return err;
-    }
-
-    ESP_LOGI(TAG, "bringup complete");
     return ESP_OK;
 }
 

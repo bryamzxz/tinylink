@@ -7,50 +7,28 @@ menu "tinylink application"
         string "Device hostname"
         default "sensor-cali"
         help
-            Hostname advertised to DHCP and used as the device identifier in
-            telemetry payloads. Should be a short, DNS-safe label.
+            Hostname advertised to DHCP, used as the Tailscale node hostname
+            (Hostinfo.Hostname) and surfaced in the admin panel.
 
-    config TINYLINK_TMP117_I2C_PORT
-        int "TMP117 I2C port"
-        default 0
-        range 0 1
+    config TINYLINK_CONTROL_HOST
+        string "Control plane host"
+        default "controlplane.tailscale.com"
         help
-            ESP-IDF I2C port number used for the TMP117 temperature sensor.
+            Tailscale control plane hostname. Override only for testing
+            against a self-hosted Headscale.
 
-    config TINYLINK_TMP117_SDA_GPIO
-        int "TMP117 SDA GPIO"
-        default 21
-        range 0 39
-        help
-            GPIO pin connected to the TMP117 SDA line.
-
-    config TINYLINK_TMP117_SCL_GPIO
-        int "TMP117 SCL GPIO"
-        default 22
-        range 0 39
-        help
-            GPIO pin connected to the TMP117 SCL line.
-
-    config TINYLINK_TMP117_I2C_ADDR
-        hex "TMP117 I2C address"
-        default 0x48
-        range 0x48 0x4B
-        help
-            7-bit I2C address of the TMP117 (ADD0 strapping). 0x48 by default.
-
-    config TINYLINK_TELEMETRY_INTERVAL_MS
-        int "Telemetry interval (ms)"
-        default 30000
-        range 1000 3600000
-        help
-            How often the telemetry task reads the sensor and emits a UDP
-            datagram to the WireGuard peer.
-
-    config TINYLINK_TELEMETRY_UDP_PORT
-        int "Telemetry UDP destination port"
-        default 9999
+    config TINYLINK_CONTROL_PORT
+        int "Control plane TCP port"
+        default 443
         range 1 65535
+
+    config TINYLINK_REGISTER_RETRY_MS
+        int "Retry interval after MachineAuthorized=false (ms)"
+        default 30000
+        range 1000 600000
         help
-            UDP port on the WireGuard peer that receives telemetry datagrams.
+            How long to wait between retries when the control plane reports
+            MachineAuthorized=false (e.g. waiting for the operator to approve
+            the node in the admin panel).
 
 endmenu

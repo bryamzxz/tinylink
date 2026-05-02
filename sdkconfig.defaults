@@ -60,9 +60,15 @@ CONFIG_FREERTOS_HZ=1000
 CONFIG_FREERTOS_USE_TRACE_FACILITY=y
 CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS=y
 
-# ---- WireGuard (droscy/esp_wireguard) ----------------------------------------
-CONFIG_WIREGUARD_MAX_PEERS=1
-CONFIG_WIREGUARD_X25519_IMPL_DEFAULT=y
+# ---- TLS to control plane ----------------------------------------------------
+# tinylink talks ts2021 over TLS to controlplane.tailscale.com. We use
+# esp_tls on top of mbedtls and verify against the IDF certificate bundle.
+CONFIG_ESP_TLS_USING_MBEDTLS=y
+CONFIG_ESP_TLS_USE_SECURE_ELEMENT=n
+CONFIG_ESP_TLS_INSECURE=n
+CONFIG_MBEDTLS_POLY1305_C=y
 
 # ---- App task stacks ---------------------------------------------------------
-CONFIG_ESP_MAIN_TASK_STACK_SIZE=4096
+# Bigger main stack: TLS + Noise IK + JSON construction is much heavier than
+# the M1-WG bringup that this replaces.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192

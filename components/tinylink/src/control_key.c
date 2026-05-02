@@ -1,0 +1,167 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Bryam (bryamzxz)
+
+#include "control_key.h"
+
+#include <string.h>
+
+#include "esp_crt_bundle.h"
+#include "esp_http_client.h"
+#include "esp_log.h"
+#include "nvs.h"
+
+#include "cJSON.h"
+
+#include "json_helpers.h"
+
+static const char *TAG = "ctrl_key";
+
+#define NS         "tl_pin"
+#define KEY_PIN    "control_pub"
+#define KEY_PREFIX "nlpub:"
+#define KEY_HEX_LEN 64
+#define KEY_PATH   "/key?v=100"
+#define BODY_MAX   512
+
+static int hex_nibble(char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+static esp_err_t hex_decode_32(const char *hex, uint8_t out[CONTROL_KEY_LEN])
+{
+    for (int i = 0; i < CONTROL_KEY_LEN; i++) {
+        int hi = hex_nibble(hex[2 * i]);
+        int lo = hex_nibble(hex[2 * i + 1]);
+        if (hi < 0 || lo < 0) return ESP_ERR_INVALID_ARG;
+        out[i] = (uint8_t)((hi << 4) | lo);
+    }
+    return ESP_OK;
+}
+
+typedef struct {
+    char  *buf;
+    size_t cap;
+    size_t len;
+} body_buf_t;
+
+static esp_err_t http_event_collect(esp_http_client_event_t *evt)
+{
+    body_buf_t *b = (body_buf_t *)evt->user_data;
+    if (evt->event_id == HTTP_EVENT_ON_DATA && evt->data_len > 0) {
+        if (b->len + (size_t)evt->data_len >= b->cap) {
+            return ESP_FAIL; /* response too large */
+        }
+        memcpy(b->buf + b->len, evt->data, evt->data_len);
+        b->len += evt->data_len;
+        b->buf[b->len] = '\0';
+    }
+    return ESP_OK;
+}
+
+static esp_err_t fetch_pubkey(uint8_t out[CONTROL_KEY_LEN])
+{
+    char url[160];
+    int n = snprintf(url, sizeof(url), "https://%s:%d%s",
+                     CONFIG_TINYLINK_CONTROL_HOST,
+                     CONFIG_TINYLINK_CONTROL_PORT,
+                     KEY_PATH);
+    if (n <= 0 || n >= (int)sizeof(url)) return ESP_ERR_INVALID_SIZE;
+
+    char body[BODY_MAX];
+    body_buf_t bb = { .buf = body, .cap = BODY_MAX, .len = 0 };
+
+    esp_http_client_config_t cfg = {
+        .url = url,
+        .crt_bundle_attach = esp_crt_bundle_attach,
+        .event_handler = http_event_collect,
+        .user_data = &bb,
+        .timeout_ms = 15000,
+    };
+    esp_http_client_handle_t client = esp_http_client_init(&cfg);
+    if (client == NULL) return ESP_FAIL;
+
+    esp_err_t err = esp_http_client_perform(client);
+    int status = esp_http_client_get_status_code(client);
+    esp_http_client_cleanup(client);
+    if (err != ESP_OK) return err;
+    if (status != 200) {
+        ESP_LOGE(TAG, "GET %s returned %d", KEY_PATH, status);
+        return ESP_FAIL;
+    }
+
+    cJSON *root = cJSON_ParseWithLength(body, bb.len);
+    if (root == NULL) return ESP_ERR_INVALID_RESPONSE;
+
+    char pub_b64_or_hex[80] = {0};
+    err = json_get_string(root, "publicKey",
+                          pub_b64_or_hex, sizeof(pub_b64_or_hex));
+    cJSON_Delete(root);
+    if (err != ESP_OK) return err;
+
+    /* Tailscale's /key endpoint returns "nlpub:<64hex>". */
+    const char *p = pub_b64_or_hex;
+    if (strncmp(p, KEY_PREFIX, strlen(KEY_PREFIX)) == 0) {
+        p += strlen(KEY_PREFIX);
+    }
+    if (strlen(p) != KEY_HEX_LEN) {
+        ESP_LOGE(TAG, "publicKey wrong length: %u", (unsigned)strlen(p));
+        return ESP_ERR_INVALID_SIZE;
+    }
+    return hex_decode_32(p, out);
+}
+
+static esp_err_t persist(const uint8_t pub[CONTROL_KEY_LEN])
+{
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NS, NVS_READWRITE, &h);
+    if (err != ESP_OK) return err;
+    err = nvs_set_blob(h, KEY_PIN, pub, CONTROL_KEY_LEN);
+    if (err == ESP_OK) err = nvs_commit(h);
+    nvs_close(h);
+    return err;
+}
+
+static esp_err_t load_pin(uint8_t out[CONTROL_KEY_LEN])
+{
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NS, NVS_READONLY, &h);
+    if (err != ESP_OK) return err;
+    size_t len = CONTROL_KEY_LEN;
+    err = nvs_get_blob(h, KEY_PIN, out, &len);
+    nvs_close(h);
+    if (err == ESP_OK && len != CONTROL_KEY_LEN) return ESP_ERR_INVALID_SIZE;
+    return err;
+}
+
+esp_err_t control_key_get(uint8_t out_pub[CONTROL_KEY_LEN])
+{
+    if (out_pub == NULL) return ESP_ERR_INVALID_ARG;
+
+    esp_err_t err = load_pin(out_pub);
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "using pinned control pub from NVS");
+        return ESP_OK;
+    }
+    if (err != ESP_ERR_NVS_NOT_FOUND && err != ESP_ERR_NVS_NOT_INITIALIZED) {
+        ESP_LOGW(TAG, "load_pin returned 0x%x, will fetch", err);
+    }
+    err = fetch_pubkey(out_pub);
+    if (err != ESP_OK) return err;
+    err = persist(out_pub);
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "control pub fetched and pinned");
+    }
+    return err;
+}
+
+esp_err_t control_key_refresh(uint8_t out_pub[CONTROL_KEY_LEN])
+{
+    if (out_pub == NULL) return ESP_ERR_INVALID_ARG;
+    esp_err_t err = fetch_pubkey(out_pub);
+    if (err != ESP_OK) return err;
+    return persist(out_pub);
+}
