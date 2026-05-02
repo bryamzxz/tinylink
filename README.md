@@ -5,16 +5,18 @@ written in pure C on **ESP-IDF v5.5.x**.
 
 ## Status
 
-**Pre-alpha — Milestone 1 complete, Milestone 2 substantially
+**Pre-alpha — M1 + M2 complete, M3 first cut (TMP117 telemetry)
 landed.** M1 lands the ts2021 control plane (Noise IK + register,
-wire format verified against upstream in commit `2717ab7`). M2 has
-landed in three steps: (1) the `MapRequest` emitter and `jsmn`-based
+wire format verified against upstream in commit `2717ab7`). M2 ran in
+three steps: (1) the `MapRequest` emitter and `jsmn`-based
 `MapResponse` parser, (2) `trombik/esp_wireguard` lift + the data
 plane bringup against `peers[0]`, and (3) the long-poll
 (`Stream:true`) loop in a dedicated FreeRTOS task that keeps the
 netmap fresh and updates the WG peer endpoint when the control plane
-hands us a new one. M3 (DISCO + TMP117 + UDP demuxer for socket
-sharing) is next.
+hands us a new one. M3 step 1 (this commit) brings TMP117 telemetry
+back online: I²C driver in continuous mode, 8-sample averaging,
+periodic JSON-over-UDP push to the home peer through the WG netif.
+DISCO + UDP demuxer for socket sharing follow next.
 
 Not production-ready. Not affiliated with Tailscale Inc. The Tailscale
 name and logo are trademarks of Tailscale Inc.; this project is a
@@ -49,7 +51,10 @@ single-peer, ~600 KiB flash.
 ## Hardware
 
 - Freenove ESP32-WROOM-32E DevKit (CH340 USB-UART).
-- TMP117 high-accuracy temperature sensor on I²C — re-enabled in M3.
+- TMP117 high-accuracy temperature sensor on I²C. Default wiring per
+  the Freenove DevKit pinout: SDA=GPIO21, SCL=GPIO22, ADD0 tied to
+  GND for I²C address `0x48`. All three are overridable in
+  `idf.py menuconfig` → *tinylink application* → *Telemetry*.
 
 ## Architecture
 
@@ -79,8 +84,8 @@ See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and
 | # | Milestone                                       | Status   |
 |---|-------------------------------------------------|----------|
 | 1 | ts2021 control plane (register only)            | done     |
-| 2 | MapRequest streaming + WireGuard data plane     | current  |
-| 3 | DISCO P2P discovery + TMP117 telemetry          | pending  |
+| 2 | MapRequest streaming + WireGuard data plane     | done     |
+| 3 | DISCO P2P discovery + TMP117 telemetry          | current  |
 | 4 | STUN minimal binding                            | pending  |
 | 5 | DERP relay fallback + reconnection              | pending  |
 | 6 | Production hardening (NVS, secure boot, OTA)    | pending  |

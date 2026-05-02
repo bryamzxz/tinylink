@@ -78,7 +78,13 @@ static esp_err_t bringup(void)
         ESP_LOGE(TAG, "long-poll start failed: 0x%x", err);
         return err;
     }
-    ESP_LOGI(TAG, "data plane up + map long-poll running — idle until M3");
+    err = tinylink_telemetry_start();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "telemetry start failed: 0x%x — continuing", err);
+        /* fall through: telemetry isn't load-bearing for the rest of
+         * the system. */
+    }
+    ESP_LOGI(TAG, "tinylink up: WG + map long-poll + telemetry");
     return ESP_OK;
 }
 

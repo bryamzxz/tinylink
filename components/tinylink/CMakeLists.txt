@@ -13,6 +13,8 @@ idf_component_register(
         "src/register.c"
         "src/mapreq.c"
         "src/wg_dataplane.c"
+        "src/tmp117.c"
+        "src/telemetry.c"
         "src/crypto/blake2s.c"
         "src/crypto/curve25519.c"
         "src/crypto/hkdf_blake2s.c"
@@ -28,6 +30,8 @@ idf_component_register(
         esp_event
         esp-tls
         esp_http_client
+        esp_driver_i2c
+        lwip
         mbedtls
         json
     PRIV_REQUIRES
