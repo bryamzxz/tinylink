@@ -50,13 +50,18 @@ CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
 CONFIG_MBEDTLS_CLIENT_SSL_SESSION_TICKETS=y
 
 # ---- lwIP tunings ------------------------------------------------------------
-# CRITICAL: TCPIP core locking MUST stay enabled. droscy/esp_wireguard requires
-# it. The original trombik/esp_wireguard breaks here in IDF >= 5.3 because
-# core locking is the IDF default.
 CONFIG_LWIP_TCPIP_CORE_LOCKING=y
 CONFIG_LWIP_DHCP_DOES_ARP_CHECK=n
 CONFIG_LWIP_TCP_SACK_OUT=n
 CONFIG_LWIP_TCP_MSS=1440
+
+# PPP netstack used by tinylink_wg's lwIP integration (wg_lwip.c) for
+# the point-to-point WG tunnel netif. We don't actually run PPP — we
+# need ESP_NETIF_NETSTACK_DEFAULT_PPP as the base netstack template
+# (raw IP, no link layer, no DHCP triggers). Enabling PPP costs ~10
+# KiB flash; turning it on lets esp_netif register our custom netif
+# without the DHCP-callback collision that killed trombik on IDF v5.5.
+CONFIG_LWIP_PPP_SUPPORT=y
 
 # ---- NVS encryption ----------------------------------------------------------
 CONFIG_NVS_ENCRYPTION=y

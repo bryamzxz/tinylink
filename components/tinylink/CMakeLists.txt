@@ -18,6 +18,7 @@ idf_component_register(
         "src/wg_transport.c"
         "src/wg_demux.c"
         "src/wg_netif.c"
+        "src/wg_lwip.c"
         "src/tmp117.c"
         "src/telemetry.c"
         "src/crypto/blake2s.c"
@@ -36,6 +37,7 @@ idf_component_register(
     REQUIRES
         nvs_flash
         esp_event
+        esp_netif
         esp-tls
         esp_http_client
         esp_driver_i2c
@@ -44,5 +46,4 @@ idf_component_register(
         json
     PRIV_REQUIRES
         espressif__nghttp
-        trombik__esp_wireguard
 )
