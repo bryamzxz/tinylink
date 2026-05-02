@@ -13,12 +13,11 @@
 #define MSG_COOKIE_REPLY  3
 #define MSG_TRANSPORT     4
 
-/* DISCO v1 magic prefix per Tailscale's disco/disco.go. Used in step 7;
- * declared here so the demuxer can already shed DISCO traffic to its
- * own bucket before the parser exists. Verified at
- * /home/bryam/dev/tailscale/disco/disco.go before integration. */
-static const uint8_t DISCO_V1_MAGIC[8] = {
-    0x01, 0x05, 0xfe, 0x16, 0x76, 0x46, 0x90, 0x80
+/* DISCO v1 magic prefix per Tailscale's disco/disco.go (const Magic =
+ * "TS💬", 6 bytes: 0x54 0x53 0xf0 0x9f 0x92 0xac). Cited from
+ * /home/bryam/dev/tailscale/disco/disco.go line 35. */
+static const uint8_t DISCO_V1_MAGIC[6] = {
+    0x54, 0x53, 0xf0, 0x9f, 0x92, 0xac
 };
 
 /* Hard-coded sizes. Off-by-one or short reads must NOT escalate to
@@ -28,17 +27,19 @@ static const uint8_t DISCO_V1_MAGIC[8] = {
 #define WG_COOKIE_LEN      64
 #define WG_TRANSPORT_MIN   32   /* 16 B header + 16 B AEAD tag, empty payload */
 #define STUN_FIRST_TWO     2
-#define DISCO_HEADER_MIN   (sizeof(DISCO_V1_MAGIC) + 32 + 24 + 16)
-                                /* magic + sender DiscoPub + nonce + tag */
+/* magic(6) + senderDiscoPub(32) + nonce(24) + AEAD tag(16) + msgType(1) +
+ * msgVer(1) = 80 bytes — the smallest disco datagram that could possibly
+ * decrypt and parse to a known message type. Anything shorter is junk. */
+#define DISCO_HEADER_MIN   (sizeof(DISCO_V1_MAGIC) + 32 + 24 + 16 + 2)
 
 wg_demux_kind_t wg_demux_classify(const uint8_t *buf, size_t len)
 {
     if (buf == NULL || len == 0) return WG_DEMUX_DISCARD;
 
-    /* DISCO check first: the magic is 8 bytes long, and starts with
-     * 0x01 — the same as MessageInitiation's first byte. So we MUST
-     * check the magic before we'd otherwise accept it as a 148-byte
-     * handshake init. */
+    /* DISCO check first. Real magic starts with 0x54 ('T'), so it can't
+     * be confused with any WG message-type byte (0x01..0x04), but we
+     * still check magic ahead of WG so a future protocol whose first
+     * byte happens to land in the WG range can be cleanly partitioned. */
     if (len >= sizeof(DISCO_V1_MAGIC) &&
         memcmp(buf, DISCO_V1_MAGIC, sizeof(DISCO_V1_MAGIC)) == 0) {
         if (len < DISCO_HEADER_MIN) return WG_DEMUX_DISCARD;

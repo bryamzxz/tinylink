@@ -15,7 +15,7 @@
 //   first byte 0x03 → MessageCookieReply      ( 64 B exactly)
 //   first byte 0x04 → MessageTransport        (≥ 32 B; 16 hdr + 16 tag)
 //   first byte 0x00 0x01 → STUN binding request (RFC 5389 first 2 bytes)
-//   8-byte prefix "\x01\x05\xfe\x16\x76\x46\x90\x80" → DISCO v1 (step 7)
+//   6-byte prefix "TS💬" (\x54\x53\xf0\x9f\x92\xac) → DISCO v1 (step 7)
 //   anything else → discard
 
 #pragma once
