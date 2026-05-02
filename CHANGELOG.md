@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **M2 scaffolding: `MapRequest` + `MapResponse` parser.**
+  - Vendored `jsmn` (single-header zero-alloc tokenizer, MIT, ~350 LoC)
+    at `components/tinylink/src/jsmn.h`.
+  - `tl_netmap_t` (`netmap.h`) holds the M2 working set: self addresses,
+    up to 4 peers (`{ID, NodeKey, DiscoKey, Addresses, Endpoints,
+    HomeDERP}`), and up to 4 DERP regions. v6 entries are dropped at
+    parse time since the lwIP netif is v4-only.
+  - `mapreq_fetch_once()` POSTs `/machine/map` with `Stream:false` and
+    `Compress:""`; the server replies with a single `MapResponse` and
+    closes the stream. The `Stream:true` long-poll form lands alongside
+    the WireGuard bringup.
+  - `mapresp_parse()` is platform-independent and runs under a host KAT
+    (`tools/test/test_mapresp.c`) that exercises a one-peer +
+    one-DERP-region stub.
+
 ### Fixed
 - **ts2021 wire format corrected against upstream.** Initial implementation
   put the Noise IK msg1 in the HTTP body and used a 4-byte invented frame

@@ -14,8 +14,8 @@ Go implementation, which is the authoritative reference for wire format.
 
 | #  | Name                                          | Status   | Targeted release | Estimate |
 |----|-----------------------------------------------|----------|------------------|----------|
-| M1 | ts2021 control plane (register only)          | current  | v0.1             | 2-3 wk   |
-| M2 | MapRequest streaming + WireGuard data plane   | pending  | v0.2             | 2-3 wk   |
+| M1 | ts2021 control plane (register only)          | done     | v0.1             | 2-3 wk   |
+| M2 | MapRequest streaming + WireGuard data plane   | current  | v0.2             | 2-3 wk   |
 | M3 | DISCO P2P discovery + TMP117 telemetry        | pending  | v0.3             | 1-2 wk   |
 | M4 | STUN minimal binding                          | pending  | v0.4             | 0.5 wk   |
 | M5 | DERP relay fallback + reconnection            | pending  | v0.5             | 1-2 wk   |
@@ -83,11 +83,33 @@ Parse with **jsmn** (zero-alloc tokenizer, ~350 LoC), not cJSON DOM —
 budget 20 KB SRAM during parse, 4 KB for retained peer state. Disable
 zstd by not advertising support (saves ~30 KB flash).
 
+**Step 1 (landed in `feat(m2): scaffolding`):**
+- jsmn vendored at `components/tinylink/src/jsmn.h`.
+- `tl_netmap_t` defined in `components/tinylink/src/netmap.h` with a
+  4-peer / 4-DERP-region budget.
+- `mapreq_fetch_once()` does a one-shot `POST /machine/map` with
+  `Stream:false` and `Compress:""`; the server responds with a single
+  `MapResponse` and closes. Sufficient for bootstrapping the netmap
+  while the data plane is being wired up; long-poll `Stream:true`
+  follows in step 3.
+- `mapresp_parse()` extracts `Node.Addresses`, `Peers[].{ID,Key,
+  DiscoKey,Addresses,Endpoints,HomeDERP}`, and `DERPMap.Regions`.
+  v6 endpoints/addresses are dropped during parse — the lwIP build is
+  v4-only at the netif layer.
+- Host-side KAT in `tools/test/test_mapresp.c` parses a stub modeled
+  on a real one-peer MapResponse and checks each extracted field.
+
+**Step 2 (next commit, "feat(m2): WireGuard data plane via trombik"):**
 Lift `trombik/esp_wireguard` (active port of `smartalock/wireguard-lwip`,
 ~3500 LoC C, BSD-3) as the data-plane component [research §B]. Patch
 ~50 lines in `wireguardif.c` to accept packets injected from a demuxer
 task rather than `udp_bind(IP_ADDR_ANY, port)` so the same UDP socket
 can multiplex DISCO/STUN later.
+
+**Step 3:** swap `Stream:false` for `Stream:true` and run the parser
+in a long-poll loop driven by an `app_task` FreeRTOS task; integrate
+with the WG bringup so peer endpoint changes update the WG peer in
+place.
 
 Cookie reply (WG message type 3, XChaCha20-Poly1305) is intentionally
 **dropped on receive** and `mac2 = 0^16` always on send — saves ~1-2 KB

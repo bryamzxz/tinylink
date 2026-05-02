@@ -5,10 +5,16 @@ written in pure C on **ESP-IDF v5.5.x**.
 
 ## Status
 
-**Pre-alpha — Milestone 1 in progress (ts2021 control plane).** Not
-production-ready. Not affiliated with Tailscale Inc. The Tailscale name and
-logo are trademarks of Tailscale Inc.; this project is a clean-room
-reimplementation of the documented wire protocols.
+**Pre-alpha — Milestone 1 complete, Milestone 2 in progress.** M1 lands
+the ts2021 control plane (Noise IK + register, wire format verified
+against upstream in commit `2717ab7`). M2 is starting on the data
+plane: a `MapRequest` emitter and `jsmn`-based `MapResponse` parser
+have landed; the WireGuard component (lift of `trombik/esp_wireguard`
++ demuxer patch) is the next piece.
+
+Not production-ready. Not affiliated with Tailscale Inc. The Tailscale
+name and logo are trademarks of Tailscale Inc.; this project is a
+clean-room reimplementation of the documented wire protocols.
 
 ## Scope (what tinylink IS)
 
@@ -48,10 +54,14 @@ single-peer, ~600 KiB flash.
   `controlplane.tailscale.com`. The device generates Curve25519 identities
   on first boot, fetches and pins the control plane public key, and
   registers via `POST /machine/register`.
-- **MapRequest streaming + WireGuard data plane** (Milestone 2): the
-  inner protocol upgrades from HTTP/1.1 to HTTP/2 (nghttp2) so the
-  register stream transitions into a long-lived MapRequest, and
-  `droscy/esp_wireguard` is wired to the peer announced in MapResponse.
+- **MapRequest + WireGuard data plane** (Milestone 2, in progress): the
+  Noise channel already runs HTTP/2 via nghttp2 from M1, so M2 reuses
+  it for `POST /machine/map`. A jsmn-based parser extracts only the
+  fields the data plane needs (self/peer addresses, peer endpoints,
+  DERP map). The data plane lifts `trombik/esp_wireguard` with a
+  ~50-line patch to `wireguardif.c` so packets are injected from a
+  demuxer task instead of via `udp_bind` — that lets the same UDP
+  socket multiplex DISCO/STUN later.
 - **DISCO** (Milestone 3): NaCl-box over the same UDP socket as WireGuard,
   alongside the TMP117 driver and UDP telemetry task.
 - **DERP** (Milestone 5): TLS relay fallback.
@@ -63,8 +73,8 @@ See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and
 
 | # | Milestone                                       | Status   |
 |---|-------------------------------------------------|----------|
-| 1 | ts2021 control plane (register only)            | current  |
-| 2 | MapRequest streaming + WireGuard data plane     | pending  |
+| 1 | ts2021 control plane (register only)            | done     |
+| 2 | MapRequest streaming + WireGuard data plane     | current  |
 | 3 | DISCO P2P discovery + TMP117 telemetry          | pending  |
 | 4 | STUN minimal binding                            | pending  |
 | 5 | DERP relay fallback + reconnection              | pending  |

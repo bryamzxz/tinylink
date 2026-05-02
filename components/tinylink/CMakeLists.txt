@@ -11,6 +11,7 @@ idf_component_register(
         "src/ts2021_client.c"
         "src/h2_client.c"
         "src/register.c"
+        "src/mapreq.c"
         "src/crypto/blake2s.c"
         "src/crypto/curve25519.c"
         "src/crypto/hkdf_blake2s.c"
