@@ -17,11 +17,23 @@ static const char *TAG = "tmp117";
 
 #define TMP117_REG_TEMP        0x00
 #define TMP117_REG_CONFIG      0x01
-#define TMP117_REG_DEVICE_ID   0x07
+#define TMP117_REG_DEVICE_ID   0x0F
 #define TMP117_DEVICE_ID       0x0117
 #define TMP117_RAW_INVALID     ((int16_t)0x8000)
 #define TMP117_LSB_NUMER       78125          /* 7.8125 m°C × 10⁴ */
 #define TMP117_LSB_DENOM       10000
+
+/* Probe retries mirror the SparkFun Arduino reference (3 × 500 ms);
+ * covers a slow-rising rail or lazy pull-ups before declaring the
+ * sensor absent. */
+#define TMP117_PROBE_RETRIES   3
+#define TMP117_PROBE_DELAY_MS  500
+
+/* Plausibility envelope, intentionally tighter than the device's
+ * -55..150 °C spec to flag rail/wiring glitches (matches the Arduino
+ * sketch's Zero-Trust validation). */
+#define TMP117_MIN_MILLI_C     (-50000)
+#define TMP117_MAX_MILLI_C     (150000)
 
 static i2c_master_bus_handle_t s_bus;
 static i2c_master_dev_handle_t s_dev;
@@ -71,16 +83,30 @@ esp_err_t tmp117_init(int sda_gpio, int scl_gpio, uint8_t i2c_addr)
     /* Cheap sanity probe: read DEVICE_ID and confirm the chip is alive.
      * If the I²C lines are floating or the address is wrong, this is
      * where we find out — much cheaper than diagnosing a frozen
-     * conversion later. */
-    uint16_t did = 0;
-    err = read_reg16(TMP117_REG_DEVICE_ID, &did);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "DEVICE_ID read failed: %s", esp_err_to_name(err));
-        return err;
+     * conversion later. Retry mirrors the SparkFun reference, since
+     * a slow rail or lazy pull-ups can NACK the first transaction. */
+    uint16_t  did      = 0;
+    esp_err_t probe_err = ESP_FAIL;
+    for (int attempt = 0; attempt < TMP117_PROBE_RETRIES; attempt++) {
+        probe_err = read_reg16(TMP117_REG_DEVICE_ID, &did);
+        if (probe_err == ESP_OK && (did & 0x0FFF) == TMP117_DEVICE_ID) {
+            break;
+        }
+        ESP_LOGW(TAG, "DEVICE_ID probe %d/%d failed (err=%s, raw=0x%04x)",
+                 attempt + 1, TMP117_PROBE_RETRIES,
+                 esp_err_to_name(probe_err), did);
+        if (attempt + 1 < TMP117_PROBE_RETRIES) {
+            vTaskDelay(pdMS_TO_TICKS(TMP117_PROBE_DELAY_MS));
+        }
+    }
+    if (probe_err != ESP_OK) {
+        ESP_LOGE(TAG, "DEVICE_ID read failed after %d attempts: %s",
+                 TMP117_PROBE_RETRIES, esp_err_to_name(probe_err));
+        return probe_err;
     }
     if ((did & 0x0FFF) != TMP117_DEVICE_ID) {
-        ESP_LOGE(TAG, "unexpected DEVICE_ID 0x%04x (want 0x%04x)",
-                 did, TMP117_DEVICE_ID);
+        ESP_LOGE(TAG, "unexpected DEVICE_ID 0x%04x (want 0x%04x) after %d attempts",
+                 did, TMP117_DEVICE_ID, TMP117_PROBE_RETRIES);
         return ESP_ERR_NOT_FOUND;
     }
     ESP_LOGI(TAG, "TMP117 detected (DEVICE_ID=0x%04x)", did);
@@ -110,6 +136,10 @@ esp_err_t tmp117_read_milli_c(int32_t *out_milli_c)
      * ≈ 2.56e9, which exceeds int32 max 2.15e9 — lift to int64). */
     int64_t milli = ((int64_t)signed_raw * TMP117_LSB_NUMER) /
                     TMP117_LSB_DENOM;
+    if (milli < TMP117_MIN_MILLI_C || milli > TMP117_MAX_MILLI_C) {
+        ESP_LOGW(TAG, "reading out of range: %lld m°C", (long long)milli);
+        return ESP_ERR_INVALID_RESPONSE;
+    }
     *out_milli_c = (int32_t)milli;
     return ESP_OK;
 }
