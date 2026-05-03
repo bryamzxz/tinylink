@@ -8,6 +8,7 @@
 
 #include "esp_crt_bundle.h"
 #include "esp_log.h"
+#include "mbedtls/ssl.h"
 
 static const char *TAG = "ts2021";
 
@@ -46,6 +47,16 @@ static esp_err_t tls_read_full(esp_tls_t *tls, uint8_t *buf, size_t need)
     size_t got = 0;
     while (got < need) {
         ssize_t r = esp_tls_conn_read(tls, buf + got, need - got);
+        if (r == MBEDTLS_ERR_SSL_WANT_READ ||
+            r == MBEDTLS_ERR_SSL_WANT_WRITE) {
+            /* Transient: socket recv timeout fired (esp_tls_cfg.timeout_ms
+             * is wired to SO_RCVTIMEO) and there was no data on the wire.
+             * Tailscale's /machine/map long-poll sits idle between server
+             * KeepAlives (~50–60 s upstream, longer than the 30 s socket
+             * timeout). Treat as "keep waiting" — only a real socket error
+             * or peer FIN should close the stream. */
+            continue;
+        }
         if (r < 0) {
             ESP_LOGE(TAG, "esp_tls_conn_read failed: %d", (int)r);
             return ESP_FAIL;
