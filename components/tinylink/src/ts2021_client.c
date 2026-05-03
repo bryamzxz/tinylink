@@ -10,6 +10,8 @@
 #include "esp_log.h"
 #include "mbedtls/ssl.h"
 
+#include "tls_io.h"
+
 static const char *TAG = "ts2021";
 
 #define UPGRADE_TOKEN  "tailscale-control-protocol"
@@ -42,41 +44,32 @@ static int b64_encode(const uint8_t *in, size_t in_len,
     return 0;
 }
 
+/* Adapter shims so tls_io_* can call esp_tls_conn_{read,write}. The
+ * cast on the write side hides esp_tls_conn_write's `void *` (non-const)
+ * second parameter — we never mutate it. */
+static ssize_t ts2021_tls_read(void *ctx, uint8_t *buf, size_t len) {
+    return esp_tls_conn_read((esp_tls_t *)ctx, buf, len);
+}
+static ssize_t ts2021_tls_write(void *ctx, const uint8_t *buf, size_t len) {
+    return esp_tls_conn_write((esp_tls_t *)ctx, (void *)buf, len);
+}
+
 static esp_err_t tls_read_full(esp_tls_t *tls, uint8_t *buf, size_t need)
 {
-    size_t got = 0;
-    while (got < need) {
-        ssize_t r = esp_tls_conn_read(tls, buf + got, need - got);
-        if (r == MBEDTLS_ERR_SSL_WANT_READ ||
-            r == MBEDTLS_ERR_SSL_WANT_WRITE) {
-            /* Transient: socket recv timeout fired (esp_tls_cfg.timeout_ms
-             * is wired to SO_RCVTIMEO) and there was no data on the wire.
-             * Tailscale's /machine/map long-poll sits idle between server
-             * KeepAlives (~50–60 s upstream, longer than the 30 s socket
-             * timeout). Treat as "keep waiting" — only a real socket error
-             * or peer FIN should close the stream. */
-            continue;
-        }
-        if (r < 0) {
-            ESP_LOGE(TAG, "esp_tls_conn_read failed: %d", (int)r);
-            return ESP_FAIL;
-        }
-        if (r == 0) return ESP_FAIL;
-        got += (size_t)r;
+    int rc = tls_io_read_full(ts2021_tls_read, tls, buf, need);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "tls_read_full failed: %d", rc);
+        return ESP_FAIL;
     }
     return ESP_OK;
 }
 
 static esp_err_t tls_write_full(esp_tls_t *tls, const uint8_t *buf, size_t len)
 {
-    size_t sent = 0;
-    while (sent < len) {
-        ssize_t w = esp_tls_conn_write(tls, buf + sent, len - sent);
-        if (w < 0) {
-            ESP_LOGE(TAG, "esp_tls_conn_write failed: %d", (int)w);
-            return ESP_FAIL;
-        }
-        sent += (size_t)w;
+    int rc = tls_io_write_full(ts2021_tls_write, tls, buf, len);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "tls_write_full failed: %d", rc);
+        return ESP_FAIL;
     }
     return ESP_OK;
 }
@@ -87,6 +80,14 @@ static esp_err_t read_upgrade_response(esp_tls_t *tls,
     size_t total = 0;
     while (total < buf_size - 1) {
         ssize_t r = esp_tls_conn_read(tls, buf + total, 1);
+        if (r == MBEDTLS_ERR_SSL_WANT_READ ||
+            r == MBEDTLS_ERR_SSL_WANT_WRITE) {
+            /* Same transient-timeout class as tls_io_read_full handles
+             * — but here we read one byte at a time scanning for
+             * "\r\n\r\n", so we open-code the retry instead of
+             * pulling the helper. */
+            continue;
+        }
         if (r <= 0) {
             ESP_LOGE(TAG, "tls read while waiting for 101: %d", (int)r);
             return ESP_FAIL;
