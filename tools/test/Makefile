@@ -19,7 +19,7 @@ TL_SRC  := ../../components/tinylink/src
 TARGETS := test_blake2s test_curve25519 test_mapresp \
            test_chacha20 test_poly1305 test_chacha20poly1305 \
            test_hkdf_noise test_wg_handshake test_wg_transport \
-           test_wg_demux test_disco
+           test_wg_demux test_disco test_stun
 
 all: $(TARGETS)
 
@@ -95,6 +95,11 @@ test_disco: test_disco.c \
 	    $(CRYPTO)/nacl_box.c $(CRYPTO)/curve25519.c $(CRYPTO)/salsa20.c \
 	    $(CRYPTO)/poly1305_donna.c host_mbedtls_shim.c
 
+# STUN binding client (RFC 5389) — public-endpoint discovery for
+# magicsock NAT traversal. Pure codec, no I/O, no platform deps.
+test_stun: test_stun.c $(TL_SRC)/stun.c $(TL_SRC)/stun.h
+	$(CC) $(CFLAGS) -I$(TL_SRC) -o $@ test_stun.c $(TL_SRC)/stun.c
+
 # WG transport (data plane) — encrypt/decrypt + RFC 6479 anti-replay.
 test_wg_transport: test_wg_transport.c \
                   $(TL_SRC)/wg_transport.c $(TL_SRC)/wg_transport.h \
@@ -111,12 +116,12 @@ test_wg_transport: test_wg_transport.c \
 .PHONY: test test_blake2s.run test_curve25519.run test_mapresp.run \
         test_chacha20.run test_poly1305.run test_chacha20poly1305.run \
         test_hkdf_noise.run test_wg_handshake.run test_wg_transport.run \
-        test_wg_demux.run test_disco.run clean
+        test_wg_demux.run test_disco.run test_stun.run clean
 
 test: test_blake2s.run test_curve25519.run test_mapresp.run \
       test_chacha20.run test_poly1305.run test_chacha20poly1305.run \
       test_hkdf_noise.run test_wg_handshake.run test_wg_transport.run \
-      test_wg_demux.run test_disco.run
+      test_wg_demux.run test_disco.run test_stun.run
 
 test_blake2s.run: test_blake2s
 	./test_blake2s
@@ -150,6 +155,9 @@ test_wg_demux.run: test_wg_demux
 
 test_disco.run: test_disco
 	./test_disco
+
+test_stun.run: test_stun
+	./test_stun
 
 clean:
 	rm -f $(TARGETS)
