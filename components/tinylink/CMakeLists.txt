@@ -8,6 +8,7 @@ idf_component_register(
         "src/control_key.c"
         "src/json_helpers.c"
         "src/noise_ik.c"
+        "src/tls_io.c"
         "src/ts2021_client.c"
         "src/h2_client.c"
         "src/register.c"

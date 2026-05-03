@@ -19,7 +19,7 @@ TL_SRC  := ../../components/tinylink/src
 TARGETS := test_blake2s test_curve25519 test_mapresp \
            test_chacha20 test_poly1305 test_chacha20poly1305 \
            test_hkdf_noise test_wg_handshake test_wg_transport \
-           test_wg_demux test_disco test_stun
+           test_wg_demux test_disco test_stun test_tls_io
 
 all: $(TARGETS)
 
@@ -100,6 +100,15 @@ test_disco: test_disco.c \
 test_stun: test_stun.c $(TL_SRC)/stun.c $(TL_SRC)/stun.h
 	$(CC) $(CFLAGS) -I$(TL_SRC) -o $@ test_stun.c $(TL_SRC)/stun.c
 
+# tls_io — retry-on-WANT regression KAT. Gates against the long-poll
+# disconnect bug fixed in c2d8d63 (treating MBEDTLS_ERR_SSL_WANT_READ
+# as fatal would tear down the /machine/map stream every 30 s).
+# Uses host_include/mbedtls/ssl.h shim for the WANT_* constants only.
+test_tls_io: test_tls_io.c $(TL_SRC)/tls_io.c $(TL_SRC)/tls_io.h \
+             host_include/mbedtls/ssl.h
+	$(CC) $(CFLAGS) -I$(TL_SRC) -Ihost_include -o $@ \
+	    test_tls_io.c $(TL_SRC)/tls_io.c
+
 # WG transport (data plane) — encrypt/decrypt + RFC 6479 anti-replay.
 test_wg_transport: test_wg_transport.c \
                   $(TL_SRC)/wg_transport.c $(TL_SRC)/wg_transport.h \
@@ -116,12 +125,12 @@ test_wg_transport: test_wg_transport.c \
 .PHONY: test test_blake2s.run test_curve25519.run test_mapresp.run \
         test_chacha20.run test_poly1305.run test_chacha20poly1305.run \
         test_hkdf_noise.run test_wg_handshake.run test_wg_transport.run \
-        test_wg_demux.run test_disco.run test_stun.run clean
+        test_wg_demux.run test_disco.run test_stun.run test_tls_io.run clean
 
 test: test_blake2s.run test_curve25519.run test_mapresp.run \
       test_chacha20.run test_poly1305.run test_chacha20poly1305.run \
       test_hkdf_noise.run test_wg_handshake.run test_wg_transport.run \
-      test_wg_demux.run test_disco.run test_stun.run
+      test_wg_demux.run test_disco.run test_stun.run test_tls_io.run
 
 test_blake2s.run: test_blake2s
 	./test_blake2s
@@ -158,6 +167,9 @@ test_disco.run: test_disco
 
 test_stun.run: test_stun
 	./test_stun
+
+test_tls_io.run: test_tls_io
+	./test_tls_io
 
 clean:
 	rm -f $(TARGETS)
