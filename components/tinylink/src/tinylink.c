@@ -8,11 +8,14 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+#include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_system.h"
 #include "nvs.h"
 #include "sdkconfig.h"
 
 #include "control_key.h"
+#include "derp_client.h"
 #include "keys.h"
 #include "mapreq.h"
 #include "netmap.h"
@@ -162,6 +165,47 @@ esp_err_t tinylink_dataplane_start(void)
 /* ---- long-poll MapRequest task ----------------------------------------- */
 
 static bool s_dataplane_started;
+
+/* ---- DERP smoke test (M5 step 2a) --------------------------------------
+ *
+ * One-shot synchronous connect+login against a configured DERP server.
+ * Designed to run BEFORE tinylink_long_poll_start so only one TLS conn
+ * is in flight — running it AFTER the long-poll grabs heap (we
+ * observed 10 KiB largest-free-block while the long-poll's TLS conn
+ * is alive, which is below mbedtls's ~12 KiB cert chain verify
+ * peak) deterministically failed with TLS-connect ESP_FAIL.
+ *
+ * Step 2b will turn this into a long-running supervised connection
+ * with packet relay; for step 2a we only prove the upgrade dance +
+ * login frame exchange land cleanly against a real production DERP
+ * server. */
+
+esp_err_t tinylink_derp_smoke(void)
+{
+    if (!s_initialized) return ESP_ERR_INVALID_STATE;
+    const char *host = CONFIG_TINYLINK_DERP_SMOKE_HOST;
+    if (host == NULL || host[0] == '\0') {
+        ESP_LOGI(TAG, "DERP smoke disabled (empty host config)");
+        return ESP_OK;
+    }
+    ESP_LOGI(TAG, "DERP smoke: target=%s heap_free=%u largest_block=%u",
+             host,
+             (unsigned)esp_get_free_heap_size(),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
+
+    derp_client_t c = {0};
+    esp_err_t err = derp_client_connect_login(&c, host, 443,
+                                              s_keys.node_priv,
+                                              s_keys.node_pub);
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "DERP smoke OK: %s server-version=%d",
+                 host, c.server_version);
+    } else {
+        ESP_LOGW(TAG, "DERP smoke failed: 0x%x", err);
+    }
+    derp_client_close(&c);
+    return err;
+}
 
 static esp_err_t long_poll_handler(const tl_netmap_t *nm, void *ctx)
 {

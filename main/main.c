@@ -83,6 +83,16 @@ static esp_err_t bringup(void)
         ESP_LOGE(TAG, "dataplane bringup failed: 0x%x", err);
         return err;
     }
+
+    /* M5 step 2a smoke: validate the DERP TLS upgrade + login frame
+     * exchange against a real production DERP server BEFORE the
+     * long-poll grabs ~12 KiB of mbedtls cert-chain-verify heap.
+     * Best-effort — failure is non-fatal. */
+    esp_err_t derr = tinylink_derp_smoke();
+    if (derr != ESP_OK) {
+        ESP_LOGW(TAG, "derp smoke: 0x%x — continuing", derr);
+    }
+
     err = tinylink_long_poll_start();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "long-poll start failed: 0x%x", err);
