@@ -103,6 +103,17 @@ esp_err_t tinylink_telemetry_start(void);
  * baseline. Safe to call only after WiFi is up. */
 esp_err_t tinylink_stun_probe(void);
 
+/* Spawn a low-priority FreeRTOS task that re-runs the STUN probe every
+ * CONFIG_TINYLINK_STUN_REPROBE_MS milliseconds, refreshing the cached
+ * public AddrPort so subsequent MapRequests advertise the current
+ * NAT mapping (which can drift when the NAT rebinds an idle port or
+ * the WAN address changes). A failed re-probe leaves the previously
+ * cached endpoint untouched — losing the cache only on confirmed
+ * change would require explicit "this is invalid" signaling we don't
+ * have a way to receive. Best-effort, no return-value contract for
+ * the task itself; callers get ESP_OK if the task spawned. */
+esp_err_t tinylink_stun_reprobe_start(void);
+
 /* Read-only accessor for the cached STUN result. Returns true and
  * fills *addr_v4 / *port if a successful probe has run; returns false
  * otherwise. mapreq.c queries this when building the HostInfo block. */

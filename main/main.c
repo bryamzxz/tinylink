@@ -94,7 +94,16 @@ static esp_err_t bringup(void)
         /* fall through: telemetry isn't load-bearing for the rest of
          * the system. */
     }
-    ESP_LOGI(TAG, "tinylink up: WG + map long-poll + telemetry");
+
+    /* Periodic STUN re-probe so HostInfo.Endpoints stays fresh against
+     * NAT rebinds and WAN address changes. Best-effort, silent on
+     * transient failures (cached value remains in use). */
+    esp_err_t rerr = tinylink_stun_reprobe_start();
+    if (rerr != ESP_OK) {
+        ESP_LOGW(TAG, "stun reprobe start failed: 0x%x — continuing static", rerr);
+    }
+
+    ESP_LOGI(TAG, "tinylink up: WG + map long-poll + telemetry + stun-reprobe");
     return ESP_OK;
 }
 
