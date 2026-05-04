@@ -46,6 +46,15 @@ menu "tinylink application"
         default 19302
         range 1 65535
 
+    config TINYLINK_DERP_SMOKE_HOST
+        string "DERP smoke-test hostname (M5 step 2a)"
+        default "derp1.tailscale.com"
+        help
+            Hostname used for the boot-time DERP connect+login smoke
+            test. derp1 is region 1 (US East) — adjust if you want a
+            closer relay for boot-latency reasons. Set to empty to
+            skip the smoke test entirely.
+
     config TINYLINK_STUN_REPROBE_MS
         int "STUN re-probe cadence (ms, M4)"
         default 300000

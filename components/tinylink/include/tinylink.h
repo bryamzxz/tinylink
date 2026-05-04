@@ -94,6 +94,23 @@ esp_err_t tinylink_long_poll_start(void);
  */
 esp_err_t tinylink_telemetry_start(void);
 
+/* M5 step 2a — best-effort DERP smoke test. Opens a TLS connection
+ * to CONFIG_TINYLINK_DERP_SMOKE_HOST:443, runs the HTTP Upgrade dance,
+ * exchanges the login frames (FrameServerKey ← / FrameClientInfo → /
+ * FrameServerInfo ←), logs the server version on success, then closes.
+ *
+ * Synchronous: blocks the calling task for ~3–5 s while the TLS
+ * handshake + DERP login completes. Designed to run BEFORE
+ * tinylink_long_poll_start() so only one TLS conn is alive — the
+ * long-poll's persistent TLS state would otherwise compete for ~12 KiB
+ * of mbedtls cert-chain-verify heap and the smoke would fail with
+ * ESP_FAIL.
+ *
+ * Returns ESP_OK on a successful login, an esp_err_t on any failure.
+ * Failure is non-fatal — the rest of the stack stays up exactly like
+ * the pre-M5 baseline. */
+esp_err_t tinylink_derp_smoke(void);
+
 /* M4 — best-effort STUN binding probe to discover the device's public
  * AddrPort. Result is cached and uploaded to the control plane via
  * Hostinfo.Endpoints on the next MapRequest, so peers learn an address
