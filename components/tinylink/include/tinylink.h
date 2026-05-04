@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -92,6 +93,20 @@ esp_err_t tinylink_long_poll_start(void);
  * boards that ship without a TMP117 still build and run.
  */
 esp_err_t tinylink_telemetry_start(void);
+
+/* M4 — best-effort STUN binding probe to discover the device's public
+ * AddrPort. Result is cached and uploaded to the control plane via
+ * Hostinfo.Endpoints on the next MapRequest, so peers learn an address
+ * they can try to dial directly even before DERP-mediated CallMeMaybe
+ * (M5) is wired up. Failure is non-fatal; the device just operates
+ * without a reflexive endpoint advertised, exactly like the pre-M4
+ * baseline. Safe to call only after WiFi is up. */
+esp_err_t tinylink_stun_probe(void);
+
+/* Read-only accessor for the cached STUN result. Returns true and
+ * fills *addr_v4 / *port if a successful probe has run; returns false
+ * otherwise. mapreq.c queries this when building the HostInfo block. */
+bool tinylink_get_public_endpoint(uint8_t addr_v4[4], uint16_t *port);
 
 const char *tinylink_version_string(void);
 

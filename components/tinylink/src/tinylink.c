@@ -17,6 +17,7 @@
 #include "mapreq.h"
 #include "netmap.h"
 #include "register.h"
+#include "stun_probe.h"
 #include "telemetry.h"
 #include "ts2021_client.h"
 #include "wg_dataplane.h"
@@ -34,6 +35,11 @@ static const char k_version[] =
 static tinylink_keys_t s_keys;
 static uint8_t         s_control_pub[32];
 static bool            s_initialized;
+
+/* M4 STUN probe result. Populated by tinylink_stun_probe(); read by
+ * mapreq.c when building HostInfo.Endpoints. The accessor below is
+ * the only way out — the global is private. */
+static stun_probe_result_t s_stun_result;
 
 /* Persistent ts2021/Noise channel to the control plane, mirroring
  * upstream's controlclient.Direct.noiseClient (one client reused for
@@ -235,4 +241,25 @@ esp_err_t tinylink_telemetry_start(void)
      * This entry point is a no-op kept for boot-sequence backward
      * compatibility with main.c. */
     return ESP_OK;
+}
+
+esp_err_t tinylink_stun_probe(void)
+{
+    /* Bounded so a black-holed STUN server doesn't park the boot
+     * sequence. 3 s is generous — Google STUN typically answers
+     * in <100 ms. Cleared first so a re-probe that fails leaves us
+     * with no stale endpoint advertised. */
+    s_stun_result.valid = false;
+    return stun_probe_run(CONFIG_TINYLINK_STUN_HOST,
+                          (uint16_t)CONFIG_TINYLINK_STUN_PORT,
+                          3000, &s_stun_result);
+}
+
+bool tinylink_get_public_endpoint(uint8_t addr_v4[4], uint16_t *port)
+{
+    if (!s_stun_result.valid) return false;
+    if (addr_v4 == NULL || port == NULL) return false;
+    memcpy(addr_v4, s_stun_result.addr_v4, 4);
+    *port = s_stun_result.port;
+    return true;
 }

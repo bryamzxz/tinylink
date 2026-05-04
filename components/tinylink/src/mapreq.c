@@ -14,6 +14,7 @@
 #include "esp_system.h"
 #include "sdkconfig.h"
 #include "h2_client.h"
+#include "tinylink.h"   /* tinylink_get_public_endpoint */
 #endif
 
 #define JSMN_STATIC
@@ -469,6 +470,23 @@ static int build_request_body(const tinylink_keys_t *keys,
      * field was missing, suggesting the control plane treats "absent"
      * as "client supports our default compression". Send the explicit
      * empty string. */
+    /* If the M4 STUN probe ran and succeeded, glue the discovered
+     * AddrPort onto Hostinfo as a single-element Endpoints array.
+     * Tailscale's control plane fans this out to the peers' netmaps,
+     * so they learn an address they can try to dial directly even
+     * before our DERP-mediated CallMeMaybe (M5) is wired. Empty
+     * string when no probe result — matches the pre-M4 behavior of
+     * just not sending the field. */
+    char endpoints_field[64] = "";
+    uint8_t  ep_addr[4];
+    uint16_t ep_port;
+    if (tinylink_get_public_endpoint(ep_addr, &ep_port)) {
+        snprintf(endpoints_field, sizeof(endpoints_field),
+                 ",\"Endpoints\":[\"%u.%u.%u.%u:%u\"]",
+                 ep_addr[0], ep_addr[1], ep_addr[2], ep_addr[3],
+                 (unsigned)ep_port);
+    }
+
     int n = snprintf(out, out_size,
         "{"
         "\"Version\":138,"
@@ -476,11 +494,12 @@ static int build_request_body(const tinylink_keys_t *keys,
         "\"NodeKey\":\"%s\","
         "\"DiscoKey\":\"%s\","
         "\"Stream\":%s,"
-        "\"Hostinfo\":{\"OS\":\"esp32\",\"Hostname\":\"%s\",\"IPNVersion\":\"0.1.0-tinylink\"}"
+        "\"Hostinfo\":{\"OS\":\"esp32\",\"Hostname\":\"%s\",\"IPNVersion\":\"0.1.0-tinylink\"%s}"
         "}",
         node_key_hex, disco_key_hex,
         stream ? "true" : "false",
-        CONFIG_TINYLINK_DEVICE_HOSTNAME);
+        CONFIG_TINYLINK_DEVICE_HOSTNAME,
+        endpoints_field);
     if (n < 0 || (size_t)n >= out_size) return -1;
     return n;
 }
