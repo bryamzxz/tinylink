@@ -245,14 +245,36 @@ esp_err_t tinylink_telemetry_start(void)
 
 esp_err_t tinylink_stun_probe(void)
 {
-    /* Bounded so a black-holed STUN server doesn't park the boot
-     * sequence. 3 s is generous — Google STUN typically answers
-     * in <100 ms. Cleared first so a re-probe that fails leaves us
-     * with no stale endpoint advertised. */
-    s_stun_result.valid = false;
-    return stun_probe_run(CONFIG_TINYLINK_STUN_HOST,
-                          (uint16_t)CONFIG_TINYLINK_STUN_PORT,
-                          3000, &s_stun_result);
+    /* Probe into a LOCAL result first, only commit to the cached
+     * global on success. This way a transient probe failure (DNS
+     * blip, NAT dropping our send, etc.) does NOT wipe a previously
+     * good endpoint — the next MapRequest keeps advertising the
+     * old-but-still-correct value. Boot-time initial probe also
+     * works the same way: s_stun_result is zero-initialized so
+     * .valid stays false until the first success.
+     *
+     * 3 s timeout is generous — Google STUN typically answers in
+     * <100 ms. Worst case adds 3 s of boot delay if the configured
+     * server is dead. */
+    stun_probe_result_t local = {0};
+    esp_err_t err = stun_probe_run(CONFIG_TINYLINK_STUN_HOST,
+                                   (uint16_t)CONFIG_TINYLINK_STUN_PORT,
+                                   3000, &local);
+    if (err == ESP_OK && local.valid) {
+        if (s_stun_result.valid &&
+            (memcmp(s_stun_result.addr_v4, local.addr_v4, 4) != 0 ||
+             s_stun_result.port != local.port)) {
+            ESP_LOGI(TAG, "stun: endpoint changed %u.%u.%u.%u:%u → %u.%u.%u.%u:%u",
+                     s_stun_result.addr_v4[0], s_stun_result.addr_v4[1],
+                     s_stun_result.addr_v4[2], s_stun_result.addr_v4[3],
+                     (unsigned)s_stun_result.port,
+                     local.addr_v4[0], local.addr_v4[1],
+                     local.addr_v4[2], local.addr_v4[3],
+                     (unsigned)local.port);
+        }
+        s_stun_result = local;
+    }
+    return err;
 }
 
 bool tinylink_get_public_endpoint(uint8_t addr_v4[4], uint16_t *port)
@@ -262,4 +284,38 @@ bool tinylink_get_public_endpoint(uint8_t addr_v4[4], uint16_t *port)
     memcpy(addr_v4, s_stun_result.addr_v4, 4);
     *port = s_stun_result.port;
     return true;
+}
+
+static void stun_reprobe_task(void *arg)
+{
+    (void)arg;
+    /* Sleep before the first iteration: the boot-time probe ran in
+     * tinylink_stun_probe() before this task was even spawned, so
+     * doing a second probe immediately would just burn bandwidth. */
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(CONFIG_TINYLINK_STUN_REPROBE_MS));
+        esp_err_t err = tinylink_stun_probe();
+        if (err != ESP_OK) {
+            /* Don't escalate: the cached value (if any) is still in
+             * use. ESP_LOGD instead of W to avoid spamming the log
+             * when, e.g., the user briefly loses internet. */
+            ESP_LOGD(TAG, "stun re-probe transient failure: 0x%x", err);
+        }
+    }
+}
+
+esp_err_t tinylink_stun_reprobe_start(void)
+{
+    /* 4 KiB stack: stun_probe_run does one DNS lookup + one
+     * sendto + one recvfrom; no TLS or crypto. Same budget as the
+     * WG RX task. Priority IDLE+1 — explicitly below the long-poll
+     * (IDLE+4) and the WG dataplane so neither gets preempted by a
+     * background probe. */
+    BaseType_t ok = xTaskCreate(stun_reprobe_task, "tinylink_stun_re",
+                                4096, NULL, tskIDLE_PRIORITY + 1, NULL);
+    if (ok != pdPASS) {
+        ESP_LOGE(TAG, "xTaskCreate(stun_reprobe) failed");
+        return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
 }

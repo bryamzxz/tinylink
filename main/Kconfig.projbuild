@@ -46,6 +46,18 @@ menu "tinylink application"
         default 19302
         range 1 65535
 
+    config TINYLINK_STUN_REPROBE_MS
+        int "STUN re-probe cadence (ms, M4)"
+        default 300000
+        range 30000 3600000
+        help
+            How often to re-run the STUN binding probe after the boot-time
+            probe. NATs periodically rebind external ports (especially
+            after idle) and residential WAN IPs can change without the
+            device noticing. The default 300 s (5 min) matches the natural
+            cadence of Tailscale long-poll reconnects so the freshest
+            endpoint is in HostInfo when the next /machine/map fires.
+
     menu "Telemetry (M3)"
 
         config TINYLINK_TELEMETRY_ENABLE
