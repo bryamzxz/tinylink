@@ -31,6 +31,21 @@ menu "tinylink application"
             MachineAuthorized=false (e.g. waiting for the operator to approve
             the node in the admin panel).
 
+    config TINYLINK_STUN_HOST
+        string "STUN server hostname (M4)"
+        default "stun.l.google.com"
+        help
+            STUN server queried at boot to discover the device's public
+            AddrPort. The result is uploaded to the Tailscale control
+            plane via Hostinfo.Endpoints so peers learn an address they
+            can try to dial directly. Failure is non-fatal — the rest
+            of the stack stays up exactly like the pre-M4 baseline.
+
+    config TINYLINK_STUN_PORT
+        int "STUN server UDP port (M4)"
+        default 19302
+        range 1 65535
+
     menu "Telemetry (M3)"
 
         config TINYLINK_TELEMETRY_ENABLE

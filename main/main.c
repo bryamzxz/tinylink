@@ -55,6 +55,16 @@ static esp_err_t bringup(void)
         return err;
     }
 
+    /* M4 — best-effort STUN probe. Runs once before the first
+     * MapRequest so HostInfo.Endpoints can advertise our reflexive
+     * AddrPort to the control plane (which forwards it to peers).
+     * Non-load-bearing: a probe failure leaves us with no endpoint
+     * advertised, identical to the pre-M4 baseline. */
+    esp_err_t serr = tinylink_stun_probe();
+    if (serr != ESP_OK) {
+        ESP_LOGW(TAG, "stun probe failed: 0x%x — continuing without endpoint", serr);
+    }
+
     /* Register loop: control plane may answer MachineAuthorized=false until
      * the operator approves the new node. Retry on a slow cadence. */
     for (;;) {
