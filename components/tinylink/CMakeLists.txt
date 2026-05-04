@@ -21,6 +21,7 @@ idf_component_register(
         "src/disco.c"
         "src/stun.c"
         "src/stun_probe.c"
+        "src/derp.c"
         "src/wg_netif.c"
         "src/wg_lwip.c"
         "src/tmp117.c"

@@ -19,7 +19,7 @@ TL_SRC  := ../../components/tinylink/src
 TARGETS := test_blake2s test_curve25519 test_mapresp \
            test_chacha20 test_poly1305 test_chacha20poly1305 \
            test_hkdf_noise test_wg_handshake test_wg_transport \
-           test_wg_demux test_disco test_stun test_tls_io
+           test_wg_demux test_disco test_stun test_tls_io test_derp
 
 all: $(TARGETS)
 
@@ -109,6 +109,20 @@ test_tls_io: test_tls_io.c $(TL_SRC)/tls_io.c $(TL_SRC)/tls_io.h \
 	$(CC) $(CFLAGS) -I$(TL_SRC) -Ihost_include -o $@ \
 	    test_tls_io.c $(TL_SRC)/tls_io.c
 
+# DERP wire codec — frame header + login handshake + packet relay +
+# ping/pong + control frames. Pulls in nacl_box like test_disco does
+# (same poly1305 host shim).
+test_derp: test_derp.c \
+           $(TL_SRC)/derp.c $(TL_SRC)/derp.h \
+           $(CRYPTO)/nacl_box.c $(CRYPTO)/nacl_box.h \
+           $(CRYPTO)/curve25519.c $(CRYPTO)/salsa20.c \
+           $(CRYPTO)/poly1305_donna.c host_mbedtls_shim.c \
+           host_include/mbedtls/poly1305.h
+	$(CC) $(CFLAGS) -I$(TL_SRC) -I$(CRYPTO) -Ihost_include -o $@ \
+	    test_derp.c $(TL_SRC)/derp.c \
+	    $(CRYPTO)/nacl_box.c $(CRYPTO)/curve25519.c $(CRYPTO)/salsa20.c \
+	    $(CRYPTO)/poly1305_donna.c host_mbedtls_shim.c
+
 # WG transport (data plane) — encrypt/decrypt + RFC 6479 anti-replay.
 test_wg_transport: test_wg_transport.c \
                   $(TL_SRC)/wg_transport.c $(TL_SRC)/wg_transport.h \
@@ -125,12 +139,14 @@ test_wg_transport: test_wg_transport.c \
 .PHONY: test test_blake2s.run test_curve25519.run test_mapresp.run \
         test_chacha20.run test_poly1305.run test_chacha20poly1305.run \
         test_hkdf_noise.run test_wg_handshake.run test_wg_transport.run \
-        test_wg_demux.run test_disco.run test_stun.run test_tls_io.run clean
+        test_wg_demux.run test_disco.run test_stun.run test_tls_io.run \
+        test_derp.run clean
 
 test: test_blake2s.run test_curve25519.run test_mapresp.run \
       test_chacha20.run test_poly1305.run test_chacha20poly1305.run \
       test_hkdf_noise.run test_wg_handshake.run test_wg_transport.run \
-      test_wg_demux.run test_disco.run test_stun.run test_tls_io.run
+      test_wg_demux.run test_disco.run test_stun.run test_tls_io.run \
+      test_derp.run
 
 test_blake2s.run: test_blake2s
 	./test_blake2s
@@ -170,6 +186,9 @@ test_stun.run: test_stun
 
 test_tls_io.run: test_tls_io
 	./test_tls_io
+
+test_derp.run: test_derp
+	./test_derp
 
 clean:
 	rm -f $(TARGETS)
