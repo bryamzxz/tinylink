@@ -16,6 +16,7 @@
 
 #include "control_key.h"
 #include "derp_client.h"
+#include "disco_handler.h"
 #include "keys.h"
 #include "mapreq.h"
 #include "netmap.h"
@@ -235,7 +236,65 @@ typedef struct {
     uint64_t keepalives;
     uint64_t peer_present;
     uint64_t peer_gone;
+    uint64_t disco_pings_answered;
+    uint64_t disco_pongs_seen;
+    uint64_t disco_cmms_seen;
+    uint64_t disco_send_errors;
 } derp_sup_stats_t;
+
+/* Try to decrypt+answer the relayed packet as DISCO. If it's not a
+ * DISCO frame the handler short-circuits cheap; if it's a Ping we
+ * build a sealed Pong and ship it back via derp_client_send_packet.
+ *
+ * The DERP src_pub is the originator's NodePublic (DERP routes by
+ * NodeKey); reusing it as the dst for our Pong sends the reply back
+ * along the same DERP route. The DiscoKey lives in the encrypted
+ * frame's cleartext header — disco_handle_recv extracts it for us. */
+static void handle_disco_relayed(const derp_event_t *e,
+                                 derp_sup_stats_t *st)
+{
+    uint8_t reply[DISCO_HANDLER_REPLY_MAX];
+    disco_msg_type_t type = (disco_msg_type_t)0;
+    uint8_t peer_disco_pub[DISCO_KEY_LEN] = {0};
+    uint8_t txid[DISCO_TXID_LEN] = {0};
+
+    size_t reply_len = disco_handle_recv(reply, sizeof(reply),
+                                         e->data, e->data_len,
+                                         s_keys.disco_priv, s_keys.disco_pub,
+                                         &type, peer_disco_pub, txid);
+    switch (type) {
+    case DISCO_TYPE_PING:
+        if (reply_len > 0) {
+            esp_err_t err = derp_client_send_packet(
+                &s_derp_sup, e->src_pub, reply, reply_len);
+            if (err == ESP_OK) {
+                st->disco_pings_answered++;
+                ESP_LOGI(TAG,
+                    "disco ping→pong: peer=%02x%02x..%02x%02x txid=%02x%02x%02x%02x..",
+                    e->src_pub[0], e->src_pub[1],
+                    e->src_pub[DERP_KEY_LEN - 2], e->src_pub[DERP_KEY_LEN - 1],
+                    txid[0], txid[1], txid[2], txid[3]);
+            } else {
+                st->disco_send_errors++;
+                ESP_LOGW(TAG, "disco pong send failed: 0x%x", err);
+            }
+        }
+        break;
+    case DISCO_TYPE_PONG:
+        st->disco_pongs_seen++;
+        ESP_LOGD(TAG, "disco pong received (no outbound prober yet)");
+        break;
+    case DISCO_TYPE_CALLMEMAYBE:
+        st->disco_cmms_seen++;
+        ESP_LOGI(TAG, "disco call-me-maybe (M5 step 3 territory)");
+        break;
+    default:
+        /* Either non-DISCO bytes (handler returned 0 with type
+         * untouched) or a relayed WG transport packet. M5 step 3
+         * will route those into wg_demux. */
+        break;
+    }
+}
 
 static int derp_sup_event_cb(const derp_event_t *e, void *ctx)
 {
@@ -248,6 +307,7 @@ static int derp_sup_event_cb(const derp_event_t *e, void *ctx)
                  e->src_pub[DERP_KEY_LEN - 2], e->src_pub[DERP_KEY_LEN - 1],
                  (unsigned)e->data_len,
                  (unsigned long long)st->recv_packets);
+        handle_disco_relayed(e, st);
         break;
     case DERP_EVT_KEEPALIVE:
         st->keepalives++;
@@ -306,10 +366,15 @@ static void derp_supervised_task(void *arg)
             ESP_LOGW(TAG, "derp supervisor: server restarting — backoff");
         } else {
             ESP_LOGW(TAG, "derp supervisor: stream ended 0x%x — "
-                          "stats recv=%llu pings=%llu keepalives=%llu",
+                          "stats recv=%llu disco_pongs=%llu "
+                          "disco_pings_seen=%llu disco_cmms=%llu "
+                          "send_err=%llu keepalives=%llu",
                      err,
                      (unsigned long long)stats.recv_packets,
-                     (unsigned long long)stats.pings_answered,
+                     (unsigned long long)stats.disco_pings_answered,
+                     (unsigned long long)stats.disco_pongs_seen,
+                     (unsigned long long)stats.disco_cmms_seen,
+                     (unsigned long long)stats.disco_send_errors,
                      (unsigned long long)stats.keepalives);
         }
         derp_client_close(&s_derp_sup);
