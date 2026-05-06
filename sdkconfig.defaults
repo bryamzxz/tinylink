@@ -36,18 +36,21 @@ CONFIG_MBEDTLS_HARDWARE_MPI=y
 CONFIG_MBEDTLS_CHACHA20_C=y
 CONFIG_MBEDTLS_CHACHAPOLY_C=y
 CONFIG_MBEDTLS_HKDF_C=y
-# CONFIG_MBEDTLS_DYNAMIC_BUFFER previously =y to save RAM, but on first
-# HW boot 2026-05-02 it corrupted the TX-buffer pointer in mbedtls
-# during the first ts2021_send → esp_tls_conn_write call (crash in
-# heap_caps_free of an already-freed pointer). Feature is known to
-# misbehave when combined with session tickets. We have RAM headroom;
-# turn it off.
-CONFIG_MBEDTLS_DYNAMIC_BUFFER=n
+# MBEDTLS_DYNAMIC_BUFFER allocates per-record instead of permanent
+# IN/OUT buffers — half-or-better per-conn footprint. Re-enabled
+# 2026-05-06 to make TINYLINK_DERP_SUPERVISED=y fit. The
+# 2026-05-02 incident (TX-buffer pointer corruption mid-write)
+# happened with SESSION_TICKETS=y; we now disable tickets so the
+# code path that previously misbehaved is gone. tickets only save
+# a Noise IK + cert-verify on TLS resume to the same host within
+# the cache lifetime, which we don't currently exploit anywhere
+# (every request opens a fresh esp_tls).
+CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
 CONFIG_MBEDTLS_DYNAMIC_FREE_CA_CERT=n
 CONFIG_MBEDTLS_SSL_KEEP_PEER_CERTIFICATE=n
 CONFIG_MBEDTLS_SSL_MAX_CONTENT_LEN=4096
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
-CONFIG_MBEDTLS_CLIENT_SSL_SESSION_TICKETS=y
+CONFIG_MBEDTLS_CLIENT_SSL_SESSION_TICKETS=n
 
 # ---- lwIP tunings ------------------------------------------------------------
 CONFIG_LWIP_TCPIP_CORE_LOCKING=y
