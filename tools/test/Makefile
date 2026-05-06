@@ -109,17 +109,20 @@ test_tls_io: test_tls_io.c $(TL_SRC)/tls_io.c $(TL_SRC)/tls_io.h \
 	$(CC) $(CFLAGS) -I$(TL_SRC) -Ihost_include -o $@ \
 	    test_tls_io.c $(TL_SRC)/tls_io.c
 
-# DERP wire codec — frame header + login handshake + packet relay +
-# ping/pong + control frames. Pulls in nacl_box like test_disco does
-# (same poly1305 host shim).
+# DERP wire codec + recv loop — frame header + login handshake +
+# packet relay + ping/pong + control frames + the M5 step 2b dispatch
+# loop. Pulls in nacl_box like test_disco does (same poly1305 host
+# shim) and tls_io for the WANT_READ-tolerant frame reader.
 test_derp: test_derp.c \
            $(TL_SRC)/derp.c $(TL_SRC)/derp.h \
+           $(TL_SRC)/tls_io.c $(TL_SRC)/tls_io.h \
            $(CRYPTO)/nacl_box.c $(CRYPTO)/nacl_box.h \
            $(CRYPTO)/curve25519.c $(CRYPTO)/salsa20.c \
            $(CRYPTO)/poly1305_donna.c host_mbedtls_shim.c \
-           host_include/mbedtls/poly1305.h
+           host_include/mbedtls/poly1305.h \
+           host_include/mbedtls/ssl.h
 	$(CC) $(CFLAGS) -I$(TL_SRC) -I$(CRYPTO) -Ihost_include -o $@ \
-	    test_derp.c $(TL_SRC)/derp.c \
+	    test_derp.c $(TL_SRC)/derp.c $(TL_SRC)/tls_io.c \
 	    $(CRYPTO)/nacl_box.c $(CRYPTO)/curve25519.c $(CRYPTO)/salsa20.c \
 	    $(CRYPTO)/poly1305_donna.c host_mbedtls_shim.c
 
