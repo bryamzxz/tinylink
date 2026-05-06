@@ -20,6 +20,9 @@
 #include "esp_err.h"
 #include "esp_tls.h"
 
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+
 #include "derp.h"
 
 #ifdef __cplusplus
@@ -27,10 +30,14 @@ extern "C" {
 #endif
 
 typedef struct {
-    esp_tls_t *tls;                       /* owned: closed by derp_client_close */
-    bool      connected;
-    uint8_t   server_pub[DERP_KEY_LEN];
-    int       server_version;             /* parsed from FrameServerInfo JSON */
+    esp_tls_t        *tls;                /* owned: closed by derp_client_close */
+    bool              connected;
+    uint8_t           server_pub[DERP_KEY_LEN];
+    int               server_version;     /* parsed from FrameServerInfo JSON */
+    /* Serializes writes between the recv-loop's auto-pongs and any
+     * external sender (e.g. magicsock relay). Held across one full
+     * frame write so DERP framing on the wire stays intact. */
+    SemaphoreHandle_t write_lock;
 } derp_client_t;
 
 /* Open a TLS connection to server_host:port, complete the HTTP
@@ -66,6 +73,21 @@ void derp_client_close(derp_client_t *c);
 esp_err_t derp_client_run(derp_client_t *c,
                           uint8_t *frame_buf, size_t frame_cap,
                           derp_event_cb_t cb, void *cb_ctx);
+
+/* Send one DERP FrameSendPacket relaying `packet` to peer `dst_pub`.
+ * Atomic on the wire: holds c->write_lock across header + payload, so
+ * concurrent calls (and the recv-loop's pongs) cannot interleave.
+ *
+ * Used by the M5 step 3 magicsock fallback when the direct UDP path
+ * to a peer fails (ENETUNREACH, no recent reply). plen must be ≤
+ * DERP_MAX_PACKET; in practice WG packets are < 1500 B.
+ *
+ * Returns ESP_OK on success, ESP_ERR_INVALID_STATE if not connected,
+ * ESP_ERR_INVALID_ARG / ESP_ERR_INVALID_SIZE on misuse, ESP_FAIL on
+ * transport error (caller should drop the conn and reconnect). */
+esp_err_t derp_client_send_packet(derp_client_t *c,
+                                  const uint8_t dst_pub[DERP_KEY_LEN],
+                                  const uint8_t *packet, size_t plen);
 
 #ifdef __cplusplus
 }

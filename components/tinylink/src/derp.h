@@ -204,10 +204,17 @@ typedef struct {
 /* Return non-zero from the callback to stop the loop cleanly. */
 typedef int (*derp_event_cb_t)(const derp_event_t *evt, void *ctx);
 
-/* Run the recv loop using the supplied I/O callbacks (same shape as
- * tls_io_*_full's reader/writer). Reads frames in a hot loop,
- * internally answers FramePing with FramePong (echoing the 8-byte
- * payload), and invokes cb on every event the loop deems interesting.
+/* Atomically write one DERP frame (5-byte header + payload). The
+ * implementation MUST serialize concurrent calls from different
+ * threads — this is the sole synchronization point shared by the
+ * recv loop's pongs and any external sender (e.g. magicsock relay).
+ * Returns 0 on success, negative on transport failure. */
+typedef int (*derp_send_frame_fn)(void *ctx, derp_frame_type_t type,
+                                  const uint8_t *payload, size_t plen);
+
+/* Run the recv loop. Reads frames via rd, internally answers
+ * FramePing by calling send(PONG, payload), and invokes cb on every
+ * event the loop deems interesting.
  *
  * frame_buf must hold a single frame's payload. We cap accepted
  * payload length at frame_cap; oversized frames are fatal (we cannot
@@ -220,7 +227,7 @@ typedef int (*derp_event_cb_t)(const derp_event_t *evt, void *ctx);
  *   -3  bad frame parse
  *   -4  unexpected post-login frame (ServerKey / ServerInfo)
  *   -5  bad arg / capacity too small */
-int derp_run_loop(tls_io_read_fn rd, tls_io_write_fn wr, void *io_ctx,
+int derp_run_loop(tls_io_read_fn rd, derp_send_frame_fn send, void *io_ctx,
                   uint8_t *frame_buf, size_t frame_cap,
                   derp_event_cb_t cb, void *cb_ctx);
 

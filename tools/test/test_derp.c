@@ -374,16 +374,25 @@ static void test_restarting(void) {
 
 /* A flat byte stream the fake "tls" reader serves in chunks. Each call
  * to fake_read returns at most chunk_max bytes, simulating the way
- * mbedtls hands us back partial records. */
+ * mbedtls hands us back partial records.
+ *
+ * The send fn captures full frames (post atomic-frame refactor): each
+ * call to derp_run_loop's send delivers one (type, payload, plen)
+ * tuple, so we record those directly. */
+typedef struct {
+    derp_frame_type_t type;
+    uint8_t           payload[64];
+    size_t            plen;
+} sent_frame_t;
+
 typedef struct {
     const uint8_t *src;
     size_t         src_len;
     size_t         off;
     size_t         chunk_max;     /* 0 = no cap */
 
-    uint8_t       *wbuf;          /* captures bytes written by the loop */
-    size_t         wcap;
-    size_t         wlen;
+    sent_frame_t   sends[4];
+    size_t         n_sends;
 } loop_io_t;
 
 static ssize_t loop_read(void *ctx, uint8_t *buf, size_t len) {
@@ -397,14 +406,18 @@ static ssize_t loop_read(void *ctx, uint8_t *buf, size_t len) {
     return (ssize_t)take;
 }
 
-static ssize_t loop_write(void *ctx, const uint8_t *buf, size_t len) {
+static int loop_send(void *ctx, derp_frame_type_t type,
+                     const uint8_t *payload, size_t plen) {
     loop_io_t *io = (loop_io_t *)ctx;
-    if (io->wbuf == NULL) return (ssize_t)len;
-    size_t avail = io->wcap - io->wlen;
-    size_t take = avail < len ? avail : len;
-    memcpy(io->wbuf + io->wlen, buf, take);
-    io->wlen += take;
-    return (ssize_t)take;
+    if (io->n_sends >= sizeof(io->sends) / sizeof(io->sends[0])) return -1;
+    sent_frame_t *s = &io->sends[io->n_sends++];
+    s->type = type;
+    s->plen = plen;
+    if (plen > 0) {
+        size_t take = plen < sizeof(s->payload) ? plen : sizeof(s->payload);
+        memcpy(s->payload, payload, take);
+    }
+    return 0;
 }
 
 /* Captured events. Pointers in derp_event_t are borrowed from the
@@ -477,7 +490,7 @@ static void test_loop_recv_packet(void) {
     loop_io_t io = { .src = stream, .src_len = end };
     cap_ctx_t cap = { .stop_on_kind = (int)DERP_EVT_RECV_PACKET };
     uint8_t fbuf[1600];
-    int rc = derp_run_loop(loop_read, loop_write, &io,
+    int rc = derp_run_loop(loop_read, loop_send, &io,
                            fbuf, sizeof(fbuf), cap_cb, &cap);
     fails += eq_int_named("loop/recv-packet/rc", rc, 0);
     fails += ok("loop/recv-packet/n", cap.n == 1);
@@ -500,21 +513,18 @@ static void test_loop_ping_to_pong(void) {
     memcpy(stream2, stream, end);
     size_t end2 = append_frame(stream2, end, DERP_FRAME_KEEPALIVE, NULL, 0);
 
-    uint8_t wbuf[64];
-    loop_io_t io = { .src = stream2, .src_len = end2,
-                     .wbuf = wbuf, .wcap = sizeof(wbuf) };
+    loop_io_t io = { .src = stream2, .src_len = end2 };
     cap_ctx_t cap = { .stop_on_kind = (int)DERP_EVT_KEEPALIVE };
     uint8_t fbuf[64];
-    int rc = derp_run_loop(loop_read, loop_write, &io,
+    int rc = derp_run_loop(loop_read, loop_send, &io,
                            fbuf, sizeof(fbuf), cap_cb, &cap);
     fails += eq_int_named("loop/ping/rc", rc, 0);
-    fails += ok("loop/ping/wrote-13", io.wlen == 5 + 8);
-    fails += ok("loop/ping/pong-type", io.wlen >= 1 && wbuf[0] == DERP_FRAME_PONG);
-    /* BE32 length == 8 */
+    fails += ok("loop/ping/one-frame-sent", io.n_sends == 1);
+    fails += ok("loop/ping/pong-type",
+                io.n_sends >= 1 && io.sends[0].type == DERP_FRAME_PONG);
     fails += ok("loop/ping/pong-len",
-                io.wlen >= 5 &&
-                wbuf[1]==0 && wbuf[2]==0 && wbuf[3]==0 && wbuf[4]==8);
-    fails += eq_bytes("loop/ping/pong-echo", wbuf + 5, ping_data, 8);
+                io.n_sends >= 1 && io.sends[0].plen == DERP_PING_LEN);
+    fails += eq_bytes("loop/ping/pong-echo", io.sends[0].payload, ping_data, 8);
 }
 
 static void test_loop_keepalive(void) {
@@ -526,7 +536,7 @@ static void test_loop_keepalive(void) {
     cap_ctx_t cap = { .stop_on_kind = (int)DERP_EVT_KEEPALIVE };
     uint8_t fbuf[64];
     fails += eq_int_named("loop/keepalive/rc",
-        derp_run_loop(loop_read, loop_write, &io, fbuf, sizeof(fbuf), cap_cb, &cap), 0);
+        derp_run_loop(loop_read, loop_send, &io, fbuf, sizeof(fbuf), cap_cb, &cap), 0);
     fails += ok("loop/keepalive/kind",
                 cap.n == 1 && cap.evts[0].kind == DERP_EVT_KEEPALIVE);
 }
@@ -543,7 +553,7 @@ static void test_loop_peer_gone_reason_byte(void) {
     cap_ctx_t cap = { .stop_on_kind = (int)DERP_EVT_PEER_GONE };
     uint8_t fbuf[64];
     fails += eq_int_named("loop/peer-gone/rc",
-        derp_run_loop(loop_read, loop_write, &io, fbuf, sizeof(fbuf), cap_cb, &cap), 0);
+        derp_run_loop(loop_read, loop_send, &io, fbuf, sizeof(fbuf), cap_cb, &cap), 0);
     fails += ok("loop/peer-gone/kind",
                 cap.n == 1 && cap.evts[0].kind == DERP_EVT_PEER_GONE);
     fails += eq_bytes("loop/peer-gone/pub", cap.evts[0].pub, pl, 32);
@@ -562,7 +572,7 @@ static void test_loop_peer_gone_no_reason(void) {
     loop_io_t io = { .src = stream, .src_len = end };
     cap_ctx_t cap = { .stop_on_kind = (int)DERP_EVT_PEER_GONE };
     uint8_t fbuf[64];
-    (void)derp_run_loop(loop_read, loop_write, &io, fbuf, sizeof(fbuf), cap_cb, &cap);
+    (void)derp_run_loop(loop_read, loop_send, &io, fbuf, sizeof(fbuf), cap_cb, &cap);
     fails += ok("loop/peer-gone-noreason/reason",
                 cap.n == 1 && cap.evts[0].peer_gone_reason == DERP_PEER_GONE_DISCONNECTED);
 }
@@ -575,7 +585,7 @@ static void test_loop_restarting_returns_minus_two(void) {
     loop_io_t io = { .src = stream, .src_len = end };
     cap_ctx_t cap = { .stop_on_kind = -1 };
     uint8_t fbuf[64];
-    int rc = derp_run_loop(loop_read, loop_write, &io,
+    int rc = derp_run_loop(loop_read, loop_send, &io,
                            fbuf, sizeof(fbuf), cap_cb, &cap);
     fails += eq_int_named("loop/restarting/rc-minus-2", rc, -2);
     fails += ok("loop/restarting/cb-fired",
@@ -591,7 +601,7 @@ static void test_loop_oversize_frame_is_fatal(void) {
     loop_io_t io = { .src = hdr, .src_len = sizeof(hdr) };
     cap_ctx_t cap = { .stop_on_kind = -1 };
     uint8_t fbuf[100];
-    int rc = derp_run_loop(loop_read, loop_write, &io,
+    int rc = derp_run_loop(loop_read, loop_send, &io,
                            fbuf, sizeof(fbuf), cap_cb, &cap);
     fails += eq_int_named("loop/oversize/rc", rc, -1);
 }
@@ -607,7 +617,7 @@ static void test_loop_post_login_serverkey_is_fatal(void) {
     cap_ctx_t cap = { .stop_on_kind = -1 };
     uint8_t fbuf[64];
     fails += eq_int_named("loop/serverkey-post-login/rc",
-        derp_run_loop(loop_read, loop_write, &io, fbuf, sizeof(fbuf), cap_cb, &cap), -4);
+        derp_run_loop(loop_read, loop_send, &io, fbuf, sizeof(fbuf), cap_cb, &cap), -4);
 }
 
 static void test_loop_eof_mid_payload_is_fatal(void) {
@@ -620,7 +630,7 @@ static void test_loop_eof_mid_payload_is_fatal(void) {
     cap_ctx_t cap = { .stop_on_kind = -1 };
     uint8_t fbuf[64];
     fails += eq_int_named("loop/eof-mid/rc",
-        derp_run_loop(loop_read, loop_write, &io, fbuf, sizeof(fbuf), cap_cb, &cap), -1);
+        derp_run_loop(loop_read, loop_send, &io, fbuf, sizeof(fbuf), cap_cb, &cap), -1);
 }
 
 static void test_loop_unknown_frame_is_skipped(void) {
@@ -633,7 +643,7 @@ static void test_loop_unknown_frame_is_skipped(void) {
     loop_io_t io = { .src = stream, .src_len = off };
     cap_ctx_t cap = { .stop_on_kind = (int)DERP_EVT_KEEPALIVE };
     uint8_t fbuf[64];
-    int rc = derp_run_loop(loop_read, loop_write, &io,
+    int rc = derp_run_loop(loop_read, loop_send, &io,
                            fbuf, sizeof(fbuf), cap_cb, &cap);
     fails += eq_int_named("loop/unknown-skip/rc", rc, 0);
     fails += ok("loop/unknown-skip/only-keepalive",
@@ -652,7 +662,7 @@ static void test_loop_chunked_reads_partial_records(void) {
     loop_io_t io = { .src = stream, .src_len = end, .chunk_max = 1 };
     cap_ctx_t cap = { .stop_on_kind = (int)DERP_EVT_RECV_PACKET };
     uint8_t fbuf[64];
-    int rc = derp_run_loop(loop_read, loop_write, &io,
+    int rc = derp_run_loop(loop_read, loop_send, &io,
                            fbuf, sizeof(fbuf), cap_cb, &cap);
     fails += eq_int_named("loop/chunked/rc", rc, 0);
     fails += ok("loop/chunked/data-len",
@@ -664,13 +674,61 @@ static void test_loop_chunked_reads_partial_records(void) {
 static void test_loop_bad_args(void) {
     uint8_t fbuf[64];
     fails += eq_int_named("loop/bad/null-rd",
-        derp_run_loop(NULL, loop_write, NULL, fbuf, sizeof(fbuf), NULL, NULL), -5);
-    fails += eq_int_named("loop/bad/null-wr",
+        derp_run_loop(NULL, loop_send, NULL, fbuf, sizeof(fbuf), NULL, NULL), -5);
+    fails += eq_int_named("loop/bad/null-send",
         derp_run_loop(loop_read, NULL, NULL, fbuf, sizeof(fbuf), NULL, NULL), -5);
     fails += eq_int_named("loop/bad/null-buf",
-        derp_run_loop(loop_read, loop_write, NULL, NULL, sizeof(fbuf), NULL, NULL), -5);
+        derp_run_loop(loop_read, loop_send, NULL, NULL, sizeof(fbuf), NULL, NULL), -5);
     fails += eq_int_named("loop/bad/cap-too-small",
-        derp_run_loop(loop_read, loop_write, NULL, fbuf, 8, NULL, NULL), -5);
+        derp_run_loop(loop_read, loop_send, NULL, fbuf, 8, NULL, NULL), -5);
+}
+
+/* When send returns non-zero on a PONG response, the loop must return
+ * -1 (transport-level failure, supervisor reconnects). Reproduces the
+ * "TLS write failed mid-PONG" path. */
+static int loop_send_fail(void *ctx, derp_frame_type_t type,
+                          const uint8_t *payload, size_t plen) {
+    (void)ctx; (void)type; (void)payload; (void)plen;
+    return -1;
+}
+
+static void test_loop_send_failure_is_fatal(void) {
+    const uint8_t ping_data[8] = {1,2,3,4,5,6,7,8};
+    uint8_t stream[5 + 8];
+    size_t end = append_frame(stream, 0, DERP_FRAME_PING, ping_data, 8);
+
+    loop_io_t io = { .src = stream, .src_len = end };
+    cap_ctx_t cap = { .stop_on_kind = -1 };
+    uint8_t fbuf[64];
+    fails += eq_int_named("loop/send-fail/rc",
+        derp_run_loop(loop_read, loop_send_fail, &io,
+                      fbuf, sizeof(fbuf), cap_cb, &cap), -1);
+}
+
+/* Two PINGs back-to-back must produce two PONGs in order, each
+ * carrying its own echo bytes. Catches accidental state leaking
+ * between iterations of the recv loop. */
+static void test_loop_two_pings_two_pongs(void) {
+    const uint8_t a[8] = {0xa0,0xa1,0xa2,0xa3,0xa4,0xa5,0xa6,0xa7};
+    const uint8_t b[8] = {0xb0,0xb1,0xb2,0xb3,0xb4,0xb5,0xb6,0xb7};
+    uint8_t stream[5+8 + 5+8 + 5];
+    size_t off = 0;
+    off = append_frame(stream, off, DERP_FRAME_PING, a, 8);
+    off = append_frame(stream, off, DERP_FRAME_PING, b, 8);
+    off = append_frame(stream, off, DERP_FRAME_KEEPALIVE, NULL, 0);
+
+    loop_io_t io = { .src = stream, .src_len = off };
+    cap_ctx_t cap = { .stop_on_kind = (int)DERP_EVT_KEEPALIVE };
+    uint8_t fbuf[64];
+    int rc = derp_run_loop(loop_read, loop_send, &io,
+                           fbuf, sizeof(fbuf), cap_cb, &cap);
+    fails += eq_int_named("loop/two-pings/rc", rc, 0);
+    fails += ok("loop/two-pings/two-sends", io.n_sends == 2);
+    fails += ok("loop/two-pings/types",
+                io.sends[0].type == DERP_FRAME_PONG &&
+                io.sends[1].type == DERP_FRAME_PONG);
+    fails += eq_bytes("loop/two-pings/echo-a", io.sends[0].payload, a, 8);
+    fails += eq_bytes("loop/two-pings/echo-b", io.sends[1].payload, b, 8);
 }
 
 static void test_loop_health(void) {
@@ -684,7 +742,7 @@ static void test_loop_health(void) {
     cap_ctx_t cap = { .stop_on_kind = (int)DERP_EVT_HEALTH };
     uint8_t fbuf[64];
     fails += eq_int_named("loop/health/rc",
-        derp_run_loop(loop_read, loop_write, &io, fbuf, sizeof(fbuf), cap_cb, &cap), 0);
+        derp_run_loop(loop_read, loop_send, &io, fbuf, sizeof(fbuf), cap_cb, &cap), 0);
     fails += ok("loop/health/kind+len",
                 cap.n == 1 && cap.evts[0].kind == DERP_EVT_HEALTH &&
                 cap.evts[0].data_len == mlen);
@@ -719,6 +777,8 @@ int main(void) {
     test_loop_chunked_reads_partial_records();
     test_loop_bad_args();
     test_loop_health();
+    test_loop_send_failure_is_fatal();
+    test_loop_two_pings_two_pongs();
 
     if (fails) {
         printf("\n[FAIL] %d assertion(s) failed\n", fails);

@@ -134,9 +134,16 @@ esp_err_t derp_client_connect_login(derp_client_t *out,
         .timeout_ms        = DERP_TLS_TIMEOUT_MS,
     };
 
+    out->write_lock = xSemaphoreCreateMutex();
+    if (out->write_lock == NULL) {
+        ESP_LOGE(TAG, "write_lock create failed");
+        return ESP_ERR_NO_MEM;
+    }
+
     out->tls = esp_tls_init();
     if (out->tls == NULL) {
         ESP_LOGE(TAG, "esp_tls_init failed");
+        derp_client_close(out);
         return ESP_FAIL;
     }
 
@@ -246,7 +253,34 @@ void derp_client_close(derp_client_t *c)
         esp_tls_conn_destroy(c->tls);
         c->tls = NULL;
     }
+    if (c->write_lock != NULL) {
+        vSemaphoreDelete(c->write_lock);
+        c->write_lock = NULL;
+    }
     c->connected = false;
+}
+
+/* Atomic-frame writer used both by the recv loop's pongs (via
+ * derp_run_loop) and the public derp_client_send_packet. Holds
+ * c->write_lock across header + payload so concurrent senders cannot
+ * interleave and corrupt the wire framing. */
+static int derp_send_frame_locked(void *ctx, derp_frame_type_t type,
+                                  const uint8_t *payload, size_t plen)
+{
+    derp_client_t *c = (derp_client_t *)ctx;
+    if (c == NULL || c->tls == NULL) return -1;
+    if (plen > 0xffffffffU) return -1;
+
+    uint8_t hdr[DERP_FRAME_HDR_LEN];
+    derp_write_frame_header(hdr, type, (uint32_t)plen);
+
+    xSemaphoreTake(c->write_lock, portMAX_DELAY);
+    int rc = tls_io_write_full(derp_tls_write, c->tls, hdr, sizeof(hdr));
+    if (rc == 0 && plen > 0) {
+        rc = tls_io_write_full(derp_tls_write, c->tls, payload, plen);
+    }
+    xSemaphoreGive(c->write_lock);
+    return rc;
 }
 
 esp_err_t derp_client_run(derp_client_t *c,
@@ -256,13 +290,45 @@ esp_err_t derp_client_run(derp_client_t *c,
     if (c == NULL || c->tls == NULL || !c->connected || frame_buf == NULL) {
         return ESP_ERR_INVALID_STATE;
     }
-    int rc = derp_run_loop(derp_tls_read, derp_tls_write, c->tls,
+    int rc = derp_run_loop(derp_tls_read, derp_send_frame_locked, c,
                            frame_buf, frame_cap, cb, cb_ctx);
     switch (rc) {
         case  0: return ESP_OK;                          /* cb stop */
         case -2: return ESP_ERR_INVALID_RESPONSE;        /* RESTARTING */
         default: return ESP_FAIL;
     }
+}
+
+esp_err_t derp_client_send_packet(derp_client_t *c,
+                                  const uint8_t dst_pub[DERP_KEY_LEN],
+                                  const uint8_t *packet, size_t plen)
+{
+    if (c == NULL || c->tls == NULL || !c->connected || c->write_lock == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (dst_pub == NULL || (plen > 0 && packet == NULL)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (plen > DERP_MAX_PACKET) return ESP_ERR_INVALID_SIZE;
+
+    /* FrameSendPacket payload = dstPub[32] || packet[plen]. We hold
+     * the write lock across all three writes (header, dst_pub, packet)
+     * so the recv loop's pongs cannot land between chunks. */
+    const size_t total_payload = DERP_KEY_LEN + plen;
+    uint8_t hdr[DERP_FRAME_HDR_LEN];
+    derp_write_frame_header(hdr, DERP_FRAME_SEND_PACKET,
+                            (uint32_t)total_payload);
+
+    xSemaphoreTake(c->write_lock, portMAX_DELAY);
+    int rc = tls_io_write_full(derp_tls_write, c->tls, hdr, sizeof(hdr));
+    if (rc == 0) {
+        rc = tls_io_write_full(derp_tls_write, c->tls, dst_pub, DERP_KEY_LEN);
+    }
+    if (rc == 0 && plen > 0) {
+        rc = tls_io_write_full(derp_tls_write, c->tls, packet, plen);
+    }
+    xSemaphoreGive(c->write_lock);
+    return (rc == 0) ? ESP_OK : ESP_FAIL;
 }
 
 #endif /* ESP_PLATFORM */
