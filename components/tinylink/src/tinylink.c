@@ -520,6 +520,21 @@ esp_err_t tinylink_long_poll_start(void)
     return ESP_OK;
 }
 
+esp_err_t tinylink_wait_dataplane_ms(uint32_t timeout_ms)
+{
+    /* Cooperative poll: long-poll task runs at higher priority so it
+     * gets to do its handshake + first MapResponse without us blocking
+     * it. We just sleep in coarse 100 ms chunks until the flag flips. */
+    const uint32_t step_ms = 100;
+    uint32_t waited = 0;
+    while (!s_dataplane_started) {
+        if (waited >= timeout_ms) return ESP_ERR_TIMEOUT;
+        vTaskDelay(pdMS_TO_TICKS(step_ms));
+        waited += step_ms;
+    }
+    return ESP_OK;
+}
+
 esp_err_t tinylink_telemetry_start(void)
 {
     /* Telemetry now starts implicitly from the long-poll handler the

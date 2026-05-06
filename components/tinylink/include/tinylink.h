@@ -82,6 +82,22 @@ esp_err_t tinylink_dataplane_start(void);
  */
 esp_err_t tinylink_long_poll_start(void);
 
+/* Block until the long-poll task has received its first MapResponse
+ * and called wg_dataplane_start(), or until timeout_ms elapses.
+ *
+ * Used by main.c bringup to sequence the DERP supervisor AFTER the
+ * long-poll has its TLS conn + nghttp2 session in steady state — if
+ * supervised goes first, its alive TLS conn fragments the heap below
+ * the contiguous block long-poll's mbedtls cert verify needs, and
+ * long-poll repeatedly fails. Waiting for s_dataplane_started=true
+ * means: TLS up, Noise IK done, h2 session allocated, first
+ * MapRequest fired, first netmap parsed, WG netif up, our HostInfo
+ * (with PreferredDERP region) advertised to the control plane.
+ *
+ * Returns ESP_OK if dataplane came up within timeout, ESP_ERR_TIMEOUT
+ * otherwise. */
+esp_err_t tinylink_wait_dataplane_ms(uint32_t timeout_ms);
+
 /* M3 first cut — spawn the TMP117 telemetry task. The task initializes
  * the I²C bus + sensor, then sends one JSON datagram per
  * `CONFIG_TINYLINK_TELEMETRY_PERIOD_MS` to the configured destination
