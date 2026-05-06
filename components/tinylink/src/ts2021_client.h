@@ -21,6 +21,8 @@
 #include "esp_err.h"
 #include "esp_tls.h"
 
+#include "nghttp2/nghttp2.h"
+
 #include "noise_ik.h"
 
 #define TS2021_PROTOCOL_NAME    "Noise_IK_25519_ChaChaPoly_BLAKE2s"
@@ -52,6 +54,19 @@
 extern "C" {
 #endif
 
+/* Streaming-callback shape used by h2_post_json_stream(). Defined here
+ * so it can be embedded in ts2021_conn_t below without h2_client.h
+ * pulling ts2021_client.h transitively (which would create a cycle).
+ * h2_client.h aliases this as `h2_data_callback` for the public API. */
+typedef int (*h2_stream_fn_t)(const uint8_t *buf, size_t len, void *ctx);
+
+/* Cap on the SETTINGS handshake pump in h2_session_init(). The exchange
+ * we drive is: client SETTINGS → server SETTINGS+ACK → our ACK. Each
+ * iteration of the pump is one nghttp2_session_send + one
+ * nghttp2_session_recv; in practice 3 iterations suffice but we cap
+ * at 20 as a safety bound against an unresponsive peer. */
+#define H2_SETTINGS_PUMP_MAX 20
+
 typedef struct {
     esp_tls_t        *tls;
     noise_ik_state_t  noise;
@@ -63,6 +78,62 @@ typedef struct {
     uint8_t  rx_residual[TS2021_RECORD_PLAINTEXT_MAX];
     size_t   rx_residual_len;
     size_t   rx_residual_off;
+
+    /* ---- Persistent HTTP/2 session state (M5 step 2c) ----
+     *
+     * The session is created once by h2_session_init() at the end of
+     * ts2021_connect (when only the long-poll TLS conn is alive and
+     * ~24 KiB of contiguous heap is still available) and torn down by
+     * h2_session_destroy() at the start of ts2021_close. This avoids
+     * the per-request session_client_new/del cycle that returned
+     * NGHTTP2_ERR_NOMEM (-901) once a second TLS conn (the DERP
+     * supervisor) had fragmented the heap.
+     *
+     * All h2_* fields below live in this struct so the nghttp2
+     * callbacks (which receive `ts2021_conn_t *` as user_data) can
+     * persist state across requests without heap allocs. */
+    nghttp2_session *h2;
+    bool             h2_goaway;          /* server sent GOAWAY → reconnect */
+    bool             h2_settings_acked;  /* both initial SETTINGS pumped */
+
+    /* Decrypted-Noise plaintext ring fed into nghttp2's recv_cb. Lives
+     * in BSS via the file-scope ts2021_conn_t in tinylink.c — sized at
+     * one Noise record so the codec can stage one frame at a time. */
+    uint8_t  h2_rx[TS2021_RECORD_PLAINTEXT_MAX];
+    size_t   h2_rx_len;
+    size_t   h2_rx_off;
+
+    /* One-shot permission token for h2_recv_cb. Set by h2_drive_request
+     * before each session_recv; recv_cb consumes it on the first refill
+     * and returns NGHTTP2_ERR_WOULDBLOCK on subsequent ones so
+     * session_recv unwinds and queued outbound frames (notably
+     * SETTINGS_ACK) flush. Without this the server's idle timeout
+     * (~31 s) closes us before we send ACK. */
+    bool     h2_may_refill;
+
+    /* Body cursor for the in-flight POST. Cleared after each request. */
+    const uint8_t *h2_req_body;
+    size_t         h2_req_body_len;
+    size_t         h2_req_body_off;
+
+    /* Response status + per-stream tracking, written by the nghttp2
+     * callbacks. Cleared at the start of each h2_drive_request. */
+    int      h2_status;
+    int32_t  h2_stream_id;
+    bool     h2_stream_closed;
+    int      h2_stream_error;
+
+    /* Response collection (one-shot mode). Pointer is borrowed from
+     * the h2_post_json caller — this struct is NOT the owner. */
+    uint8_t *h2_resp_buf;
+    size_t   h2_resp_cap;
+    size_t   h2_resp_len;
+    bool     h2_resp_overflow;
+
+    /* Streaming mode (h2_post_json_stream). cb_ctx is borrowed. */
+    h2_stream_fn_t h2_cb;
+    void          *h2_cb_ctx;
+    bool           h2_cb_stop;
 } ts2021_conn_t;
 
 /* Connect, perform Noise IK, swallow optional EarlyPayload. The Noise
