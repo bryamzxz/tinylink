@@ -84,31 +84,60 @@ static esp_err_t bringup(void)
         return err;
     }
 
-    /* DERP login MUST happen before the long-poll grabs heap. Two
-     * modes:
-     *  - SUPERVISED=y: tinylink_derp_supervised_start() establishes a
-     *    persistent conn synchronously and hands it to a recv-loop
-     *    task. The smoke is redundant in this mode.
-     *  - SUPERVISED=n: one-shot smoke that connects+logs in+closes.
-     * Either way, failure here is non-fatal. */
-#if CONFIG_TINYLINK_DERP_SUPERVISED
-    esp_err_t derp_sup_err = tinylink_derp_supervised_start();
-    if (derp_sup_err != ESP_OK) {
-        ESP_LOGW(TAG, "derp supervised start failed: 0x%x — continuing",
-                 derp_sup_err);
-    }
-#else
+    /* SUPERVISED=n boot path: keep the legacy one-shot smoke before
+     * long-poll. Smoke connects+logs in+closes before long-poll claims
+     * heap so it sees an unfragmented heap; failure is non-fatal. */
+#if !CONFIG_TINYLINK_DERP_SUPERVISED
     esp_err_t derr = tinylink_derp_smoke();
     if (derr != ESP_OK) {
         ESP_LOGW(TAG, "derp smoke: 0x%x — continuing", derr);
     }
 #endif
 
+    /* Long-poll FIRST so its TLS conn + nghttp2 session land on a
+     * fresh heap. The long-poll task runs at priority IDLE+4 (higher
+     * than this bringup task) so it preempts here and starts its
+     * handshake immediately. */
     err = tinylink_long_poll_start();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "long-poll start failed: 0x%x", err);
         return err;
     }
+
+#if CONFIG_TINYLINK_DERP_SUPERVISED
+    /* Wait for the long-poll's first netmap before we bring up the
+     * supervised DERP conn. Two reasons:
+     *
+     *   1. Heap order: the long-poll's mbedtls cert verify needs ~12
+     *      KiB contiguous; if we let DERP supervisor's TLS conn fragment
+     *      the heap first, the long-poll handshake fails (we observed
+     *      the "Certificate matched but signature verification failed"
+     *      pattern this triggers).
+     *
+     *   2. Reachability: the FIRST MapRequest is what tells the
+     *      control plane our PreferredDERP region. Before that lands,
+     *      a remote peer doing `tailscale ping <us>` doesn't know
+     *      which DERP region to relay through — its ping never
+     *      arrives at the supervisor. Bringing up DERP after the
+     *      first MapResponse means our HostInfo.NetInfo is already
+     *      registered when DERP starts taking traffic.
+     *
+     * 30 s is generous: register + first MapRequest typically lands
+     * in 5-10 s on this hardware. On timeout we still try to start
+     * the supervisor — best-effort, the recv loop will reconnect on
+     * its own backoff cadence. */
+    esp_err_t wait_err = tinylink_wait_dataplane_ms(30000);
+    if (wait_err != ESP_OK) {
+        ESP_LOGW(TAG, "dataplane did not come up in 30 s — "
+                      "starting supervised DERP anyway");
+    }
+    esp_err_t derp_sup_err = tinylink_derp_supervised_start();
+    if (derp_sup_err != ESP_OK) {
+        ESP_LOGW(TAG, "derp supervised start failed: 0x%x — continuing",
+                 derp_sup_err);
+    }
+#endif
+
     err = tinylink_telemetry_start();
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "telemetry start failed: 0x%x — continuing", err);

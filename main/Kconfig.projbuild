@@ -59,24 +59,30 @@ menu "tinylink application"
         bool "Run a supervised DERP recv-loop task (M5 step 2b)"
         default n
         help
-            Establish a persistent DERP conn at boot (BEFORE the
-            long-poll claims heap) and run derp_client_run() in a
-            dedicated FreeRTOS task: read frames, auto-answer Pings,
-            log received packets, reconnect on stream end. When
-            enabled, the boot-time smoke becomes redundant and is
-            skipped — the supervisor's initial connect_login fills
-            that role.
+            Establish a persistent DERP conn AFTER the long-poll's
+            first netmap and run derp_client_run() in a dedicated
+            FreeRTOS task: read frames, auto-answer DISCO Pings (so
+            `tailscale ping <us>` from a remote peer responds via
+            relay), log received packets, reconnect on stream end.
 
-            Default OFF until the persistent-nghttp2-session refactor
-            lands. With supervisor=y today, ts2021_connect succeeds
-            but nghttp2_session_client_new fails NGHTTP2_ERR_NOMEM
-            (-901): the second TLS conn fragments the heap into ~5-8
-            KiB chunks while nghttp2 needs ~10-14 KiB contiguous in
-            one alloc. The right fix is the TODO already in
-            tinylink.c:137 — keep one nghttp2 session per ts2021_conn
-            so the alloc happens once before DERP comes up. The
-            DYNAMIC_BUFFER=y experiment (PR #20) appeared to work but
-            collides with IDFGH-13752 / #15984 and is not safe.
+            Default OFF on ESP32-WROOM-32E: at the point we'd start
+            the supervisor (post-netmap, post-wg_dataplane_start),
+            the long-poll's TLS in/out buffers + nghttp2 session +
+            WG netif state collectively leave heap_free ≈ 4 KiB —
+            no room for a second TLS conn (mbedtls handshake needs
+            ≥12 KiB contiguous). Measured 2026-05-06 on this branch.
+
+            Paths to enable supervisor=y:
+              - PSRAM-equipped ESP32 variant.
+              - Lazy supervisor: open DERP on demand for outbound
+                relay, close after, no permanent recv loop.
+              - Drastic memory shrink: yajl streaming JSON parser
+                (saves ~62 KiB BSS), reduced WG netif state.
+
+            The DERP_SUPERVISED code path itself is fully wired
+            (derp_client + derp_run_loop + disco_handler) and host-
+            tested — flipping this to y is a one-bit change for any
+            target where the heap budget allows it.
 
     config TINYLINK_DERP_SUPERVISED_BACKOFF_MS
         int "DERP supervised reconnect backoff (ms)"
