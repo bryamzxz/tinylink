@@ -19,7 +19,8 @@ TL_SRC  := ../../components/tinylink/src
 TARGETS := test_blake2s test_curve25519 test_mapresp \
            test_chacha20 test_poly1305 test_chacha20poly1305 \
            test_hkdf_noise test_wg_handshake test_wg_transport \
-           test_wg_demux test_disco test_stun test_tls_io test_derp
+           test_wg_demux test_disco test_stun test_tls_io test_derp \
+           test_disco_handler
 
 all: $(TARGETS)
 
@@ -109,6 +110,22 @@ test_tls_io: test_tls_io.c $(TL_SRC)/tls_io.c $(TL_SRC)/tls_io.h \
 	$(CC) $(CFLAGS) -I$(TL_SRC) -Ihost_include -o $@ \
 	    test_tls_io.c $(TL_SRC)/tls_io.c
 
+# DISCO inbound handler (M3 step 2) — orchestrates open + parse +
+# encode + seal to turn an incoming Ping into a sealed Pong reply.
+# Pure-C, host-testable. Pulls the same nacl_box bundle as test_disco.
+test_disco_handler: test_disco_handler.c \
+                    $(TL_SRC)/disco_handler.c $(TL_SRC)/disco_handler.h \
+                    $(TL_SRC)/disco.c $(TL_SRC)/disco.h \
+                    $(CRYPTO)/nacl_box.c $(CRYPTO)/nacl_box.h \
+                    $(CRYPTO)/curve25519.c $(CRYPTO)/salsa20.c \
+                    $(CRYPTO)/poly1305_donna.c host_mbedtls_shim.c \
+                    host_include/mbedtls/poly1305.h
+	$(CC) $(CFLAGS) -I$(TL_SRC) -I$(CRYPTO) -Ihost_include -o $@ \
+	    test_disco_handler.c \
+	    $(TL_SRC)/disco_handler.c $(TL_SRC)/disco.c \
+	    $(CRYPTO)/nacl_box.c $(CRYPTO)/curve25519.c $(CRYPTO)/salsa20.c \
+	    $(CRYPTO)/poly1305_donna.c host_mbedtls_shim.c
+
 # DERP wire codec + recv loop — frame header + login handshake +
 # packet relay + ping/pong + control frames + the M5 step 2b dispatch
 # loop. Pulls in nacl_box like test_disco does (same poly1305 host
@@ -143,13 +160,13 @@ test_wg_transport: test_wg_transport.c \
         test_chacha20.run test_poly1305.run test_chacha20poly1305.run \
         test_hkdf_noise.run test_wg_handshake.run test_wg_transport.run \
         test_wg_demux.run test_disco.run test_stun.run test_tls_io.run \
-        test_derp.run clean
+        test_derp.run test_disco_handler.run clean
 
 test: test_blake2s.run test_curve25519.run test_mapresp.run \
       test_chacha20.run test_poly1305.run test_chacha20poly1305.run \
       test_hkdf_noise.run test_wg_handshake.run test_wg_transport.run \
       test_wg_demux.run test_disco.run test_stun.run test_tls_io.run \
-      test_derp.run
+      test_derp.run test_disco_handler.run
 
 test_blake2s.run: test_blake2s
 	./test_blake2s
@@ -192,6 +209,9 @@ test_tls_io.run: test_tls_io
 
 test_derp.run: test_derp
 	./test_derp
+
+test_disco_handler.run: test_disco_handler
+	./test_disco_handler
 
 clean:
 	rm -f $(TARGETS)

@@ -19,6 +19,7 @@ idf_component_register(
         "src/wg_transport.c"
         "src/wg_demux.c"
         "src/disco.c"
+        "src/disco_handler.c"
         "src/stun.c"
         "src/stun_probe.c"
         "src/derp.c"
