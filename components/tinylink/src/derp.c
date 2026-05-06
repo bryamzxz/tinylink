@@ -247,21 +247,11 @@ int derp_parse_restarting(const uint8_t *payload, size_t plen,
 /* Recv loop                                                           */
 /* ------------------------------------------------------------------ */
 
-/* Echo a Ping payload back as a Pong frame. Stack scratch only. */
-static int derp_send_pong(tls_io_write_fn wr, void *io_ctx,
-                          const uint8_t ping_data[DERP_PING_LEN])
-{
-    uint8_t buf[DERP_FRAME_HDR_LEN + DERP_PING_LEN];
-    derp_write_frame_header(buf, DERP_FRAME_PONG, DERP_PING_LEN);
-    memcpy(buf + DERP_FRAME_HDR_LEN, ping_data, DERP_PING_LEN);
-    return tls_io_write_full(wr, io_ctx, buf, sizeof(buf));
-}
-
-int derp_run_loop(tls_io_read_fn rd, tls_io_write_fn wr, void *io_ctx,
+int derp_run_loop(tls_io_read_fn rd, derp_send_frame_fn send, void *io_ctx,
                   uint8_t *frame_buf, size_t frame_cap,
                   derp_event_cb_t cb, void *cb_ctx)
 {
-    if (rd == NULL || wr == NULL || frame_buf == NULL) return -5;
+    if (rd == NULL || send == NULL || frame_buf == NULL) return -5;
     /* Need at least 32 (key) + 8 (ping echo) to handle the smallest
      * non-trivial frames. In practice the supervisor will pass ~1.6 KiB
      * so this lower bound is just defensive. */
@@ -349,7 +339,9 @@ int derp_run_loop(tls_io_read_fn rd, tls_io_write_fn wr, void *io_ctx,
         case DERP_FRAME_PING: {
             uint8_t echo[DERP_PING_LEN];
             if (derp_parse_ping_or_pong(frame_buf, plen, echo) != 0) break;
-            if (derp_send_pong(wr, io_ctx, echo) != 0) return -1;
+            if (send(io_ctx, DERP_FRAME_PONG, echo, DERP_PING_LEN) != 0) {
+                return -1;
+            }
             break;
         }
         case DERP_FRAME_PONG:
