@@ -84,14 +84,25 @@ static esp_err_t bringup(void)
         return err;
     }
 
-    /* M5 step 2a smoke: validate the DERP TLS upgrade + login frame
-     * exchange against a real production DERP server BEFORE the
-     * long-poll grabs ~12 KiB of mbedtls cert-chain-verify heap.
-     * Best-effort — failure is non-fatal. */
+    /* DERP login MUST happen before the long-poll grabs heap. Two
+     * modes:
+     *  - SUPERVISED=y: tinylink_derp_supervised_start() establishes a
+     *    persistent conn synchronously and hands it to a recv-loop
+     *    task. The smoke is redundant in this mode.
+     *  - SUPERVISED=n: one-shot smoke that connects+logs in+closes.
+     * Either way, failure here is non-fatal. */
+#if CONFIG_TINYLINK_DERP_SUPERVISED
+    esp_err_t derp_sup_err = tinylink_derp_supervised_start();
+    if (derp_sup_err != ESP_OK) {
+        ESP_LOGW(TAG, "derp supervised start failed: 0x%x — continuing",
+                 derp_sup_err);
+    }
+#else
     esp_err_t derr = tinylink_derp_smoke();
     if (derr != ESP_OK) {
         ESP_LOGW(TAG, "derp smoke: 0x%x — continuing", derr);
     }
+#endif
 
     err = tinylink_long_poll_start();
     if (err != ESP_OK) {
@@ -111,14 +122,6 @@ static esp_err_t bringup(void)
     esp_err_t rerr = tinylink_stun_reprobe_start();
     if (rerr != ESP_OK) {
         ESP_LOGW(TAG, "stun reprobe start failed: 0x%x — continuing static", rerr);
-    }
-
-    /* M5 step 2b: optional supervised DERP recv-loop. No-op unless
-     * CONFIG_TINYLINK_DERP_SUPERVISED=y. Best-effort. */
-    esp_err_t derp_sup_err = tinylink_derp_supervised_start();
-    if (derp_sup_err != ESP_OK) {
-        ESP_LOGW(TAG, "derp supervised start failed: 0x%x — continuing",
-                 derp_sup_err);
     }
 
     ESP_LOGI(TAG, "tinylink up: WG + map long-poll + telemetry + stun-reprobe");

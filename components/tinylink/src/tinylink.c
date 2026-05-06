@@ -221,8 +221,13 @@ esp_err_t tinylink_derp_smoke(void)
 #if CONFIG_TINYLINK_DERP_SUPERVISED
 
 /* Frame buffer sized for typical WG packets (<1500 B) plus the 32-byte
- * src-pub prefix and slack. Per-conn, allocated on the task stack. */
+ * src-pub prefix and slack. */
 #define DERP_SUP_FRAME_CAP 1600
+
+/* Single DERP client owned by the supervisor task. File-scope so
+ * tinylink_derp_supervised_start can establish it synchronously
+ * before the long-poll claims heap, then hand ownership to the task. */
+static derp_client_t s_derp_sup;
 
 typedef struct {
     uint64_t recv_packets;
@@ -276,6 +281,12 @@ static int derp_sup_event_cb(const derp_event_t *e, void *ctx)
     return 0;
 }
 
+/* Task entry: the conn is already live (established by
+ * tinylink_derp_supervised_start). Run the recv loop until error,
+ * then reconnect with backoff. Reconnect attempts may face heap
+ * pressure once the long-poll's TLS conn is alive (~10 KiB largest
+ * free block vs ~12 KiB mbedtls handshake peak); we tolerate by
+ * retrying — eventually long-poll's stream ends and frees room. */
 static void derp_supervised_task(void *arg)
 {
     (void)arg;
@@ -283,40 +294,43 @@ static void derp_supervised_task(void *arg)
     const TickType_t backoff =
         pdMS_TO_TICKS(CONFIG_TINYLINK_DERP_SUPERVISED_BACKOFF_MS);
 
-    ESP_LOGI(TAG, "derp supervisor: starting (host=%s backoff=%dms)",
-             host, CONFIG_TINYLINK_DERP_SUPERVISED_BACKOFF_MS);
-
     derp_sup_stats_t stats = {0};
     static uint8_t frame_buf[DERP_SUP_FRAME_CAP];
 
     for (;;) {
-        derp_client_t c = {0};
-        esp_err_t err = derp_client_connect_login(&c, host, 443,
-                                                  s_keys.node_priv,
-                                                  s_keys.node_pub);
-        if (err == ESP_OK) {
-            ESP_LOGI(TAG, "derp supervisor: login OK server-version=%d, "
-                          "entering recv loop", c.server_version);
-            err = derp_client_run(&c, frame_buf, sizeof(frame_buf),
-                                  derp_sup_event_cb, &stats);
-            if (err == ESP_ERR_INVALID_RESPONSE) {
-                ESP_LOGW(TAG, "derp supervisor: server restarting — backoff");
-            } else {
-                ESP_LOGW(TAG, "derp supervisor: stream ended 0x%x — "
-                              "stats recv=%llu pings=%llu keepalives=%llu",
-                         err,
-                         (unsigned long long)stats.recv_packets,
-                         (unsigned long long)stats.pings_answered,
-                         (unsigned long long)stats.keepalives);
-            }
-            derp_client_close(&c);
+        ESP_LOGI(TAG, "derp supervisor: entering recv loop server-v=%d",
+                 s_derp_sup.server_version);
+        esp_err_t err = derp_client_run(&s_derp_sup, frame_buf, sizeof(frame_buf),
+                                        derp_sup_event_cb, &stats);
+        if (err == ESP_ERR_INVALID_RESPONSE) {
+            ESP_LOGW(TAG, "derp supervisor: server restarting — backoff");
         } else {
-            ESP_LOGW(TAG, "derp supervisor: connect failed 0x%x — backoff",
-                     err);
-            /* connect_login already closed on failure, but be defensive. */
-            derp_client_close(&c);
+            ESP_LOGW(TAG, "derp supervisor: stream ended 0x%x — "
+                          "stats recv=%llu pings=%llu keepalives=%llu",
+                     err,
+                     (unsigned long long)stats.recv_packets,
+                     (unsigned long long)stats.pings_answered,
+                     (unsigned long long)stats.keepalives);
         }
+        derp_client_close(&s_derp_sup);
         vTaskDelay(backoff);
+
+        /* Reconnect. Loop here (not the outer for) so a second
+         * connect failure doesn't fall through to derp_client_run
+         * with a closed client. */
+        for (;;) {
+            ESP_LOGI(TAG, "derp supervisor: reconnect attempt to %s "
+                          "(heap_free=%u largest=%u)",
+                     host,
+                     (unsigned)esp_get_free_heap_size(),
+                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
+            err = derp_client_connect_login(&s_derp_sup, host, 443,
+                                            s_keys.node_priv, s_keys.node_pub);
+            if (err == ESP_OK) break;
+            ESP_LOGW(TAG, "derp supervisor: reconnect failed 0x%x — backoff", err);
+            derp_client_close(&s_derp_sup);
+            vTaskDelay(backoff);
+        }
     }
 }
 
@@ -331,6 +345,30 @@ esp_err_t tinylink_derp_supervised_start(void)
         ESP_LOGI(TAG, "derp supervisor: disabled (empty host)");
         return ESP_OK;
     }
+
+    /* Synchronous first connect: returning success implies the conn
+     * is up and the heap budget for one DERP TLS session is taken.
+     * The caller (main.c bringup) sequences this BEFORE the long-poll
+     * so the second handshake (long-poll's) finds enough contiguous
+     * heap; the inverse order deterministically fails per the heap
+     * fragmentation pattern documented in our config notes. */
+    ESP_LOGI(TAG, "derp supervisor: initial connect host=%s "
+                  "heap_free=%u largest=%u",
+             host,
+             (unsigned)esp_get_free_heap_size(),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
+
+    esp_err_t err = derp_client_connect_login(&s_derp_sup, host, 443,
+                                              s_keys.node_priv,
+                                              s_keys.node_pub);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "derp supervisor: initial connect failed 0x%x", err);
+        derp_client_close(&s_derp_sup);
+        return err;
+    }
+    ESP_LOGI(TAG, "derp supervisor: initial login OK server-v=%d",
+             s_derp_sup.server_version);
+
     /* 24 KiB stack — same budget as the long-poll task. The recv loop
      * itself is small but esp_tls handshake on reconnect needs the
      * same ~12 KiB peak the long-poll already budgeted for. */
@@ -338,6 +376,7 @@ esp_err_t tinylink_derp_supervised_start(void)
                                 24576, NULL, tskIDLE_PRIORITY + 3, NULL);
     if (ok != pdPASS) {
         ESP_LOGE(TAG, "xTaskCreate(derp supervisor) failed");
+        derp_client_close(&s_derp_sup);
         return ESP_ERR_NO_MEM;
     }
     return ESP_OK;
