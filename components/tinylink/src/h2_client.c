@@ -239,17 +239,33 @@ static esp_err_t h2_drive_request(h2_req_t *r,
     nghttp2_session_callbacks_set_on_data_chunk_recv_callback(cbs, data_chunk_cb);
     nghttp2_session_callbacks_set_on_stream_close_callback(cbs, stream_close_cb);
 
+    /* Drop the HPACK encoder's dynamic table to zero: nghttp2 default
+     * is 4 KiB on each direction (encoder + decoder), held alive for
+     * the session lifetime. We're a one-shot request client — header
+     * indexing buys nothing across requests since we del the session
+     * after each — so cap encoder at 0 here, peer gets the same hint
+     * via SETTINGS_HEADER_TABLE_SIZE=0 below. ~4 KiB heap saved per
+     * request. */
+    nghttp2_option *opt = NULL;
+    if (nghttp2_option_new(&opt) != 0) {
+        nghttp2_session_callbacks_del(cbs);
+        return ESP_ERR_NO_MEM;
+    }
+    nghttp2_option_set_max_deflate_dynamic_table_size(opt, 0);
+
     nghttp2_session *session = NULL;
-    int rc = nghttp2_session_client_new(&session, cbs, r);
+    int rc = nghttp2_session_client_new2(&session, cbs, r, opt);
+    nghttp2_option_del(opt);
     nghttp2_session_callbacks_del(cbs);
     if (rc != 0) {
         ESP_LOGE(TAG, "session_client_new: %d", rc);
         return ESP_FAIL;
     }
 
-    /* Disable HPACK dynamic table indexing on our side: we never benefit
-     * from it for one-shot requests. The server may still index its own
-     * responses; nghttp2 handles that transparently on receive. */
+    /* Tell the peer we won't index its headers either: it can stop
+     * holding a 4 KiB encoder dynamic table on its side too. The
+     * server may still ignore this for in-flight indexing decisions
+     * but won't grow new entries. */
     const nghttp2_settings_entry settings[] = {
         { NGHTTP2_SETTINGS_HEADER_TABLE_SIZE, 0 },
         { NGHTTP2_SETTINGS_ENABLE_PUSH, 0 },

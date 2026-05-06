@@ -57,7 +57,7 @@ menu "tinylink application"
 
     config TINYLINK_DERP_SUPERVISED
         bool "Run a supervised DERP recv-loop task (M5 step 2b)"
-        default y
+        default n
         help
             Establish a persistent DERP conn at boot (BEFORE the
             long-poll claims heap) and run derp_client_run() in a
@@ -65,9 +65,18 @@ menu "tinylink application"
             log received packets, reconnect on stream end. When
             enabled, the boot-time smoke becomes redundant and is
             skipped — the supervisor's initial connect_login fills
-            that role. Heap budget for two simultaneous TLS conns
-            is unlocked by MBEDTLS_DYNAMIC_BUFFER=y in
-            sdkconfig.defaults — see the comment block there.
+            that role.
+
+            Default OFF until the persistent-nghttp2-session refactor
+            lands. With supervisor=y today, ts2021_connect succeeds
+            but nghttp2_session_client_new fails NGHTTP2_ERR_NOMEM
+            (-901): the second TLS conn fragments the heap into ~5-8
+            KiB chunks while nghttp2 needs ~10-14 KiB contiguous in
+            one alloc. The right fix is the TODO already in
+            tinylink.c:137 — keep one nghttp2 session per ts2021_conn
+            so the alloc happens once before DERP comes up. The
+            DYNAMIC_BUFFER=y experiment (PR #20) appeared to work but
+            collides with IDFGH-13752 / #15984 and is not safe.
 
     config TINYLINK_DERP_SUPERVISED_BACKOFF_MS
         int "DERP supervised reconnect backoff (ms)"
