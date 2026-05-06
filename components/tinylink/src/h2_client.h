@@ -49,8 +49,12 @@ esp_err_t h2_post_json(ts2021_conn_t *conn,
  * MapRequest with `Stream:true`, and the response is a sequence of
  * length-prefixed MapResponse JSON objects that the caller demuxes in
  * its callback.
- */
-typedef int (*h2_data_callback)(const uint8_t *buf, size_t len, void *ctx);
+ *
+ * `h2_data_callback` is an alias for the type defined in
+ * ts2021_client.h (`h2_stream_fn_t`); the alias keeps the public name
+ * stable while letting ts2021_conn_t embed a function pointer of the
+ * same shape without including this header. */
+typedef h2_stream_fn_t h2_data_callback;
 
 esp_err_t h2_post_json_stream(ts2021_conn_t *conn,
                               const char *path,
@@ -58,6 +62,24 @@ esp_err_t h2_post_json_stream(ts2021_conn_t *conn,
                               const uint8_t *body, size_t body_len,
                               int *status_out,
                               h2_data_callback cb, void *cb_ctx);
+
+/* Build the persistent nghttp2 session bound to `conn`. Called once at
+ * the end of ts2021_connect, while the LP TLS conn is the only one
+ * alive and the heap has a contiguous ~24 KiB free block for the
+ * ~10–14 KiB nghttp2_session struct. Pumps the initial SETTINGS
+ * exchange (client → server → ACK) so the first request lands on a
+ * synchronized session.
+ *
+ * Returns ESP_OK on success; on failure the conn must be torn down.
+ * Idempotent: calling twice on the same conn frees the prior session
+ * before allocating the new one. */
+esp_err_t h2_session_init(ts2021_conn_t *conn);
+
+/* Tear down the persistent session bound to `conn`. Safe to call on a
+ * conn that never had h2_session_init() succeed (no-op). Must be
+ * called BEFORE esp_tls_conn_destroy so the nghttp2 cleanup doesn't
+ * touch a destroyed TLS context. */
+void h2_session_destroy(ts2021_conn_t *conn);
 
 #ifdef __cplusplus
 }

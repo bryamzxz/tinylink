@@ -10,6 +10,7 @@
 #include "esp_log.h"
 #include "mbedtls/ssl.h"
 
+#include "h2_client.h"
 #include "tls_io.h"
 
 static const char *TAG = "ts2021";
@@ -355,7 +356,23 @@ esp_err_t ts2021_connect(ts2021_conn_t *out,
         return ESP_FAIL;
     }
 
+    /* Mark connected BEFORE h2_session_init so its initial SETTINGS
+     * pump can ride ts2021_send/ts2021_recv (those guard on
+     * c->connected). */
     out->connected = true;
+
+    /* Allocate the persistent nghttp2 session NOW, while only this
+     * (long-poll) TLS conn is alive and the heap still has a single
+     * contiguous ~24 KiB block. nghttp2_session_client_new2 wants
+     * ~10–14 KiB in one malloc; if we deferred this until first
+     * request, a second TLS conn (DERP supervisor) could already
+     * have fragmented the heap and the call would return -901
+     * NGHTTP2_ERR_NOMEM. */
+    if (h2_session_init(out) != ESP_OK) {
+        ESP_LOGE(TAG, "h2_session_init failed");
+        ts2021_close(out);
+        return ESP_FAIL;
+    }
     return ESP_OK;
 }
 
@@ -404,6 +421,10 @@ esp_err_t ts2021_recv(ts2021_conn_t *c,
 void ts2021_close(ts2021_conn_t *c)
 {
     if (c == NULL) return;
+    /* Free the persistent H2 session BEFORE the TLS context: nghttp2
+     * may call into our send_cb during shutdown (RST_STREAM/GOAWAY
+     * frames it had queued), and that path dereferences c->tls. */
+    h2_session_destroy(c);
     if (c->tls != NULL) {
         esp_tls_conn_destroy(c->tls);
         c->tls = NULL;
