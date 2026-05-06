@@ -59,15 +59,20 @@ menu "tinylink application"
         bool "Run a supervised DERP recv-loop task (M5 step 2b)"
         default n
         help
-            After the smoke login succeeds, keep the DERP TLS conn
-            alive and run derp_client_run() in a dedicated FreeRTOS
-            task: read frames, answer Pings, log received packets,
-            reconnect on stream end. Default OFF because the
-            supervisor's TLS conn coexists with the long-poll's TLS
-            conn and the second handshake competes for ~12 KiB of
-            mbedtls cert-chain-verify heap; enabling can therefore
-            stress heap on tight builds. Step 3 will replace this
-            opt-in with a magicsock-driven gate.
+            Establish a persistent DERP conn at boot (BEFORE the
+            long-poll claims heap) and run derp_client_run() in a
+            dedicated FreeRTOS task: read frames, auto-answer Pings,
+            log received packets, reconnect on stream end. When
+            enabled, the boot-time smoke becomes redundant and is
+            skipped — the supervisor's initial connect_login fills
+            that role. CAVEAT: with the stock SSL buffer sizes
+            (16 KiB IN / 4 KiB OUT per conn), the long-poll's TLS
+            handshake fails to allocate AFTER the supervisor's TLS
+            conn lives — both records together fragment the heap
+            below the ~12 KiB largest-block needed for mbedtls
+            cert verify. A follow-up that lowers
+            MBEDTLS_SSL_IN_CONTENT_LEN can lift this. Default OFF
+            until then so the long-poll keeps coming up cleanly.
 
     config TINYLINK_DERP_SUPERVISED_BACKOFF_MS
         int "DERP supervised reconnect backoff (ms)"

@@ -25,17 +25,30 @@ static const char *TAG = "derp_client";
  * leaves comfortable headroom and stays small enough for the stack. */
 #define DERP_LOGIN_BUF_LEN  256
 
-/* esp-tls callback adapters for tls_io_*. */
-static ssize_t derp_tls_read(void *ctx, uint8_t *buf, size_t len) {
+/* esp-tls callback adapters for tls_io_*.
+ *
+ * Two flavours: the *_raw versions take an esp_tls_t* directly (used
+ * by the login handshake where derp_client_t is half-initialised),
+ * while the bare derp_tls_read/_write expect a derp_client_t* and
+ * are wired into the recv-loop side, where derp_run_loop hands
+ * io_ctx = derp_client_t* through. Mixing them up at call sites
+ * caused an InstrFetchProhibited at PC=0 (esp_tls_conn_read deref'd
+ * a derp_client_t cast to esp_tls_t — its first field happens to be
+ * tls, so reads partially succeed before veering into garbage). */
+static ssize_t derp_tls_read_raw(void *ctx, uint8_t *buf, size_t len) {
     return esp_tls_conn_read((esp_tls_t *)ctx, buf, len);
 }
-static ssize_t derp_tls_write(void *ctx, const uint8_t *buf, size_t len) {
+static ssize_t derp_tls_write_raw(void *ctx, const uint8_t *buf, size_t len) {
     return esp_tls_conn_write((esp_tls_t *)ctx, (void *)buf, len);
+}
+static ssize_t derp_tls_read(void *ctx, uint8_t *buf, size_t len) {
+    derp_client_t *c = (derp_client_t *)ctx;
+    return esp_tls_conn_read(c->tls, buf, len);
 }
 
 static esp_err_t tls_read_full(esp_tls_t *tls, uint8_t *buf, size_t need)
 {
-    int rc = tls_io_read_full(derp_tls_read, tls, buf, need);
+    int rc = tls_io_read_full(derp_tls_read_raw, tls, buf, need);
     if (rc != 0) {
         ESP_LOGE(TAG, "tls_read_full failed: %d", rc);
         return ESP_FAIL;
@@ -45,7 +58,7 @@ static esp_err_t tls_read_full(esp_tls_t *tls, uint8_t *buf, size_t need)
 
 static esp_err_t tls_write_full(esp_tls_t *tls, const uint8_t *buf, size_t len)
 {
-    int rc = tls_io_write_full(derp_tls_write, tls, buf, len);
+    int rc = tls_io_write_full(derp_tls_write_raw, tls, buf, len);
     if (rc != 0) {
         ESP_LOGE(TAG, "tls_write_full failed: %d", rc);
         return ESP_FAIL;
@@ -275,9 +288,9 @@ static int derp_send_frame_locked(void *ctx, derp_frame_type_t type,
     derp_write_frame_header(hdr, type, (uint32_t)plen);
 
     xSemaphoreTake(c->write_lock, portMAX_DELAY);
-    int rc = tls_io_write_full(derp_tls_write, c->tls, hdr, sizeof(hdr));
+    int rc = tls_io_write_full(derp_tls_write_raw, c->tls, hdr, sizeof(hdr));
     if (rc == 0 && plen > 0) {
-        rc = tls_io_write_full(derp_tls_write, c->tls, payload, plen);
+        rc = tls_io_write_full(derp_tls_write_raw, c->tls, payload, plen);
     }
     xSemaphoreGive(c->write_lock);
     return rc;
@@ -320,12 +333,12 @@ esp_err_t derp_client_send_packet(derp_client_t *c,
                             (uint32_t)total_payload);
 
     xSemaphoreTake(c->write_lock, portMAX_DELAY);
-    int rc = tls_io_write_full(derp_tls_write, c->tls, hdr, sizeof(hdr));
+    int rc = tls_io_write_full(derp_tls_write_raw, c->tls, hdr, sizeof(hdr));
     if (rc == 0) {
-        rc = tls_io_write_full(derp_tls_write, c->tls, dst_pub, DERP_KEY_LEN);
+        rc = tls_io_write_full(derp_tls_write_raw, c->tls, dst_pub, DERP_KEY_LEN);
     }
     if (rc == 0 && plen > 0) {
-        rc = tls_io_write_full(derp_tls_write, c->tls, packet, plen);
+        rc = tls_io_write_full(derp_tls_write_raw, c->tls, packet, plen);
     }
     xSemaphoreGive(c->write_lock);
     return (rc == 0) ? ESP_OK : ESP_FAIL;
