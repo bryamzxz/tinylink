@@ -111,6 +111,25 @@ esp_err_t tinylink_telemetry_start(void);
  * the pre-M5 baseline. */
 esp_err_t tinylink_derp_smoke(void);
 
+/* M5 step 2b — spawn the supervised DERP recv-loop task. The task:
+ *   1. Connects to CONFIG_TINYLINK_DERP_SMOKE_HOST:443 and runs the
+ *      login handshake (same as derp_smoke).
+ *   2. Drives derp_client_run() until the stream errors or the server
+ *      sends FrameRestarting.
+ *   3. Sleeps the configured backoff and reconnects.
+ *
+ * Opt-in: callable only when CONFIG_TINYLINK_DERP_SUPERVISED=y. When
+ * disabled, returns ESP_OK without doing anything (so main.c can call
+ * unconditionally). The supervised conn coexists with the long-poll's
+ * TLS conn at steady state but the second handshake competes for
+ * mbedtls cert-chain-verify heap (~12 KiB), so connect failures will
+ * be retried with backoff rather than treated as fatal.
+ *
+ * Recv events are currently logged only — wiring received WireGuard
+ * packets back into the data plane lands with M5 step 3 (magicsock
+ * fallback) once DISCO peer-pub bookkeeping exists. */
+esp_err_t tinylink_derp_supervised_start(void);
+
 /* M4 — best-effort STUN binding probe to discover the device's public
  * AddrPort. Result is cached and uploaded to the control plane via
  * Hostinfo.Endpoints on the next MapRequest, so peers learn an address

@@ -113,6 +113,14 @@ static esp_err_t bringup(void)
         ESP_LOGW(TAG, "stun reprobe start failed: 0x%x — continuing static", rerr);
     }
 
+    /* M5 step 2b: optional supervised DERP recv-loop. No-op unless
+     * CONFIG_TINYLINK_DERP_SUPERVISED=y. Best-effort. */
+    esp_err_t derp_sup_err = tinylink_derp_supervised_start();
+    if (derp_sup_err != ESP_OK) {
+        ESP_LOGW(TAG, "derp supervised start failed: 0x%x — continuing",
+                 derp_sup_err);
+    }
+
     ESP_LOGI(TAG, "tinylink up: WG + map long-poll + telemetry + stun-reprobe");
     return ESP_OK;
 }

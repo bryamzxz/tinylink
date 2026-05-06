@@ -242,3 +242,128 @@ int derp_parse_restarting(const uint8_t *payload, size_t plen,
     *out_total_ms     = get_u32_be(payload + 4);
     return 0;
 }
+
+/* ------------------------------------------------------------------ */
+/* Recv loop                                                           */
+/* ------------------------------------------------------------------ */
+
+/* Echo a Ping payload back as a Pong frame. Stack scratch only. */
+static int derp_send_pong(tls_io_write_fn wr, void *io_ctx,
+                          const uint8_t ping_data[DERP_PING_LEN])
+{
+    uint8_t buf[DERP_FRAME_HDR_LEN + DERP_PING_LEN];
+    derp_write_frame_header(buf, DERP_FRAME_PONG, DERP_PING_LEN);
+    memcpy(buf + DERP_FRAME_HDR_LEN, ping_data, DERP_PING_LEN);
+    return tls_io_write_full(wr, io_ctx, buf, sizeof(buf));
+}
+
+int derp_run_loop(tls_io_read_fn rd, tls_io_write_fn wr, void *io_ctx,
+                  uint8_t *frame_buf, size_t frame_cap,
+                  derp_event_cb_t cb, void *cb_ctx)
+{
+    if (rd == NULL || wr == NULL || frame_buf == NULL) return -5;
+    /* Need at least 32 (key) + 8 (ping echo) to handle the smallest
+     * non-trivial frames. In practice the supervisor will pass ~1.6 KiB
+     * so this lower bound is just defensive. */
+    if (frame_cap < DERP_KEY_LEN + DERP_PING_LEN) return -5;
+
+    for (;;) {
+        uint8_t hdr[DERP_FRAME_HDR_LEN];
+        if (tls_io_read_full(rd, io_ctx, hdr, sizeof(hdr)) != 0) return -1;
+
+        derp_frame_type_t ftype;
+        uint32_t plen;
+        if (derp_read_frame_header(hdr, sizeof(hdr), &ftype, &plen) != 0) {
+            return -3;
+        }
+        if (plen > frame_cap) {
+            /* Oversize. tls_io has no skip primitive, so we treat this
+             * as fatal — supervisor will drop the conn and reconnect. */
+            return -1;
+        }
+        if (plen > 0) {
+            if (tls_io_read_full(rd, io_ctx, frame_buf, plen) != 0) return -1;
+        }
+
+        switch (ftype) {
+        case DERP_FRAME_RECV_PACKET: {
+            if (plen < DERP_KEY_LEN) break;   /* short, skip */
+            derp_event_t evt = {
+                .kind     = DERP_EVT_RECV_PACKET,
+                .src_pub  = frame_buf,
+                .data     = frame_buf + DERP_KEY_LEN,
+                .data_len = plen - DERP_KEY_LEN,
+            };
+            if (cb && cb(&evt, cb_ctx) != 0) return 0;
+            break;
+        }
+        case DERP_FRAME_PEER_PRESENT: {
+            if (plen < DERP_KEY_LEN) break;
+            derp_event_t evt = {
+                .kind    = DERP_EVT_PEER_PRESENT,
+                .src_pub = frame_buf,
+            };
+            if (cb && cb(&evt, cb_ctx) != 0) return 0;
+            break;
+        }
+        case DERP_FRAME_PEER_GONE: {
+            if (plen < DERP_KEY_LEN) break;
+            uint8_t reason = (plen > DERP_KEY_LEN)
+                             ? frame_buf[DERP_KEY_LEN]
+                             : (uint8_t)DERP_PEER_GONE_DISCONNECTED;
+            derp_event_t evt = {
+                .kind             = DERP_EVT_PEER_GONE,
+                .src_pub          = frame_buf,
+                .peer_gone_reason = reason,
+            };
+            if (cb && cb(&evt, cb_ctx) != 0) return 0;
+            break;
+        }
+        case DERP_FRAME_HEALTH: {
+            derp_event_t evt = {
+                .kind     = DERP_EVT_HEALTH,
+                .data     = frame_buf,
+                .data_len = plen,
+            };
+            if (cb && cb(&evt, cb_ctx) != 0) return 0;
+            break;
+        }
+        case DERP_FRAME_RESTARTING: {
+            uint32_t rc_ms = 0, tot_ms = 0;
+            (void)derp_parse_restarting(frame_buf, plen, &rc_ms, &tot_ms);
+            derp_event_t evt = {
+                .kind                  = DERP_EVT_RESTARTING,
+                .restart_reconnect_ms  = rc_ms,
+                .restart_total_ms      = tot_ms,
+            };
+            if (cb) (void)cb(&evt, cb_ctx);
+            /* Always exit so the supervisor can honor the restart
+             * timing — upstream's behavior too. */
+            return -2;
+        }
+        case DERP_FRAME_KEEPALIVE: {
+            derp_event_t evt = { .kind = DERP_EVT_KEEPALIVE };
+            if (cb && cb(&evt, cb_ctx) != 0) return 0;
+            break;
+        }
+        case DERP_FRAME_PING: {
+            uint8_t echo[DERP_PING_LEN];
+            if (derp_parse_ping_or_pong(frame_buf, plen, echo) != 0) break;
+            if (derp_send_pong(wr, io_ctx, echo) != 0) return -1;
+            break;
+        }
+        case DERP_FRAME_PONG:
+            /* We don't currently send Pings, so this is unexpected but
+             * harmless — upstream tolerates unknown/extra frames. */
+            break;
+        case DERP_FRAME_SERVER_KEY:
+        case DERP_FRAME_SERVER_INFO:
+            /* These are login-only; seeing them post-login means the
+             * server is misbehaving. */
+            return -4;
+        default:
+            /* Unknown frame type. Upstream skips silently. */
+            break;
+        }
+    }
+}

@@ -25,6 +25,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "tls_io.h"   /* tls_io_read_fn / tls_io_write_fn for derp_run_loop */
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -173,6 +175,54 @@ int derp_parse_peer_gone(const uint8_t *payload, size_t plen,
 int derp_parse_restarting(const uint8_t *payload, size_t plen,
                           uint32_t *out_reconnect_ms,
                           uint32_t *out_total_ms);
+
+/* ------------------------------------------------------------------ */
+/* Recv loop (M5 step 2b)                                              */
+/* ------------------------------------------------------------------ */
+
+typedef enum {
+    DERP_EVT_RECV_PACKET    = 1,   /* WG packet from peer (most common) */
+    DERP_EVT_PEER_PRESENT   = 2,
+    DERP_EVT_PEER_GONE      = 3,
+    DERP_EVT_HEALTH         = 4,
+    DERP_EVT_RESTARTING     = 5,
+    DERP_EVT_KEEPALIVE      = 6,
+} derp_event_kind_t;
+
+/* Borrowed pointers — only valid for the duration of the cb call.
+ * Callers that need to keep the bytes must memcpy. */
+typedef struct {
+    derp_event_kind_t kind;
+    const uint8_t    *src_pub;             /* RECV_PACKET / PEER_PRESENT / PEER_GONE: 32 B */
+    const uint8_t    *data;                /* RECV_PACKET payload, HEALTH text */
+    size_t            data_len;
+    uint8_t           peer_gone_reason;
+    uint32_t          restart_reconnect_ms;
+    uint32_t          restart_total_ms;
+} derp_event_t;
+
+/* Return non-zero from the callback to stop the loop cleanly. */
+typedef int (*derp_event_cb_t)(const derp_event_t *evt, void *ctx);
+
+/* Run the recv loop using the supplied I/O callbacks (same shape as
+ * tls_io_*_full's reader/writer). Reads frames in a hot loop,
+ * internally answers FramePing with FramePong (echoing the 8-byte
+ * payload), and invokes cb on every event the loop deems interesting.
+ *
+ * frame_buf must hold a single frame's payload. We cap accepted
+ * payload length at frame_cap; oversized frames are fatal (we cannot
+ * skip-without-reading through the tls_io abstraction).
+ *
+ * Return values:
+ *    0  cb returned non-zero — caller-driven termination
+ *   -1  read/write failure or oversized frame
+ *   -2  server FrameRestarting — supervisor must honor restart timing
+ *   -3  bad frame parse
+ *   -4  unexpected post-login frame (ServerKey / ServerInfo)
+ *   -5  bad arg / capacity too small */
+int derp_run_loop(tls_io_read_fn rd, tls_io_write_fn wr, void *io_ctx,
+                  uint8_t *frame_buf, size_t frame_cap,
+                  derp_event_cb_t cb, void *cb_ctx);
 
 #ifdef __cplusplus
 }

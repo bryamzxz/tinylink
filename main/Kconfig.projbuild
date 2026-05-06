@@ -55,6 +55,31 @@ menu "tinylink application"
             closer relay for boot-latency reasons. Set to empty to
             skip the smoke test entirely.
 
+    config TINYLINK_DERP_SUPERVISED
+        bool "Run a supervised DERP recv-loop task (M5 step 2b)"
+        default n
+        help
+            After the smoke login succeeds, keep the DERP TLS conn
+            alive and run derp_client_run() in a dedicated FreeRTOS
+            task: read frames, answer Pings, log received packets,
+            reconnect on stream end. Default OFF because the
+            supervisor's TLS conn coexists with the long-poll's TLS
+            conn and the second handshake competes for ~12 KiB of
+            mbedtls cert-chain-verify heap; enabling can therefore
+            stress heap on tight builds. Step 3 will replace this
+            opt-in with a magicsock-driven gate.
+
+    config TINYLINK_DERP_SUPERVISED_BACKOFF_MS
+        int "DERP supervised reconnect backoff (ms)"
+        depends on TINYLINK_DERP_SUPERVISED
+        default 15000
+        range 1000 600000
+        help
+            Sleep between a stream end / connect failure and the next
+            connect attempt. Mirrors the long-poll's
+            TINYLINK_REGISTER_RETRY_MS shape — small enough to recover
+            quickly, large enough to avoid hammering the server.
+
     config TINYLINK_STUN_REPROBE_MS
         int "STUN re-probe cadence (ms, M4)"
         default 300000

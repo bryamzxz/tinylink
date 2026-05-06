@@ -207,6 +207,145 @@ esp_err_t tinylink_derp_smoke(void)
     return err;
 }
 
+/* ---- DERP supervised recv-loop task (M5 step 2b) -----------------------
+ *
+ * Long-running task: connect+login → run recv loop → close → backoff →
+ * repeat. Coexists with the long-poll's TLS conn at steady state but
+ * the second handshake competes with mbedtls cert-chain-verify heap,
+ * so connect failures are logged and retried with backoff (not fatal).
+ *
+ * Recv events are currently logged only — wiring relayed WireGuard
+ * packets back into wg_demux is M5 step 3 work (depends on DISCO peer
+ * registration to know which DERP src maps to which peer index). */
+
+#if CONFIG_TINYLINK_DERP_SUPERVISED
+
+/* Frame buffer sized for typical WG packets (<1500 B) plus the 32-byte
+ * src-pub prefix and slack. Per-conn, allocated on the task stack. */
+#define DERP_SUP_FRAME_CAP 1600
+
+typedef struct {
+    uint64_t recv_packets;
+    uint64_t pings_answered;
+    uint64_t keepalives;
+    uint64_t peer_present;
+    uint64_t peer_gone;
+} derp_sup_stats_t;
+
+static int derp_sup_event_cb(const derp_event_t *e, void *ctx)
+{
+    derp_sup_stats_t *st = (derp_sup_stats_t *)ctx;
+    switch (e->kind) {
+    case DERP_EVT_RECV_PACKET:
+        st->recv_packets++;
+        ESP_LOGI(TAG, "derp recv: src=%02x%02x..%02x%02x len=%u (total=%llu)",
+                 e->src_pub[0], e->src_pub[1],
+                 e->src_pub[DERP_KEY_LEN - 2], e->src_pub[DERP_KEY_LEN - 1],
+                 (unsigned)e->data_len,
+                 (unsigned long long)st->recv_packets);
+        break;
+    case DERP_EVT_KEEPALIVE:
+        st->keepalives++;
+        ESP_LOGD(TAG, "derp keepalive (total=%llu)",
+                 (unsigned long long)st->keepalives);
+        break;
+    case DERP_EVT_PEER_PRESENT:
+        st->peer_present++;
+        ESP_LOGI(TAG, "derp peer-present: %02x%02x..%02x%02x",
+                 e->src_pub[0], e->src_pub[1],
+                 e->src_pub[DERP_KEY_LEN - 2], e->src_pub[DERP_KEY_LEN - 1]);
+        break;
+    case DERP_EVT_PEER_GONE:
+        st->peer_gone++;
+        ESP_LOGI(TAG, "derp peer-gone: %02x%02x..%02x%02x reason=%u",
+                 e->src_pub[0], e->src_pub[1],
+                 e->src_pub[DERP_KEY_LEN - 2], e->src_pub[DERP_KEY_LEN - 1],
+                 (unsigned)e->peer_gone_reason);
+        break;
+    case DERP_EVT_HEALTH:
+        ESP_LOGW(TAG, "derp health: %.*s",
+                 (int)(e->data_len > 80 ? 80 : e->data_len),
+                 (const char *)e->data);
+        break;
+    case DERP_EVT_RESTARTING:
+        ESP_LOGW(TAG, "derp restarting: reconnect_ms=%u total_ms=%u",
+                 (unsigned)e->restart_reconnect_ms,
+                 (unsigned)e->restart_total_ms);
+        break;
+    }
+    return 0;
+}
+
+static void derp_supervised_task(void *arg)
+{
+    (void)arg;
+    const char *host = CONFIG_TINYLINK_DERP_SMOKE_HOST;
+    const TickType_t backoff =
+        pdMS_TO_TICKS(CONFIG_TINYLINK_DERP_SUPERVISED_BACKOFF_MS);
+
+    ESP_LOGI(TAG, "derp supervisor: starting (host=%s backoff=%dms)",
+             host, CONFIG_TINYLINK_DERP_SUPERVISED_BACKOFF_MS);
+
+    derp_sup_stats_t stats = {0};
+    static uint8_t frame_buf[DERP_SUP_FRAME_CAP];
+
+    for (;;) {
+        derp_client_t c = {0};
+        esp_err_t err = derp_client_connect_login(&c, host, 443,
+                                                  s_keys.node_priv,
+                                                  s_keys.node_pub);
+        if (err == ESP_OK) {
+            ESP_LOGI(TAG, "derp supervisor: login OK server-version=%d, "
+                          "entering recv loop", c.server_version);
+            err = derp_client_run(&c, frame_buf, sizeof(frame_buf),
+                                  derp_sup_event_cb, &stats);
+            if (err == ESP_ERR_INVALID_RESPONSE) {
+                ESP_LOGW(TAG, "derp supervisor: server restarting — backoff");
+            } else {
+                ESP_LOGW(TAG, "derp supervisor: stream ended 0x%x — "
+                              "stats recv=%llu pings=%llu keepalives=%llu",
+                         err,
+                         (unsigned long long)stats.recv_packets,
+                         (unsigned long long)stats.pings_answered,
+                         (unsigned long long)stats.keepalives);
+            }
+            derp_client_close(&c);
+        } else {
+            ESP_LOGW(TAG, "derp supervisor: connect failed 0x%x — backoff",
+                     err);
+            /* connect_login already closed on failure, but be defensive. */
+            derp_client_close(&c);
+        }
+        vTaskDelay(backoff);
+    }
+}
+
+#endif /* CONFIG_TINYLINK_DERP_SUPERVISED */
+
+esp_err_t tinylink_derp_supervised_start(void)
+{
+#if CONFIG_TINYLINK_DERP_SUPERVISED
+    if (!s_initialized) return ESP_ERR_INVALID_STATE;
+    const char *host = CONFIG_TINYLINK_DERP_SMOKE_HOST;
+    if (host == NULL || host[0] == '\0') {
+        ESP_LOGI(TAG, "derp supervisor: disabled (empty host)");
+        return ESP_OK;
+    }
+    /* 24 KiB stack — same budget as the long-poll task. The recv loop
+     * itself is small but esp_tls handshake on reconnect needs the
+     * same ~12 KiB peak the long-poll already budgeted for. */
+    BaseType_t ok = xTaskCreate(derp_supervised_task, "tinylink_derp",
+                                24576, NULL, tskIDLE_PRIORITY + 3, NULL);
+    if (ok != pdPASS) {
+        ESP_LOGE(TAG, "xTaskCreate(derp supervisor) failed");
+        return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
+#else
+    return ESP_OK;
+#endif
+}
+
 static esp_err_t long_poll_handler(const tl_netmap_t *nm, void *ctx)
 {
     (void)ctx;

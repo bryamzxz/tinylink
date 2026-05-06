@@ -249,4 +249,20 @@ void derp_client_close(derp_client_t *c)
     c->connected = false;
 }
 
+esp_err_t derp_client_run(derp_client_t *c,
+                          uint8_t *frame_buf, size_t frame_cap,
+                          derp_event_cb_t cb, void *cb_ctx)
+{
+    if (c == NULL || c->tls == NULL || !c->connected || frame_buf == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    int rc = derp_run_loop(derp_tls_read, derp_tls_write, c->tls,
+                           frame_buf, frame_cap, cb, cb_ctx);
+    switch (rc) {
+        case  0: return ESP_OK;                          /* cb stop */
+        case -2: return ESP_ERR_INVALID_RESPONSE;        /* RESTARTING */
+        default: return ESP_FAIL;
+    }
+}
+
 #endif /* ESP_PLATFORM */

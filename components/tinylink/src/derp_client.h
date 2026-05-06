@@ -51,6 +51,22 @@ esp_err_t derp_client_connect_login(derp_client_t *out,
  * already-closed or never-connected client. */
 void derp_client_close(derp_client_t *c);
 
+/* Drive the recv loop on top of an already-logged-in client. Wraps
+ * derp_run_loop with esp_tls read/write callbacks. Internally answers
+ * FramePing with FramePong; invokes cb on every relayed event.
+ *
+ * frame_buf must persist across the call and hold at least 40 bytes
+ * (32 src key + 8 ping). Sized for typical WG packets, ~1600 B is
+ * comfortable. Returns:
+ *   ESP_OK                     cb returned non-zero (caller stop)
+ *   ESP_ERR_INVALID_RESPONSE   server FrameRestarting (supervisor must
+ *                              honor evt.restart_reconnect_ms)
+ *   ESP_ERR_INVALID_STATE      not connected
+ *   ESP_FAIL                   I/O error or protocol violation */
+esp_err_t derp_client_run(derp_client_t *c,
+                          uint8_t *frame_buf, size_t frame_cap,
+                          derp_event_cb_t cb, void *cb_ctx);
+
 #ifdef __cplusplus
 }
 #endif
