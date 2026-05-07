@@ -37,41 +37,55 @@ CONFIG_MBEDTLS_CHACHA20_C=y
 CONFIG_MBEDTLS_CHACHAPOLY_C=y
 CONFIG_MBEDTLS_HKDF_C=y
 # Heap budget for two simultaneous TLS conns (long-poll + DERP
-# supervisor) — comments revised 2026-05-06 against forensic notes
-# in ~/.claude/projects/-home-bryam-dev-tinylink/memory/reference_tinylink_supervised_heap.md
-# and the followup compass artifact at ~/Descargas/compass_artifact_*.
+# supervisor). Pinning rationale, item-by-item:
 #
-# 1. DYNAMIC_BUFFER stays OFF.
-#    The earlier "DYNAMIC_BUFFER=y unlocks supervisor=y" experiment
-#    (PR #20, 512f772) passed a 90 s soak but conflicts with two
-#    documented IDF bugs: PR #14614 / IDFGH-13752 (heap corruption
-#    when DYNAMIC_BUFFER + IN_CONTENT_LEN<16384) and #15984 (TLS 1.3
-#    panics with DYNAMIC_BUFFER on). Plus the 2026-05-02 incident
-#    that originally turned it off was corruption mid-write; even if
-#    it was tickets-related, we now have safer levers that don't
-#    rely on it.
-# 2. SESSION_TICKETS back ON.
-#    Tailscale's control plane GOAWAYs the long-poll every ~2 min;
-#    each reconnect needs a fresh TLS handshake. With a valid
-#    NewSessionTicket the resumed handshake skips the Certificate
-#    message — saves ~10 KiB on the transient peak (no cert chain
-#    verify, no RSA-2048 of the LE intermediate). Bigger lever than
-#    DYNAMIC_BUFFER's ~5 KiB, on a recurring rather than one-time
-#    event.
-# 3. IN_CONTENT_LEN stays at 16384.
-#    Go's crypto/tls (what controlplane.tailscale.com runs) emits
-#    TLS records up to 16384 plaintext, regardless of the application
-#    layer's frame sizes. Lowering IN below 16384 would surface as
-#    record_overflow alerts on a large keepalive or the first
-#    MapResponse. Confirmed by microlink/esphome-tailscale needing
-#    PSRAM precisely because of this floor.
-# 4. OUT_CONTENT_LEN drops 4096 → 2048.
-#    tinylink emits short frames in both directions: MapRequest is
-#    ~500 B-2 KiB, DERP frames are <1500 B WG packets. 2 KiB is
-#    enough headroom and saves 2 KiB per conn × 2 conns = 4 KiB.
-# 5. KEEP_PEER_CERTIFICATE stays OFF (was already n).
-#    Saves ~2 KiB per conn — we don't introspect certs after verify.
-CONFIG_MBEDTLS_DYNAMIC_BUFFER=n
+# 1. DYNAMIC_BUFFER=y + SESSION_TICKETS=n. Verified on-device 2026-05-06.
+#
+# History: PR #20 (512f772) experimented with DYNAMIC_BUFFER=y and a
+# 2026-05-02 incident reported mid-write heap corruption, after which
+# the flag was reverted. The followup notes attributed it ambiguously
+# to either DYNAMIC_BUFFER itself or the (DYNAMIC_BUFFER + tickets)
+# combination plus IDF bug PR #14614 / IDFGH-13752 (heap corruption
+# when DYNAMIC_BUFFER + IN_CONTENT_LEN<16384) and #15984 (TLS 1.3
+# panics with DYNAMIC_BUFFER on).
+#
+# This sprint isolated the variables: DYNAMIC_BUFFER=y with
+# SESSION_TICKETS=n through 5+ minutes of steady-state long-poll
+# (full handshake on every reconnect, no ticket resumption) plus
+# 70+ telemetry tx in a row, zero corruption, zero alloc fails,
+# zero stream ends. IN_CONTENT_LEN stays at 16384 so #14614 does
+# not apply. #15984 was historically a TLS 1.3 panic on connect;
+# our tinylink-→Tailscale TLS path negotiates 1.3 and connects
+# cleanly here, so either the IDF fix landed in v5.5.4 or our
+# ciphersuite/extension set sidesteps the trigger.
+#
+# Heap effect: at supervisor-connect time (post-bringup, post-WG)
+# largest_block went from 7.4 KiB → 11.8 KiB (+4.4 KiB). Still
+# below the 12 KiB peak mbedtls cert verify needs for the second
+# TLS conn, so SUPERVISED=y still doesn't connect on first try
+# without further work — that's a separate PR (supervisor task
+# restructure to retry until heap allows).
+#
+# Trade-off vs SESSION_TICKETS=y: each long-poll reconnect now does
+# a full TLS handshake (cert chain verify, RSA signature) instead
+# of resuming via NewSessionTicket. ~10 KiB transient peak instead
+# of ~4 KiB transient peak. Acceptable because the steady-state
+# heap budget freed by DYNAMIC_BUFFER=y outweighs the per-reconnect
+# cost on this ESP32-WROOM-32E target.
+#
+# 2. IN_CONTENT_LEN stays at 16384. Go's crypto/tls (what
+#    controlplane.tailscale.com runs) emits TLS records up to 16384
+#    plaintext regardless of the application layer's frame sizes.
+#    Lowering IN below 16384 would surface as record_overflow alerts
+#    on a large keepalive or the first MapResponse. Also keeps us
+#    out of IDF bug PR #14614 / IDFGH-13752 (heap corruption when
+#    DYNAMIC_BUFFER + IN_CONTENT_LEN<16384).
+# 3. OUT_CONTENT_LEN at 2048 (down from 4096). tinylink emits short
+#    frames in both directions: MapRequest ~500 B-2 KiB, DERP
+#    frames <1500 B WG packets. Saves 2 KiB per conn × 2 conns.
+# 4. KEEP_PEER_CERTIFICATE off. Saves ~2 KiB per conn; we don't
+#    introspect certs after verify.
+CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
 CONFIG_MBEDTLS_DYNAMIC_FREE_CA_CERT=n
 CONFIG_MBEDTLS_SSL_KEEP_PEER_CERTIFICATE=n
 CONFIG_MBEDTLS_SSL_MAX_CONTENT_LEN=4096
@@ -79,7 +93,7 @@ CONFIG_MBEDTLS_ASYMMETRIC_CONTENT_LEN=y
 CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=16384
 CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=2048
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
-CONFIG_MBEDTLS_CLIENT_SSL_SESSION_TICKETS=y
+CONFIG_MBEDTLS_CLIENT_SSL_SESSION_TICKETS=n
 
 # ---- lwIP tunings ------------------------------------------------------------
 CONFIG_LWIP_TCPIP_CORE_LOCKING=y
