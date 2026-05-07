@@ -68,7 +68,7 @@ menu "tinylink application"
             "client has no preference").
 
     config TINYLINK_DERP_SUPERVISED
-        bool "Run a supervised DERP recv-loop task (M5 step 2b)"
+        bool "Run a supervised DERP recv-loop task"
         default n
         help
             Establish a persistent DERP conn AFTER the long-poll's
@@ -77,24 +77,34 @@ menu "tinylink application"
             `tailscale ping <us>` from a remote peer responds via
             relay), log received packets, reconnect on stream end.
 
-            Default OFF on ESP32-WROOM-32E: at the point we'd start
-            the supervisor (post-netmap, post-wg_dataplane_start),
-            the long-poll's TLS in/out buffers + nghttp2 session +
-            WG netif state collectively leave heap_free ≈ 4 KiB —
-            no room for a second TLS conn (mbedtls handshake needs
-            ≥12 KiB contiguous). Measured 2026-05-06 on this branch.
+            Default OFF on ESP32-WROOM-32E. Measured 2026-05-06 with
+            persistent nghttp2 (#22) + boot reorder (697434f) +
+            wait-for-dataplane gate already in main:
+              At supervisor connect time: heap_free ≈ 8.9 KiB,
+              largest_block ≈ 7.4 KiB. mbedtls cert verify needs
+              ≥ 12 KiB contiguous → DERP TLS handshake fails with
+              MBEDTLS_ERR_SSL_ALLOC_FAILED in a permanent backoff
+              loop.
+              ALSO: the additional heap pressure from the supervisor
+              path's static state interacts with esp_netif_new at
+              wg_lwip_attach time — observed `esp_netif_new_ppp`
+              failing and the WG netif never coming up. Net effect
+              of flipping this to y on stock ESP32-WROOM-32E:
+              regresses the connect path entirely. Do not enable
+              without one of:
+                - PSRAM-equipped ESP32 variant
+                - MBEDTLS_DYNAMIC_BUFFER=y (needs the historical
+                  TX-buffer corruption with session tickets to be
+                  re-investigated, see sdkconfig.defaults note)
+                - Lazy supervisor (open DERP only when WG sendto
+                  fails; close after) instead of permanent recv loop
+                - Drastic BSS shrink (streaming JSON parser,
+                  reduced WG netif state)
 
-            Paths to enable supervisor=y:
-              - PSRAM-equipped ESP32 variant.
-              - Lazy supervisor: open DERP on demand for outbound
-                relay, close after, no permanent recv loop.
-              - Drastic memory shrink: yajl streaming JSON parser
-                (saves ~62 KiB BSS), reduced WG netif state.
-
-            The DERP_SUPERVISED code path itself is fully wired
-            (derp_client + derp_run_loop + disco_handler) and host-
-            tested — flipping this to y is a one-bit change for any
-            target where the heap budget allows it.
+            The supervisor *code* is fully wired (derp_client +
+            derp_run_loop + disco_handler) and host-tested. Flipping
+            to y is a one-bit change for any target where the heap
+            budget allows it.
 
     config TINYLINK_DERP_SUPERVISED_BACKOFF_MS
         int "DERP supervised reconnect backoff (ms)"
