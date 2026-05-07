@@ -59,3 +59,8 @@ tools/test/test_hkdf_noise
 tools/test/test_wg_handshake
 tools/test/test_wg_transport
 tools/test/test_wg_demux
+tools/test/test_stun
+tools/test/test_tls_io
+tools/test/test_derp
+tools/test/test_disco
+tools/test/test_disco_handler
