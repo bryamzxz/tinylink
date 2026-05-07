@@ -16,21 +16,45 @@ Go implementation, which is the authoritative reference for wire format.
 |----|-----------------------------------------------|-------------------------------------|------------------|----------|
 | M1 | ts2021 control plane (register only)          | done                                | v0.1             | 2-3 wk   |
 | M2 | MapRequest streaming + WireGuard data plane   | done                                | v0.2             | 2-3 wk   |
-| M3 | DISCO P2P discovery + TMP117 telemetry        | partial — DISCO via DERP live       | v0.3             | 1-2 wk   |
-| M4 | STUN minimal binding                          | done                                | v0.4             | 0.5 wk   |
-| M5 | DERP relay fallback + reconnection            | first cut — recv path live          | v0.5             | 1-2 wk   |
-| M6 | Production hardening (NVS, secure boot, OTA)  | pending                             | v0.6             | ongoing  |
+| M3 | DISCO P2P discovery + TMP117 telemetry        | done — direct UDP + DERP            | v0.3             | 1-2 wk   |
+| M4 | STUN minimal binding                          | done — runs on WG socket            | v0.4             | 0.5 wk   |
+| M5 | DERP relay + direct-UDP NAT traversal         | done — DISCO punch via CallMeMaybe  | v0.5             | 1-2 wk   |
+| M6 | ICMP-over-WG end-to-end                       | done — verified on hardware         | v0.6             | <1 wk    |
+| M7 | Production hardening (NVS, secure boot, OTA)  | pending                             | v0.7             | ongoing  |
 
-Outstanding cross-cutting work item: a queue-based outbound model
-that lets `wg_netif` (lwIP TCPIP context) and the DERP supervisor
-post encrypted bytes to a worker task. Without it, outbound WG
-transport via lwIP is dropped at the netif TX callback to avoid a
-re-entrancy deadlock, so real ICMP over the tunnel doesn't flow yet
-even though the WG handshake completes and DISCO ping/pong via DERP
-works. Tracked alongside the outbound DERP queue (M5 step 2).
+End-to-end verification on hardware (sensor-cali next to router,
+Servidor1 WG peer with public IP):
 
-Total realistic timeline (one engineer full-time): **8–12 weeks**
-[research §K].
+```
+$ tailscale ping sensor-cali        # from Servidor1
+pong from sensor-cali (100.67.60.92) via 190.109.12.37:50582 in 403ms
+$ ping -c 10 100.67.60.92            # from Servidor1
+10 packets transmitted, 10 received, 0% packet loss, time 9008ms
+rtt min/avg/max/mdev = 48.916/93.805/141.008/28.296 ms
+```
+
+Total realistic timeline to land all of M1–M6 (one engineer
+full-time): **8–12 weeks** [research §K]. M7 hardening is
+project-lifetime ongoing.
+
+Remaining quality-of-life follow-ups (none blocking the
+established direct-UDP + ICMP path):
+
+- **Pre-punch on netmap-receive**: the first `tailscale ping` from a
+  fresh peer takes 3 DERP rounds before flipping to direct, because
+  the device only punches outbound DISCO when it receives a CMM. If
+  we punch every advertised peer endpoint on netmap-receive too, the
+  direct path is up by the time the peer first probes us.
+- **WG handshake init delay**: handshake retries 2–5× at boot before
+  `session up`, because we fire the init at t≈15s while the peer's
+  netmap may not yet contain our current AddrPort. Delaying init
+  until the first inbound DISCO observation cuts the retry cost.
+- **stun_reprobe → fetch_once trigger**: NAT port rotates ~5 min on
+  consumer routers; we should re-push Endpoints + NetInfo via
+  `mapreq_push_endpoints` whenever the re-probe sees a port change.
+- **DERP outbound queue**: needed only for peers behind shared CGNAT
+  (where direct UDP can never punch). For peers with public IPs the
+  direct path covers all traffic.
 
 ## M1 — ts2021 control plane (current)
 
@@ -166,19 +190,40 @@ ES: Mismo contenido, en español a futuro.
   `CONFIG_TINYLINK_TELEMETRY_ENABLE=n` collapses the call to a no-op
   for boards without a TMP117.
 
-**Step 2 (next commit, "feat(m3): DISCO + UDP demuxer"):**
-NaCl-box DISCO ping/pong on the WG UDP socket (multiplexed by first
-byte: WG types 1-4, DISCO `0x54 0x53 0xF0 0x9F 0x92 0xAC` = "TS💬",
-STUN `0x00 0x01`). Only message types 0x01 (Ping), 0x02 (Pong),
-0x03 (CallMeMaybe) are required. Drop 0x04-0x09 (peer-relay) on receive,
-never emit [research §C].
+**Step 2 (landed in PR #42 `feat: direct UDP path end-to-end`):**
+NaCl-box DISCO ping/pong on the same UDP socket as WG (multiplexed
+by first byte in `wg_demux_classify`: WG types 1-4, DISCO magic
+`0x54 0x53 0xF0 0x9F 0x92 0xAC` = "TS💬", STUN `0x00 0x01`). The
+RX task in `wg_netif.c` handles WG_DEMUX_DISCO inline via
+`handle_disco_direct` — decrypts the NaCl box with the local
+DiscoKey, builds a sealed Pong, and `sendto`s it back to the source
+AddrPort. Drops `Pong` (we don't track outbound probers) and
+`CallMeMaybe` (handled below).
 
-Path probing collapses to one address: send Ping to last-known endpoint
-on startup, mark "up" on first valid Pong, heartbeat every 2 s. ~150 LoC
-versus ~1500 in the real implementation.
+CallMeMaybe handling lives in `tinylink.c::send_disco_pings_to_cmm_endpoints`:
+when the DERP supervisor receives a CMM, the device emits a fresh
+sealed DISCO Ping via the WG socket to each v4-mapped peer
+endpoint advertised in the CMM. Each outbound ping opens the
+device-side NAT mapping for that destination so the peer's
+simultaneous probe can land on us — that's the NAT-punching pair
+that makes the path go "direct" instead of "DERP" in
+`tailscale ping`.
 
-Requires the deferred `wireguardif.c` patch from M2 step 3 so DISCO
-and WG can share the UDP socket.
+Five interlocking conditions had to land together for direct UDP
+to work end-to-end (see PR #42 commit message + `reference_tinylink_direct_udp.md`):
+
+1. STUN runs on the WG socket so the advertised port matches the
+   WG NAT mapping that keepalives keep pinned.
+2. WG_DEMUX_DISCO classified before the peer-source filter so DISCO
+   from a non-WG-peer src isn't dropped.
+3. MapRequest is `Stream=false && OmitPeers=true` (lite update —
+   the only shape modern Tailscale.com persists).
+4. `NetInfo.WorkingUDP=true` accompanies the lite update — server
+   refuses to propagate Endpoints without this signal.
+5. CMM punch handler emits outbound DISCO pings on receive.
+
+Requires no `wireguardif.c` patch; the data plane is in-tree
+(`wg_netif.c`) and owns the socket.
 
 ## M4 — STUN
 
@@ -191,23 +236,91 @@ sensor unless the router reboots).
 
 ES: idem.
 
-## M5 — DERP
+## M5 — DERP relay + direct-UDP NAT traversal
 
 EN: Minimal DERP client over TLS (HTTP Upgrade), framed as
 `type(1) || BE32 length || payload`. Constants in `derp/derp.go`
 upstream. Required frames: `FrameServerKey(0x01)`, `FrameClientInfo(0x02)`,
 `FrameSendPacket(0x04)`, `FrameRecvPacket(0x05)`, `FrameKeepAlive(0x06)`,
-`FramePing(0x0D)`, `FramePong(0x0E)` [research §D]. **Skip**
-WatchConns/ForwardPacket/ClosePeer (mesh / admin only),
+`FramePing(0x0D)`, `FramePong(0x0E)` [research §D]. **Skipped**:
+WatchConns / ForwardPacket / ClosePeer (mesh / admin only),
 `FrameHealth` (log-only), `CanAckPings` negotiation (always respond).
 
-DERP is opened on demand: keep alive only when direct UDP fails 3× in
-30 s; close as soon as direct path recovers. Saves ~14 KB SRAM task
-stack + 8 KB mbedtls context for the steady state.
+`tinylink.c::derp_supervised_task` keeps a long-lived TLS upgrade
+to the `PreferredDERP` region's first node (selected from the netmap
+on initial bringup; `update_derp_host_from_netmap` switches if the
+control plane reroutes). On `DERP_EVT_RECV_PACKET` the task hands
+the relayed frame to `handle_disco_relayed`, which:
+
+- DISCO Ping → sealed Pong via the same DERP route.
+- DISCO CallMeMaybe → outbound DISCO ping per advertised v4-mapped
+  endpoint via the WG socket (`send_disco_pings_to_cmm_endpoints` —
+  the NAT-punching pair to peer's simultaneous probe).
+- Anything else (WG transport, handshake response over relay) →
+  `wg_netif_inject_packet` so it traverses the same demux + handler
+  chain a UDP recv would.
+
+The DERP connection stays open for the device's lifetime (not
+"on demand") because the supervisor doubles as a netmap-update
+listener and the cost of keeping one TLS session is small relative
+to the round-trip latency of re-handshaking on demand.
+
+Direct UDP NAT traversal is the M5 step that flips the data plane
+off DERP. See M3 step 2 above for the five conditions; together they
+make `tailscale ping` show `via 190.x.x.x:port` instead of
+`via DERP(mia)` after one CMM round-trip.
+
+Outbound DERP queue (relayed WG transport for end-to-end ICMP via
+DERP for CGNAT-trapped peers) is the only piece left for M5 and is
+deferred — for peers with public IPs the direct path covers
+everything.
 
 ES: idem.
 
-## M6 — Hardening
+## M6 — ICMP-over-WG end-to-end
+
+`tailscale ping` uses DISCO and bypasses lwIP entirely. Real ICMP
+(`ping <our-tailnet-ip>`) needs the WG netif to actually carry IP
+packets through lwIP both directions — which the original
+PPP-flagged `esp_netif` did NOT do.
+
+Four problems were chained (PR #43 commit message has the full
+forensic trail):
+
+1. `esp_netif_action_start` with `ESP_NETIF_FLAG_IS_PPP` dispatches
+   to `esp_netif_start_ppp` and returns before the AUTOUP block, so
+   `netif_set_up` and `netif_set_link_up` never fire — `lwn->flags`
+   keeps both bits at 0 and `ip4_input_accept` drops every inbound.
+2. The same path skips `netif_set_addr`, so `lwn->ip_addr.addr` is
+   0.0.0.0 even though `esp_netif_get_ip_info` returns the right
+   address — `ip4_input` finds no matching local netif for
+   inbound dst=100.x.y.z and drops before ICMP echo can reply.
+3. `ESP_NETIF_NETSTACK_DEFAULT_PPP` registers `input_fn =
+   esp_netif_lwip_ppp_input` which calls `pppos_input_tcpip_as_ram_pbuf`,
+   an HDLC-framed-PPP parser. Raw IP (`0x45 0x00 ...`) gets
+   silently discarded at the framer.
+4. The egress side wraps each outbound packet in HDLC + PPP
+   protocol headers (`0xff 0x03 0x00 0x21 ...`); peer's WireGuard
+   decrypts cleanly but the inner bytes aren't a valid IP header.
+
+Fix in `wg_lwip.c::wg_lwip_attach`:
+
+- Cache `s_lwn = esp_netif_get_netif_impl(s_netif)`.
+- `netif_set_addr` + `netif_set_up` + `netif_set_link_up` explicitly.
+- Override `lwn->output` and `lwn->linkoutput` with raw-IP
+  passthroughs that hand the pbuf payload straight to
+  `wg_netif_send_plaintext`.
+- `wg_rx_inject` now calls `tcpip_input(pbuf, lwn)` directly instead
+  of `esp_netif_receive`, bypassing the PPP `input_fn`.
+
+The PPP flag is kept because removing it triggers an IDF v5.5
+`dhcpc_cb` panic from the trombik baseline. After the four
+overrides above, the netif behaves as a true raw-IP carrier.
+
+Verified on hardware: 10/10 ICMP echo packets, 0% packet loss,
+~93 ms RTT through the tunnel from the active WG peer.
+
+## M7 — Hardening
 
 EN: TAI64N monotonicity tests across reboot scenarios (NVS-persisted
 epoch counter). NVS encryption with HMAC key in eFuses. Watchdog +
