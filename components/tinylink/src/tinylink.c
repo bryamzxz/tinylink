@@ -231,6 +231,17 @@ esp_err_t tinylink_derp_smoke(void)
  * before the long-poll claims heap, then hand ownership to the task. */
 static derp_client_t s_derp_sup;
 
+/* Latest DERP host the supervisor should connect to. Populated from
+ * the netmap's derp_regions[] using CONFIG_TINYLINK_PREFERRED_DERP as
+ * the region selector, so the supervisor lands at the same region we
+ * advertise as our HomeDERP — peers send traffic to that region; if
+ * we're connected elsewhere the relay can't route it.
+ *
+ * Initialized to the Kconfig fallback so the first connect attempt
+ * (which races against the long-poll's first netmap) doesn't see an
+ * empty string. Updated in-place from long_poll_handler each frame. */
+static char s_derp_host[TL_DERP_HOSTNAME_LEN] = CONFIG_TINYLINK_DERP_SMOKE_HOST;
+
 typedef struct {
     uint64_t recv_packets;
     uint64_t pings_answered;
@@ -365,7 +376,6 @@ static int derp_sup_event_cb(const derp_event_t *e, void *ctx)
 static void derp_supervised_task(void *arg)
 {
     (void)arg;
-    const char *host = CONFIG_TINYLINK_DERP_SMOKE_HOST;
     const TickType_t backoff =
         pdMS_TO_TICKS(CONFIG_TINYLINK_DERP_SUPERVISED_BACKOFF_MS);
 
@@ -375,9 +385,12 @@ static void derp_supervised_task(void *arg)
 
     for (;;) {
         /* Connect with backoff — runs at boot too, not just on
-         * reconnect. */
+         * reconnect. Re-read s_derp_host every iteration so a netmap
+         * update that changes the preferred region's host steers the
+         * NEXT reconnect to the right relay. */
         for (;;) {
             attempt++;
+            const char *host = s_derp_host;
             ESP_LOGI(TAG, "derp supervisor: connect attempt #%u to %s "
                           "(heap_free=%u largest=%u)",
                      attempt, host,
@@ -431,7 +444,10 @@ esp_err_t tinylink_derp_supervised_start(void)
 {
 #if CONFIG_TINYLINK_DERP_SUPERVISED
     if (!s_initialized) return ESP_ERR_INVALID_STATE;
-    const char *host = CONFIG_TINYLINK_DERP_SMOKE_HOST;
+    /* s_derp_host is initialized from the Kconfig fallback at file
+     * scope and updated to the netmap-derived hostname for our
+     * advertised PreferredDERP region by long_poll_handler. */
+    const char *host = s_derp_host;
     if (host == NULL || host[0] == '\0') {
         ESP_LOGI(TAG, "derp supervisor: disabled (empty host)");
         return ESP_OK;
@@ -473,9 +489,37 @@ esp_err_t tinylink_derp_supervised_start(void)
 #endif
 }
 
+#if CONFIG_TINYLINK_DERP_SUPERVISED
+/* Walk the netmap's DERP region table for the region matching our
+ * advertised PreferredDERP and copy the first node's hostname into
+ * s_derp_host. No-op if PreferredDERP isn't represented in the
+ * parsed netmap (region_id mismatch or region has no nodes). The
+ * supervisor task reads s_derp_host on every connect attempt so the
+ * next reconnect picks up the change. */
+static void update_derp_host_from_netmap(const tl_netmap_t *nm)
+{
+    const int want = CONFIG_TINYLINK_PREFERRED_DERP;
+    if (want <= 0) return;
+    for (size_t i = 0; i < nm->n_derp_regions; i++) {
+        const tl_derp_region_t *r = &nm->derp_regions[i];
+        if (r->region_id != want || r->n_nodes == 0) continue;
+        const char *h = r->nodes[0].hostname;
+        if (h[0] == '\0') continue;
+        if (strcmp(s_derp_host, h) == 0) return;  /* unchanged */
+        snprintf(s_derp_host, sizeof(s_derp_host), "%s", h);
+        ESP_LOGI(TAG, "derp host updated to region %d node: %s",
+                 want, s_derp_host);
+        return;
+    }
+}
+#endif
+
 static esp_err_t long_poll_handler(const tl_netmap_t *nm, void *ctx)
 {
     (void)ctx;
+#if CONFIG_TINYLINK_DERP_SUPERVISED
+    update_derp_host_from_netmap(nm);
+#endif
     if (!s_dataplane_started) {
         ESP_LOGI(TAG, "netmap (initial): self.id=%llu peers=%u derp_regions=%u",
                  (unsigned long long)nm->self_id,
