@@ -55,6 +55,18 @@ menu "tinylink application"
             closer relay for boot-latency reasons. Set to empty to
             skip the smoke test entirely.
 
+    config TINYLINK_PREFERRED_DERP
+        int "Preferred DERP region ID advertised in MapRequest"
+        default 16
+        range 0 65535
+        help
+            Tailscale region ID we tell the control plane is our home
+            DERP. Peers use this to pick which relay to send packets
+            through when they can't reach us directly. Region 16 is
+            mia (Miami) — closest to most South American deployments.
+            Set to 0 to omit the field entirely (server treats as
+            "client has no preference").
+
     config TINYLINK_DERP_SUPERVISED
         bool "Run a supervised DERP recv-loop task (M5 step 2b)"
         default n
