@@ -12,14 +12,22 @@ Go implementation, which is the authoritative reference for wire format.
 
 ## Milestones (high level)
 
-| #  | Name                                          | Status   | Targeted release | Estimate |
-|----|-----------------------------------------------|----------|------------------|----------|
-| M1 | ts2021 control plane (register only)          | done     | v0.1             | 2-3 wk   |
-| M2 | MapRequest streaming + WireGuard data plane   | done     | v0.2             | 2-3 wk   |
-| M3 | DISCO P2P discovery + TMP117 telemetry        | current  | v0.3             | 1-2 wk   |
-| M4 | STUN minimal binding                          | pending  | v0.4             | 0.5 wk   |
-| M5 | DERP relay fallback + reconnection            | pending  | v0.5             | 1-2 wk   |
-| M6 | Production hardening (NVS, secure boot, OTA)  | pending  | v0.6             | ongoing  |
+| #  | Name                                          | Status                              | Targeted release | Estimate |
+|----|-----------------------------------------------|-------------------------------------|------------------|----------|
+| M1 | ts2021 control plane (register only)          | done                                | v0.1             | 2-3 wk   |
+| M2 | MapRequest streaming + WireGuard data plane   | done                                | v0.2             | 2-3 wk   |
+| M3 | DISCO P2P discovery + TMP117 telemetry        | partial — DISCO via DERP live       | v0.3             | 1-2 wk   |
+| M4 | STUN minimal binding                          | done                                | v0.4             | 0.5 wk   |
+| M5 | DERP relay fallback + reconnection            | first cut — recv path live          | v0.5             | 1-2 wk   |
+| M6 | Production hardening (NVS, secure boot, OTA)  | pending                             | v0.6             | ongoing  |
+
+Outstanding cross-cutting work item: a queue-based outbound model
+that lets `wg_netif` (lwIP TCPIP context) and the DERP supervisor
+post encrypted bytes to a worker task. Without it, outbound WG
+transport via lwIP is dropped at the netif TX callback to avoid a
+re-entrancy deadlock, so real ICMP over the tunnel doesn't flow yet
+even though the WG handshake completes and DISCO ping/pong via DERP
+works. Tracked alongside the outbound DERP queue (M5 step 2).
 
 Total realistic timeline (one engineer full-time): **8–12 weeks**
 [research §K].

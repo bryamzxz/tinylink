@@ -94,7 +94,7 @@ sizes once M1–M5 are all landed.
 | mbedTLS minimal preset + chachapoly + curve25519 + bundle    | 250      |
 | nghttp2 (espressif/nghttp managed component)                 | 60       |
 | lwIP + WiFi + FreeRTOS                                       | 180      |
-| trombik/esp_wireguard (data plane, M2+)                      | 40       |
+| In-tree WireGuard data plane (wg_netif + wg_lwip + wg_*.c)   | 40       |
 | Vendored BLAKE2s + HKDF + Salsa20 + NaCl-box                 | 12       |
 | ts2021 Noise IK state machine (hand-rolled)                  | 4        |
 | DERP client (M5)                                             | 6        |
