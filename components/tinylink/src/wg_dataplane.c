@@ -17,6 +17,7 @@
 #include "lwip/inet.h"
 #include "lwip/sockets.h"
 
+#include "tinylink.h"   /* tinylink_get_public_endpoint */
 #include "wg_lwip.h"
 #include "wg_netif.h"
 
@@ -81,52 +82,98 @@ static bool ipv4_is_public(uint32_t v4_be)
     return true;
 }
 
-/* Walk peer->endpoints[] and pick the first publicly-routable one.
- * Falls back to endpoints[0] when none qualify, preserving prior
- * behavior for LAN-only test setups. Returns 0 on success and writes
- * the parsed host string + port + binary v4 into the out params. */
+/* Walk peer->endpoints[] and pick the best dial target.
+ *
+ * Decision tree:
+ *   1. Parse every endpoint up front into a small candidate table.
+ *   2. If our STUN-discovered public IP matches one of the peer's
+ *      public endpoints, we are behind the same NAT. The peer's
+ *      "public" address is then a hairpin to our own external IP and
+ *      most consumer routers refuse to route hairpin UDP. Prefer the
+ *      first NON-public (LAN-side) endpoint instead — it's the only
+ *      one that crosses the internal switch.
+ *   3. Otherwise prefer the first publicly-routable endpoint.
+ *   4. If neither pass yields a candidate, fall back to the first
+ *      parseable endpoint (preserves prior behavior for LAN-only test
+ *      setups, e.g. headscale on a developer LAN).
+ *
+ * Returns 0 on success.
+ */
 static int pick_peer_endpoint(const tl_peer_t *peer,
                               char *host_out, size_t host_size,
                               int *port_out, uint32_t *v4_be_out,
                               size_t *picked_index_out)
 {
-    int      best_port = 0;
-    uint32_t best_v4 = 0;
-    char     best_host[64] = {0};
-    size_t   best_idx = (size_t)-1;
+    /* Build a parsed candidate table sized to TL_MAX_PEER_ENDPOINTS. */
+    struct cand {
+        char     host[64];
+        int      port;
+        uint32_t v4_be;
+        bool     valid;
+        bool     is_public;
+    } cands[TL_MAX_PEER_ENDPOINTS];
 
-    for (size_t i = 0; i < peer->n_endpoints; i++) {
-        char     h[64];
-        int      p = 0;
-        uint32_t v4 = 0;
-        if (parse_endpoint(peer->endpoints[i].str, h, sizeof(h), &p) != 0) {
+    bool have_any = false;
+    size_t first_parseable = (size_t)-1;
+    size_t first_public    = (size_t)-1;
+    size_t first_private   = (size_t)-1;
+
+    for (size_t i = 0; i < peer->n_endpoints && i < TL_MAX_PEER_ENDPOINTS; i++) {
+        cands[i].valid = false;
+        if (parse_endpoint(peer->endpoints[i].str,
+                           cands[i].host, sizeof(cands[i].host),
+                           &cands[i].port) != 0) {
             continue;
         }
-        if (inet_pton(AF_INET, h, &v4) != 1) {
+        if (inet_pton(AF_INET, cands[i].host, &cands[i].v4_be) != 1) {
             continue;
         }
-        if (ipv4_is_public(v4)) {
-            memcpy(best_host, h, sizeof(h));
-            best_port = p;
-            best_v4 = v4;
-            best_idx = i;
-            break;
-        }
-        /* Remember endpoints[0] (or the first parsed one) as the
-         * fallback if nothing public turns up. */
-        if (best_idx == (size_t)-1) {
-            memcpy(best_host, h, sizeof(h));
-            best_port = p;
-            best_v4 = v4;
-            best_idx = i;
+        cands[i].is_public = ipv4_is_public(cands[i].v4_be);
+        cands[i].valid = true;
+        have_any = true;
+        if (first_parseable == (size_t)-1) first_parseable = i;
+        if (cands[i].is_public  && first_public  == (size_t)-1) first_public  = i;
+        if (!cands[i].is_public && first_private == (size_t)-1) first_private = i;
+    }
+    if (!have_any) return -1;
+
+    /* Same-NAT detection: ask the STUN cache for our public endpoint
+     * and check whether the peer announced a matching public IP.
+     * Detection is by IP only (NAT remaps the source port; the IP is
+     * shared). If STUN never produced a result, treat as cross-NAT. */
+    bool same_nat = false;
+    uint8_t  our_addr[4];
+    uint16_t our_port_unused;
+    if (tinylink_get_public_endpoint(our_addr, &our_port_unused)) {
+        uint32_t our_v4_be = 0;
+        memcpy(&our_v4_be, our_addr, sizeof(our_v4_be));
+        for (size_t i = 0; i < peer->n_endpoints; i++) {
+            if (cands[i].valid && cands[i].is_public &&
+                cands[i].v4_be == our_v4_be) {
+                same_nat = true;
+                break;
+            }
         }
     }
-    if (best_idx == (size_t)-1) return -1;
-    if (host_size < sizeof(best_host)) return -1;
-    memcpy(host_out, best_host, sizeof(best_host));
-    *port_out = best_port;
-    *v4_be_out = best_v4;
-    if (picked_index_out) *picked_index_out = best_idx;
+
+    size_t pick = (size_t)-1;
+    if (same_nat && first_private != (size_t)-1) {
+        pick = first_private;
+    } else if (first_public != (size_t)-1) {
+        pick = first_public;
+    } else {
+        pick = first_parseable;
+    }
+
+    if (host_size < sizeof(cands[pick].host)) return -1;
+    memcpy(host_out, cands[pick].host, sizeof(cands[pick].host));
+    *port_out  = cands[pick].port;
+    *v4_be_out = cands[pick].v4_be;
+    if (picked_index_out) *picked_index_out = pick;
+    if (same_nat) {
+        ESP_LOGI(TAG, "same-NAT detected (peer announces our public IP); "
+                      "preferring LAN endpoint #%u", (unsigned)pick);
+    }
     return 0;
 }
 
@@ -176,8 +223,9 @@ esp_err_t wg_dataplane_start(const tinylink_keys_t *keys,
         return ESP_ERR_INVALID_ARG;
     }
     if (picked_idx != 0) {
-        ESP_LOGI(TAG, "skipped %u non-public endpoint(s); using #%u: %s",
-                 (unsigned)picked_idx, (unsigned)picked_idx, s_endpoint_host);
+        ESP_LOGI(TAG, "selected endpoint #%u of %u: %s (skipped %u earlier)",
+                 (unsigned)picked_idx, (unsigned)peer->n_endpoints,
+                 s_endpoint_host, (unsigned)picked_idx);
     }
     s_endpoint_port = (uint16_t)port;
 
