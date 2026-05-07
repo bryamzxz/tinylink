@@ -57,6 +57,79 @@ static int parse_endpoint(const char *ep, char *host_out, size_t host_size,
     return 0;
 }
 
+/* True iff `v4_be` (network-byte-order IPv4) is publicly routable from
+ * the ESP32 — i.e. NOT RFC1918, link-local, loopback, or this-network.
+ * The control plane often advertises a peer's LAN address alongside its
+ * public NAT address; on a different LAN we can never reach the LAN
+ * one, so trying it first wastes the WG handshake budget on guaranteed
+ * ENETUNREACH/timeouts. Upstream tailscale ranks rather than filters,
+ * but the minimal client doesn't track per-endpoint latency, so we
+ * filter conservatively and let the DERP relay path (M5+) cover the
+ * cases where no public endpoint exists. */
+static bool ipv4_is_public(uint32_t v4_be)
+{
+    uint32_t a = ntohl(v4_be);
+    uint8_t  b0 = (a >> 24) & 0xFF;
+    uint8_t  b1 = (a >> 16) & 0xFF;
+    if (b0 == 10) return false;                            /* 10/8 */
+    if (b0 == 172 && (b1 & 0xF0) == 16) return false;      /* 172.16/12 */
+    if (b0 == 192 && b1 == 168) return false;              /* 192.168/16 */
+    if (b0 == 127) return false;                           /* 127/8 loopback */
+    if (b0 == 169 && b1 == 254) return false;              /* link-local */
+    if (b0 == 0) return false;                             /* this-network / unspecified */
+    if (b0 >= 224) return false;                           /* multicast / reserved */
+    return true;
+}
+
+/* Walk peer->endpoints[] and pick the first publicly-routable one.
+ * Falls back to endpoints[0] when none qualify, preserving prior
+ * behavior for LAN-only test setups. Returns 0 on success and writes
+ * the parsed host string + port + binary v4 into the out params. */
+static int pick_peer_endpoint(const tl_peer_t *peer,
+                              char *host_out, size_t host_size,
+                              int *port_out, uint32_t *v4_be_out,
+                              size_t *picked_index_out)
+{
+    int      best_port = 0;
+    uint32_t best_v4 = 0;
+    char     best_host[64] = {0};
+    size_t   best_idx = (size_t)-1;
+
+    for (size_t i = 0; i < peer->n_endpoints; i++) {
+        char     h[64];
+        int      p = 0;
+        uint32_t v4 = 0;
+        if (parse_endpoint(peer->endpoints[i].str, h, sizeof(h), &p) != 0) {
+            continue;
+        }
+        if (inet_pton(AF_INET, h, &v4) != 1) {
+            continue;
+        }
+        if (ipv4_is_public(v4)) {
+            memcpy(best_host, h, sizeof(h));
+            best_port = p;
+            best_v4 = v4;
+            best_idx = i;
+            break;
+        }
+        /* Remember endpoints[0] (or the first parsed one) as the
+         * fallback if nothing public turns up. */
+        if (best_idx == (size_t)-1) {
+            memcpy(best_host, h, sizeof(h));
+            best_port = p;
+            best_v4 = v4;
+            best_idx = i;
+        }
+    }
+    if (best_idx == (size_t)-1) return -1;
+    if (host_size < sizeof(best_host)) return -1;
+    memcpy(host_out, best_host, sizeof(best_host));
+    *port_out = best_port;
+    *v4_be_out = best_v4;
+    if (picked_index_out) *picked_index_out = best_idx;
+    return 0;
+}
+
 esp_err_t wg_dataplane_start(const tinylink_keys_t *keys,
                              const tl_netmap_t *nm)
 {
@@ -90,17 +163,21 @@ esp_err_t wg_dataplane_start(const tinylink_keys_t *keys,
         return ESP_ERR_INVALID_ARG;
     }
 
-    /* Peer endpoint. */
-    int port = 41641;
-    if (parse_endpoint(peer->endpoints[0].str,
-                       s_endpoint_host, sizeof(s_endpoint_host), &port) != 0) {
-        ESP_LOGE(TAG, "peer endpoint malformed: %s", peer->endpoints[0].str);
+    /* Peer endpoint — prefer the first publicly-routable candidate so
+     * we don't waste the handshake budget dialing a peer's LAN address
+     * from a different network. */
+    int      port = 41641;
+    uint32_t peer_v4_be = 0;
+    size_t   picked_idx = 0;
+    if (pick_peer_endpoint(peer, s_endpoint_host, sizeof(s_endpoint_host),
+                           &port, &peer_v4_be, &picked_idx) != 0) {
+        ESP_LOGE(TAG, "no usable peer endpoint among %u candidates",
+                 (unsigned)peer->n_endpoints);
         return ESP_ERR_INVALID_ARG;
     }
-    uint32_t peer_v4_be = 0;
-    if (inet_pton(AF_INET, s_endpoint_host, &peer_v4_be) != 1) {
-        ESP_LOGE(TAG, "inet_pton peer(%s) failed", s_endpoint_host);
-        return ESP_ERR_INVALID_ARG;
+    if (picked_idx != 0) {
+        ESP_LOGI(TAG, "skipped %u non-public endpoint(s); using #%u: %s",
+                 (unsigned)picked_idx, (unsigned)picked_idx, s_endpoint_host);
     }
     s_endpoint_port = (uint16_t)port;
 
@@ -165,12 +242,15 @@ esp_err_t wg_dataplane_update_peer(const tinylink_keys_t *keys,
         return ESP_OK;
     }
 
-    /* Parse the new endpoint and compare with what we have. */
-    char  new_host[64];
-    int   new_port = 0;
-    if (parse_endpoint(nm->peers[0].endpoints[0].str,
-                       new_host, sizeof(new_host), &new_port) != 0) {
-        return ESP_OK;  /* malformed; leave the live session alone */
+    /* Re-pick the best endpoint from the fresh peer list and compare
+     * with what we have. Same public-first preference as the initial
+     * bring-up so a roam doesn't downgrade us to a LAN address. */
+    char     new_host[64];
+    int      new_port = 0;
+    uint32_t v4_be = 0;
+    if (pick_peer_endpoint(&nm->peers[0], new_host, sizeof(new_host),
+                           &new_port, &v4_be, NULL) != 0) {
+        return ESP_OK;  /* nothing usable; leave the live session alone */
     }
     if (s_started &&
         strcmp(new_host, s_endpoint_host) == 0 &&
@@ -182,10 +262,6 @@ esp_err_t wg_dataplane_update_peer(const tinylink_keys_t *keys,
      * fresh handshake — we just point the UDP socket at the new
      * sockaddr. The transport keys remain valid. */
     if (s_started) {
-        uint32_t v4_be = 0;
-        if (inet_pton(AF_INET, new_host, &v4_be) != 1) {
-            return ESP_ERR_INVALID_ARG;
-        }
         ESP_LOGI(TAG, "peer endpoint changed: %s:%u → %s:%d",
                  s_endpoint_host, (unsigned)s_endpoint_port,
                  new_host, new_port);
