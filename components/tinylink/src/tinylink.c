@@ -178,6 +178,28 @@ esp_err_t tinylink_dataplane_start(void)
         return ESP_OK;  /* not fatal — long-poll task handles reconnect */
     }
 
+    /* Observability: was the STUN-discovered endpoint available when
+     * we built the MapRequest body? STUN runs synchronously before
+     * tinylink_register() in main.c::bringup so by the time we get
+     * here it should be populated; log the actual state to surface
+     * any future boot-race regression and to give a clear breadcrumb
+     * when an admin-panel "Endpoints" field comes up empty. */
+    uint8_t  ep_addr[4];
+    uint16_t ep_port;
+    bool stun_ready = tinylink_get_public_endpoint(ep_addr, &ep_port);
+    if (stun_ready) {
+        ESP_LOGI(TAG, "dataplane_start: pushing endpoint %u.%u.%u.%u:%u",
+                 ep_addr[0], ep_addr[1], ep_addr[2], ep_addr[3],
+                 (unsigned)ep_port);
+    } else {
+        ESP_LOGW(TAG, "dataplane_start: no STUN endpoint cached yet — "
+                      "Stream=false MapRequest will land NetInfo only; "
+                      "subsequent reprobe results never reach the server "
+                      "while the long-poll's Stream=true cycle ignores "
+                      "Hostinfo (followup PR: trigger fetch_once on "
+                      "stun_reprobe endpoint-change)");
+    }
+
     static tl_netmap_t nm;  /* file-static, single-shot */
     err = mapreq_fetch_once(&s_conn, &s_keys, &nm);
     if (err != ESP_OK) {
@@ -190,8 +212,9 @@ esp_err_t tinylink_dataplane_start(void)
         drop_control_conn();
         return ESP_OK;
     }
-    ESP_LOGI(TAG, "dataplane_start: pushed Stream=false MapRequest, "
-                  "got %u peers / %u DERP regions",
+    ESP_LOGI(TAG, "dataplane_start: pushed Stream=false MapRequest "
+                  "(stun=%s), got %u peers / %u DERP regions",
+             stun_ready ? "ready" : "missing",
              (unsigned)nm.n_peers, (unsigned)nm.n_derp_regions);
     /* Keep s_conn open — the long-poll will reuse it for the
      * Stream=true cycle. */
