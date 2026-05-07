@@ -11,4 +11,14 @@ menu "tinylink core"
             Maps to esp_log levels: 0=NONE, 1=ERROR, 2=WARN, 3=INFO,
             4=DEBUG, 5=VERBOSE.
 
+    config TINYLINK_BENCH_AEAD
+        bool "Run ChaCha20-Poly1305 AEAD micro-benchmark on boot"
+        default n
+        help
+            When y, bringup() calls tinylink_bench_aead() once after
+            tinylink_init() and before register, printing µs/call,
+            MB/s and ns/byte for 64B and 1500B payloads. Used as the
+            baseline against which crypto micro-optimizations are
+            measured. Off by default; opt-in for perf work.
+
 endmenu

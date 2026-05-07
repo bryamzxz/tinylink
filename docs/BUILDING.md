@@ -29,6 +29,32 @@ idf.py -p /dev/ttyUSB0 flash
 idf.py -p /dev/ttyUSB0 monitor   # Ctrl-] to exit
 ```
 
+## Benchmarking AEAD
+
+The ChaCha20-Poly1305 hot path has an opt-in micro-benchmark that runs
+once on boot, prints µs/call + ns/B + MB/s for 64 B and 1500 B payloads
+(encrypt and decrypt), and verifies a round-trip before reporting any
+numbers.
+
+Enable, build, flash, capture:
+
+```bash
+idf.py menuconfig             # tinylink core → Run ChaCha20-Poly1305 AEAD
+                              # micro-benchmark on boot → y
+idf.py build
+idf.py -p /dev/ttyUSB0 flash
+python tools/serial_capture.py --port /dev/ttyUSB0 --duration 30 \
+    --out /tmp/bench.log
+grep "bench-aead" /tmp/bench.log
+```
+
+The bench fires after `tinylink_init()` returns and before
+`tinylink_register()`, so the heap is still pristine and the timer
+numbers aren't confounded by background TLS/long-poll work. Run-to-run
+variance is roughly 1-2 % on the 1500 B path — treat smaller deltas as
+noise. Disable the flag for production builds (`# CONFIG_TINYLINK_BENCH_AEAD
+is not set`); the bench code drops out of the binary entirely.
+
 ## Common gotchas
 
 - **`CONFIG_LWIP_TCPIP_CORE_LOCKING` must stay `y`.** It is the IDF default

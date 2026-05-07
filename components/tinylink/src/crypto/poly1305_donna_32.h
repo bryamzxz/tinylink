@@ -8,6 +8,8 @@
 // here for SPDX clarity. Validated by host KAT against RFC 8439
 // §2.5.2.
 
+#include <stdint.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -32,14 +34,20 @@ typedef struct poly1305_state_internal_t {
     unsigned char final;
 } poly1305_state_internal_t;
 
-/* interpret four 8 bit unsigned integers as a 32 bit unsigned integer in little endian */
+/* interpret four 8 bit unsigned integers as a 32 bit unsigned integer in little endian.
+ *
+ * tinylink change: use __builtin_memcpy instead of byte-by-byte
+ * assembly. On Xtensa little-endian (ESP32 LX6) this compiles to
+ *   - 1× l32i  when GCC can prove p is 4-byte aligned (offsets 0 and 12
+ *              in poly1305_blocks IF the call site passes an aligned m,
+ *              e.g. the leftover path which always uses st->buffer);
+ *   - 4× l8ui + reassembly otherwise (same as the original macro).
+ * Never UB, never traps — strict-aliasing-safe by construction. */
 static unsigned long
 U8TO32(const unsigned char *p) {
-    return
-        (((unsigned long)(p[0] & 0xff)      ) |
-         ((unsigned long)(p[1] & 0xff) <<  8) |
-         ((unsigned long)(p[2] & 0xff) << 16) |
-         ((unsigned long)(p[3] & 0xff) << 24));
+    uint32_t v;
+    __builtin_memcpy(&v, p, sizeof(v));
+    return v;
 }
 
 /* store a 32 bit unsigned integer as four 8 bit unsigned integers in little endian */

@@ -53,18 +53,21 @@
 #define U8V(v)  ((uint8_t)(v) & U8C(0xFF))
 #define U32V(v) ((uint32_t)(v) & U32C(0xFFFFFFFF))
 
-#define U8TO32_LITTLE(p)                            \
-    (((uint32_t)((p)[0])      ) |                   \
-     ((uint32_t)((p)[1]) <<  8) |                   \
-     ((uint32_t)((p)[2]) << 16) |                   \
-     ((uint32_t)((p)[3]) << 24))
+/* Xtensa LX6 is little-endian, so a u32 read is byte-identical to the
+ * macro form. __builtin_memcpy folds to:
+ *   - 1× l32i / 1× s32i when alignment is provable;
+ *   - 4× l8ui / 4× s8i otherwise (same as the original macro).
+ * Strict-aliasing-safe by construction. */
+#define U8TO32_LITTLE(p) ({               \
+    uint32_t _v;                          \
+    __builtin_memcpy(&_v, (p), 4);        \
+    _v;                                   \
+})
 
-#define U32TO8_LITTLE(p, v)        \
-    do {                           \
-        (p)[0] = U8V((v)      );   \
-        (p)[1] = U8V((v) >>  8);   \
-        (p)[2] = U8V((v) >> 16);   \
-        (p)[3] = U8V((v) >> 24);   \
+#define U32TO8_LITTLE(p, v)               \
+    do {                                  \
+        uint32_t _v = (v);                \
+        __builtin_memcpy((p), &_v, 4);    \
     } while (0)
 
 /* 2.3. The ChaCha20 Block Function — first four words are the
@@ -111,28 +114,56 @@ static void chacha20_block(struct chacha20_ctx *ctx, uint8_t *stream) {
 
     TWENTY_ROUNDS(working_state);
 
+    /* `stream` is the caller-supplied keystream block; chacha20() passes
+     * a 4-byte aligned local. Xtensa is little-endian, so a plain u32
+     * store via __builtin_memcpy is byte-identical to U32TO8_LITTLE and
+     * compiles to a single `s32i` when the destination is aligned. */
     for (i = 0; i < 16; ++i) {
-        U32TO8_LITTLE(stream + (4 * i), PLUS(working_state[i], ctx->state[i]));
+        uint32_t v = PLUS(working_state[i], ctx->state[i]);
+        __builtin_memcpy(stream + (4 * i), &v, sizeof(v));
+    }
+}
+
+/* Hot path: process the keystream/plaintext XOR in 4-byte chunks
+ * instead of byte-by-byte. `output` is 4-byte aligned (declared below);
+ * `in`/`out` may not be (WG packets come from lwIP pbufs at arbitrary
+ * offsets), so we go through __builtin_memcpy which compiles to:
+ *   - 1× l32i / 1× s32i when the compiler proves alignment;
+ *   - 4× l8ui / 4× s8i otherwise — same as the original macro, no UB,
+ *     no Xtensa unaligned trap. */
+static inline void xor_block_u32(uint8_t *out, const uint8_t *in,
+                                 const uint8_t *output, size_t n) {
+    size_t i = 0;
+    size_t bulk = n & ~(size_t)3;
+    for (; i < bulk; i += 4) {
+        uint32_t a, b;
+        __builtin_memcpy(&a, in + i, 4);
+        __builtin_memcpy(&b, output + i, 4);
+        a ^= b;
+        __builtin_memcpy(out + i, &a, 4);
+    }
+    for (; i < n; ++i) {
+        out[i] = in[i] ^ output[i];
     }
 }
 
 void chacha20(struct chacha20_ctx *ctx, uint8_t *out, const uint8_t *in, uint32_t len) {
-    uint8_t output[CHACHA20_BLOCK_SIZE];
-    uint32_t i;
+    /* Aligned so chacha20_block's 16 u32 stores hit `s32i` and the XOR
+     * loop's 16 u32 loads of `output` hit `l32i`. Xtensa requires
+     * 4-byte alignment for full-word load/store; without this attribute
+     * the compiler may place `output` at any byte offset and silently
+     * trap-and-emulate. */
+    uint8_t __attribute__((aligned(4))) output[CHACHA20_BLOCK_SIZE];
 
     if (len) {
         for (;;) {
             chacha20_block(ctx, output);
             ctx->state[12] = PLUSONE(ctx->state[12]);
             if (len <= 64) {
-                for (i = 0; i < len; ++i) {
-                    out[i] = in[i] ^ output[i];
-                }
+                xor_block_u32(out, in, output, len);
                 return;
             }
-            for (i = 0; i < 64; ++i) {
-                out[i] = in[i] ^ output[i];
-            }
+            xor_block_u32(out, in, output, 64);
             len -= 64;
             out += 64;
             in += 64;
@@ -147,14 +178,11 @@ void chacha20_init(struct chacha20_ctx *ctx, const uint8_t *key, uint64_t nonce)
     ctx->state[ 1] = CHACHA20_CONSTANT_2;
     ctx->state[ 2] = CHACHA20_CONSTANT_3;
     ctx->state[ 3] = CHACHA20_CONSTANT_4;
-    ctx->state[ 4] = U8TO32_LITTLE(key +  0);
-    ctx->state[ 5] = U8TO32_LITTLE(key +  4);
-    ctx->state[ 6] = U8TO32_LITTLE(key +  8);
-    ctx->state[ 7] = U8TO32_LITTLE(key + 12);
-    ctx->state[ 8] = U8TO32_LITTLE(key + 16);
-    ctx->state[ 9] = U8TO32_LITTLE(key + 20);
-    ctx->state[10] = U8TO32_LITTLE(key + 24);
-    ctx->state[11] = U8TO32_LITTLE(key + 28);
+    /* Bulk-copy the 32-byte key into state[4..11]. GCC schedules this
+     * as 8× l32i / 8× s32i (interleaved) when key is aligned, which
+     * beats 8 separate U8TO32_LITTLE expansions because the loads can
+     * issue without the rotate/or chain in between. */
+    __builtin_memcpy(&ctx->state[4], key, 32);
     ctx->state[12] = 0;
     ctx->state[13] = 0;
     ctx->state[14] = (uint32_t)(nonce & 0xFFFFFFFFu);
