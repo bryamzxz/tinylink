@@ -3,6 +3,7 @@
 
 #include "tinylink.h"
 
+#include <errno.h>
 #include <string.h>
 
 #include "freertos/FreeRTOS.h"
@@ -16,8 +17,14 @@
 
 #include "control_key.h"
 #include "derp_client.h"
+#include "disco.h"
 #include "disco_handler.h"
 #include "keys.h"
+#include "esp_random.h"
+
+#ifdef ESP_PLATFORM
+#include "lwip/sockets.h"
+#endif
 #include "mapreq.h"
 #include "netmap.h"
 #include "register.h"
@@ -200,22 +207,20 @@ esp_err_t tinylink_dataplane_start(void)
                       "stun_reprobe endpoint-change)");
     }
 
-    static tl_netmap_t nm;  /* file-static, single-shot */
-    err = mapreq_fetch_once(&s_conn, &s_keys, &nm);
+    err = mapreq_push_endpoints(&s_conn, &s_keys);
     if (err != ESP_OK) {
         /* Drop the conn so the long-poll's next ensure_control_conn
          * gets a fresh one. Don't fail bringup — the long-poll path
          * will keep trying and may eventually succeed (or surface a
          * different error). */
-        ESP_LOGW(TAG, "dataplane_start: mapreq_fetch_once: 0x%x — "
+        ESP_LOGW(TAG, "dataplane_start: mapreq_push_endpoints: 0x%x — "
                       "endpoints not pushed; long-poll will run anyway", err);
         drop_control_conn();
         return ESP_OK;
     }
-    ESP_LOGI(TAG, "dataplane_start: pushed Stream=false MapRequest "
-                  "(stun=%s), got %u peers / %u DERP regions",
-             stun_ready ? "ready" : "missing",
-             (unsigned)nm.n_peers, (unsigned)nm.n_derp_regions);
+    ESP_LOGI(TAG, "dataplane_start: pushed lite MapRequest "
+                  "(Stream=false, OmitPeers=true, stun=%s)",
+             stun_ready ? "ready" : "missing");
     /* Keep s_conn open — the long-poll will reuse it for the
      * Stream=true cycle. */
     return ESP_OK;
@@ -311,6 +316,108 @@ typedef struct {
     uint64_t disco_send_errors;
 } derp_sup_stats_t;
 
+/* Detect if a 16-byte DISCO addr is the v4-mapped IPv6 form
+ * `::ffff:a.b.c.d` (the only form our v4-only netif can dial). */
+static bool disco_addr_is_v4_mapped(const uint8_t addr[16])
+{
+    static const uint8_t v4_mapped_prefix[12] = {
+        0,0,0,0, 0,0,0,0, 0,0, 0xff, 0xff,
+    };
+    return memcmp(addr, v4_mapped_prefix, 12) == 0;
+}
+
+/* When a peer sends us a CallMeMaybe via DERP they're saying: "I want a
+ * direct path; here are the endpoints I'm probing — please probe them
+ * back so our NATs both open mappings simultaneously." Without this
+ * handler, the peer's inbound DISCO Pings are dropped at one of the two
+ * NATs and the direct path never establishes — `tailscale ping` stays
+ * stuck on `via DERP(...)` forever.
+ *
+ * For each v4-mapped endpoint in the CMM we emit a fresh DISCO Ping
+ * sealed against the peer's DiscoKey, sourced from the WG netif's UDP
+ * socket so the source AddrPort is the same one our boot-time STUN
+ * advertised — that's the AddrPort the peer's magicsock is targeting,
+ * so its NAT mapping aligns with ours.
+ *
+ * On the peer's reply (our wg_netif RX task answers their inbound
+ * Ping with a Pong; we currently don't track our outbound Pongs to
+ * confirm a path is up, but the peer's magicsock tracks its own —
+ * hence `tailscale ping` will report direct once any one of these
+ * makes it through). */
+static void send_disco_pings_to_cmm_endpoints(const derp_event_t *e)
+{
+    /* Re-decrypt + re-parse: handle_disco_relayed already did this
+     * through disco_handle_recv, but that helper doesn't expose the
+     * parsed CallMeMaybe payload. Doing it twice is a few KB of
+     * NaCl-box CPU per CMM, which is rare enough to not matter. */
+    uint8_t pt[256];
+    uint8_t peer_disco_pub[DISCO_KEY_LEN];
+    size_t pt_len = disco_open(pt, sizeof(pt), peer_disco_pub,
+                               e->data, e->data_len, s_keys.disco_priv);
+    if (pt_len == 0) return;
+
+    disco_msg_t msg;
+    if (disco_parse(pt, pt_len, &msg) != 0) return;
+    if (msg.type != DISCO_TYPE_CALLMEMAYBE) return;
+
+    int sock = wg_netif_get_socket();
+    if (sock < 0) {
+        ESP_LOGW(TAG, "cmm: wg socket not up — cannot punch");
+        return;
+    }
+
+    size_t sent = 0;
+    for (size_t i = 0; i < msg.u.cmm.n; i++) {
+        const disco_addrport_t *ep = &msg.u.cmm.endpoints[i];
+        if (!disco_addr_is_v4_mapped(ep->addr)) continue;
+
+        /* Build a fresh ping inner. Includes our NodeKey so the peer's
+         * magicsock can correlate this probe with the right peer entry
+         * when its DiscoKey-to-NodeKey mapping is sparse. */
+        disco_ping_t ping = {0};
+        esp_fill_random(ping.txid, DISCO_TXID_LEN);
+        memcpy(ping.node_key, s_keys.node_pub, DISCO_NODEKEY_LEN);
+        ping.has_node_key = true;
+
+        uint8_t inner[DISCO_HANDLER_REPLY_MAX];
+        size_t inner_len = disco_encode_ping(inner, sizeof(inner), &ping);
+        if (inner_len == 0) continue;
+
+        uint8_t nonce[DISCO_NONCE_LEN];
+        esp_fill_random(nonce, sizeof(nonce));
+
+        uint8_t wire[DISCO_HANDLER_REPLY_MAX];
+        size_t wire_len = disco_seal(wire, sizeof(wire),
+                                     inner, inner_len, nonce,
+                                     s_keys.disco_pub, peer_disco_pub,
+                                     s_keys.disco_priv);
+        if (wire_len == 0) continue;
+
+#ifdef ESP_PLATFORM
+        struct sockaddr_in dst = {
+            .sin_family = AF_INET,
+            .sin_port   = htons(ep->port),
+        };
+        memcpy(&dst.sin_addr.s_addr, &ep->addr[12], 4);
+        ssize_t n = sendto(sock, wire, wire_len, 0,
+                           (struct sockaddr *)&dst, sizeof(dst));
+        if (n < 0) {
+            ESP_LOGW(TAG, "cmm ping sendto: errno=%d", errno);
+            continue;
+        }
+#endif
+        sent++;
+        ESP_LOGI(TAG, "cmm punch ping → %u.%u.%u.%u:%u txid=%02x%02x%02x%02x..",
+                 ep->addr[12], ep->addr[13], ep->addr[14], ep->addr[15],
+                 (unsigned)ep->port,
+                 ping.txid[0], ping.txid[1], ping.txid[2], ping.txid[3]);
+    }
+    if (sent == 0 && msg.u.cmm.n > 0) {
+        ESP_LOGW(TAG, "cmm: %u endpoints but none v4-mapped",
+                 (unsigned)msg.u.cmm.n);
+    }
+}
+
 /* Try to decrypt+answer the relayed packet as DISCO. If it's not a
  * DISCO frame the handler short-circuits cheap; if it's a Ping we
  * build a sealed Pong and ship it back via derp_client_send_packet.
@@ -355,7 +462,8 @@ static void handle_disco_relayed(const derp_event_t *e,
         break;
     case DISCO_TYPE_CALLMEMAYBE:
         st->disco_cmms_seen++;
-        ESP_LOGI(TAG, "disco call-me-maybe (M5 step 3 territory)");
+        ESP_LOGI(TAG, "disco call-me-maybe — punching endpoints");
+        send_disco_pings_to_cmm_endpoints(e);
         break;
     default: {
         /* Not a DISCO frame for us — could be a relayed WireGuard
@@ -670,6 +778,18 @@ esp_err_t tinylink_telemetry_start(void)
     return ESP_OK;
 }
 
+esp_err_t tinylink_wg_socket_init(void)
+{
+    if (!s_initialized) return ESP_ERR_INVALID_STATE;
+    struct wg_netif_local_config local = {0};
+    memcpy(local.static_priv, s_keys.node_priv,  TINYLINK_KEY_LEN);
+    memcpy(local.static_pub,  s_keys.node_pub,   TINYLINK_KEY_LEN);
+    memcpy(local.disco_priv,  s_keys.disco_priv, TINYLINK_KEY_LEN);
+    memcpy(local.disco_pub,   s_keys.disco_pub,  TINYLINK_KEY_LEN);
+    local.bind_port = 0;  /* kernel picks; STUN learns whatever it is */
+    return wg_netif_init(&local);
+}
+
 esp_err_t tinylink_stun_probe(void)
 {
     /* Probe into a LOCAL result first, only commit to the cached
@@ -684,21 +804,58 @@ esp_err_t tinylink_stun_probe(void)
      * <100 ms. Worst case adds 3 s of boot delay if the configured
      * server is dead. */
     stun_probe_result_t local = {0};
-    esp_err_t err = stun_probe_run(CONFIG_TINYLINK_STUN_HOST,
-                                   (uint16_t)CONFIG_TINYLINK_STUN_PORT,
-                                   3000, &local);
-    if (err == ESP_OK && local.valid) {
-        if (s_stun_result.valid &&
-            (memcmp(s_stun_result.addr_v4, local.addr_v4, 4) != 0 ||
-             s_stun_result.port != local.port)) {
-            ESP_LOGI(TAG, "stun: endpoint changed %u.%u.%u.%u:%u → %u.%u.%u.%u:%u",
+    esp_err_t err;
+    int wg_sock = wg_netif_get_socket();
+    bool rx_running = wg_netif_rx_running();
+
+    if (wg_sock >= 0 && !rx_running) {
+        /* Boot-time path: probe via the WG socket so the public
+         * AddrPort we advertise lines up with the WG NAT mapping that
+         * keepalives keep pinned. Peers dialing this AddrPort actually
+         * reach our WG socket. */
+        err = stun_probe_run_on_socket(wg_sock,
+                                       CONFIG_TINYLINK_STUN_HOST,
+                                       (uint16_t)CONFIG_TINYLINK_STUN_PORT,
+                                       3000, &local);
+        if (err == ESP_OK && local.valid) {
+            if (s_stun_result.valid &&
+                (memcmp(s_stun_result.addr_v4, local.addr_v4, 4) != 0 ||
+                 s_stun_result.port != local.port)) {
+                ESP_LOGI(TAG, "stun: endpoint changed %u.%u.%u.%u:%u → %u.%u.%u.%u:%u",
+                         s_stun_result.addr_v4[0], s_stun_result.addr_v4[1],
+                         s_stun_result.addr_v4[2], s_stun_result.addr_v4[3],
+                         (unsigned)s_stun_result.port,
+                         local.addr_v4[0], local.addr_v4[1],
+                         local.addr_v4[2], local.addr_v4[3],
+                         (unsigned)local.port);
+            }
+            s_stun_result = local;
+        }
+        return err;
+    }
+
+    /* Re-probe path: RX task owns the WG socket, so we can't recvfrom
+     * on it without racing. Probe on an ephemeral socket — but its
+     * source port is NOT the WG socket's, so the port we'd learn is
+     * wrong relative to inbound WG transport. Use this only to detect
+     * WAN-address changes; do NOT overwrite the cached good port. */
+    err = stun_probe_run(CONFIG_TINYLINK_STUN_HOST,
+                         (uint16_t)CONFIG_TINYLINK_STUN_PORT,
+                         3000, &local);
+    if (err == ESP_OK && local.valid && s_stun_result.valid) {
+        if (memcmp(s_stun_result.addr_v4, local.addr_v4, 4) != 0) {
+            ESP_LOGW(TAG, "stun re-probe: WAN address changed "
+                          "%u.%u.%u.%u → %u.%u.%u.%u — cached port now "
+                          "stale; followup PR re-probes via wg socket",
                      s_stun_result.addr_v4[0], s_stun_result.addr_v4[1],
                      s_stun_result.addr_v4[2], s_stun_result.addr_v4[3],
-                     (unsigned)s_stun_result.port,
                      local.addr_v4[0], local.addr_v4[1],
-                     local.addr_v4[2], local.addr_v4[3],
-                     (unsigned)local.port);
+                     local.addr_v4[2], local.addr_v4[3]);
         }
+    } else if (err == ESP_OK && local.valid && !s_stun_result.valid) {
+        /* No cached value yet (boot probe failed?). Stash this even
+         * though the port is ephemeral-not-WG — better than nothing,
+         * and dataplane_start log will flag it. */
         s_stun_result = local;
     }
     return err;

@@ -55,6 +55,21 @@ static esp_err_t bringup(void)
         return err;
     }
 
+    /* Bring up the WG UDP socket EARLY (bind only — no handshake yet)
+     * so the boot-time STUN probe can run on the same socket the
+     * dataplane will eventually use. This is what makes the public
+     * AddrPort we advertise to peers match the NAT mapping that WG
+     * keepalives keep pinned: peers dialing the advertised AddrPort
+     * actually reach our WG socket, and direct UDP path discovery
+     * (DISCO ping/pong) works. Without this, STUN runs on its own
+     * ephemeral socket whose NAT mapping closes immediately, so
+     * peers fall back to DERP forever. */
+    err = tinylink_wg_socket_init();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "wg socket init failed: 0x%x", err);
+        return err;
+    }
+
     /* M4 — best-effort STUN probe. Runs once before the first
      * MapRequest so HostInfo.Endpoints can advertise our reflexive
      * AddrPort to the control plane (which forwards it to peers).

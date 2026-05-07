@@ -43,6 +43,21 @@ typedef struct {
 esp_err_t stun_probe_run(const char *server_host, uint16_t server_port,
                          uint32_t timeout_ms, stun_probe_result_t *out);
 
+/* Same as stun_probe_run but uses an externally-managed UDP socket
+ * instead of opening an ephemeral one. The socket MUST be AF_INET
+ * SOCK_DGRAM, already bound. The caller retains ownership — this
+ * function does not close it. The recv timeout is set on the socket
+ * for the duration of the call (and left set; callers that need a
+ * different timeout afterwards must restore it). Used at boot to
+ * probe through the WireGuard socket so the public AddrPort the
+ * server returns matches the NAT mapping the WG keepalives keep
+ * alive — peers dialing that AddrPort actually reach the WG socket. */
+esp_err_t stun_probe_run_on_socket(int sock,
+                                   const char *server_host,
+                                   uint16_t server_port,
+                                   uint32_t timeout_ms,
+                                   stun_probe_result_t *out);
+
 #ifdef __cplusplus
 }
 #endif
