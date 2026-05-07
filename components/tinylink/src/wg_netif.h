@@ -95,6 +95,13 @@ esp_err_t wg_netif_inject_packet(const uint8_t *src_node_pub,
  * material. Safe to call from any state. */
 void wg_netif_stop(void);
 
+/* Cumulative count of outbound plaintext frames dropped because the
+ * TX queue was full when wg_netif_send_plaintext tried to enqueue. A
+ * non-zero value indicates the encrypt-then-send pipeline can't keep
+ * up with lwIP's TX rate (or the worker task is starving — check task
+ * priority + WiFi RF stalls). Read-only, monotonically increasing. */
+uint64_t wg_netif_get_tx_drops(void);
+
 #ifdef __cplusplus
 }
 #endif

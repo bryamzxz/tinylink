@@ -9,6 +9,7 @@
 #include <string.h>
 
 #include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 
@@ -38,10 +39,46 @@ static const char *TAG = "wg_netif";
 #define WG_RX_TASK_STACK_BYTES 4096
 #define WG_RX_TASK_PRIO        (tskIDLE_PRIORITY + 3)
 
+/* TX worker task: drains the outbound queue and runs sendto outside
+ * the lwIP TCPIP context (calling sendto from there re-enters the
+ * lwIP socket API and posts a tcpip_callback that the TCPIP task
+ * itself would have to drain — guaranteed deadlock). One step below
+ * the RX task so packet decode wins under load. 4 KiB matches the
+ * RX task budget — sendto recursing into the WiFi driver TX
+ * callback chain alone needed >2 KiB on first measurement (canary
+ * tripped on 3 KiB), and we keep the 1.5 KiB queue item OFF this
+ * stack (in g.tx_worker_scratch) so the budget covers actual call
+ * frames. */
+#define WG_TX_TASK_STACK_BYTES 4096
+#define WG_TX_TASK_PRIO        (tskIDLE_PRIORITY + 2)
+
+/* Outbound TX queue depth. At 1.5 KiB per item, 3 items = 4.7 KiB
+ * heap. Telemetry ticks every 5 s and ICMP responses are sporadic;
+ * realistic burst depth is 1–2. Three gives margin without waste.
+ * If this ever fills under steady-state operation it shows up in
+ * wg_netif_get_tx_drops + the throttled drop log below. */
+#define WG_TX_QUEUE_LEN        3
+
+/* Drop-on-full log throttle. Print one warning per N drops so the
+ * UART doesn't spam if the worker is stuck for an extended window. */
+#define WG_TX_DROP_LOG_EVERY   64
+
 /* Largest WG datagram we accept on the wire. WG transport packets are
  * usually MTU-bounded; with our 1.5 KiB upper bound we have plenty of
  * headroom for IPv4 over WG. */
 #define WG_RX_BUF_LEN 1536
+
+/* Item shipped from wg_netif_send_plaintext (lwIP TCPIP context) to
+ * the TX worker task. Carries the already-encrypted wire bytes plus a
+ * snapshot of the destination sockaddr — snapshotting avoids racing
+ * wg_netif_update_peer_endpoint between encrypt and send (the WG spec
+ * tolerates a short trailing window of packets to the old endpoint
+ * during roaming, so the old snapshot landing is fine). */
+typedef struct {
+    size_t              len;
+    struct sockaddr_in  dst;
+    uint8_t             buf[WG_RX_BUF_LEN];
+} wg_tx_item_t;
 
 typedef enum {
     WG_NETIF_IDLE = 0,
@@ -70,6 +107,25 @@ static struct {
 
     TaskHandle_t            rx_task;
     SemaphoreHandle_t       lock;
+
+    /* Outbound TX queue + worker. The worker drains in non-TCPIP
+     * context so sendto can re-enter lwIP safely. tx_done_sem is
+     * given by the worker as the last thing it does before
+     * vTaskDelete(NULL); wg_netif_stop takes it (with timeout) so
+     * vQueueDelete cannot race against an in-flight xQueueReceive. */
+    QueueHandle_t           tx_queue;
+    TaskHandle_t            tx_task;
+    SemaphoreHandle_t       tx_done_sem;
+    uint64_t                tx_drops;
+
+    /* Scratch slots that keep the 1.5 KiB tx items OFF the stacks of
+     * the producer (lwIP TCPIP, 3 KiB) and the worker (4 KiB but
+     * sendto's WiFi tx chain eats most of it). Each is single-owner:
+     * only the TCPIP task ever writes to tx_scratch (input to
+     * xQueueSend), only the wg_tx worker ever writes to
+     * tx_worker_scratch (output of xQueueReceive). */
+    wg_tx_item_t            tx_scratch;
+    wg_tx_item_t            tx_worker_scratch;
 
     wg_netif_rx_cb_t        rx_cb;
     void                   *rx_cb_user;
@@ -270,6 +326,36 @@ static void rx_task(void *arg)
     vTaskDelete(NULL);
 }
 
+/* TX worker: drains tx_queue + sendto outside the lwIP TCPIP task.
+ * Gives tx_done_sem as the last thing before vTaskDelete(NULL) so
+ * wg_netif_stop can wait for clean exit before destroying the queue. */
+static void tx_task_fn(void *arg)
+{
+    (void)arg;
+    while (!g.stop_requested) {
+        /* 500 ms wakeup so stop_requested is observed even when no
+         * outbound traffic is flowing. xQueueReceive memcpys the
+         * dequeued item directly into our BSS scratch — keeping it
+         * off-stack matters here because sendto recurses into the
+         * WiFi TX callback chain and chews into our budget. */
+        if (xQueueReceive(g.tx_queue, &g.tx_worker_scratch,
+                          pdMS_TO_TICKS(500)) != pdTRUE) {
+            continue;
+        }
+        ssize_t n = sendto(g.sock,
+                           g.tx_worker_scratch.buf, g.tx_worker_scratch.len, 0,
+                           (struct sockaddr *)&g.tx_worker_scratch.dst,
+                           sizeof(g.tx_worker_scratch.dst));
+        if (n < 0) {
+            ESP_LOGW(TAG, "tx sendto: errno=%d", errno);
+        }
+    }
+    if (g.tx_done_sem != NULL) {
+        xSemaphoreGive(g.tx_done_sem);
+    }
+    vTaskDelete(NULL);
+}
+
 /* --- Public API ----------------------------------------------------- */
 
 esp_err_t wg_netif_init(const struct wg_netif_local_config *local)
@@ -304,6 +390,33 @@ esp_err_t wg_netif_init(const struct wg_netif_local_config *local)
         g.bind_port_actual = ntohs(bind_addr.sin_port);
     }
     ESP_LOGI(TAG, "udp bound on port %u", (unsigned)g.bind_port_actual);
+
+    g.tx_queue = xQueueCreate(WG_TX_QUEUE_LEN, sizeof(wg_tx_item_t));
+    if (g.tx_queue == NULL) {
+        ESP_LOGE(TAG, "tx_queue create failed");
+        close(g.sock);
+        return ESP_ERR_NO_MEM;
+    }
+    g.tx_done_sem = xSemaphoreCreateBinary();
+    if (g.tx_done_sem == NULL) {
+        ESP_LOGE(TAG, "tx_done_sem create failed");
+        vQueueDelete(g.tx_queue);
+        g.tx_queue = NULL;
+        close(g.sock);
+        return ESP_ERR_NO_MEM;
+    }
+    BaseType_t ok = xTaskCreate(tx_task_fn, "wg_tx",
+                                WG_TX_TASK_STACK_BYTES, NULL,
+                                WG_TX_TASK_PRIO, &g.tx_task);
+    if (ok != pdPASS) {
+        ESP_LOGE(TAG, "tx task spawn failed");
+        vSemaphoreDelete(g.tx_done_sem);
+        g.tx_done_sem = NULL;
+        vQueueDelete(g.tx_queue);
+        g.tx_queue = NULL;
+        close(g.sock);
+        return ESP_ERR_NO_MEM;
+    }
 
     g.state       = WG_NETIF_IDLE;
     g.initialized = true;
@@ -388,30 +501,38 @@ esp_err_t wg_netif_send_plaintext(const uint8_t *pkt, size_t len)
     if (len + WG_TRANSPORT_OVERHEAD > WG_RX_BUF_LEN) {
         return ESP_ERR_INVALID_SIZE;
     }
-    /* Refuse calls from the lwIP TCPIP task. wg_lwip's wg_transmit hooks
-     * us as the netif TX callback, so any IP packet routed to the WG
-     * netif lands here on TCPIP context. send_to_peer below issues a
-     * BSD sendto on g.sock, which goes back through lwIP's socket API
-     * and posts a tcpip_callback that waits on a semaphore — but the
-     * TCPIP task is the very one that would have to dequeue it, so it
-     * deadlocks. Symptom is a silent freeze of the entire data plane
-     * (telemetry, DERP recv, ICMP all stop) while the supervisor task's
-     * SO_RCVTIMEO-driven socket reads keep producing WANT_READ logs.
+    /* Encrypt inline. ChaCha20-Poly1305 is pure CPU + memory and is
+     * safe to run on the lwIP TCPIP task. The actual sendto is what
+     * re-enters lwIP — that's why the wire bytes are handed off to the
+     * tx worker via tx_queue instead of called here directly.
      *
-     * Dropping here mirrors the pre-WG_NETIF_UP behavior: lwIP sees a
-     * TX failure and discards the buffer. Outbound WG transport over
-     * the tunnel is therefore non-functional via this path; a queue
-     * model (encrypted bytes posted to a worker task that does the
-     * sendto outside TCPIP context) is the proper fix and intended for
-     * a follow-up PR alongside the outbound DERP queue. */
-    const char *task_name = pcTaskGetName(NULL);
-    if (task_name != NULL && strcmp(task_name, "tiT") == 0) {
-        return ESP_ERR_INVALID_STATE;
-    }
-    uint8_t wire[WG_RX_BUF_LEN];
-    int wlen = wg_transport_encrypt(&g.transport, wire, sizeof(wire), pkt, len);
+     * Use g.tx_scratch (BSS) instead of a stack-local item so the
+     * TCPIP task's small stack doesn't have to absorb the 1.5 KiB
+     * wire buffer alongside its own frames. xQueueSend memcpys the
+     * full sizeof(wg_tx_item_t) into the queue's internal storage,
+     * so it's safe to reuse the scratch on the next call. */
+    int wlen = wg_transport_encrypt(&g.transport,
+                                    g.tx_scratch.buf, sizeof(g.tx_scratch.buf),
+                                    pkt, len);
     if (wlen < 0) return ESP_FAIL;
-    if (send_to_peer(wire, (size_t)wlen) < 0) return ESP_FAIL;
+    g.tx_scratch.len = (size_t)wlen;
+    /* Snapshot the dest sockaddr at enqueue time so a concurrent
+     * wg_netif_update_peer_endpoint after we release can't redirect a
+     * frame whose counter is already committed. */
+    g.tx_scratch.dst = g.peer_addr;
+
+    if (xQueueSend(g.tx_queue, &g.tx_scratch, 0) != pdTRUE) {
+        /* Queue full. Drop this frame; lwIP treats any non-OK return
+         * as a TX failure and discards its pbuf. The worker is either
+         * starving (priority) or stuck in sendto — log throttled so
+         * UART doesn't spam if backlog runs hot for a sustained burst. */
+        uint64_t prev = g.tx_drops++;
+        if ((prev % WG_TX_DROP_LOG_EVERY) == 0) {
+            ESP_LOGW(TAG, "tx queue full — dropped frame (total=%llu)",
+                     (unsigned long long)g.tx_drops);
+        }
+        return ESP_FAIL;
+    }
     return ESP_OK;
 }
 
@@ -430,9 +551,26 @@ void wg_netif_stop(void)
 {
     if (!g.initialized) return;
     g.stop_requested = true;
-    /* The RX task notices stop_requested when its 1-s recvfrom
-     * timeout fires and self-deletes. We don't join here to keep
-     * stop() non-blocking; the OS will reclaim. */
+    /* Wait for the TX worker to observe stop_requested and exit before
+     * we tear down its queue; otherwise vQueueDelete can race against
+     * an in-flight xQueueReceive. The worker wakes at most every 500
+     * ms; 2 s is comfortable margin even under priority pressure. The
+     * RX task observes stop_requested via its 1-s recvfrom timeout
+     * and self-deletes; we don't gate on it here because nothing it
+     * touches gets freed below. */
+    if (g.tx_done_sem != NULL) {
+        if (xSemaphoreTake(g.tx_done_sem, pdMS_TO_TICKS(2000)) != pdTRUE) {
+            ESP_LOGW(TAG, "tx task did not exit within 2s — forcing teardown");
+        }
+    }
+    if (g.tx_queue != NULL) {
+        vQueueDelete(g.tx_queue);
+        g.tx_queue = NULL;
+    }
+    if (g.tx_done_sem != NULL) {
+        vSemaphoreDelete(g.tx_done_sem);
+        g.tx_done_sem = NULL;
+    }
     if (g.sock >= 0) {
         close(g.sock);
         g.sock = -1;
@@ -440,6 +578,11 @@ void wg_netif_stop(void)
     wg_handshake_scrub(&g.handshake);
     memset(&g.transport, 0, sizeof(g.transport));
     g.initialized = false;
+}
+
+uint64_t wg_netif_get_tx_drops(void)
+{
+    return g.tx_drops;
 }
 
 #endif /* ESP_PLATFORM */
