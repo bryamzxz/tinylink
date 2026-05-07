@@ -171,6 +171,12 @@ make
 for t in test_*; do ./$t; done   # 15 KAT binaries, all should report ALL OK
 ```
 
+On-device AEAD micro-bench (opt-in via `CONFIG_TINYLINK_BENCH_AEAD`,
+off by default — see [`docs/BUILDING.md`](docs/BUILDING.md#benchmarking-aead)).
+Used to measure the ChaCha20-Poly1305 hot path; current numbers on
+ESP32 LX6 are ~660 µs/encrypt and ~654 µs/decrypt at 1500 B
+(`CHANGELOG.md` has the full change log).
+
 ## Provisioning
 
 Credentials (WiFi + Tailscale auth key) are stored in an encrypted NVS

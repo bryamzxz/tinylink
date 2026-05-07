@@ -81,6 +81,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     (`tools/test/test_mapresp.c`) that exercises a one-peer +
     one-DERP-region stub.
 
+### Performance
+- **ChaCha20-Poly1305 AEAD: ~10% faster encrypt and ~12% faster decrypt
+  on 1500 B payloads on ESP32 LX6.** Three changes in
+  `components/tinylink/src/crypto/`:
+  1. `chacha20.c`: keystream/plaintext XOR loop in `chacha20()` and the
+     16 keystream stores in `chacha20_block()` now go through
+     `__builtin_memcpy` of `uint32_t` chunks instead of byte-by-byte.
+     `output[CHACHA20_BLOCK_SIZE]` is `__attribute__((aligned(4)))` so
+     the compiler folds these to single `l32i`/`s32i` on Xtensa.
+  2. `poly1305_donna_32.h`: `U8TO32` rewritten as `__builtin_memcpy`.
+     Compiler emits `l32i` when alignment is provable (the
+     leftover-completing call always passes `st->buffer`, which is
+     4-aligned) and falls back to the original byte path otherwise.
+     Strict-aliasing-safe by construction.
+  3. `chacha20.c`: `U8TO32_LITTLE` / `U32TO8_LITTLE` macros switched to
+     `__builtin_memcpy`; `chacha20_init` now bulk-copies the 32-byte
+     key into `state[4..11]` so GCC schedules the loads/stores
+     interleaved instead of expanding 8 separate macro instances.
+- **Bench harness.** New `CONFIG_TINYLINK_BENCH_AEAD` (off by default)
+  builds an opt-in micro-bench (`components/tinylink/src/tinylink_bench.c`)
+  that times encrypt + decrypt over 64 B and 1500 B payloads with
+  `esp_timer_get_time()` and verifies a round-trip before reporting
+  numbers. Used to measure the changes above; left in place as the
+  reference for future crypto work.
+- Measured on Freenove ESP32-WROOM-32E, ESP-IDF v5.5.4, `-Os`:
+  enc 739→659 µs, dec 740→654 µs at 1500 B. Variance run-to-run is
+  ~1-2 % on MTU; treat sub-3 % deltas as noise.
+
 ### Fixed
 - **ts2021 wire format corrected against upstream.** Initial implementation
   put the Noise IK msg1 in the HTTP body and used a 4-byte invented frame

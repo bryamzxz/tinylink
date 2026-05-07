@@ -19,6 +19,7 @@
 #include "esp_log.h"
 
 #include "tinylink.h"
+#include "tinylink_bench.h"
 
 #include "app_nvs.h"
 #include "app_wifi.h"
@@ -54,6 +55,17 @@ static esp_err_t bringup(void)
         ESP_LOGE(TAG, "tinylink_init failed: 0x%x", err);
         return err;
     }
+
+#if CONFIG_TINYLINK_BENCH_AEAD
+    /* AEAD baseline. Runs before register/dataplane so the heap is
+     * still pristine and the timer numbers aren't confounded by
+     * background TLS/long-poll work. The 8 s delay is purely so the
+     * host serial capture can attach after `idf.py flash` releases the
+     * port — without it the bench fires before capture is listening
+     * and the numbers are lost. */
+    vTaskDelay(pdMS_TO_TICKS(8000));
+    (void)tinylink_bench_aead();
+#endif
 
     /* Bring up the WG UDP socket EARLY (bind only — no handshake yet)
      * so the boot-time STUN probe can run on the same socket the
