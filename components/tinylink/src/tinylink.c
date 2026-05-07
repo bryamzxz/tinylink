@@ -341,12 +341,15 @@ static int derp_sup_event_cb(const derp_event_t *e, void *ctx)
     return 0;
 }
 
-/* Task entry: the conn is already live (established by
- * tinylink_derp_supervised_start). Run the recv loop until error,
- * then reconnect with backoff. Reconnect attempts may face heap
- * pressure once the long-poll's TLS conn is alive (~10 KiB largest
- * free block vs ~12 KiB mbedtls handshake peak); we tolerate by
- * retrying — eventually long-poll's stream ends and frees room. */
+/* Task entry: own the connect + recv-loop + close + backoff cycle
+ * end-to-end. Initial connect lives here (not in the start() caller)
+ * so a transient heap shortage at bringup time doesn't tear the
+ * supervisor down for the rest of the session — the task simply
+ * loops on backoff until heap settles enough for the mbedtls cert
+ * chain verify (~12 KiB contiguous). With the post-#32 budget
+ * (DYNAMIC_BUFFER=y, SESSION_TICKETS=n) the supervisor's connect
+ * peak slips below the largest free block once the long-poll's
+ * first reconnect cycle frees its handshake scratch. */
 static void derp_supervised_task(void *arg)
 {
     (void)arg;
@@ -356,8 +359,36 @@ static void derp_supervised_task(void *arg)
 
     derp_sup_stats_t stats = {0};
     static uint8_t frame_buf[DERP_SUP_FRAME_CAP];
+    unsigned attempt = 0;
 
     for (;;) {
+        /* Connect with backoff — runs at boot too, not just on
+         * reconnect. */
+        for (;;) {
+            attempt++;
+            ESP_LOGI(TAG, "derp supervisor: connect attempt #%u to %s "
+                          "(heap_free=%u largest=%u)",
+                     attempt, host,
+                     (unsigned)esp_get_free_heap_size(),
+                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
+            esp_err_t cerr = derp_client_connect_login(&s_derp_sup, host, 443,
+                                                       s_keys.node_priv,
+                                                       s_keys.node_pub);
+            if (cerr == ESP_OK) {
+                ESP_LOGI(TAG, "derp supervisor: login OK server-v=%d "
+                              "(after %u attempts)",
+                         s_derp_sup.server_version, attempt);
+                attempt = 0;
+                break;
+            }
+            ESP_LOGW(TAG, "derp supervisor: connect attempt #%u failed 0x%x — "
+                          "backoff %u ms",
+                     attempt, cerr,
+                     (unsigned)CONFIG_TINYLINK_DERP_SUPERVISED_BACKOFF_MS);
+            derp_client_close(&s_derp_sup);
+            vTaskDelay(backoff);
+        }
+
         ESP_LOGI(TAG, "derp supervisor: entering recv loop server-v=%d",
                  s_derp_sup.server_version);
         esp_err_t err = derp_client_run(&s_derp_sup, frame_buf, sizeof(frame_buf),
@@ -379,23 +410,6 @@ static void derp_supervised_task(void *arg)
         }
         derp_client_close(&s_derp_sup);
         vTaskDelay(backoff);
-
-        /* Reconnect. Loop here (not the outer for) so a second
-         * connect failure doesn't fall through to derp_client_run
-         * with a closed client. */
-        for (;;) {
-            ESP_LOGI(TAG, "derp supervisor: reconnect attempt to %s "
-                          "(heap_free=%u largest=%u)",
-                     host,
-                     (unsigned)esp_get_free_heap_size(),
-                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
-            err = derp_client_connect_login(&s_derp_sup, host, 443,
-                                            s_keys.node_priv, s_keys.node_pub);
-            if (err == ESP_OK) break;
-            ESP_LOGW(TAG, "derp supervisor: reconnect failed 0x%x — backoff", err);
-            derp_client_close(&s_derp_sup);
-            vTaskDelay(backoff);
-        }
     }
 }
 
@@ -411,39 +425,36 @@ esp_err_t tinylink_derp_supervised_start(void)
         return ESP_OK;
     }
 
-    /* Synchronous first connect: returning success implies the conn
-     * is up and the heap budget for one DERP TLS session is taken.
-     * The caller (main.c bringup) sequences this BEFORE the long-poll
-     * so the second handshake (long-poll's) finds enough contiguous
-     * heap; the inverse order deterministically fails per the heap
-     * fragmentation pattern documented in our config notes. */
-    ESP_LOGI(TAG, "derp supervisor: initial connect host=%s "
-                  "heap_free=%u largest=%u",
-             host,
-             (unsigned)esp_get_free_heap_size(),
-             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
-
-    esp_err_t err = derp_client_connect_login(&s_derp_sup, host, 443,
-                                              s_keys.node_priv,
-                                              s_keys.node_pub);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "derp supervisor: initial connect failed 0x%x", err);
-        derp_client_close(&s_derp_sup);
-        return err;
-    }
-    ESP_LOGI(TAG, "derp supervisor: initial login OK server-v=%d",
-             s_derp_sup.server_version);
-
-    /* 24 KiB stack — same budget as the long-poll task. The recv loop
-     * itself is small but esp_tls handshake on reconnect needs the
-     * same ~12 KiB peak the long-poll already budgeted for. */
+    /* Spawn the task. 12 KiB stack: mbedtls handshake peak is the
+     * dominant frame (~6 KiB stack) plus the derp recv loop's small
+     * frames. The long-poll task ships at 24 KiB but holds a static
+     * tl_netmap_t in its frame; the supervisor doesn't, so half the
+     * budget is enough.
+     *
+     * On stock ESP32-WROOM-32E the heap at this point of bringup is
+     * already claimed by the long-poll's TLS conn + nghttp2 session
+     * + WG netif state, leaving < 12 KiB largest contiguous block.
+     * xTaskCreate returning ESP_ERR_NO_MEM here is the expected
+     * failure mode and the function returns the error so main.c
+     * can log + continue. The retry/backoff inside
+     * derp_supervised_task only fires once xTaskCreate succeeds —
+     * spawning the task itself requires heap we may not have. The
+     * static-stack alternative was tested on-device 2026-05-06 and
+     * pushed BSS past the DRAM threshold, crashing startup with
+     * `esp_startup_start_app: res == pdTRUE` assertion. Fixing this
+     * properly needs BSS shrink (streaming JSON parser frees ~48
+     * KiB) or PSRAM. */
     BaseType_t ok = xTaskCreate(derp_supervised_task, "tinylink_derp",
-                                24576, NULL, tskIDLE_PRIORITY + 3, NULL);
+                                12288, NULL, tskIDLE_PRIORITY + 3, NULL);
     if (ok != pdPASS) {
-        ESP_LOGE(TAG, "xTaskCreate(derp supervisor) failed");
-        derp_client_close(&s_derp_sup);
+        ESP_LOGE(TAG, "xTaskCreate(derp supervisor) failed — "
+                      "heap_free=%u largest=%u (need 12 KiB contiguous)",
+                 (unsigned)esp_get_free_heap_size(),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
         return ESP_ERR_NO_MEM;
     }
+    ESP_LOGI(TAG, "derp supervisor: task spawned (host=%s, backoff=%u ms)",
+             host, (unsigned)CONFIG_TINYLINK_DERP_SUPERVISED_BACKOFF_MS);
     return ESP_OK;
 #else
     return ESP_OK;
