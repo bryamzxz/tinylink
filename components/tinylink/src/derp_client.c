@@ -133,10 +133,14 @@ esp_err_t derp_client_connect_login(derp_client_t *out,
                                     const uint8_t client_priv[DERP_KEY_LEN],
                                     const uint8_t client_pub[DERP_KEY_LEN])
 {
-    if (out == NULL || server_host == NULL || port == 0 ||
+    if (out == NULL || server_host == NULL ||
         client_priv == NULL || client_pub == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
+    /* DERPMap nodes have no DERPPort field in the wire JSON, so the
+     * parser leaves tl_derp_node_t.port at 0. Treat 0 as "use the DERP
+     * default" so callers can pass dn->port unchanged. */
+    if (port == 0) port = 443;
     memset(out, 0, sizeof(*out));
 
     char url[160];
