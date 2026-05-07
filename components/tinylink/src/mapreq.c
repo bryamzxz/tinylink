@@ -487,6 +487,20 @@ static int build_request_body(const tinylink_keys_t *keys,
                  (unsigned)ep_port);
     }
 
+    /* Hostinfo.NetInfo.PreferredDERP — tells the control plane (and
+     * via the netmap, our peers) which DERP region to relay through
+     * when they can't reach us directly. Without it, every peer's
+     * StableRelay falls back to whatever they last knew, and packets
+     * to us get black-holed at peers that picked a region we don't
+     * actually maintain a connection to. Hardcoded bootstrap value;
+     * 0 = omit (matches Go's omitzero on the field). */
+    char netinfo_field[48] = "";
+    if (CONFIG_TINYLINK_PREFERRED_DERP > 0) {
+        snprintf(netinfo_field, sizeof(netinfo_field),
+                 ",\"NetInfo\":{\"PreferredDERP\":%d}",
+                 CONFIG_TINYLINK_PREFERRED_DERP);
+    }
+
     int n = snprintf(out, out_size,
         "{"
         "\"Version\":138,"
@@ -494,12 +508,13 @@ static int build_request_body(const tinylink_keys_t *keys,
         "\"NodeKey\":\"%s\","
         "\"DiscoKey\":\"%s\","
         "\"Stream\":%s,"
-        "\"Hostinfo\":{\"OS\":\"esp32\",\"Hostname\":\"%s\",\"IPNVersion\":\"0.1.0-tinylink\"%s}"
+        "\"Hostinfo\":{\"OS\":\"esp32\",\"Hostname\":\"%s\",\"IPNVersion\":\"0.1.0-tinylink\"%s%s}"
         "}",
         node_key_hex, disco_key_hex,
         stream ? "true" : "false",
         CONFIG_TINYLINK_DEVICE_HOSTNAME,
-        endpoints_field);
+        endpoints_field,
+        netinfo_field);
     if (n < 0 || (size_t)n >= out_size) return -1;
     return n;
 }
