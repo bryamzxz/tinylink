@@ -25,6 +25,7 @@
 #include "telemetry.h"
 #include "ts2021_client.h"
 #include "wg_dataplane.h"
+#include "wg_netif.h"
 
 #define STR_HELPER(x) #x
 #define STR(x) STR_HELPER(x)
@@ -288,11 +289,22 @@ static void handle_disco_relayed(const derp_event_t *e,
         st->disco_cmms_seen++;
         ESP_LOGI(TAG, "disco call-me-maybe (M5 step 3 territory)");
         break;
-    default:
-        /* Either non-DISCO bytes (handler returned 0 with type
-         * untouched) or a relayed WG transport packet. M5 step 3
-         * will route those into wg_demux. */
+    default: {
+        /* Not a DISCO frame for us — could be a relayed WireGuard
+         * handshake response or transport packet from the active
+         * peer. Hand it to wg_netif's inject path so the existing
+         * demux + handler chain treats it identically to a UDP recv.
+         * Mismatched src_pub (a peer we don't have a session with)
+         * is dropped inside the inject API. */
+        esp_err_t ie = wg_netif_inject_packet(e->src_pub, e->data, e->data_len);
+        if (ie == ESP_ERR_INVALID_RESPONSE) {
+            ESP_LOGD(TAG, "relayed pkt from non-active peer dropped (len=%u)",
+                     (unsigned)e->data_len);
+        } else if (ie != ESP_OK) {
+            ESP_LOGW(TAG, "wg_netif_inject_packet: 0x%x", ie);
+        }
         break;
+    }
     }
 }
 

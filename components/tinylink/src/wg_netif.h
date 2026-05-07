@@ -76,6 +76,21 @@ void wg_netif_set_rx_callback(wg_netif_rx_cb_t cb, void *user);
  * can send/receive. */
 bool wg_netif_is_up(void);
 
+/* Inject a wire-shaped WG datagram from a DERP-relayed source. Used
+ * by the supervisor task to feed inbound packets through the same
+ * demux + handler path the UDP RX task uses. `src_node_pub` must
+ * match the active peer's static public key — packets from anyone
+ * else are dropped (we'd never have a session with them).
+ *
+ * Returns ESP_OK if the packet was classified and dispatched. Returns
+ * ESP_ERR_INVALID_STATE before init, ESP_ERR_INVALID_ARG on null
+ * inputs, ESP_ERR_INVALID_RESPONSE on src_node_pub mismatch. Packets
+ * the demux classifies as initiator-only (HANDSHAKE_INIT) or as
+ * already-handled-elsewhere (DISCO) are silently dropped — same
+ * policy as the UDP RX task. */
+esp_err_t wg_netif_inject_packet(const uint8_t *src_node_pub,
+                                 const uint8_t *buf, size_t len);
+
 /* Tear down. Closes the socket, stops the RX task, scrubs key
  * material. Safe to call from any state. */
 void wg_netif_stop(void);

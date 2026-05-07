@@ -343,6 +343,43 @@ esp_err_t wg_netif_update_peer_endpoint(uint32_t v4_be, uint16_t port)
     return ESP_OK;
 }
 
+esp_err_t wg_netif_inject_packet(const uint8_t *src_node_pub,
+                                 const uint8_t *buf, size_t len)
+{
+    if (!g.initialized) return ESP_ERR_INVALID_STATE;
+    if (src_node_pub == NULL || buf == NULL || len == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    /* Constant-time-ish equality check is overkill here: the src_pub
+     * comes from a DERP frame the relay authenticated against the
+     * peer's NodeKey, so an adversary can't trivially spoof it. A
+     * mismatch here means a different peer (CC'd PEER_PRESENT, etc.)
+     * — drop. */
+    if (memcmp(src_node_pub, g.peer.peer_static_pub, WG_KEY_LEN) != 0) {
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    wg_demux_kind_t kind = wg_demux_classify(buf, len);
+    switch (kind) {
+    case WG_DEMUX_HANDSHAKE_RESP:
+        handle_handshake_response(buf, len);
+        return ESP_OK;
+    case WG_DEMUX_TRANSPORT:
+        handle_transport(buf, len);
+        return ESP_OK;
+    case WG_DEMUX_HANDSHAKE_INIT:
+    case WG_DEMUX_HANDSHAKE_COOKIE:
+    case WG_DEMUX_DISCO:
+    case WG_DEMUX_STUN:
+    case WG_DEMUX_DISCARD:
+    default:
+        /* Initiator-only and out-of-scope kinds match the UDP RX
+         * task policy: silently drop. DISCO via DERP is already
+         * processed by handle_disco_relayed before we get here. */
+        return ESP_OK;
+    }
+}
+
 esp_err_t wg_netif_send_plaintext(const uint8_t *pkt, size_t len)
 {
     if (!g.initialized || g.state != WG_NETIF_UP) {
