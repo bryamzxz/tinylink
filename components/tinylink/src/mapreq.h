@@ -47,6 +47,18 @@ esp_err_t mapreq_fetch_once(ts2021_conn_t *conn,
                             const tinylink_keys_t *keys,
                             tl_netmap_t *out);
 
+/* Lite endpoint update: POST /machine/map with `Stream:false` AND
+ * `OmitPeers:true`. Per upstream
+ * tailscale/control/controlclient/auto.go:249-251, this is the only
+ * MapRequest shape the modern (CapVer >= 68) control plane treats as
+ * a writable Hostinfo / NetInfo / Endpoints push. The server is
+ * documented to be allowed to omit the response body entirely; we
+ * only inspect the HTTP status code. After this returns ESP_OK,
+ * peers receiving fresh MapResponses will see our top-level
+ * Endpoints (and their `Addrs` field is no longer null). */
+esp_err_t mapreq_push_endpoints(ts2021_conn_t *conn,
+                                const tinylink_keys_t *keys);
+
 /* Long-poll variant. POSTs `/machine/map` with `Stream:true`; the server
  * replies with a sequence of length-prefixed (LE32) MapResponse JSON
  * objects on the same HTTP/2 stream and keeps the connection open. The

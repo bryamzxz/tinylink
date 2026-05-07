@@ -20,6 +20,7 @@
 #include "lwip/inet.h"
 #include "lwip/sockets.h"
 
+#include "disco_handler.h"
 #include "wg_demux.h"
 #include "wg_handshake.h"
 #include "wg_transport.h"
@@ -34,9 +35,14 @@ static const char *TAG = "wg_netif";
 #define WG_REKEY_TIMEOUT_MS  5000
 #define WG_HANDSHAKE_MAX_RETRIES 12
 
-/* RX task stack: the dispatch path is shallow (recvfrom + decrypt +
- * callback). 4 KiB matches research §J's `app_task` budget. */
-#define WG_RX_TASK_STACK_BYTES 4096
+/* RX task stack: WG decrypt path alone fits in 4 KiB, but the DISCO
+ * direct branch adds NaCl-box open + a sealed Pong build + sendto on
+ * the same socket — verified 2026-05-07 to overflow 4 KiB ("stack
+ * overflow in task wg_rx" reset on every inbound CMM-punched ping).
+ * 8 KiB has comfortable headroom for the deepest path (handle_disco_direct
+ * → disco_handle_recv → disco_open → NaCl box_open with curve25519/salsa20
+ * crypto on the stack → disco_seal → sendto into WiFi TX). */
+#define WG_RX_TASK_STACK_BYTES 8192
 #define WG_RX_TASK_PRIO        (tskIDLE_PRIORITY + 3)
 
 /* TX worker task: drains the outbound queue and runs sendto outside
@@ -254,6 +260,55 @@ static void handle_transport(const uint8_t *buf, size_t len)
     memset(plaintext, 0, plen);
 }
 
+/* Handle a DISCO datagram that arrived on the shared UDP socket. The
+ * source AddrPort is whatever the peer used to dial us — for direct UDP
+ * this is the peer's reflexive endpoint behind their NAT. We sendto the
+ * reply on g.sock back to that exact src so the response traverses the
+ * same NAT mappings as the request (which is how peer A learns its own
+ * public AddrPort works to reach us). */
+static void handle_disco_direct(const uint8_t *buf, size_t len,
+                                const struct sockaddr_in *src)
+{
+    uint8_t reply[DISCO_HANDLER_REPLY_MAX];
+    disco_msg_type_t type = (disco_msg_type_t)0;
+    uint8_t peer_disco_pub[WG_KEY_LEN] = {0};
+    uint8_t txid[DISCO_TXID_LEN] = {0};
+    (void)peer_disco_pub;
+
+    size_t reply_len = disco_handle_recv(reply, sizeof(reply),
+                                         buf, len,
+                                         g.local.disco_priv, g.local.disco_pub,
+                                         &type, peer_disco_pub, txid);
+    if (type == 0) {
+        /* Decrypt failed: someone sealed against the wrong DiscoKey, or
+         * the bytes weren't actually a DISCO frame. Silent drop — magic
+         * prefix already matched so spam is bounded. */
+        return;
+    }
+    if (type == DISCO_TYPE_PING && reply_len > 0) {
+        ssize_t n = sendto(g.sock, reply, reply_len, 0,
+                           (const struct sockaddr *)src, sizeof(*src));
+        if (n < 0) {
+            ESP_LOGW(TAG, "disco pong sendto: errno=%d", errno);
+        } else {
+            char src_ip[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, &src->sin_addr, src_ip, sizeof(src_ip));
+            ESP_LOGI(TAG, "disco ping→pong (direct): src=%s:%u txid=%02x%02x%02x%02x..",
+                     src_ip, (unsigned)ntohs(src->sin_port),
+                     txid[0], txid[1], txid[2], txid[3]);
+        }
+        return;
+    }
+    if (type == DISCO_TYPE_PONG) {
+        ESP_LOGD(TAG, "disco pong received (direct path; no outbound prober yet)");
+        return;
+    }
+    if (type == DISCO_TYPE_CALLMEMAYBE) {
+        ESP_LOGI(TAG, "disco call-me-maybe (direct path)");
+        return;
+    }
+}
+
 /* RX task: blocks on recvfrom, classifies, dispatches. */
 static void rx_task(void *arg)
 {
@@ -277,16 +332,24 @@ static void rx_task(void *arg)
                 ESP_LOGW(TAG, "recvfrom: errno=%d", errno);
             }
         } else if (n > 0) {
-            /* Drop datagrams from anyone who isn't our peer. (We
-             * could relax this for DISCO discovery once step 7
-             * lands.) */
-            if (src.sin_addr.s_addr != g.peer_addr.sin_addr.s_addr ||
-                src.sin_port        != g.peer_addr.sin_port) {
-                ESP_LOGD(TAG, "drop datagram from non-peer src");
-                continue;
+            /* Classify FIRST, then apply the source filter only to
+             * WG-protocol kinds. DISCO frames legitimately arrive from
+             * a peer's reflexive endpoint (which is by definition NOT
+             * the same AddrPort the WG handshake currently targets —
+             * that's the whole point of direct-path discovery). */
+            wg_demux_kind_t kind = wg_demux_classify(buf, (size_t)n);
+            const bool is_wg_proto =
+                (kind == WG_DEMUX_HANDSHAKE_INIT ||
+                 kind == WG_DEMUX_HANDSHAKE_RESP ||
+                 kind == WG_DEMUX_HANDSHAKE_COOKIE ||
+                 kind == WG_DEMUX_TRANSPORT);
+            if (is_wg_proto &&
+                (src.sin_addr.s_addr != g.peer_addr.sin_addr.s_addr ||
+                 src.sin_port        != g.peer_addr.sin_port)) {
+                ESP_LOGD(TAG, "drop WG datagram from non-peer src");
+                goto retry_timer;
             }
 
-            wg_demux_kind_t kind = wg_demux_classify(buf, (size_t)n);
             switch (kind) {
             case WG_DEMUX_HANDSHAKE_RESP:
                 handle_handshake_response(buf, (size_t)n);
@@ -294,18 +357,22 @@ static void rx_task(void *arg)
             case WG_DEMUX_TRANSPORT:
                 handle_transport(buf, (size_t)n);
                 break;
+            case WG_DEMUX_DISCO:
+                handle_disco_direct(buf, (size_t)n, &src);
+                break;
             case WG_DEMUX_HANDSHAKE_INIT:
             case WG_DEMUX_HANDSHAKE_COOKIE:
-            case WG_DEMUX_DISCO:
             case WG_DEMUX_STUN:
-                /* Initiator-only — we never accept inbound init. DISCO
-                 * and STUN handlers land in step 7 and M4. */
+                /* Initiator-only on INIT/COOKIE; STUN response landed
+                 * after the boot prober closed (re-probe lives on its
+                 * own ephemeral socket). Drop. */
                 break;
             case WG_DEMUX_DISCARD:
             default:
                 break;
             }
         }
+retry_timer:;
 
         /* Handshake retry timer. Fires regardless of whether recvfrom
          * timed out. */
@@ -583,6 +650,16 @@ void wg_netif_stop(void)
 uint64_t wg_netif_get_tx_drops(void)
 {
     return g.tx_drops;
+}
+
+int wg_netif_get_socket(void)
+{
+    return g.initialized ? g.sock : -1;
+}
+
+bool wg_netif_rx_running(void)
+{
+    return g.rx_task != NULL;
 }
 
 #endif /* ESP_PLATFORM */

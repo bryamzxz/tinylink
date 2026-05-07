@@ -146,13 +146,31 @@ esp_err_t tinylink_derp_smoke(void);
  * fallback) once DISCO peer-pub bookkeeping exists. */
 esp_err_t tinylink_derp_supervised_start(void);
 
+/* Bring up the WireGuard UDP socket early — bind only, no handshake.
+ * Must be called after tinylink_init (so the local node identity is
+ * loaded from NVS) and before tinylink_stun_probe (so STUN can probe
+ * through the same socket). Without this prologue, STUN runs on its
+ * own ephemeral socket and the public AddrPort the control plane
+ * advertises to peers does NOT match the WG socket's NAT mapping, so
+ * inbound DISCO/transport from peers never reaches the device.
+ *
+ * Idempotent: subsequent calls (e.g. via tinylink_dataplane_start's
+ * later wg_netif_init) are no-ops. */
+esp_err_t tinylink_wg_socket_init(void);
+
 /* M4 — best-effort STUN binding probe to discover the device's public
  * AddrPort. Result is cached and uploaded to the control plane via
  * Hostinfo.Endpoints on the next MapRequest, so peers learn an address
  * they can try to dial directly even before DERP-mediated CallMeMaybe
  * (M5) is wired up. Failure is non-fatal; the device just operates
  * without a reflexive endpoint advertised, exactly like the pre-M4
- * baseline. Safe to call only after WiFi is up. */
+ * baseline. Safe to call only after WiFi is up.
+ *
+ * Probes through the WireGuard socket if it has been brought up
+ * (tinylink_wg_socket_init) and the RX task hasn't started yet. Else
+ * falls back to an ephemeral socket — useful only for re-probes that
+ * detect WAN-IP changes; the port they discover does NOT match the
+ * WG socket's bound port. */
 esp_err_t tinylink_stun_probe(void);
 
 /* Spawn a low-priority FreeRTOS task that re-runs the STUN probe every

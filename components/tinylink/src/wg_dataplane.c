@@ -296,10 +296,15 @@ esp_err_t wg_dataplane_start(const tinylink_keys_t *keys,
     }
     s_endpoint_port = (uint16_t)port;
 
-    /* 1) WG protocol engine (UDP socket + handshake state machine). */
+    /* 1) WG protocol engine (UDP socket + handshake state machine).
+     * If tinylink_wg_socket_init already brought up wg_netif (so STUN
+     * could probe through the same socket), this call is a no-op —
+     * the local config we pass here is ignored. */
     struct wg_netif_local_config local = {0};
-    memcpy(local.static_priv, keys->node_priv, WG_KEY_LEN);
-    memcpy(local.static_pub,  keys->node_pub,  WG_KEY_LEN);
+    memcpy(local.static_priv, keys->node_priv,  WG_KEY_LEN);
+    memcpy(local.static_pub,  keys->node_pub,   WG_KEY_LEN);
+    memcpy(local.disco_priv,  keys->disco_priv, WG_KEY_LEN);
+    memcpy(local.disco_pub,   keys->disco_pub,  WG_KEY_LEN);
     local.bind_port = 0;  /* let the kernel pick an ephemeral source port */
     esp_err_t err = wg_netif_init(&local);
     if (err != ESP_OK) {

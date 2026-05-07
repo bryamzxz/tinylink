@@ -45,6 +45,13 @@ struct wg_netif_peer_config {
 struct wg_netif_local_config {
     uint8_t  static_priv[WG_KEY_LEN];
     uint8_t  static_pub [WG_KEY_LEN];
+    /* DISCO NaCl-box keys. Used by the RX task to decrypt inbound DISCO
+     * pings on the shared UDP socket and reply with a sealed pong over
+     * the same path the ping arrived on. Without this the direct-UDP
+     * path stays cold even after STUN advertises a correct AddrPort —
+     * peers probe with DISCO before sending real WG transport. */
+    uint8_t  disco_priv [WG_KEY_LEN];
+    uint8_t  disco_pub  [WG_KEY_LEN];
     uint16_t bind_port;            /* 0 = let the kernel pick (ephemeral) */
 };
 
@@ -101,6 +108,20 @@ void wg_netif_stop(void);
  * up with lwIP's TX rate (or the worker task is starving — check task
  * priority + WiFi RF stalls). Read-only, monotonically increasing. */
 uint64_t wg_netif_get_tx_drops(void);
+
+/* Returns the bound UDP socket descriptor, or -1 if wg_netif has not
+ * been initialized yet. Exposed so STUN can run on the same socket the
+ * data plane uses — that way the public AddrPort the STUN response
+ * advertises matches the NAT mapping that WG keepalives keep alive,
+ * and inbound transport from peers actually reaches us. Caller MUST
+ * NOT close the socket; it remains owned by wg_netif. */
+int wg_netif_get_socket(void);
+
+/* Returns true once wg_netif_start has spawned the RX task. Boot-time
+ * STUN must run before this flips so a synchronous recvfrom on the
+ * shared socket doesn't race against the RX task's recvfrom (only one
+ * of the two would receive a given datagram). */
+bool wg_netif_rx_running(void);
 
 #ifdef __cplusplus
 }

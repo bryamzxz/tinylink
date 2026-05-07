@@ -458,11 +458,21 @@ static void hex_encode(const uint8_t *in, size_t len, char *out)
 
 /* MapRequest body builder. `stream=false` → the server returns one
  * MapResponse and closes; `stream=true` → long-poll, see
- * `mapreq_run_stream` for the framing format. `Compress:""` disables
- * zstd (we don't link it). Hostinfo is intentionally minimal; the
- * server treats it as informational once we're already registered. */
+ * `mapreq_run_stream` for the framing format. `omit_peers=true` plus
+ * `stream=false` is the upstream "lite" endpoint-update request
+ * documented in tailscale/control/controlclient/auto.go:249-251 —
+ * the ONLY combination at Version >= 68 where the control plane
+ * actually persists Hostinfo + top-level Endpoints. `Stream=true` is
+ * read-only (tailcfg.go:1408+1436); `Stream=false && OmitPeers=false`
+ * is treated as a normal map fetch and the embedded Endpoints are
+ * silently ignored, which left every peer with `Addrs: null` for
+ * sensor-cali after PR #37 — same symptom as before #37 had been
+ * applied. `Compress:""` disables zstd (we don't link it). Hostinfo
+ * is intentionally minimal; the server treats it as informational
+ * once we're already registered. */
 static int build_request_body(const tinylink_keys_t *keys,
                               bool stream,
+                              bool omit_peers,
                               char *out, size_t out_size)
 {
     char node_key_hex[8 + 64 + 1];
@@ -494,12 +504,18 @@ static int build_request_body(const tinylink_keys_t *keys,
      * left every peer with `Addrs: null` for sensor-cali — verified
      * 2026-05-07 via `tailscale debug peer-status` from a peer that
      * shared our tailnet but couldn't dial us. */
-    char endpoints_field[64] = "";
-    uint8_t  ep_addr[4];
-    uint16_t ep_port;
-    if (tinylink_get_public_endpoint(ep_addr, &ep_port)) {
+    /* `EndpointTypes` mirrors the upstream client (direct.go:1082);
+     * `2` = EndpointSTUN per tailcfg.go:1334, which is what our STUN
+     * probe is. The slice MUST be the same length as Endpoints — we
+     * only ever push one. */
+    char endpoints_field[96] = "";
+    uint8_t  ep_addr[4] = {0};
+    uint16_t ep_port = 0;
+    bool stun_ok = tinylink_get_public_endpoint(ep_addr, &ep_port);
+    if (stun_ok) {
         snprintf(endpoints_field, sizeof(endpoints_field),
-                 ",\"Endpoints\":[\"%u.%u.%u.%u:%u\"]",
+                 ",\"Endpoints\":[\"%u.%u.%u.%u:%u\"]"
+                 ",\"EndpointTypes\":[2]",
                  ep_addr[0], ep_addr[1], ep_addr[2], ep_addr[3],
                  (unsigned)ep_port);
     }
@@ -510,12 +526,27 @@ static int build_request_body(const tinylink_keys_t *keys,
      * StableRelay falls back to whatever they last knew, and packets
      * to us get black-holed at peers that picked a region we don't
      * actually maintain a connection to. Hardcoded bootstrap value;
-     * 0 = omit (matches Go's omitzero on the field). */
-    char netinfo_field[48] = "";
-    if (CONFIG_TINYLINK_PREFERRED_DERP > 0) {
+     * 0 = omit (matches Go's omitzero on the field).
+     *
+     * WorkingUDP is conditioned on a successful STUN probe — we just
+     * received a binding response, so UDP is empirically working. Without
+     * this signal, controlplane.tailscale.com appears NOT to propagate
+     * the Endpoints field to peers (peer's `tailscale status` shows
+     * `Addrs: null` even after a `Stream=false, OmitPeers=true` lite
+     * update returns 200). With it, peers get the dial candidate. */
+    char netinfo_field[96] = "";
+    if (CONFIG_TINYLINK_PREFERRED_DERP > 0 || stun_ok) {
+        char preferred_part[40] = "";
+        if (CONFIG_TINYLINK_PREFERRED_DERP > 0) {
+            snprintf(preferred_part, sizeof(preferred_part),
+                     "\"PreferredDERP\":%d",
+                     CONFIG_TINYLINK_PREFERRED_DERP);
+        }
+        const char *sep = (preferred_part[0] != '\0' && stun_ok) ? "," : "";
         snprintf(netinfo_field, sizeof(netinfo_field),
-                 ",\"NetInfo\":{\"PreferredDERP\":%d}",
-                 CONFIG_TINYLINK_PREFERRED_DERP);
+                 ",\"NetInfo\":{%s%s%s}",
+                 preferred_part, sep,
+                 stun_ok ? "\"WorkingUDP\":true" : "");
     }
 
     int n = snprintf(out, out_size,
@@ -525,16 +556,58 @@ static int build_request_body(const tinylink_keys_t *keys,
         "\"NodeKey\":\"%s\","
         "\"DiscoKey\":\"%s\","
         "\"Stream\":%s,"
+        "%s"
         "\"Hostinfo\":{\"OS\":\"esp32\",\"Hostname\":\"%s\",\"IPNVersion\":\"0.1.0-tinylink\"%s}"
         "%s"
         "}",
         node_key_hex, disco_key_hex,
         stream ? "true" : "false",
+        omit_peers ? "\"OmitPeers\":true," : "",
         CONFIG_TINYLINK_DEVICE_HOSTNAME,
         netinfo_field,    /* %s inside Hostinfo */
         endpoints_field); /* %s at top level */
     if (n < 0 || (size_t)n >= out_size) return -1;
     return n;
+}
+
+esp_err_t mapreq_push_endpoints(ts2021_conn_t *conn,
+                                const tinylink_keys_t *keys)
+{
+    if (conn == NULL || keys == NULL) return ESP_ERR_INVALID_ARG;
+
+    /* Body fits comfortably in the ~600-byte upper bound of a
+     * minimal Hostinfo + Endpoints request — no need for the
+     * heap-allocated REQUEST_BUF_SZ used by the netmap-fetching
+     * path. Use a stack buffer to avoid heap pressure. */
+    char body[1024];
+    int body_len = build_request_body(keys, /*stream=*/false,
+                                      /*omit_peers=*/true,
+                                      body, sizeof(body));
+    if (body_len < 0) return ESP_ERR_INVALID_SIZE;
+
+    /* The server is documented to be allowed to omit the response
+     * body entirely (tailcfg.go MapRequest.OmitPeers comment). 256 B
+     * is plenty whether the body is empty, "{}", or a tiny error
+     * message — we only check the HTTP status. */
+    uint8_t resp[256];
+    size_t resp_len = 0;
+    int status = 0;
+    esp_err_t err = h2_post_json(conn, "/machine/map",
+                                 CONFIG_TINYLINK_CONTROL_HOST,
+                                 (const uint8_t *)body, (size_t)body_len,
+                                 &status, resp, sizeof(resp), &resp_len);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "endpoint push h2_post_json failed: 0x%x", err);
+        return err;
+    }
+    ESP_LOGI(TAG, "endpoint push: HTTP %d (resp %u B)",
+             status, (unsigned)resp_len);
+    if (status != 200) {
+        ESP_LOGE(TAG, "endpoint push HTTP %d (server rejected lite update)",
+                 status);
+        return ESP_FAIL;
+    }
+    return ESP_OK;
 }
 
 esp_err_t mapreq_fetch_once(ts2021_conn_t *conn,
@@ -556,7 +629,7 @@ esp_err_t mapreq_fetch_once(ts2021_conn_t *conn,
         return ESP_ERR_NO_MEM;
     }
 
-    int body_len = build_request_body(keys, false, body, REQUEST_BUF_SZ);
+    int body_len = build_request_body(keys, false, false, body, REQUEST_BUF_SZ);
     if (body_len < 0) {
         free(body); free(resp);
         return ESP_ERR_INVALID_SIZE;
@@ -764,7 +837,7 @@ esp_err_t mapreq_run_stream(ts2021_conn_t *conn,
     }
 
     static char body[REQUEST_BUF_SZ];
-    int body_len = build_request_body(keys, true, body, sizeof(body));
+    int body_len = build_request_body(keys, true, false, body, sizeof(body));
     if (body_len < 0) return ESP_ERR_INVALID_SIZE;
 
     /* Body buffer for one assembled MapResponse. 16 KiB matches the

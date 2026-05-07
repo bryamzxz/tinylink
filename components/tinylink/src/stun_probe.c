@@ -17,39 +17,15 @@
 
 static const char *TAG = "stun_probe";
 
-esp_err_t stun_probe_run(const char *server_host, uint16_t server_port,
-                         uint32_t timeout_ms, stun_probe_result_t *out)
+/* Shared probe core. Sends one request on `sock`, polls up to 4
+ * recvfroms for a matching response, populates *out on success. The
+ * caller owns `sock` (open/close + bind). */
+static esp_err_t do_probe(int sock,
+                          const struct sockaddr *server_addr,
+                          socklen_t server_addrlen,
+                          uint32_t timeout_ms,
+                          stun_probe_result_t *out)
 {
-    if (server_host == NULL || out == NULL || server_port == 0) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    out->valid = false;
-
-    /* DNS resolve. Restrict to AF_INET — our STUN parser surfaces v4
-     * addresses (in v4-mapped form), and the device only has a v4
-     * netif anyway. */
-    struct addrinfo hints = {
-        .ai_family   = AF_INET,
-        .ai_socktype = SOCK_DGRAM,
-    };
-    char port_str[8];
-    snprintf(port_str, sizeof(port_str), "%u", (unsigned)server_port);
-
-    struct addrinfo *res = NULL;
-    int gai = getaddrinfo(server_host, port_str, &hints, &res);
-    if (gai != 0 || res == NULL) {
-        ESP_LOGW(TAG, "getaddrinfo(%s:%u) failed: %d", server_host,
-                 (unsigned)server_port, gai);
-        return ESP_FAIL;
-    }
-
-    int sock = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sock < 0) {
-        ESP_LOGE(TAG, "socket() failed: errno=%d", errno);
-        freeaddrinfo(res);
-        return ESP_FAIL;
-    }
-
     /* Bound recv timeout so a black-holed server doesn't park the boot
      * sequence forever. */
     struct timeval tv = {
@@ -67,30 +43,23 @@ esp_err_t stun_probe_run(const char *server_host, uint16_t server_port,
     uint8_t req[STUN_REQUEST_LEN];
     if (stun_build_request(req, txid) != STUN_REQUEST_LEN) {
         ESP_LOGE(TAG, "stun_build_request failed");
-        close(sock); freeaddrinfo(res);
         return ESP_FAIL;
     }
 
     ssize_t sent = sendto(sock, req, sizeof(req), 0,
-                          res->ai_addr, res->ai_addrlen);
-    freeaddrinfo(res);
+                          server_addr, server_addrlen);
     if (sent != (ssize_t)sizeof(req)) {
         ESP_LOGW(TAG, "sendto failed: ret=%d errno=%d", (int)sent, errno);
-        close(sock);
         return ESP_FAIL;
     }
 
-    /* Recv loop: discard any response that doesn't match our txid (the
-     * socket can in theory pick up unrelated probes if behind a busy
-     * NAT, though for our one-shot use it's almost always our own
-     * answer on the first packet). Bounded to 4 attempts so a chatty
-     * NAT doesn't keep us spinning. */
+    /* Recv loop: discard any response that doesn't match our txid.
+     * Bounded to 4 attempts so a chatty NAT doesn't keep us spinning. */
     uint8_t resp[256];
     for (int attempt = 0; attempt < 4; attempt++) {
         ssize_t got = recvfrom(sock, resp, sizeof(resp), 0, NULL, NULL);
         if (got < 0) {
             ESP_LOGW(TAG, "recvfrom timeout/error: errno=%d", errno);
-            close(sock);
             return ESP_FAIL;
         }
         uint8_t got_txid[STUN_TXID_LEN];
@@ -118,16 +87,83 @@ esp_err_t stun_probe_run(const char *server_host, uint16_t server_port,
         out->addr_v4[3] = addr.addr[15];
         out->port  = addr.port;
         out->valid = true;
-        close(sock);
         ESP_LOGI(TAG, "public endpoint: %u.%u.%u.%u:%u",
                  out->addr_v4[0], out->addr_v4[1], out->addr_v4[2], out->addr_v4[3],
                  (unsigned)out->port);
         return ESP_OK;
     }
 
-    close(sock);
     ESP_LOGW(TAG, "no matching STUN response in 4 attempts");
     return ESP_FAIL;
+}
+
+static esp_err_t resolve_server(const char *host, uint16_t port,
+                                struct sockaddr_in *out)
+{
+    struct addrinfo hints = {
+        .ai_family   = AF_INET,
+        .ai_socktype = SOCK_DGRAM,
+    };
+    char port_str[8];
+    snprintf(port_str, sizeof(port_str), "%u", (unsigned)port);
+
+    struct addrinfo *res = NULL;
+    int gai = getaddrinfo(host, port_str, &hints, &res);
+    if (gai != 0 || res == NULL) {
+        ESP_LOGW(TAG, "getaddrinfo(%s:%u) failed: %d", host,
+                 (unsigned)port, gai);
+        return ESP_FAIL;
+    }
+    /* getaddrinfo with AF_INET hint always returns a sockaddr_in. */
+    memcpy(out, res->ai_addr, sizeof(*out));
+    freeaddrinfo(res);
+    return ESP_OK;
+}
+
+esp_err_t stun_probe_run(const char *server_host, uint16_t server_port,
+                         uint32_t timeout_ms, stun_probe_result_t *out)
+{
+    if (server_host == NULL || out == NULL || server_port == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    out->valid = false;
+
+    struct sockaddr_in server;
+    if (resolve_server(server_host, server_port, &server) != ESP_OK) {
+        return ESP_FAIL;
+    }
+
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock < 0) {
+        ESP_LOGE(TAG, "socket() failed: errno=%d", errno);
+        return ESP_FAIL;
+    }
+
+    esp_err_t err = do_probe(sock,
+                             (struct sockaddr *)&server, sizeof(server),
+                             timeout_ms, out);
+    close(sock);
+    return err;
+}
+
+esp_err_t stun_probe_run_on_socket(int sock,
+                                   const char *server_host,
+                                   uint16_t server_port,
+                                   uint32_t timeout_ms,
+                                   stun_probe_result_t *out)
+{
+    if (sock < 0 || server_host == NULL || out == NULL || server_port == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    out->valid = false;
+
+    struct sockaddr_in server;
+    if (resolve_server(server_host, server_port, &server) != ESP_OK) {
+        return ESP_FAIL;
+    }
+    return do_probe(sock,
+                    (struct sockaddr *)&server, sizeof(server),
+                    timeout_ms, out);
 }
 
 #endif /* ESP_PLATFORM */
