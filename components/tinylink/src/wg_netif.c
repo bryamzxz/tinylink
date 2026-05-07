@@ -388,6 +388,26 @@ esp_err_t wg_netif_send_plaintext(const uint8_t *pkt, size_t len)
     if (len + WG_TRANSPORT_OVERHEAD > WG_RX_BUF_LEN) {
         return ESP_ERR_INVALID_SIZE;
     }
+    /* Refuse calls from the lwIP TCPIP task. wg_lwip's wg_transmit hooks
+     * us as the netif TX callback, so any IP packet routed to the WG
+     * netif lands here on TCPIP context. send_to_peer below issues a
+     * BSD sendto on g.sock, which goes back through lwIP's socket API
+     * and posts a tcpip_callback that waits on a semaphore — but the
+     * TCPIP task is the very one that would have to dequeue it, so it
+     * deadlocks. Symptom is a silent freeze of the entire data plane
+     * (telemetry, DERP recv, ICMP all stop) while the supervisor task's
+     * SO_RCVTIMEO-driven socket reads keep producing WANT_READ logs.
+     *
+     * Dropping here mirrors the pre-WG_NETIF_UP behavior: lwIP sees a
+     * TX failure and discards the buffer. Outbound WG transport over
+     * the tunnel is therefore non-functional via this path; a queue
+     * model (encrypted bytes posted to a worker task that does the
+     * sendto outside TCPIP context) is the proper fix and intended for
+     * a follow-up PR alongside the outbound DERP queue. */
+    const char *task_name = pcTaskGetName(NULL);
+    if (task_name != NULL && strcmp(task_name, "tiT") == 0) {
+        return ESP_ERR_INVALID_STATE;
+    }
     uint8_t wire[WG_RX_BUF_LEN];
     int wlen = wg_transport_encrypt(&g.transport, wire, sizeof(wire), pkt, len);
     if (wlen < 0) return ESP_FAIL;
