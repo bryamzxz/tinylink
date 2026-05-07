@@ -4,7 +4,173 @@ This document describes the tinylink runtime layout. For the on-the-wire
 protocols see [`PROTOCOL.md`](PROTOCOL.md). For why we picked the cryptographic
 primitives we did, see [`SECURITY-MODEL.md`](SECURITY-MODEL.md).
 
+## Quick navigation
+
+- [Component layout (M1)](#component-layout-m1) — original ts2021-only build.
+- [Component layout (current — M1–M6 landed)](#component-layout-current--m1m6-landed)
+- [WG netif as raw-IP carrier](#wg-netif-as-raw-ip-carrier) — why the netif
+  has `ESP_NETIF_FLAG_IS_PPP` set yet does NOT speak PPP, and what overrides
+  make it carry raw IP.
+- [Direct-UDP NAT traversal](#direct-udp-nat-traversal) — the five conditions
+  that flip `tailscale ping` from DERP fallback to direct-UDP path.
+- [Data flow (M1)](#data-flow-m1) — register-only flow, kept for reference.
+
+## Component layout (current — M1–M6 landed)
+
+```
++------------------------- main/main.c -------------------------+
+|  bringup():                                                   |
+|     app_nvs_init / app_wifi_start / app_wifi_wait_connected   |
+|     tinylink_init                                             |
+|     tinylink_wg_socket_init   ← bind WG UDP socket EARLY      |
+|     tinylink_stun_probe       ← STUN probes via WG socket so  |
+|                                  advertised port == NAT map   |
+|     tinylink_register loop                                    |
+|     tinylink_dataplane_start  ← Stream=false + OmitPeers=true |
+|                                  lite update with WorkingUDP  |
+|     tinylink_long_poll_start  ← stream=true read-only poll    |
+|     tinylink_derp_supervised_start                            |
+|     tinylink_telemetry_start                                  |
+|     tinylink_stun_reprobe_start                               |
++---------------------------------------------------------------+
+        │
+        ▼
++--------------- components/tinylink/src/ ----------------------+
+|                                                               |
+|  control plane (one Noise+H/2 channel reused for everything): |
+|     ts2021_client.c   Noise IK over TLS Upgrade               |
+|        ↑                                                      |
+|        │                                                      |
+|     register.c        POST /machine/register                  |
+|     mapreq.c          POST /machine/map                       |
+|       ├── mapreq_push_endpoints  Stream=false+OmitPeers=true  |
+|       │                          (lite update — only writable |
+|       │                          shape at CapVer ≥ 68)        |
+|       └── mapreq_run_stream      Stream=true (read-only       |
+|                                   netmap stream)              |
+|                                                               |
+|  data plane (single UDP socket, demuxed):                     |
+|     wg_netif.c                                                |
+|       ├── socket(AF_INET, SOCK_DGRAM)  ← shared with STUN     |
+|       ├── rx_task                                             |
+|       │     wg_demux_classify(buf[0])                         |
+|       │       ├── HANDSHAKE_RESP  → handle_handshake_response |
+|       │       ├── TRANSPORT       → handle_transport →        |
+|       │       │                     decrypt → rx_cb           |
+|       │       │                       │                       |
+|       │       │                       ▼                       |
+|       │       │                 wg_lwip::wg_rx_inject →       |
+|       │       │                 tcpip_input (bypasses PPP     |
+|       │       │                 framing — see below)          |
+|       │       └── DISCO          → handle_disco_direct →      |
+|       │                            decrypt + sealed Pong via  |
+|       │                            sendto on the same socket  |
+|       └── tx_task                                             |
+|             drains tx_queue → sendto                          |
+|             (encrypt happens inline in TCPIP context;         |
+|              sendto must run OUTSIDE TCPIP to avoid lwIP      |
+|              re-entrancy deadlock — see PR #41)               |
+|                                                               |
+|     wg_lwip.c                                                 |
+|       esp_netif PPP-flagged (sidesteps IDF dhcpc_cb panic)    |
+|       BUT we override:                                        |
+|         lwn->output      = wg_lwip_ip4_output                 |
+|         lwn->linkoutput  = wg_lwip_linkoutput                 |
+|       so the netif carries raw IP both ways. Without these    |
+|       overrides PPP would HDLC-frame egress and discard       |
+|       ingress at the framing layer.                           |
+|                                                               |
+|     stun_probe.c     RFC 5389; uses wg_netif's socket so the  |
+|                      public AddrPort matches the WG NAT map   |
+|                                                               |
+|     derp_client.c    Long-lived TLS upgrade                   |
+|     tinylink.c::derp_supervised_task                          |
+|       ├── handle_disco_relayed                                |
+|       │     CMM → send_disco_pings_to_cmm_endpoints           |
+|       │           (sends DISCO ping via wg_netif socket to    |
+|       │            each peer endpoint — NAT punch)            |
+|       └── default → wg_netif_inject_packet                    |
+|             (DERP-relayed WG transport / handshake-resp re-   |
+|              enters the demux + handler chain identically to  |
+|              a UDP recv)                                      |
+|                                                               |
+|  application:                                                 |
+|     tmp117.c         I²C continuous-mode driver               |
+|     telemetry.c      JSON datagram, routed through wg_netif   |
++---------------------------------------------------------------+
+```
+
+## WG netif as raw-IP carrier
+
+The WG netif is created with `ESP_NETIF_FLAG_IS_PPP` set. That flag was
+chosen because it:
+1. Tells esp_netif "no DHCP, no ARP, point-to-point" — exactly what a
+   tunnel netif needs.
+2. Sidesteps an IDF v5.5 panic in `esp_netif_internal_dhcpc_cb` that
+   killed the trombik-component-based WG netif baseline.
+
+But the flag also pulls in the PPP netstack glue
+(`ESP_NETIF_NETSTACK_DEFAULT_PPP`) which assumes the netif speaks
+HDLC-framed PPP on the wire. We're a raw-IP tunnel — there's no PPP
+modem. Four IDF behaviors had to be overridden:
+
+| Behavior                                                         | Override                                              |
+|------------------------------------------------------------------|-------------------------------------------------------|
+| `esp_netif_action_start` skips `netif_set_up` for PPP netifs     | call `netif_set_up(lwn)` explicitly post-attach       |
+| Same path skips `netif_set_link_up`                              | call `netif_set_link_up(lwn)` explicitly              |
+| Same path skips `netif_set_addr`                                 | call `netif_set_addr(lwn, ip, mask, gw)` explicitly   |
+| `input_fn = esp_netif_lwip_ppp_input` HDLC-frames raw IP         | bypass: `wg_rx_inject` calls `tcpip_input(p, lwn)`    |
+| `lwn->output` / `lwn->linkoutput` PPP-encapsulate egress         | replace both with raw-IP passthroughs                 |
+
+After all five overrides the netif behaves exactly like a normal IP
+tunnel netif from lwIP's POV — `ip4_input_accept` matches local dst,
+`ip4_output` routes egress by subnet match (100.64.0.0/10 → WG netif),
+and ICMP / TCP / UDP all flow through the WireGuard tunnel.
+
+See PR #43's commit message for the diagnostic trail.
+
+## Direct-UDP NAT traversal
+
+`tailscale ping` shows `via 190.x.x.x:port` (direct UDP) instead of
+`via DERP(mia)` only when ALL of these are true:
+
+1. **STUN ran on the WG socket** — `tinylink_stun_probe` calls
+   `stun_probe_run_on_socket(wg_netif_get_socket(), …)` so the public
+   AddrPort the control plane advertises is the same NAT mapping the
+   WG keepalives keep alive. Without this, the advertised port is for
+   an ephemeral STUN socket that closes immediately.
+2. **WG_DEMUX_DISCO classified before the peer-source filter** — the
+   RX task in `wg_netif.c` runs `wg_demux_classify` first, then only
+   applies the WG-peer source filter to WG protocol kinds. DISCO from
+   a peer's reflexive endpoint is NOT from our handshake destination,
+   so the old "drop everything not from peer.endpoint" filter would
+   have killed the punch ping.
+3. **Lite endpoint update** — `mapreq_push_endpoints` sends a
+   `Stream=false && OmitPeers=true` MapRequest at boot. Per upstream
+   `controlclient/auto.go:249-251`, that's the only shape modern
+   Tailscale.com accepts as writable for Hostinfo / NetInfo /
+   Endpoints. The success signal is HTTP 200 with body length 0 (the
+   server can omit the response on a lite update).
+4. **`NetInfo.WorkingUDP=true`** — empirically, controlplane.tailscale.com
+   refuses to propagate Endpoints to peers without this signal. We set
+   it true whenever the STUN probe succeeded (STUN responding IS proof
+   UDP works).
+5. **CallMeMaybe punch handler** — when the DERP supervisor receives
+   a CMM, `send_disco_pings_to_cmm_endpoints` sends a fresh sealed
+   DISCO ping via the WG socket to each v4-mapped peer endpoint. Each
+   outbound ping opens our NAT for the peer's simultaneous probe;
+   without this, port-restricted-cone NATs on either side stay closed
+   against each other and direct never punches through.
+
+The first four landed in PR #42 (`feat: direct UDP path end-to-end`);
+the fifth is also in #42. PR #43 then made the netif carry raw IP so
+real ICMP could traverse the now-direct path. See `MEMORY.md` entries
+`reference_tinylink_direct_udp.md` and PR commit messages for the
+forensic detail.
+
 ## Component layout (M1)
+
+The original M1-only layout, kept for historical reference:
 
 ```
 +--------------------------- main/ ------------------------------+

@@ -5,25 +5,40 @@ written in pure C on **ESP-IDF v5.5.x**.
 
 ## Status
 
-**Pre-alpha — DERP relay path live.** M1 lands the ts2021 control
-plane (Noise IK + register). M2 lands the `MapRequest` emitter
-(`jsmn` parser, top-level `Endpoints` + `NetInfo`, `Stream:false`
-push so the server actually persists state) and the in-tree
-WireGuard data plane (`wg_netif`, `wg_lwip` over a PPP-flagged
-esp_netif). M3 lands TMP117 telemetry. M4 lands a minimal STUN
-binding probe. **M5 first cut**: the DERP supervisor task
-connects to the `PreferredDERP` region pulled from the netmap,
-maintains the long-lived TLS upgrade against `derpNN.tailscale.com`,
-and answers DISCO Pings with sealed Pongs over the relay —
-`tailscale ping sensor-cali` from another tailnet node returns
-pongs via DERP reliably across multi-minute sessions.
+**Pre-alpha — direct UDP + ICMP-over-WG live end-to-end.**
 
-**The remaining gap**: real ICMP over the WG transport. Outbound
-packets routed via the WG netif from the lwIP TCPIP task are
-guarded against re-entering the lwIP socket API (which would
-deadlock the data plane); a follow-up queue model that posts
-encrypted bytes to a worker task running outside TCPIP context is
-the proper fix and unlocks ICMP end-to-end.
+| Layer                          | State                                  |
+|--------------------------------|----------------------------------------|
+| ts2021 control plane (M1)      | done                                   |
+| MapRequest + WireGuard (M2)    | done                                   |
+| TMP117 telemetry (M3)          | done                                   |
+| DISCO ping/pong (M3)           | done — direct + DERP                   |
+| STUN binding probe (M4)        | done — runs over WG socket             |
+| DERP supervised recv (M5)      | done                                   |
+| Direct UDP NAT punching (M5)   | done                                   |
+| ICMP over WG transport         | **done** — `ping <our-tailnet-ip>` flows |
+| Production hardening (M6)      | pending                                |
+
+What works today, verified on real hardware:
+
+- A peer running upstream `tailscaled` runs `tailscale ping sensor-cali`
+  and gets pongs `via 190.x.x.x:<port>` (direct UDP, no DERP relay).
+- The same peer runs `ping -c 10 100.67.60.92` (sensor-cali's tailnet IP)
+  and gets `0% packet loss, ~93ms RTT` over the WireGuard tunnel —
+  ICMP encapsulated, encrypted, decrypted, replied, end-to-end.
+- TMP117 telemetry frames flow out over the same tunnel every 5 s.
+- The Tailscale admin panel shows `Endpoints: 190.x.x.x:<port>` and
+  `Client connectivity → UDP: Yes`.
+
+What's still pending:
+
+- M6 hardening (real Ed25519 NLKey, secure boot, OTA, NVS encryption).
+- Pre-punch on netmap-receive (cuts the first `tailscale ping` from
+  3-DERP-rounds-then-direct down to direct-from-attempt-1).
+- DERP outbound queue (only relevant for peers behind shared CGNAT
+  where direct UDP can never work — for peers with public IPs the
+  direct path covers everything).
+- Multi-peer (single-peer today).
 
 Not production-ready. Not affiliated with Tailscale Inc. The Tailscale
 name and logo are trademarks of Tailscale Inc.; this project is a
@@ -65,41 +80,63 @@ single-peer, ~600 KiB flash.
 
 ## Architecture
 
-- **ts2021 control protocol** (Milestone 1, current): Noise IK
-  (`Noise_IK_25519_ChaChaPoly_BLAKE2s`) inside TLS to
-  `controlplane.tailscale.com`. The device generates Curve25519 identities
-  on first boot, fetches and pins the control plane public key, and
-  registers via `POST /machine/register`.
-- **MapRequest + WireGuard data plane** (Milestone 2, landed): the
-  Noise channel already runs HTTP/2 via nghttp2 from M1, so M2
-  reuses it for `POST /machine/map`. A jsmn-based parser extracts
-  only the fields the data plane needs (self/peer addresses, peer
-  endpoints, DERP map). The data plane is in-tree under
-  `components/tinylink/src/wg_netif.{c,h}` and `wg_lwip.c`: a UDP
-  socket for the wire transport, an esp_netif with PPP-flagged
-  netstack as the lwIP integration point, ChaCha20-Poly1305
-  transport via the in-tree `wg_transport.c`, and a single-peer
-  selector (`select_target_peer`) that prefers cross-NAT-reachable
-  endpoints over hairpin-blocked ones.
-- **DISCO** (Milestone 3, partial): NaCl-box ping/pong implemented
-  in `disco_handler.c`. Today it answers Pings relayed via DERP
-  (the supervisor task hands frames to the handler, which seals a
-  Pong and ships it back over the relay). Direct-UDP DISCO
-  multiplexed on the WG socket lands alongside the queue-based
-  outbound rework.
-- **STUN** (Milestone 4, landed): minimal RFC 5389 binding probe at
-  boot, result re-advertised on every MapRequest's `Endpoints`.
-  Re-probe runs on a slow timer to track NAT port rotation.
-- **DERP** (Milestone 5, first cut landed): supervisor task in
-  `tinylink.c::derp_supervised_task` keeps a long-lived TLS upgrade
-  to the `PreferredDERP` region's first node and dispatches relayed
-  frames either to the DISCO handler or back into `wg_netif` via
-  `wg_netif_inject_packet`. Outbound DERP send (relayed WG transport
-  for end-to-end ICMP) lands in the same queue-based PR as the
-  outbound WG fix.
+End-state component layout. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
+for the full call graphs and threading model.
 
-See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and
-[`docs/PROTOCOL.md`](docs/PROTOCOL.md) for the full protocol map.
+```
+control plane (one Noise+HTTP/2 channel reused for everything):
+  ts2021_client.c  Noise IK over TLS Upgrade → controlplane.tailscale.com
+   ├── register.c       POST /machine/register (boot)
+   ├── mapreq.c         POST /machine/map  (Stream=false lite push, then Stream=true poll)
+   └── (long-poll task lives in tinylink.c::long_poll_task)
+
+data plane (single UDP socket, demuxed):
+  wg_netif.c       UDP socket + handshake + transport state machine
+   ├── wg_demux.c       classify first byte: WG / DISCO / STUN
+   ├── wg_handshake.c   Noise_IK_25519_ChaChaPoly_BLAKE2s
+   ├── wg_transport.c   ChaCha20-Poly1305 + counter
+   └── handle_disco_direct  inbound DISCO ping → sealed pong via same socket
+
+  wg_lwip.c        lwIP integration (PPP-flagged esp_netif, but with
+                   linkoutput / output / input bypassed so it carries
+                   raw IP — see "WG netif as raw-IP carrier" in ARCHITECTURE.md)
+
+  stun_probe.c     RFC 5389 binding probe; runs ON the wg_netif socket
+                   so the public AddrPort matches the WG NAT mapping
+
+  derp_client.c    Long-lived TLS upgrade to PreferredDERP region
+   tinylink.c::derp_supervised_task
+   ├── handle_disco_relayed       relayed DISCO via DERP
+   │    └── send_disco_pings_to_cmm_endpoints  CallMeMaybe → outbound
+   │                                            DISCO ping (NAT punch)
+   └── wg_netif_inject_packet     relayed WG transport → demux + handler
+
+application:
+  tmp117.c         I²C driver (continuous mode, ~1 s conversion)
+  telemetry.c      JSON datagram → CONFIG_TINYLINK_TELEMETRY_DEST
+                   (routed through wg_netif, so the dest is a tailnet IP)
+```
+
+Three properties that are non-obvious from a casual read of the code:
+
+1. **One UDP socket carries everything**: WG transport, DISCO direct,
+   STUN. The RX task classifies the first byte and dispatches; STUN
+   piggy-backs on the WG socket at boot so the public AddrPort the
+   control plane advertises lines up with the NAT mapping that WG
+   keepalives keep pinned.
+
+2. **The WG netif is PPP-flagged but is NOT a PPP link.** The flag
+   tells esp_netif "no DHCP, no ARP, point-to-point" and sidesteps an
+   IDF-v5.5 `dhcpc_cb` panic; we then override the netif's
+   `input` / `output` / `linkoutput` so that ingress doesn't get
+   eaten by the PPP HDLC framer and egress doesn't get wrapped in PPP
+   protocol headers. End result: the netif carries raw IP both
+   directions, which is what WireGuard needs.
+
+3. **Endpoints are pushed via a "lite" MapRequest** (Stream=false +
+   OmitPeers=true), the only shape modern Tailscale.com persists at
+   CapVer ≥ 68. The long-poll Stream=true is read-only — it streams
+   netmap updates but ignores any Hostinfo/Endpoints in the request.
 
 ## Roadmap
 
@@ -107,12 +144,13 @@ See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and
 |---|-------------------------------------------------|-----------------------|
 | 1 | ts2021 control plane (register only)            | done                  |
 | 2 | MapRequest streaming + WireGuard data plane     | done                  |
-| 3 | DISCO P2P discovery + TMP117 telemetry          | partial — DISCO via DERP works; direct UDP demux pending |
+| 3 | DISCO P2P discovery + TMP117 telemetry          | done                  |
 | 4 | STUN minimal binding                            | done                  |
-| 5 | DERP relay fallback + reconnection              | first cut — recv path live; outbound queue pending |
-| 6 | Production hardening (NVS, secure boot, OTA)    | pending               |
+| 5 | DERP relay fallback + direct-UDP NAT traversal  | done                  |
+| 6 | ICMP-over-WG end-to-end                         | done                  |
+| 7 | Production hardening (NVS, secure boot, OTA)    | pending               |
 
-See [`docs/ROADMAP.md`](docs/ROADMAP.md) for details.
+See [`docs/ROADMAP.md`](docs/ROADMAP.md) for the per-milestone breakdown.
 
 ## Building
 
@@ -123,6 +161,14 @@ source ~/entorno_investigación/bin/activate
 . ~/esp/esp-idf-v5.5.4/export.sh
 idf.py set-target esp32
 idf.py build
+```
+
+Host-side codec tests:
+
+```bash
+cd tools/test
+make
+for t in test_*; do ./$t; done   # 15 KAT binaries, all should report ALL OK
 ```
 
 ## Provisioning
