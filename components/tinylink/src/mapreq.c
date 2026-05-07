@@ -31,14 +31,17 @@ static const char *TAG = "mapreq";
  * boot 2026-05-02. 48 KiB gives us headroom for a handful of peers
  * before we'd need streaming. */
 #define RESPONSE_BUF_SZ  32768
-/* MapResponse JSON is structurally dense: a 19 KiB body parses to
- * ~3500 tokens (~1 token / 5 bytes). 3500 + 12% headroom = 3920;
- * round to 3920 → 62.7 KiB BSS table at sizeof(jsmntok_t)=16. The
- * companion Tailscale-on-ESP32 protocol artifact recommends a 20 KiB
- * parse budget assuming SAX-style streaming, but we use jsmn (DOM-
- * style) which needs the full token table. 62 KiB is the smallest we
- * can go without truncating real netmaps observed on-device. */
-#define MAX_TOKENS       3920
+/* MapResponse JSON token budget. Empirically measured 2026-05-06
+ * post-#25 (28 DERP regions, 2 peers, full DERPMap): 1884 tokens for
+ * a 19248-byte first netmap. Token count is bounded by the in-tree
+ * caps (TL_MAX_PEERS=4 with 4 endpoints each ≈ 80 tokens, plus
+ * TL_MAX_DERP_REGIONS=28 × TL_MAX_DERP_NODES=3 × ≈6 fields ≈ 500
+ * tokens), so growth from the measured peak is structurally limited.
+ * 2500 = 1884 × 1.33 (33% margin over observed peak) + headroom for
+ * the bounded growth surface. Saves ~23 KiB BSS vs the prior 3920
+ * size (which was an over-estimate from the pre-#25 era when only
+ * 4 DERP regions were parsed). 2500 × 16 = 40 KiB BSS table. */
+#define MAX_TOKENS       2500
 
 /* ------------------------------ helpers ----------------------------------- */
 
@@ -396,6 +399,18 @@ esp_err_t mapresp_parse(const char *json, size_t json_len, tl_netmap_t *out)
     jsmn_parser p;
     jsmn_init(&p);
     int n = jsmn_parse(&p, json, json_len, toks, MAX_TOKENS);
+    if (n == JSMN_ERROR_NOMEM) {
+        /* Token table too small. A real Tailscale netmap saturating
+         * this budget means the in-tree TL_MAX_* caps are also out
+         * of step with the live tailnet. Distinct error code so the
+         * caller can log + raise MAX_TOKENS. */
+#ifdef ESP_PLATFORM
+        ESP_LOGE(TAG, "jsmn token budget exhausted (%d tokens, %u bytes) — "
+                      "raise MAX_TOKENS",
+                 MAX_TOKENS, (unsigned)json_len);
+#endif
+        return ESP_ERR_INVALID_RESPONSE;
+    }
     if (n < 1 || !tok_is_obj(&toks[0])) {
         return ESP_ERR_INVALID_RESPONSE;
     }
