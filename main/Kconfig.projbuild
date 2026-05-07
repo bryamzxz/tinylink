@@ -71,40 +71,31 @@ menu "tinylink application"
         bool "Run a supervised DERP recv-loop task"
         default n
         help
-            Establish a persistent DERP conn AFTER the long-poll's
-            first netmap and run derp_client_run() in a dedicated
-            FreeRTOS task: read frames, auto-answer DISCO Pings (so
-            `tailscale ping <us>` from a remote peer responds via
-            relay), log received packets, reconnect on stream end.
+            Establish a persistent DERP conn and run derp_client_run()
+            in a dedicated FreeRTOS task: read frames, auto-answer
+            DISCO Pings (so `tailscale ping <us>` from a remote peer
+            responds via relay), log received packets, reconnect on
+            stream end.
 
-            Default OFF on ESP32-WROOM-32E. Measured 2026-05-06 with
-            persistent nghttp2 (#22) + boot reorder (697434f) +
-            wait-for-dataplane gate already in main:
-              At supervisor connect time: heap_free ≈ 8.9 KiB,
-              largest_block ≈ 7.4 KiB. mbedtls cert verify needs
-              ≥ 12 KiB contiguous → DERP TLS handshake fails with
-              MBEDTLS_ERR_SSL_ALLOC_FAILED in a permanent backoff
-              loop.
-              ALSO: the additional heap pressure from the supervisor
-              path's static state interacts with esp_netif_new at
-              wg_lwip_attach time — observed `esp_netif_new_ppp`
-              failing and the WG netif never coming up. Net effect
-              of flipping this to y on stock ESP32-WROOM-32E:
-              regresses the connect path entirely. Do not enable
-              without one of:
-                - PSRAM-equipped ESP32 variant
-                - MBEDTLS_DYNAMIC_BUFFER=y (needs the historical
-                  TX-buffer corruption with session tickets to be
-                  re-investigated, see sdkconfig.defaults note)
-                - Lazy supervisor (open DERP only when WG sendto
-                  fails; close after) instead of permanent recv loop
-                - Drastic BSS shrink (streaming JSON parser,
-                  reduced WG netif state)
+            The task body is resilient — initial connect runs inside
+            its own backoff loop, so a low-largest-block window
+            during long-poll handshake doesn't permanently disable
+            the supervisor. But spawning the task at all requires
+            ~12 KiB largest contiguous free heap for the stack alloc,
+            and on stock ESP32-WROOM-32E with the current build the
+            heap at supervisor-spawn time has < 12 KiB contiguous
+            (verified on-device 2026-05-06 with DYNAMIC_BUFFER=y +
+            SESSION_TICKETS=n). xTaskCreate returns ESP_ERR_NO_MEM
+            and the supervisor never starts.
 
-            The supervisor *code* is fully wired (derp_client +
-            derp_run_loop + disco_handler) and host-tested. Flipping
-            to y is a one-bit change for any target where the heap
-            budget allows it.
+            Static-stack alternative was tested and pushed BSS past
+            the DRAM threshold, crashing startup. Real fix paths:
+              - PSRAM-equipped ESP32 variant
+              - BSS shrink (streaming JSON parser frees ~48 KiB)
+              - Multi-task heap rebalance via DRAM/IRAM tunings
+
+            Set to y on PSRAM targets or after one of the above
+            lands. Default n keeps stock-WROOM bringup unaffected.
 
     config TINYLINK_DERP_SUPERVISED_BACKOFF_MS
         int "DERP supervised reconnect backoff (ms)"
