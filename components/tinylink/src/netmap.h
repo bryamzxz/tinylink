@@ -7,11 +7,11 @@
 // MagicDNS metadata we deliberately do not enforce on-device (see
 // docs/SECURITY-MODEL.md non-goals).
 //
-// Sizing rationale: the M1 device targets one peer (sensor → home node).
-// We over-budget to 4 peers + 4 DERP regions so the same struct can
-// serve M2 (data plane bringup) and an eventual M5 DERP fallback
-// without rework, while still fitting the ~4 KiB SRAM cap from
-// research §J.
+// Sizing rationale: 4 peers covers the M1/M2 sensor → home topology.
+// DERP regions are sized to 28 (the full Tailscale DERPMap) because
+// capping below the production region count silently drops whichever
+// region the parser hits last — observed loss of mia/region 16 at
+// cap=4 left every peer in this tailnet unreachable.
 
 #pragma once
 
@@ -33,8 +33,13 @@ extern "C" {
 #define TL_MAX_PEERS            4
 #define TL_MAX_PEER_ENDPOINTS   4
 #define TL_MAX_PEER_ADDRESSES   2
-#define TL_MAX_DERP_REGIONS     4
-#define TL_MAX_DERP_NODES       2
+/* Tailscale ships 28 DERP regions today (mia/region 16 is the closest
+ * to most peers in this tailnet). Capping below that silently dropped
+ * region 16 from the parsed netmap, leaving the device unable to reach
+ * any peer that homes there. Max nodes per region observed in prod = 5;
+ * 3 covers all current regions with headroom. BSS cost: ~6 KiB. */
+#define TL_MAX_DERP_REGIONS     28
+#define TL_MAX_DERP_NODES       3
 
 /* "ip:port" form for an IPv4 endpoint. ESP32 lwIP build is v4-only at the
  * netif layer, so v6 endpoints announced by the control plane are dropped
