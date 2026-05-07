@@ -69,7 +69,7 @@ menu "tinylink application"
 
     config TINYLINK_DERP_SUPERVISED
         bool "Run a supervised DERP recv-loop task"
-        default n
+        default y
         help
             Establish a persistent DERP conn and run derp_client_run()
             in a dedicated FreeRTOS task: read frames, auto-answer
@@ -78,24 +78,20 @@ menu "tinylink application"
             stream end.
 
             The task body is resilient — initial connect runs inside
-            its own backoff loop, so a low-largest-block window
-            during long-poll handshake doesn't permanently disable
-            the supervisor. But spawning the task at all requires
-            ~12 KiB largest contiguous free heap for the stack alloc,
-            and on stock ESP32-WROOM-32E with the current build the
-            heap at supervisor-spawn time has < 12 KiB contiguous
-            (verified on-device 2026-05-06 with DYNAMIC_BUFFER=y +
-            SESSION_TICKETS=n). xTaskCreate returns ESP_ERR_NO_MEM
-            and the supervisor never starts.
+            its own backoff loop, so a transient low-largest-block
+            window doesn't permanently disable the supervisor.
 
-            Static-stack alternative was tested and pushed BSS past
-            the DRAM threshold, crashing startup. Real fix paths:
-              - PSRAM-equipped ESP32 variant
-              - BSS shrink (streaming JSON parser frees ~48 KiB)
-              - Multi-task heap rebalance via DRAM/IRAM tunings
+            Heap budget verified on-device 2026-05-06 after BSS
+            shrink (jsmn token table 3920→2500): largest contiguous
+            block at supervisor-spawn ≈ 21.5 KiB, mbedtls cert chain
+            verify peak ~12 KiB → supervisor connects on attempt #1.
+            8-minute steady-state run: 0 panics, 0 stream ends, 0
+            supervisor reconnects, telemetry uninterrupted, parser
+            still under token budget.
 
-            Set to y on PSRAM targets or after one of the above
-            lands. Default n keeps stock-WROOM bringup unaffected.
+            Set to n only if a target derivation needs to drop DERP
+            entirely (e.g. extreme memory-bound sensor build with
+            no DERP relay path).
 
     config TINYLINK_DERP_SUPERVISED_BACKOFF_MS
         int "DERP supervised reconnect backoff (ms)"
