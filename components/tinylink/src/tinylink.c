@@ -153,15 +153,49 @@ esp_err_t tinylink_register(void)
 
 esp_err_t tinylink_dataplane_start(void)
 {
-    /* Mirrors upstream's controlclient.Direct: there is NO separate
-     * "fetch one MapResponse, then start streaming" call. The streaming
-     * /machine/map request itself delivers the initial netmap as its
-     * first frame and subsequent updates as follow-up frames on the same
-     * stream. So this entry point now only validates state — the actual
-     * WG bring-up happens inside long_poll_handler on the first netmap
-     * the stream emits. Kept in the API for backward compatibility with
-     * the boot sequence in main.c. */
-    return s_initialized ? ESP_OK : ESP_ERR_INVALID_STATE;
+    /* The streaming /machine/map (Stream=true) request delivers the
+     * initial netmap as its first frame, but per upstream tailcfg.go
+     * (lines 1408-1436) the server treats Stream=true MapRequests as
+     * READ-ONLY at Version >= 68 — Hostinfo and top-level Endpoints
+     * are silently discarded. Verified 2026-05-07 against
+     * controlplane.tailscale.com: a peer's `tailscale status` showed
+     * `Addrs: null, Relay: ""` for sensor-cali after multiple
+     * Stream=true cycles that included Endpoints + NetInfo.
+     *
+     * Push the device's current endpoints + NetInfo via a one-shot
+     * Stream=false MapRequest before the long-poll grabs the conn.
+     * This is the "fresh state upload" that updates the server's
+     * cached Hostinfo/Endpoints record so peers see real dial
+     * candidates and a HomeDERP region in their MapResponse. The
+     * response (a full netmap) is parsed for status only — the
+     * long-poll will redeliver it as its first stream frame. */
+    if (!s_initialized) return ESP_ERR_INVALID_STATE;
+
+    esp_err_t err = ensure_control_conn();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "dataplane_start: ensure_conn failed: 0x%x — "
+                      "long-poll will retry the connect anyway", err);
+        return ESP_OK;  /* not fatal — long-poll task handles reconnect */
+    }
+
+    static tl_netmap_t nm;  /* file-static, single-shot */
+    err = mapreq_fetch_once(&s_conn, &s_keys, &nm);
+    if (err != ESP_OK) {
+        /* Drop the conn so the long-poll's next ensure_control_conn
+         * gets a fresh one. Don't fail bringup — the long-poll path
+         * will keep trying and may eventually succeed (or surface a
+         * different error). */
+        ESP_LOGW(TAG, "dataplane_start: mapreq_fetch_once: 0x%x — "
+                      "endpoints not pushed; long-poll will run anyway", err);
+        drop_control_conn();
+        return ESP_OK;
+    }
+    ESP_LOGI(TAG, "dataplane_start: pushed Stream=false MapRequest, "
+                  "got %u peers / %u DERP regions",
+             (unsigned)nm.n_peers, (unsigned)nm.n_derp_regions);
+    /* Keep s_conn open — the long-poll will reuse it for the
+     * Stream=true cycle. */
+    return ESP_OK;
 }
 
 /* ---- long-poll MapRequest task ----------------------------------------- */

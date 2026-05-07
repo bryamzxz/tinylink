@@ -485,13 +485,15 @@ static int build_request_body(const tinylink_keys_t *keys,
      * field was missing, suggesting the control plane treats "absent"
      * as "client supports our default compression". Send the explicit
      * empty string. */
-    /* If the M4 STUN probe ran and succeeded, glue the discovered
-     * AddrPort onto Hostinfo as a single-element Endpoints array.
-     * Tailscale's control plane fans this out to the peers' netmaps,
-     * so they learn an address they can try to dial directly even
-     * before our DERP-mediated CallMeMaybe (M5) is wired. Empty
-     * string when no probe result — matches the pre-M4 behavior of
-     * just not sending the field. */
+    /* Endpoints go at the TOP LEVEL of MapRequest, not inside
+     * Hostinfo (per upstream tailcfg.go:1436). The control plane
+     * persists these in the node's database record and propagates
+     * them to peers as their dial candidates. Hostinfo had a legacy
+     * Endpoints field too but the modern (Version >= 68) shape reads
+     * the top-level slice. Putting them in the wrong place is what
+     * left every peer with `Addrs: null` for sensor-cali — verified
+     * 2026-05-07 via `tailscale debug peer-status` from a peer that
+     * shared our tailnet but couldn't dial us. */
     char endpoints_field[64] = "";
     uint8_t  ep_addr[4];
     uint16_t ep_port;
@@ -523,13 +525,14 @@ static int build_request_body(const tinylink_keys_t *keys,
         "\"NodeKey\":\"%s\","
         "\"DiscoKey\":\"%s\","
         "\"Stream\":%s,"
-        "\"Hostinfo\":{\"OS\":\"esp32\",\"Hostname\":\"%s\",\"IPNVersion\":\"0.1.0-tinylink\"%s%s}"
+        "\"Hostinfo\":{\"OS\":\"esp32\",\"Hostname\":\"%s\",\"IPNVersion\":\"0.1.0-tinylink\"%s}"
+        "%s"
         "}",
         node_key_hex, disco_key_hex,
         stream ? "true" : "false",
         CONFIG_TINYLINK_DEVICE_HOSTNAME,
-        endpoints_field,
-        netinfo_field);
+        netinfo_field,    /* %s inside Hostinfo */
+        endpoints_field); /* %s at top level */
     if (n < 0 || (size_t)n >= out_size) return -1;
     return n;
 }
