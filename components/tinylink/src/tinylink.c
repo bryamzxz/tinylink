@@ -481,14 +481,15 @@ static void derp_supervised_task(void *arg)
             ESP_LOGW(TAG, "derp supervisor: stream ended 0x%x — "
                           "stats recv=%llu disco_pongs=%llu "
                           "disco_pings_seen=%llu disco_cmms=%llu "
-                          "send_err=%llu keepalives=%llu",
+                          "send_err=%llu keepalives=%llu wg_tx_drops=%llu",
                      err,
                      (unsigned long long)stats.recv_packets,
                      (unsigned long long)stats.disco_pings_answered,
                      (unsigned long long)stats.disco_pongs_seen,
                      (unsigned long long)stats.disco_cmms_seen,
                      (unsigned long long)stats.disco_send_errors,
-                     (unsigned long long)stats.keepalives);
+                     (unsigned long long)stats.keepalives,
+                     (unsigned long long)wg_netif_get_tx_drops());
         }
         derp_client_close(&s_derp_sup);
         vTaskDelay(backoff);
