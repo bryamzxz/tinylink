@@ -168,6 +168,77 @@ real ICMP could traverse the now-direct path. See `MEMORY.md` entries
 `reference_tinylink_direct_udp.md` and PR commit messages for the
 forensic detail.
 
+## WireGuard handshake lifecycle
+
+The data plane is **initiator-only by design** — `wg_handshake.{c,h}`
+intentionally omits responder support, and `wg_netif.c`'s RX path
+silently drops every inbound `HANDSHAKE_INIT` (UDP and DERP-injected
+both). This halves the WG state machine and the per-session memory
+footprint; the trade-off is that we cannot react to a peer-initiated
+rekey, so the session lifecycle is driven entirely from our side.
+
+The WireGuard whitepaper §6.5 prescribes:
+
+| constant            | value | role                                          |
+|---------------------|-------|-----------------------------------------------|
+| `REKEY_AFTER_TIME`  | 120 s | responder fires a fresh `HANDSHAKE_INIT`      |
+| `REJECT_AFTER_TIME` | 180 s | responder invalidates the previous session   |
+| `REKEY_TIMEOUT`     | 5 s   | retransmit interval for unacknowledged INIT  |
+
+Because we drop the responder's INIT at 120 s, without intervention
+the responder hits 180 s, invalidates our transport keys, and our
+outbound packets enter a silent black hole — the local `g.state`
+still reads `UP`, but every encrypted frame is dropped peer-side.
+This was observed in the wild as ICMP failing 100 % at
+`icmp_seq=181`.
+
+Fix: proactive rekey from our side, fired *before* the responder's
+120 s mark.
+
+```
+   t=0       handshake_completed_us = now()
+              g.state = UP
+              g.rekey_in_flight = false
+
+   t≈110s   rx_task observes session age > WG_REKEY_AFTER_MS:
+              start_rekey() builds a fresh INIT (new ephemeral, new
+              local_index) and sends it. g.state stays UP. The
+              existing g.transport session keeps serving inbound
+              decrypts and outbound encrypts with the OLD keys —
+              both are still valid until the responder rotates at
+              120 s. g.rekey_in_flight = true.
+
+   t≈110s+RTT  HANDSHAKE_RESP arrives. handle_handshake_response
+              accepts it because rekey_in_flight is set.
+              wg_transport_session_init swaps NEW keys into
+              g.transport atomically. Any encrypt that just sampled
+              the OLD pointer is fine on the wire (responder accepts
+              both during its rotation grace). g.rekey_in_flight =
+              false; handshake_completed_us = now(); cycle restarts.
+```
+
+Two retry layers cover failure modes:
+
+- **Rekey retry**: same 5 s × 12 budget as the cold path. Each retry
+  re-runs `start_rekey()` (new ephemeral, new index). `g.state`
+  remains `UP` so app traffic isn't paused.
+- **Cold-path fallback**: if all 12 rekey attempts miss (60 s),
+  session age is ~170 s and the 180 s deadline is imminent. We
+  transition to `HANDSHAKE_PENDING` and run a cold handshake.
+  This briefly pauses `wg_netif_send_plaintext` and inbound
+  decrypts, but is strictly better than the silent black hole that
+  follows the 180 s mark.
+
+The trigger reads `g.last_handshake_completed_us` (set on every
+successful handshake response, cold or rekey), not
+`g.last_handshake_us` (set on every INIT we send). This matters
+during retries — we don't want to delay the next rekey just because
+the boot handshake took three attempts to complete.
+
+Responder mode is no longer required for steady-state operation. It
+remains a follow-up for peer-roaming corner cases where the peer
+endpoint changes mid-session and only the peer can re-initiate.
+
 ## Component layout (M1)
 
 The original M1-only layout, kept for historical reference:
