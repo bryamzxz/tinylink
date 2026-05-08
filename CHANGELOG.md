@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **`stun_reprobe` task spawn now retries on `ESP_ERR_NO_MEM`.**
+  Previously, if the boot-time `xTaskCreate(stun_reprobe_task)` failed
+  due to a low largest-contiguous-heap-block at boot (typical: ~3.5 KiB
+  free during the supervisor TLS handshake transient, below the
+  4 KiB+TCB requirement), `tinylink_stun_reprobe_start` logged
+  `"continuing static"` and silently dropped the re-probe. The
+  endpoint pushed at boot then stayed stale forever, and any later NAT
+  rebind broke the direct-UDP path with no recovery — observed on
+  hardware as `tailscale ping` reverting to `via DERP(...)` after
+  router-side port rotation. Fix: schedule an `esp_timer` one-shot at
+  +30 s on spawn failure; the callback retries `xTaskCreate` and
+  reprograms itself if still failing. Verified on hardware: failed at
+  t=18 s with `largest_block=3456 B`, succeeded at t=48 s with
+  `largest_block=12800 B` once the TLS-handshake transient freed.
+  Third M7 hardening item.
+
 ### Added
 - **Compile-in fallback control plane pubkey
   (`CONFIG_TINYLINK_CONTROL_PUB_FALLBACK_HEX`).** New optional Kconfig

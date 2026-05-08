@@ -12,6 +12,7 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_system.h"
+#include "esp_timer.h"
 #include "nvs.h"
 #include "sdkconfig.h"
 
@@ -904,18 +905,85 @@ static void stun_reprobe_task(void *arg)
     }
 }
 
-esp_err_t tinylink_stun_reprobe_start(void)
+/* Retry-spawn shape for stun_reprobe_task. Boot-time heap pressure
+ * (TLS handshake transient + supervisor connect peak still settling)
+ * can fail the initial xTaskCreate with ESP_ERR_NO_MEM, and the prior
+ * handler logged "continuing static" and gave up — leaving the
+ * boot-pushed endpoint permanently stale if the NAT later rebound,
+ * which manifested as "direct connection not established" on the peer
+ * side. The retry timer fires every 30 s and tries again; once spawn
+ * succeeds the timer is one-shot-stopped and the task takes over. */
+#define STUN_RE_SPAWN_RETRY_US (30 * 1000 * 1000)
+
+static esp_timer_handle_t s_reprobe_retry_timer = NULL;
+
+static BaseType_t stun_reprobe_try_spawn(void)
 {
     /* 4 KiB stack: stun_probe_run does one DNS lookup + one
      * sendto + one recvfrom; no TLS or crypto. Same budget as the
      * WG RX task. Priority IDLE+1 — explicitly below the long-poll
      * (IDLE+4) and the WG dataplane so neither gets preempted by a
      * background probe. */
-    BaseType_t ok = xTaskCreate(stun_reprobe_task, "tinylink_stun_re",
-                                4096, NULL, tskIDLE_PRIORITY + 1, NULL);
-    if (ok != pdPASS) {
-        ESP_LOGE(TAG, "xTaskCreate(stun_reprobe) failed");
-        return ESP_ERR_NO_MEM;
+    return xTaskCreate(stun_reprobe_task, "tinylink_stun_re",
+                       4096, NULL, tskIDLE_PRIORITY + 1, NULL);
+}
+
+static void stun_reprobe_retry_cb(void *arg)
+{
+    (void)arg;
+    if (stun_reprobe_try_spawn() == pdPASS) {
+        ESP_LOGI(TAG, "stun_reprobe spawn OK on retry "
+                      "(heap_free=%u largest=%u)",
+                 (unsigned)esp_get_free_heap_size(),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
+        /* Timer is one-shot — do not rearm. */
+        return;
+    }
+    ESP_LOGW(TAG, "stun_reprobe spawn retry still failing "
+                  "(heap_free=%u largest=%u) — retry in %d s",
+             (unsigned)esp_get_free_heap_size(),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT),
+             STUN_RE_SPAWN_RETRY_US / 1000000);
+    esp_err_t err = esp_timer_start_once(s_reprobe_retry_timer,
+                                         STUN_RE_SPAWN_RETRY_US);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_timer_start_once(retry) failed: 0x%x — giving up",
+                 err);
+    }
+}
+
+esp_err_t tinylink_stun_reprobe_start(void)
+{
+    if (stun_reprobe_try_spawn() == pdPASS) return ESP_OK;
+
+    /* Boot-time spawn failed. Schedule a retry via esp_timer (which
+     * runs on the system esp_timer task — no per-call xTaskCreate
+     * required, sidesteps the chicken-and-egg of "we have no heap to
+     * spawn the worker that watches for heap"). Returning ESP_OK
+     * tells the caller the re-probe loop *will* run; it just hasn't
+     * spawned yet. */
+    ESP_LOGW(TAG, "xTaskCreate(stun_reprobe) failed at boot "
+                  "(heap_free=%u largest=%u) — scheduling retry in %d s",
+             (unsigned)esp_get_free_heap_size(),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT),
+             STUN_RE_SPAWN_RETRY_US / 1000000);
+
+    if (s_reprobe_retry_timer == NULL) {
+        const esp_timer_create_args_t targs = {
+            .callback = stun_reprobe_retry_cb,
+            .name     = "stun_re_retry",
+        };
+        esp_err_t terr = esp_timer_create(&targs, &s_reprobe_retry_timer);
+        if (terr != ESP_OK) {
+            ESP_LOGE(TAG, "esp_timer_create(retry) failed: 0x%x", terr);
+            return terr;
+        }
+    }
+    esp_err_t terr = esp_timer_start_once(s_reprobe_retry_timer,
+                                          STUN_RE_SPAWN_RETRY_US);
+    if (terr != ESP_OK) {
+        ESP_LOGE(TAG, "esp_timer_start_once(retry) failed: 0x%x", terr);
+        return terr;
     }
     return ESP_OK;
 }
