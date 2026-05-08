@@ -145,6 +145,37 @@ static uint32_t monotonic_nanos_partial(void)
 #endif
 }
 
+/* --- TAI64N floor + reservation state ---------------------------------
+ *
+ * `s_emitted_high` tracks the highest seconds value we've ever emitted
+ * in this boot. wg_tai64n_now never goes below it (intra-session
+ * monotonicity). `s_reservation` is the upper bound we have promised
+ * NVS — the next reboot will read it back as its `s_emitted_high`
+ * starting point. When wg_tai64n_now is about to emit a value past
+ * the reservation, it calls the persist callback to extend the
+ * reservation forward by another chunk before emitting.
+ *
+ * Defaults (zero, NULL) reproduce the legacy unprotected behavior so
+ * host tests and code that hasn't called wg_tai64n_init() still build
+ * and run correctly. */
+static uint64_t              s_emitted_high   = 0;
+static uint64_t              s_reservation    = 0;
+static wg_tai64n_persist_fn  s_persist_fn     = NULL;
+
+void wg_tai64n_init(uint64_t persisted_floor_secs,
+                    uint64_t reservation_secs,
+                    wg_tai64n_persist_fn persist_fn)
+{
+    s_emitted_high = persisted_floor_secs;
+    s_reservation  = reservation_secs;
+    s_persist_fn   = persist_fn;
+}
+
+uint64_t wg_tai64n_high_water_secs(void)
+{
+    return s_emitted_high;
+}
+
 void wg_tai64n_now(uint8_t out[WG_TAI64N_LEN])
 {
     /* Try wall-clock first; if it returns 0 (no SNTP), fall back to
@@ -159,6 +190,34 @@ void wg_tai64n_now(uint8_t out[WG_TAI64N_LEN])
         /* When wall-clock is set, prefer real nanos for jitter. */
         nanos = monotonic_nanos_partial();
     }
+
+    /* Cross-boot floor: a fresh boot's monotonic_seconds restarts at 0,
+     * so without this clamp the very first post-reboot handshake would
+     * emit a value well below what the responder already saw and get
+     * rejected as out-of-order. Bump up to floor+1; the nanos field
+     * still differentiates same-second emits within this session. */
+    if (secs <= s_emitted_high) {
+        secs = s_emitted_high + 1;
+    }
+
+    /* Reservation extend: if we're about to emit past what NVS has
+     * promised, persist a fresh reservation chunk first. With the
+     * default chunk = 1 day, this fires at most once per 86400 emits
+     * during a single boot session. The boot-time orchestration also
+     * pre-reserves a chunk so this branch typically does NOT fire on
+     * any given boot. */
+    if (s_persist_fn != NULL && secs >= s_reservation) {
+        uint64_t new_reservation = secs + WG_TAI64N_RESERVE_CHUNK_SECS;
+        if (s_persist_fn(new_reservation) == 0) {
+            s_reservation = new_reservation;
+        }
+        /* If persist fails we still emit `secs`. Worst case: a reboot
+         * within the next chunk-window reads a stale floor and the
+         * next handshake gets rejected once. Bounded fallout. */
+    }
+
+    s_emitted_high = secs;
+
     /* TAI64 epoch shifts seconds by 2^62. WG doesn't strictly require
      * the shift (it treats the bytes as opaque ordering), but real
      * peers serialize TAI64 this way. We follow the convention. */

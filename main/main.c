@@ -56,6 +56,18 @@ static esp_err_t bringup(void)
         return err;
     }
 
+    /* TAI64N floor must be installed before the first WG handshake
+     * so the post-reboot timestamp strictly exceeds what the responder
+     * already saw pre-reboot. Fail-soft: on NVS error the function
+     * logs a warning and falls back to legacy unprotected behavior;
+     * we proceed anyway since the device shouldn't refuse to boot
+     * just because TAI64N persistence is broken. */
+    esp_err_t terr = tinylink_tai64n_floor_init();
+    if (terr != ESP_OK) {
+        ESP_LOGW(TAG, "tai64n floor init failed: 0x%x — continuing without "
+                      "cross-reboot handshake monotonicity", terr);
+    }
+
 #if CONFIG_TINYLINK_BENCH_AEAD
     /* AEAD baseline. Runs before register/dataplane so the heap is
      * still pristine and the timer numbers aren't confounded by

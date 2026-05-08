@@ -348,12 +348,17 @@ change has its own verification trail. Status as of HEAD:
   `control_key_refresh()` refuses a fetched key that disagrees.
   Empty preserves legacy TOFU (with a loud WARN). See
   `components/tinylink/src/control_key.{c,h}`.
-- [ ] **TAI64N monotonicity across reboots.** `wg_proto.c::wg_tai64n_now`
-  falls back to `monotonic_seconds()` from boot when SNTP hasn't
-  synced — that resets to 0 on every reboot, so the responder may
-  reject our handshake as out-of-order against a peer that knew us
-  pre-reboot. Persist a monotonic epoch counter in NVS (or land
-  proper SNTP) so timestamps strictly increase across power cycles.
+- [x] **TAI64N monotonicity across reboots.** `wg_tai64n_init()`
+  installs a persisted seconds floor at boot;
+  `tinylink_tai64n_floor_init()` reads it from NVS namespace
+  `tl_state` key `tai_floor`, pre-reserves
+  `WG_TAI64N_RESERVE_CHUNK_SECS` (1 day) forward, and writes it back
+  so the next reboot reads the new floor. `wg_tai64n_now` clamps
+  emitted seconds to `floor + 1` minimum and extends the reservation
+  inline if a single boot session ever exhausts the chunk. Verified
+  across three sequential resets: 86400 → 172800 → 259200 → 345600.
+  See `components/tinylink/src/wg_proto.{c,h}` and
+  `tinylink.c::tinylink_tai64n_floor_init`.
 - [ ] **Auth-key rotation path.** Auth key already lives in NVS
   (`tl_creds/auth_key`), not Kconfig — but there's no API to update
   it at runtime. Add a control-plane-driven rotation path or an OTA

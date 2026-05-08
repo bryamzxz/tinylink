@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **TAI64N handshake-timestamp persistence across reboots.**
+  `wg_proto.c::wg_tai64n_now` previously fell back to
+  `monotonic_seconds()` whenever wall-clock was unset (no SNTP yet);
+  every reboot rewound that to 0, so the next handshake's TAI64N
+  timestamp could be lower than the value the responder saw before
+  the reboot, and the responder rejected the handshake as
+  out-of-order. New shape: `wg_tai64n_init(floor, reservation,
+  persist_fn)` installs a persisted seconds floor at boot;
+  `wg_tai64n_now` clamps emitted seconds to `floor + 1` minimum and
+  asks the orchestration layer to extend the reservation forward by
+  `WG_TAI64N_RESERVE_CHUNK_SECS` (1 day) when needed. New
+  `tinylink_tai64n_floor_init()` (public API) reads the floor from
+  NVS namespace `tl_state` key `tai_floor`, pre-reserves a chunk
+  forward, and persists it so a subsequent reboot reads it back.
+  `main.c::bringup` invokes it between `tinylink_init` and the first
+  WG handshake. NVS write cost: one per boot (the pre-reserve);
+  inline extends from `wg_tai64n_now` only fire if a single boot
+  session emits past 1 day of seconds. Verified on hardware across
+  three sequential resets: NVS chained 86400 → 172800 → 259200 →
+  345600 (Δ = chunk exact every time). Fail-soft: NVS errors fall
+  back to legacy unprotected behavior so a transient NVS issue
+  doesn't brick boot. Fourth M7 hardening item.
+
 ### Fixed
 - **`stun_reprobe` task spawn now retries on `ESP_ERR_NO_MEM`.**
   Previously, if the boot-time `xTaskCreate(stun_reprobe_task)` failed

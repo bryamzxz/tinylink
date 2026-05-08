@@ -111,12 +111,47 @@ void wg_keyed_mac16(uint8_t out_mac[WG_MAC_LEN],
                     const uint8_t key[WG_HASH_LEN],
                     const uint8_t *data, size_t data_len);
 
-/* TAI64N "now". Falls back to seconds-since-boot if the clock has not
- * been synced (we have no SNTP yet). The WG responder accepts any
- * monotonically-increasing value from the same peer, so an unsynced
- * clock works for first-handshake bring-up; it will misorder against
- * a peer that knew us pre-reboot. Real wall-clock sync lands in M7. */
+/* TAI64N "now". Falls back to seconds-since-boot if the wall clock
+ * has not been synced (no SNTP yet). The WG responder accepts any
+ * monotonically-increasing value from the same peer; without
+ * persistence, a reboot rewinds monotonic_seconds to 0 and the
+ * responder rejects the next handshake as out-of-order against the
+ * peer that knew us pre-reboot. Call wg_tai64n_init() once at boot
+ * to install a persisted floor and a callback that writes future
+ * reservations to non-volatile storage. */
 void wg_tai64n_now(uint8_t out[WG_TAI64N_LEN]);
+
+/* How far ahead of the current high-water wg_tai64n_now reserves on
+ * each NVS write. 1 day in seconds — trades worst-case "TAI64N space
+ * burned per reboot" for NVS write frequency. Exported so the boot-
+ * time orchestration uses the same chunk size as the inline extend. */
+#define WG_TAI64N_RESERVE_CHUNK_SECS  86400ULL
+
+/* Persist callback. Called from wg_tai64n_now when the in-RAM
+ * reservation needs to grow past the previously-persisted floor. The
+ * callback should write `reservation_secs` to non-volatile storage so
+ * a subsequent reboot reads it back as the new floor.
+ *
+ * Returns 0 on success, non-zero on failure. On failure wg_tai64n_now
+ * still emits the requested timestamp (best-effort) but the reservation
+ * stays at its old value, so the next call may try to persist again. */
+typedef int (*wg_tai64n_persist_fn)(uint64_t reservation_secs);
+
+/* Initialize the TAI64N floor + reservation from a persisted value.
+ * Call once at boot, before any handshake fires. The caller has
+ * already loaded `persisted_floor_secs` from NVS (0 on first ever
+ * boot) and persisted `reservation_secs ==
+ * persisted_floor_secs + WG_TAI64N_RESERVE_CHUNK_SECS` so the next
+ * reboot reads it back. `persist_fn` may be NULL (host tests) — in
+ * that case wg_tai64n_now skips the inline extend and behaves like a
+ * pure in-RAM floor. */
+void wg_tai64n_init(uint64_t persisted_floor_secs,
+                    uint64_t reservation_secs,
+                    wg_tai64n_persist_fn persist_fn);
+
+/* The highest seconds-value wg_tai64n_now has emitted in this boot.
+ * Diagnostic use only; not load-bearing for correctness. */
+uint64_t wg_tai64n_high_water_secs(void);
 
 #ifdef __cplusplus
 }
