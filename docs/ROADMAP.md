@@ -358,14 +358,15 @@ change has its own verification trail. Status as of HEAD:
   (`tl_creds/auth_key`), not Kconfig — but there's no API to update
   it at runtime. Add a control-plane-driven rotation path or an OTA
   hook so a compromised key can be replaced without UART access.
-- [ ] **`stun_reprobe` task spawn resilience.** Boot-time spawn of
-  the STUN re-probe task fails with `ESP_ERR_NO_MEM` (0x101) under
-  heap pressure on first-boot flashes (observed on the post-M7-2
-  smoke trace). The current handler logs `"continuing static"` and
-  drops the re-probe entirely — leaving the endpoint pushed at boot
-  permanently stale if the NAT later rebinds. Fix: retry the spawn
-  on a slow timer (every ~30 s) until it succeeds, then keep the
-  re-probe loop running normally.
+- [x] **`stun_reprobe` task spawn resilience.** Boot-time
+  `xTaskCreate(stun_reprobe_task)` could fail with `ESP_ERR_NO_MEM`
+  while the supervisor TLS handshake transient was still holding the
+  largest contiguous heap block. The handler now schedules an
+  `esp_timer` one-shot at +30 s and retries until spawn succeeds,
+  reprogramming itself on each still-failed attempt. Verified on
+  hardware: failed at boot with `largest_block=3456 B`, succeeded
+  30 s later at `largest_block=12800 B`. See
+  `tinylink.c::tinylink_stun_reprobe_start`.
 - [ ] **Disassembly review of crypto.** Walk the compiled `.o` /
   `.elf` for `chacha20`, `poly1305`, `blake2s`, `curve25519`,
   `chacha20poly1305` and verify no secret-dependent branches survive
