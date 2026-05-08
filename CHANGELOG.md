@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **WG session expiry at exactly 180 s of inactivity.** Symptoms: ICMP
+  from a peer to the device's CGNAT IP started failing 100 % at
+  `icmp_seq=181`; `tailscale ping` reactivated the path because DISCO
+  forced new outbound traffic; ping then worked again until the next
+  180 s window. Root cause: the device is initiator-only by design
+  (incoming `HANDSHAKE_INIT` is dropped — `wg_handshake.h:5-7`), so
+  when the responder hits `REKEY_AFTER_TIME = 120 s` and tries to
+  rotate, its INIT goes nowhere; at `REJECT_AFTER_TIME = 180 s` the
+  responder invalidates our transport keys and our outbound enters a
+  silent black hole (`g.state` is still `UP`, but the responder
+  drops every encrypted packet). Fix: proactive rekey on the
+  initiator side. A new timer in `wg_netif.c::rx_task` fires
+  `start_rekey()` once session age exceeds `WG_REKEY_AFTER_MS`
+  (110 s, slightly before the responder's 120 s mark). The rekey is
+  make-before-break — `g.state` stays `UP` and the existing
+  `g.transport` keeps serving traffic until
+  `handle_handshake_response` swaps in the new keys via
+  `wg_transport_session_init`. If the rekey exhausts its 12-attempt
+  retry budget (60 s) we fall back to a cold handshake before the
+  180 s mark so we never silently zombie. Verified on hardware:
+  6 consecutive 110 s rekey cycles, 0 retries, 0 fallbacks, telemetry
+  cadence unbroken across each rekey (tx seq deltas held at 5003 ms).
+  Responder-mode is no longer needed for steady-state operation; it
+  remains a follow-up for peer-roaming corner cases where the peer
+  endpoint changes mid-session and only the peer can re-initiate.
+
 ### Added
 - **M3 first cut: TMP117 telemetry over UDP-through-WG.**
   - New `tmp117.{c,h}`: I²C driver using IDF v5.5

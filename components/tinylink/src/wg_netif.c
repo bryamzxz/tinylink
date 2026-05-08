@@ -35,6 +35,19 @@ static const char *TAG = "wg_netif";
 #define WG_REKEY_TIMEOUT_MS  5000
 #define WG_HANDSHAKE_MAX_RETRIES 12
 
+/* Proactive rekey threshold. WG spec: the *responder* hits
+ * REKEY_AFTER_TIME = 120 s and starts initiating a new handshake; if
+ * we don't respond (we're initiator-only — incoming HANDSHAKE_INIT is
+ * dropped on purpose), the responder hits REJECT_AFTER_TIME = 180 s
+ * and invalidates our transport keys. From that moment our outbound
+ * encrypts with keys the peer no longer accepts (silent black hole).
+ *
+ * Fix: initiate our own rekey just before the responder's 120 s mark,
+ * so the new session is established while the old one is still live.
+ * 110 s leaves a 10 s budget for the round trip — the same retry path
+ * (5 s × 12) covers transient losses. Keep this strictly below 120 s. */
+#define WG_REKEY_AFTER_MS    110000
+
 /* RX task stack: WG decrypt path alone fits in 4 KiB, but the DISCO
  * direct branch adds NaCl-box open + a sealed Pong build + sendto on
  * the same socket — verified 2026-05-07 to overflow 4 KiB ("stack
@@ -111,6 +124,19 @@ static struct {
     int64_t                 last_handshake_us;
     int                     handshake_attempt;
 
+    /* Make-before-break rekey. While `rekey_in_flight` is true the
+     * transport session in g.transport keeps serving inbound + outbound
+     * with the OLD keys; only when the response to our fresh INIT lands
+     * does wg_transport_session_init swap in the new keys. State stays
+     * WG_NETIF_UP throughout — no observable downtime for app traffic.
+     * `last_handshake_completed_us` ages from the most recent successful
+     * RESPONSE, not from the most recent INIT (the difference matters
+     * during retries — we don't want to delay rekey just because the
+     * boot handshake took a few attempts). */
+    int64_t                 last_handshake_completed_us;
+    bool                    rekey_in_flight;
+    int                     rekey_attempt;
+
     TaskHandle_t            rx_task;
     SemaphoreHandle_t       lock;
 
@@ -172,8 +198,12 @@ static int send_to_peer(const uint8_t *buf, size_t len)
     return (int)n;
 }
 
-/* Compose and send MessageInitiation, advance state to PENDING. */
-static int kick_off_handshake(void)
+/* Build a fresh INIT and send it. Mutates g.handshake (overwrites the
+ * Noise material with new ephemerals + chain key) and assigns a fresh
+ * sender_index into g.local_index. Does NOT mutate g.state or the
+ * existing g.transport session — callers decide what those mean for
+ * the path they're on (cold start vs. proactive rekey). */
+static int build_and_send_init(void)
 {
     if (wg_handshake_init(&g.handshake,
                           g.local.static_priv,
@@ -195,6 +225,15 @@ static int kick_off_handshake(void)
         return -1;
     }
     g.last_handshake_us = now_us();
+    return 0;
+}
+
+/* Cold start: send INIT and transition to HANDSHAKE_PENDING. App
+ * traffic is paused until the response lands. Used at boot and as the
+ * fallback path when proactive rekey exhausts its budget. */
+static int kick_off_handshake(void)
+{
+    if (build_and_send_init() != 0) return -1;
     g.handshake_attempt++;
     g.state = WG_NETIF_HANDSHAKE_PENDING;
     ESP_LOGI(TAG, "handshake init sent (attempt %d, idx=0x%08x)",
@@ -202,12 +241,43 @@ static int kick_off_handshake(void)
     return 0;
 }
 
-/* Process a MessageResponse arriving on the socket. */
+/* Proactive rekey: send a fresh INIT while keeping g.state == UP and
+ * the existing g.transport session live. The new keys land only when
+ * handle_handshake_response sees the matching reply and calls
+ * wg_transport_session_init to swap them in atomically. Until then,
+ * outbound app traffic continues to encrypt with the OLD keys (which
+ * the responder still accepts up to its REJECT_AFTER_TIME = 180 s). */
+static int start_rekey(void)
+{
+    if (build_and_send_init() != 0) return -1;
+    g.rekey_attempt++;
+    ESP_LOGI(TAG, "rekey init sent (attempt %d, idx=0x%08x, age=%llds)",
+             g.rekey_attempt, (unsigned)g.local_index,
+             (long long)((now_us() - g.last_handshake_completed_us) / 1000000LL));
+    return 0;
+}
+
+/* Process a MessageResponse arriving on the socket. Two valid paths:
+ *
+ *  - Cold path: state == HANDSHAKE_PENDING. Boot or post-FAILED retry.
+ *    App traffic was paused until now; transition to UP.
+ *  - Rekey path: state == UP && rekey_in_flight. Old transport session
+ *    is still serving traffic; we atomically install the new keys and
+ *    drop the rekey-in-flight flag.
+ *
+ * In either case wg_transport_session_init overwrites g.transport with
+ * the new keys, so any in-flight encrypt that just sampled the OLD
+ * session pointer races into the swap; that's fine because both keys
+ * are valid on the wire (responder accepts the previous session for
+ * REJECT_AFTER_TIME after rotating). */
 static void handle_handshake_response(const uint8_t *buf, size_t len)
 {
     if (len != sizeof(struct wg_msg_response)) return;
-    if (g.state != WG_NETIF_HANDSHAKE_PENDING) {
-        ESP_LOGD(TAG, "handshake response in state=%d ignored", g.state);
+    const bool cold_path  = (g.state == WG_NETIF_HANDSHAKE_PENDING);
+    const bool rekey_path = (g.state == WG_NETIF_UP && g.rekey_in_flight);
+    if (!cold_path && !rekey_path) {
+        ESP_LOGD(TAG, "handshake response in state=%d rekey=%d ignored",
+                 g.state, (int)g.rekey_in_flight);
         return;
     }
     const struct wg_msg_response *resp = (const struct wg_msg_response *)buf;
@@ -216,7 +286,8 @@ static void handle_handshake_response(const uint8_t *buf, size_t len)
     uint32_t remote_index = 0;
     if (wg_handshake_process_response(&g.handshake, resp,
                                       send_key, recv_key, &remote_index) != 0) {
-        ESP_LOGW(TAG, "handshake response rejected");
+        ESP_LOGW(TAG, "handshake response rejected (path=%s)",
+                 cold_path ? "cold" : "rekey");
         memset(send_key, 0, sizeof(send_key));
         memset(recv_key, 0, sizeof(recv_key));
         return;
@@ -229,9 +300,16 @@ static void handle_handshake_response(const uint8_t *buf, size_t len)
     memset(recv_key, 0, sizeof(recv_key));
     wg_handshake_scrub(&g.handshake);
 
-    g.state = WG_NETIF_UP;
-    g.handshake_attempt = 0;
-    ESP_LOGI(TAG, "session up: remote_idx=0x%08x", (unsigned)remote_index);
+    g.last_handshake_completed_us = now_us();
+    if (cold_path) {
+        g.state = WG_NETIF_UP;
+        g.handshake_attempt = 0;
+        ESP_LOGI(TAG, "session up: remote_idx=0x%08x", (unsigned)remote_index);
+    } else {
+        g.rekey_in_flight = false;
+        g.rekey_attempt = 0;
+        ESP_LOGI(TAG, "session rekeyed: remote_idx=0x%08x", (unsigned)remote_index);
+    }
 }
 
 /* Process a MessageTransport from the peer. */
@@ -387,6 +465,48 @@ retry_timer:;
                 kick_off_handshake();
             }
         }
+
+        /* Proactive rekey trigger. Only meaningful in steady state
+         * (UP, no INIT in flight, completed at least one full
+         * handshake). Fires once per rekey window — start_rekey sets
+         * rekey_in_flight = true, which gates further entries here
+         * until the response lands or the rekey-retry block below
+         * gives up. */
+        if (g.state == WG_NETIF_UP && !g.rekey_in_flight &&
+            g.last_handshake_completed_us > 0 &&
+            (now_us() - g.last_handshake_completed_us) >
+                WG_REKEY_AFTER_MS * 1000LL) {
+            ESP_LOGI(TAG, "session age >%ds — triggering proactive rekey",
+                     WG_REKEY_AFTER_MS / 1000);
+            g.rekey_attempt = 0;
+            if (start_rekey() == 0) {
+                g.rekey_in_flight = true;
+            }
+        }
+
+        /* Rekey retry timer. Mirrors the cold-path retry but does NOT
+         * tear down the live session on failure — if all attempts miss,
+         * we fall back to a cold handshake (state = PENDING) which
+         * pauses app traffic and uses the aggressive cold retry budget.
+         * That fallback path matters because by then session age is
+         * ~170 s and the responder is about to invalidate our keys
+         * anyway; better a brief outage now than a silent black hole. */
+        if (g.rekey_in_flight &&
+            (now_us() - g.last_handshake_us) > WG_REKEY_TIMEOUT_MS * 1000LL) {
+            if (g.rekey_attempt >= WG_HANDSHAKE_MAX_RETRIES) {
+                ESP_LOGW(TAG, "proactive rekey exhausted after %d attempts — "
+                              "falling back to cold handshake",
+                         g.rekey_attempt);
+                g.rekey_in_flight = false;
+                g.rekey_attempt = 0;
+                g.handshake_attempt = 0;
+                g.state = WG_NETIF_HANDSHAKE_PENDING;
+                kick_off_handshake();
+            } else {
+                ESP_LOGW(TAG, "rekey retry %d", g.rekey_attempt + 1);
+                start_rekey();
+            }
+        }
     }
 
     ESP_LOGI(TAG, "rx task exiting");
@@ -499,6 +619,9 @@ esp_err_t wg_netif_start(const struct wg_netif_peer_config *peer)
     rebuild_peer_sockaddr();
 
     g.handshake_attempt = 0;
+    g.rekey_attempt = 0;
+    g.rekey_in_flight = false;
+    g.last_handshake_completed_us = 0;
     if (kick_off_handshake() != 0) return ESP_FAIL;
 
     BaseType_t ok = xTaskCreate(rx_task, "wg_rx",

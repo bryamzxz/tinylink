@@ -55,6 +55,14 @@ established direct-UDP + ICMP path):
 - **DERP outbound queue**: needed only for peers behind shared CGNAT
   (where direct UDP can never punch). For peers with public IPs the
   direct path covers all traffic.
+- **Responder-mode handshake**: steady-state session expiry is already
+  fixed by initiator-side proactive rekey at session_age=110 s (see
+  `ARCHITECTURE.md` § "WireGuard handshake lifecycle"). Responder
+  mode is only needed for the peer-roaming corner case where the
+  peer endpoint changes mid-session and we cannot reach it to
+  re-initiate; in practice peer NAT rebindings are observed
+  end-to-end via DISCO and handled by `wg_netif_update_peer_endpoint`,
+  so this is a long-tail item rather than a blocker.
 
 ## M1 — ts2021 control plane (current)
 
