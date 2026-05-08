@@ -115,7 +115,7 @@ void wg_keyed_mac16(uint8_t out_mac[WG_MAC_LEN],
  * been synced (we have no SNTP yet). The WG responder accepts any
  * monotonically-increasing value from the same peer, so an unsynced
  * clock works for first-handshake bring-up; it will misorder against
- * a peer that knew us pre-reboot. Real wall-clock sync lands in M6. */
+ * a peer that knew us pre-reboot. Real wall-clock sync lands in M7. */
 void wg_tai64n_now(uint8_t out[WG_TAI64N_LEN]);
 
 #ifdef __cplusplus

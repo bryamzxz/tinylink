@@ -56,7 +56,7 @@ static esp_err_t build_request_body(const tinylink_keys_t *keys,
 
     /* NLKey is required (no `omitempty` upstream). M1 has no TKA, so an
      * all-zero Ed25519 public key is tolerated. Real NLPrivate generation
-     * lands in M6 hardening. */
+     * lands in M7 hardening. */
     memcpy(nl_key_zero, "nlpub:", 6);
     memset(nl_key_zero + 6, '0', 64);
     nl_key_zero[6 + 64] = '\0';
