@@ -22,6 +22,23 @@ menu "tinylink application"
         default 443
         range 1 65535
 
+    config TINYLINK_CONTROL_PUB_FALLBACK_HEX
+        string "Compile-in fallback control plane pubkey (64 hex chars, empty = TOFU)"
+        default ""
+        help
+            If non-empty, must be exactly 64 hex chars representing the
+            32-byte Curve25519 public key of the control plane the
+            device should trust. On first boot (NVS namespace tl_pin
+            empty), the device installs this fallback as the pin
+            without contacting the network — eliminating the TOFU
+            window where a MITM during the initial GET /key?v=100
+            could substitute the pin. control_key_refresh() also
+            refuses any fetched key that disagrees with this value, so
+            the protection survives later rotation attempts. Leave
+            empty to keep the legacy first-boot TOFU behavior (suitable
+            for development; for production use ship the operator's
+            known control pubkey here).
+
     config TINYLINK_REGISTER_RETRY_MS
         int "Retry interval after MachineAuthorized=false (ms)"
         default 30000

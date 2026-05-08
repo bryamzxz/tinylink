@@ -114,11 +114,16 @@ Distilled from the protocol research artifact §L.
   `xtensa-esp32-elf-gcc`. LLVM's `select-optimize` pass has been known
   to transform mbedTLS's constant-time-select macros into branchy code.
   Do not switch to Clang without disassembling the crypto primitives.
-- **Compile-in fallback control pub.** TLS-only TOFU on first
-  `/key?v=100` fetch is the weakest link in ts2021 (man-in-the-middle
-  via a corporate TLS root). For production firmware, hardcode the
-  known control plane public key as a second pin and refuse to accept
-  a `/key` response that disagrees. Tracked in M7.
+- **Compile-in fallback control pub** (mitigation available, opt-in).
+  TLS-only TOFU on first `/key?v=100` fetch is the weakest link in
+  ts2021 (man-in-the-middle via a corporate TLS root). Set
+  `CONFIG_TINYLINK_CONTROL_PUB_FALLBACK_HEX` to the operator's known
+  control plane pubkey (64 hex chars): on first boot the device
+  installs that value as the NVS pin without any network round-trip,
+  and `control_key_refresh()` later refuses any fetched key that
+  disagrees. Empty (the default) preserves the legacy TOFU behavior
+  for development. Production firmware MUST set this; logged as a
+  WARN at boot when empty.
 - **Replay window.** A 64-bit single-word bitmap is fine for single-peer
   single-flow. If tinylink ever extends to multi-peer, switch to the
   RFC 6479 2000-entry scheme or accept replay risk.
