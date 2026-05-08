@@ -13,19 +13,30 @@
 extern "C" {
 #endif
 
-/* Bootstrap the control plane public key.
- * - First call: HTTPS GET https://<host>/key?v=100, parse the JSON
- *   "publicKey" ("nlpub:<64 hex>"), persist the 32 raw bytes to NVS
- *   namespace "tl_pin", key "control_pub".
- * - Subsequent calls: read from NVS, return cached pin. If we see a
- *   different value on the wire later, the caller should treat that as
- *   a hard failure (possible MITM) — that check happens in
- *   tinylink_register() after the handshake completes.
+/* Resolve the control plane public key. Resolution order:
+ *
+ *   1. NVS namespace "tl_pin", blob "control_pub" — if present, used
+ *      directly. The operator already accepted this key.
+ *   2. CONFIG_TINYLINK_CONTROL_PUB_FALLBACK_HEX — if non-empty (must
+ *      be exactly 64 hex chars), installed into NVS as the pin
+ *      without any network round-trip. Eliminates the TOFU MITM
+ *      window. Production firmware should ship this.
+ *   3. HTTPS GET https://<host>/key?v=100 (TOFU). Legacy first-boot
+ *      flow, logged as a WARN since it's vulnerable to a MITM during
+ *      the initial fetch. Suitable for development only.
+ *
+ * Subsequent calls take path 1 (cached pin). If the control plane
+ * later presents a key that disagrees with the pin, the caller treats
+ * that as a hard failure (possible MITM) — that check happens in
+ * tinylink_register() after the handshake completes.
  */
 esp_err_t control_key_get(uint8_t out_pub[CONTROL_KEY_LEN]);
 
-/* Refresh: forces a re-fetch and overwrites the pin. Use only after a
- * controlled key rotation event. */
+/* Force-refresh the pin from /key?v=100. If
+ * CONFIG_TINYLINK_CONTROL_PUB_FALLBACK_HEX is set, the fetched key
+ * MUST match it; otherwise the refresh is refused and the existing
+ * NVS pin is left intact (returns ESP_ERR_INVALID_RESPONSE). Use only
+ * after a controlled key rotation event. */
 esp_err_t control_key_refresh(uint8_t out_pub[CONTROL_KEY_LEN]);
 
 #ifdef __cplusplus

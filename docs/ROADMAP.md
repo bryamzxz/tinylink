@@ -341,11 +341,13 @@ change has its own verification trail. Status as of HEAD:
   `components/tinylink/src/crypto/curve25519.c` already uses
   `c = ~(b - 1)` mask + XOR, no secret-dependent branches. Verified
   during the M7 review audit.
-- [ ] **Compile-in fallback control plane pubkey.** Today
-  `control_key.c` does TOFU on first boot — a MITM during the
-  initial `GET /key?v=100` can substitute the pin. Ship the known
-  Tailscale control pubkey as a `const uint8_t[32]` and refuse a
-  `/key` response that disagrees.
+- [x] **Compile-in fallback control plane pubkey.** Optional
+  `CONFIG_TINYLINK_CONTROL_PUB_FALLBACK_HEX` (64 hex chars). When
+  set, `control_key_get()` installs the fallback as the NVS pin on
+  first boot without any network round-trip, and
+  `control_key_refresh()` refuses a fetched key that disagrees.
+  Empty preserves legacy TOFU (with a loud WARN). See
+  `components/tinylink/src/control_key.{c,h}`.
 - [ ] **TAI64N monotonicity across reboots.** `wg_proto.c::wg_tai64n_now`
   falls back to `monotonic_seconds()` from boot when SNTP hasn't
   synced — that resets to 0 on every reboot, so the responder may
@@ -356,6 +358,14 @@ change has its own verification trail. Status as of HEAD:
   (`tl_creds/auth_key`), not Kconfig — but there's no API to update
   it at runtime. Add a control-plane-driven rotation path or an OTA
   hook so a compromised key can be replaced without UART access.
+- [ ] **`stun_reprobe` task spawn resilience.** Boot-time spawn of
+  the STUN re-probe task fails with `ESP_ERR_NO_MEM` (0x101) under
+  heap pressure on first-boot flashes (observed on the post-M7-2
+  smoke trace). The current handler logs `"continuing static"` and
+  drops the re-probe entirely — leaving the endpoint pushed at boot
+  permanently stale if the NAT later rebinds. Fix: retry the spawn
+  on a slow timer (every ~30 s) until it succeeds, then keep the
+  re-probe loop running normally.
 - [ ] **Disassembly review of crypto.** Walk the compiled `.o` /
   `.elf` for `chacha20`, `poly1305`, `blake2s`, `curve25519`,
   `chacha20poly1305` and verify no secret-dependent branches survive

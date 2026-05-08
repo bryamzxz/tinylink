@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Compile-in fallback control plane pubkey
+  (`CONFIG_TINYLINK_CONTROL_PUB_FALLBACK_HEX`).** New optional Kconfig
+  string (64 hex chars or empty). When set, `control_key_get()` installs
+  the fallback as the NVS pin on first boot without contacting the
+  network — eliminating the TOFU window where a MITM during the initial
+  `GET /key?v=100` could substitute the pin. `control_key_refresh()`
+  also refuses any fetched key that disagrees with the fallback, closing
+  the malicious-refresh vector after first boot. Resolution order is
+  now: NVS pin (operator-accepted) → compile-in fallback (production
+  pin) → TOFU via `/key` (legacy, logs a loud WARN). Empty fallback
+  preserves the previous TOFU behavior so existing development
+  `sdkconfig` files keep working unchanged. Second M7 hardening item.
+
 ### Changed
 - **DERP supervisor reconnect backoff is now exponential, capped at 30 s.**
   `tinylink.c::derp_supervised_task` previously slept a fixed

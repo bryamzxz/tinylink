@@ -9,6 +9,7 @@
 #include "esp_http_client.h"
 #include "esp_log.h"
 #include "nvs.h"
+#include "sdkconfig.h"
 
 #include "cJSON.h"
 
@@ -143,6 +144,44 @@ static esp_err_t load_pin(uint8_t out[CONTROL_KEY_LEN])
     return err;
 }
 
+/* Decode the optional compile-in fallback pin from
+ * CONFIG_TINYLINK_CONTROL_PUB_FALLBACK_HEX into 32 raw bytes.
+ *
+ * Return values:
+ *   ESP_OK              — fallback is present and valid; out filled.
+ *   ESP_ERR_NOT_FOUND   — fallback is empty (legacy TOFU mode).
+ *   ESP_ERR_INVALID_SIZE — fallback present but wrong length / hex.
+ *
+ * Callers fail-loud on INVALID_SIZE because a non-empty malformed pin
+ * almost certainly means the operator intended to ship a fallback and
+ * fat-fingered it; silently falling back to TOFU would be a footgun. */
+static esp_err_t parse_fallback(uint8_t out[CONTROL_KEY_LEN])
+{
+    const char *s = CONFIG_TINYLINK_CONTROL_PUB_FALLBACK_HEX;
+    if (s == NULL || s[0] == '\0') return ESP_ERR_NOT_FOUND;
+    if (strlen(s) != KEY_HEX_LEN) {
+        ESP_LOGE(TAG,
+            "CONFIG_TINYLINK_CONTROL_PUB_FALLBACK_HEX must be %d hex chars "
+            "(got %u) — refusing to boot insecure",
+            KEY_HEX_LEN, (unsigned)strlen(s));
+        return ESP_ERR_INVALID_SIZE;
+    }
+    return hex_decode_32(s, out);
+}
+
+/* Three-tier trust resolution for the control plane pubkey:
+ *
+ *   1. NVS pin present  → use it. The operator already accepted this
+ *      key (either via prior TOFU, prior fallback install, or manual
+ *      provisioning). NVS wins regardless of fallback config.
+ *   2. NVS empty + fallback set → install fallback as the pin without
+ *      contacting the network. This eliminates the TOFU window where
+ *      a MITM during the initial GET /key?v=100 could substitute the
+ *      pin. Production deployments should always reach this branch on
+ *      first boot.
+ *   3. NVS empty + no fallback → legacy TOFU via GET /key. Logs a
+ *      loud WARN so this path is visible in production logs (it
+ *      should not happen in production firmware). */
 esp_err_t control_key_get(uint8_t out_pub[CONTROL_KEY_LEN])
 {
     if (out_pub == NULL) return ESP_ERR_INVALID_ARG;
@@ -153,21 +192,57 @@ esp_err_t control_key_get(uint8_t out_pub[CONTROL_KEY_LEN])
         return ESP_OK;
     }
     if (err != ESP_ERR_NVS_NOT_FOUND && err != ESP_ERR_NVS_NOT_INITIALIZED) {
-        ESP_LOGW(TAG, "load_pin returned 0x%x, will fetch", err);
+        ESP_LOGW(TAG, "load_pin returned 0x%x, will try fallback / fetch", err);
     }
+
+    uint8_t fallback[CONTROL_KEY_LEN];
+    err = parse_fallback(fallback);
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "no NVS pin — installing compile-in fallback (no TOFU)");
+        memcpy(out_pub, fallback, CONTROL_KEY_LEN);
+        return persist(out_pub);
+    }
+    if (err != ESP_ERR_NOT_FOUND) {
+        /* Malformed Kconfig — surface immediately. */
+        return err;
+    }
+
+    ESP_LOGW(TAG,
+        "no NVS pin and no compile-in fallback — falling back to TOFU "
+        "via GET /key (vulnerable to first-boot MITM; set "
+        "CONFIG_TINYLINK_CONTROL_PUB_FALLBACK_HEX for production)");
     err = fetch_pubkey(out_pub);
     if (err != ESP_OK) return err;
     err = persist(out_pub);
     if (err == ESP_OK) {
-        ESP_LOGI(TAG, "control pub fetched and pinned");
+        ESP_LOGI(TAG, "control pub fetched and pinned (TOFU)");
     }
     return err;
 }
 
+/* Force-refresh the pin from /key?v=100. If a compile-in fallback is
+ * configured, the fetched key MUST match it — otherwise we refuse and
+ * leave the existing NVS pin untouched. This closes the malicious-
+ * refresh vector where an attacker with control of /key (or DNS) tries
+ * to rotate the pinned key out from under us after first boot. */
 esp_err_t control_key_refresh(uint8_t out_pub[CONTROL_KEY_LEN])
 {
     if (out_pub == NULL) return ESP_ERR_INVALID_ARG;
     esp_err_t err = fetch_pubkey(out_pub);
     if (err != ESP_OK) return err;
+
+    uint8_t fallback[CONTROL_KEY_LEN];
+    esp_err_t fb_err = parse_fallback(fallback);
+    if (fb_err == ESP_OK) {
+        if (memcmp(out_pub, fallback, CONTROL_KEY_LEN) != 0) {
+            ESP_LOGE(TAG,
+                "fetched control pub disagrees with compile-in fallback — "
+                "refusing refresh (existing NVS pin left intact)");
+            return ESP_ERR_INVALID_RESPONSE;
+        }
+    } else if (fb_err != ESP_ERR_NOT_FOUND) {
+        return fb_err;  /* malformed Kconfig */
+    }
+
     return persist(out_pub);
 }
