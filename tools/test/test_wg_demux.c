@@ -63,15 +63,33 @@ int main(void) {
                        WG_DEMUX_DISCARD);
     }
 
-    /* STUN binding request (first 2 bytes 0x00 0x01). */
+    /* STUN classification keys off the magic cookie (RFC 5389 §6) at
+     * offset 4 — that catches both binding requests (msg_type 0x0001)
+     * and binding responses (0x0101). */
     {
         uint8_t buf[20] = {0};
+        const uint8_t magic[4] = {0x21, 0x12, 0xa4, 0x42};
+        memcpy(buf + 4, magic, 4);
+        /* Binding request: byte 0 = 0x00, byte 1 = 0x01. */
         buf[0] = 0x00; buf[1] = 0x01;
         fails += check("stun/binding-req", wg_demux_classify(buf, 20),
                        WG_DEMUX_STUN);
-        /* 0x00 0x02 is not a binding request — discard. */
-        buf[1] = 0x02;
-        fails += check("stun/wrong-method", wg_demux_classify(buf, 20),
+        /* Binding success response: byte 0 = 0x01, byte 1 = 0x01.
+         * Without the magic-cookie check this would land in the WG
+         * MSG_RESPONSE arm, fail the 92-byte size, and get discarded.
+         * The fix this test guards: a real STUN response *must* be
+         * routed to the STUN handler. */
+        buf[0] = 0x01; buf[1] = 0x01;
+        fails += check("stun/binding-resp", wg_demux_classify(buf, 20),
+                       WG_DEMUX_STUN);
+        /* Same shape but no magic cookie: not STUN. */
+        memset(buf + 4, 0, 4);
+        buf[0] = 0x00; buf[1] = 0x01;
+        fails += check("stun/no-magic-cookie", wg_demux_classify(buf, 20),
+                       WG_DEMUX_DISCARD);
+        /* Magic cookie present but length below 20-byte header: junk. */
+        memcpy(buf + 4, magic, 4);
+        fails += check("stun/short-19", wg_demux_classify(buf, 19),
                        WG_DEMUX_DISCARD);
     }
 

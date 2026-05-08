@@ -7,6 +7,7 @@
 #include <string.h>
 
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 
 #include "esp_heap_caps.h"
@@ -24,11 +25,13 @@
 #include "esp_random.h"
 
 #ifdef ESP_PLATFORM
+#include "lwip/netdb.h"
 #include "lwip/sockets.h"
 #endif
 #include "mapreq.h"
 #include "netmap.h"
 #include "register.h"
+#include "stun.h"
 #include "stun_probe.h"
 #include "telemetry.h"
 #include "ts2021_client.h"
@@ -883,6 +886,219 @@ esp_err_t tinylink_wg_socket_init(void)
     return wg_netif_init(&local);
 }
 
+/* --- One-shot endpoint-push task ---------------------------------------
+ *
+ * After a STUN re-probe finds a new public AddrPort, we need to tell
+ * the control plane via a Stream=false MapRequest. The long-poll's
+ * Stream=true cycle is read-only (tailcfg.go:1408+1436), and we can't
+ * touch s_conn while the long-poll is mid-stream. Solution: spawn a
+ * task that opens its OWN ts2021 channel, fires one mapreq_push_endpoints,
+ * closes the channel, and self-deletes.
+ *
+ * Stack: 24 KiB matches the long-poll task — ts2021_connect peaks at
+ * ~12 KiB during the mbedtls cert chain verify + Noise IK init. The
+ * spawn cost is bounded because re-probes only fire on a 5-minute
+ * cadence and the push only runs when the endpoint actually changed
+ * (residential NATs rebind every few hours at worst). */
+static void endpoint_push_task(void *arg)
+{
+    (void)arg;
+    ts2021_conn_t conn;
+    esp_err_t err = ts2021_connect(&conn, s_keys.machine_priv,
+                                   s_keys.machine_pub, s_control_pub);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "endpoint_push: ts2021_connect failed: 0x%x", err);
+        vTaskDelete(NULL);
+        return;
+    }
+    err = mapreq_push_endpoints(&conn, &s_keys);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "endpoint_push: mapreq_push_endpoints failed: 0x%x", err);
+    } else {
+        uint8_t  ep_addr[4];
+        uint16_t ep_port = 0;
+        if (tinylink_get_public_endpoint(ep_addr, &ep_port)) {
+            ESP_LOGI(TAG, "endpoint_push: pushed %u.%u.%u.%u:%u to control plane",
+                     ep_addr[0], ep_addr[1], ep_addr[2], ep_addr[3],
+                     (unsigned)ep_port);
+        }
+    }
+    ts2021_close(&conn);
+    vTaskDelete(NULL);
+}
+
+static void tinylink_endpoint_push_async(void)
+{
+    BaseType_t ok = xTaskCreate(endpoint_push_task, "tinylink_ep_push",
+                                24576, NULL, tskIDLE_PRIORITY + 2, NULL);
+    if (ok != pdPASS) {
+        ESP_LOGW(TAG, "endpoint_push: xTaskCreate failed — endpoint not "
+                      "pushed; next reprobe will retry");
+    }
+}
+
+/* --- STUN reprobe via the live WG socket -------------------------------
+ *
+ * Once rx_task owns g.sock, we cannot recvfrom on it from another task
+ * without racing. The legacy reprobe path opened an ephemeral socket,
+ * which works but its source port is NOT the WG socket's, so the
+ * AddrPort the STUN server learns can't be advertised back to peers.
+ *
+ * Option B: split send/receive across the existing tasks.
+ *   - The reprobe task `sendto`s the STUN binding request directly on
+ *     g.sock (sendto is thread-safe in lwIP, no ownership transfer).
+ *   - rx_task already classifies WG_DEMUX_STUN; we hook it via
+ *     wg_netif_set_stun_callback() to a parser that matches the
+ *     in-flight txid and signals a semaphore.
+ *   - The reprobe task waits on that semaphore with a 3 s timeout.
+ *
+ * No race: rx_task remains the only recvfrom-er. No data loss: rx_task
+ * keeps dispatching DISCO/transport packets normally; STUN is just
+ * routed to a new arm.
+ *
+ * The pending-probe slot (s_stun_pending) is single-writer (the reprobe
+ * task) and single-reader (the rx_task callback runs on rx_task);
+ * concurrent probes are not possible because the reprobe task takes
+ * a mutex around the entire build/sendto/wait sequence. */
+static struct {
+    SemaphoreHandle_t   mutex;        /* serializes concurrent reprobes */
+    SemaphoreHandle_t   done_sem;     /* given by handler on txid match */
+    uint8_t             txid[STUN_TXID_LEN];
+    bool                in_flight;
+    stun_probe_result_t result;       /* filled by handler on success */
+} s_stun_pending;
+
+static void stun_response_handler(const uint8_t *buf, size_t len, void *user)
+{
+    (void)user;
+    if (!s_stun_pending.in_flight) {
+        /* No probe expected — late response from a previous attempt
+         * or a stray STUN frame. Drop. */
+        return;
+    }
+    uint8_t got_txid[STUN_TXID_LEN];
+    stun_addr_t addr;
+    int rc = stun_parse_response(buf, len, got_txid, &addr);
+    if (rc != 0) {
+        /* Malformed / not-success / no-mapped-addr — let it slide;
+         * the reprobe task will time out and try again next cycle. */
+        return;
+    }
+    if (memcmp(got_txid, s_stun_pending.txid, STUN_TXID_LEN) != 0) {
+        return;  /* response to a stale probe — ignore */
+    }
+    if (addr.is_v6) {
+        return;  /* v6 mapped — we asked for v4 */
+    }
+    s_stun_pending.result.addr_v4[0] = addr.addr[12];
+    s_stun_pending.result.addr_v4[1] = addr.addr[13];
+    s_stun_pending.result.addr_v4[2] = addr.addr[14];
+    s_stun_pending.result.addr_v4[3] = addr.addr[15];
+    s_stun_pending.result.port  = addr.port;
+    s_stun_pending.result.valid = true;
+    xSemaphoreGive(s_stun_pending.done_sem);
+}
+
+/* Lazily build the once-per-process pending-probe state and register
+ * the rx_task callback. Idempotent. Returns false on allocation
+ * failure — caller falls back to the ephemeral-socket legacy path. */
+static bool stun_pending_init_once(void)
+{
+    if (s_stun_pending.mutex != NULL) return true;
+    SemaphoreHandle_t m = xSemaphoreCreateMutex();
+    if (m == NULL) return false;
+    SemaphoreHandle_t d = xSemaphoreCreateBinary();
+    if (d == NULL) {
+        vSemaphoreDelete(m);
+        return false;
+    }
+    s_stun_pending.mutex    = m;
+    s_stun_pending.done_sem = d;
+    wg_netif_set_stun_callback(stun_response_handler, NULL);
+    return true;
+}
+
+/* Re-probe over the live WG socket. Builds a STUN binding request,
+ * arms the pending-probe slot, sendto's it via g.sock, and waits up
+ * to timeout_ms for the rx_task callback to signal a matching
+ * response. The result populates *out on success. */
+static esp_err_t stun_reprobe_via_wg_socket(uint32_t timeout_ms,
+                                            stun_probe_result_t *out)
+{
+    if (out == NULL) return ESP_ERR_INVALID_ARG;
+    out->valid = false;
+
+    int sock = wg_netif_get_socket();
+    if (sock < 0) return ESP_ERR_INVALID_STATE;
+
+    if (!stun_pending_init_once()) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    /* DNS-resolve the STUN server. lwIP getaddrinfo can block briefly
+     * — the reprobe task is the only caller and runs at IDLE+1, so a
+     * synchronous DNS lookup here is safe. */
+    struct addrinfo hints = {
+        .ai_family   = AF_INET,
+        .ai_socktype = SOCK_DGRAM,
+    };
+    char port_str[8];
+    snprintf(port_str, sizeof(port_str), "%u",
+             (unsigned)CONFIG_TINYLINK_STUN_PORT);
+    struct addrinfo *res = NULL;
+    if (getaddrinfo(CONFIG_TINYLINK_STUN_HOST, port_str, &hints, &res) != 0
+        || res == NULL) {
+        ESP_LOGW(TAG, "stun reprobe: DNS resolve failed for %s",
+                 CONFIG_TINYLINK_STUN_HOST);
+        if (res) freeaddrinfo(res);
+        return ESP_FAIL;
+    }
+    struct sockaddr_in dest;
+    memcpy(&dest, res->ai_addr, sizeof(dest));
+    freeaddrinfo(res);
+
+    /* Take the mutex for the whole build/send/wait sequence so a
+     * second reprobe call can't smash the txid out from under us. */
+    if (xSemaphoreTake(s_stun_pending.mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    esp_fill_random(s_stun_pending.txid, STUN_TXID_LEN);
+    memset(&s_stun_pending.result, 0, sizeof(s_stun_pending.result));
+    /* Drain any stale signal from a prior cycle that timed out after
+     * the handler had already given the sem. */
+    (void)xSemaphoreTake(s_stun_pending.done_sem, 0);
+    s_stun_pending.in_flight = true;
+
+    uint8_t req[STUN_REQUEST_LEN];
+    if (stun_build_request(req, s_stun_pending.txid) != STUN_REQUEST_LEN) {
+        s_stun_pending.in_flight = false;
+        xSemaphoreGive(s_stun_pending.mutex);
+        return ESP_FAIL;
+    }
+    ssize_t sent = sendto(sock, req, sizeof(req), 0,
+                          (const struct sockaddr *)&dest, sizeof(dest));
+    if (sent != (ssize_t)sizeof(req)) {
+        ESP_LOGW(TAG, "stun reprobe sendto: ret=%d errno=%d",
+                 (int)sent, errno);
+        s_stun_pending.in_flight = false;
+        xSemaphoreGive(s_stun_pending.mutex);
+        return ESP_FAIL;
+    }
+
+    esp_err_t err;
+    if (xSemaphoreTake(s_stun_pending.done_sem,
+                       pdMS_TO_TICKS(timeout_ms)) == pdTRUE) {
+        *out = s_stun_pending.result;
+        err = (out->valid) ? ESP_OK : ESP_FAIL;
+    } else {
+        err = ESP_ERR_TIMEOUT;
+    }
+    s_stun_pending.in_flight = false;
+    xSemaphoreGive(s_stun_pending.mutex);
+    return err;
+}
+
 esp_err_t tinylink_stun_probe(void)
 {
     /* Probe into a LOCAL result first, only commit to the cached
@@ -927,31 +1143,46 @@ esp_err_t tinylink_stun_probe(void)
         return err;
     }
 
-    /* Re-probe path: RX task owns the WG socket, so we can't recvfrom
-     * on it without racing. Probe on an ephemeral socket — but its
-     * source port is NOT the WG socket's, so the port we'd learn is
-     * wrong relative to inbound WG transport. Use this only to detect
-     * WAN-address changes; do NOT overwrite the cached good port. */
-    err = stun_probe_run(CONFIG_TINYLINK_STUN_HOST,
-                         (uint16_t)CONFIG_TINYLINK_STUN_PORT,
-                         3000, &local);
-    if (err == ESP_OK && local.valid && s_stun_result.valid) {
-        if (memcmp(s_stun_result.addr_v4, local.addr_v4, 4) != 0) {
-            ESP_LOGW(TAG, "stun re-probe: WAN address changed "
-                          "%u.%u.%u.%u → %u.%u.%u.%u — cached port now "
-                          "stale; followup PR re-probes via wg socket",
+    /* Re-probe path: RX task owns g.sock, so we send the STUN request
+     * via sendto (thread-safe in lwIP) and let rx_task dispatch the
+     * response back to us via the wg_netif_set_stun_callback hook.
+     * The result's source-port is now the WG socket's bound port, so
+     * a port change between boot and now can be propagated to the
+     * control plane. */
+    err = stun_reprobe_via_wg_socket(3000, &local);
+    if (err != ESP_OK || !local.valid) return err;
+    ESP_LOGI(TAG, "stun re-probe ok via wg socket: %u.%u.%u.%u:%u",
+             local.addr_v4[0], local.addr_v4[1],
+             local.addr_v4[2], local.addr_v4[3],
+             (unsigned)local.port);
+
+    if (s_stun_result.valid) {
+        const bool addr_changed =
+            memcmp(s_stun_result.addr_v4, local.addr_v4, 4) != 0;
+        const bool port_changed = s_stun_result.port != local.port;
+        if (addr_changed || port_changed) {
+            ESP_LOGI(TAG, "stun re-probe: endpoint changed "
+                          "%u.%u.%u.%u:%u → %u.%u.%u.%u:%u",
                      s_stun_result.addr_v4[0], s_stun_result.addr_v4[1],
                      s_stun_result.addr_v4[2], s_stun_result.addr_v4[3],
+                     (unsigned)s_stun_result.port,
                      local.addr_v4[0], local.addr_v4[1],
-                     local.addr_v4[2], local.addr_v4[3]);
+                     local.addr_v4[2], local.addr_v4[3],
+                     (unsigned)local.port);
+            s_stun_result = local;
+            /* Push the new endpoint to the control plane. The push runs
+             * in the reprobe task's context (4 KiB stack — too small
+             * for a TLS handshake) so we spawn a one-shot task with
+             * adequate stack instead. Best-effort: a failed push just
+             * means the next reprobe will retry. */
+            tinylink_endpoint_push_async();
         }
-    } else if (err == ESP_OK && local.valid && !s_stun_result.valid) {
-        /* No cached value yet (boot probe failed?). Stash this even
-         * though the port is ephemeral-not-WG — better than nothing,
-         * and dataplane_start log will flag it. */
+    } else {
+        /* Boot probe failed and this is the first valid sample. */
         s_stun_result = local;
+        tinylink_endpoint_push_async();
     }
-    return err;
+    return ESP_OK;
 }
 
 bool tinylink_get_public_endpoint(uint8_t addr_v4[4], uint16_t *port)

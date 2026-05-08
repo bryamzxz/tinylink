@@ -79,6 +79,19 @@ esp_err_t wg_netif_send_plaintext(const uint8_t *pkt, size_t len);
  * registers the esp_netif input function here. */
 void wg_netif_set_rx_callback(wg_netif_rx_cb_t cb, void *user);
 
+/* Callback invoked from the RX task when a STUN datagram (request or
+ * response, classified by `wg_demux_classify` via the magic cookie at
+ * offset 4) arrives on the shared UDP socket. Dispatch lets the
+ * orchestration layer (tinylink.c) implement periodic STUN re-probes
+ * over the live WG socket without taking ownership of recvfrom — which
+ * would race with the RX task. The buffer is owned by the RX task;
+ * the callee must copy what it needs before returning.
+ *
+ * Setting cb=NULL (the default) restores the prior "drop on receive"
+ * behavior. */
+typedef void (*wg_netif_stun_cb_t)(const uint8_t *buf, size_t len, void *user);
+void wg_netif_set_stun_callback(wg_netif_stun_cb_t cb, void *user);
+
 /* Returns true once the handshake has produced transport keys and we
  * can send/receive. */
 bool wg_netif_is_up(void);

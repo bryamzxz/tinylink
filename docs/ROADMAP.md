@@ -49,9 +49,15 @@ established direct-UDP + ICMP path):
   `session up`, because we fire the init at t≈15s while the peer's
   netmap may not yet contain our current AddrPort. Delaying init
   until the first inbound DISCO observation cuts the retry cost.
-- **stun_reprobe → fetch_once trigger**: NAT port rotates ~5 min on
-  consumer routers; we should re-push Endpoints + NetInfo via
-  `mapreq_push_endpoints` whenever the re-probe sees a port change.
+- ~~**stun_reprobe → fetch_once trigger**~~ — *landed*. The
+  periodic re-probe now runs over the live WG socket
+  (`stun_reprobe_via_wg_socket` in `tinylink.c`, dispatched through
+  the new `wg_netif_set_stun_callback()` hook), so the port it
+  learns is the one peers can actually reach. On detected change a
+  one-shot `tinylink_ep_push` task pushes a fresh
+  `mapreq_push_endpoints` over its own ts2021 channel without
+  perturbing the long-poll's `s_conn`. See `wg_demux.c` for the
+  STUN-response classification fix (magic cookie at offset 4).
 - **DERP outbound queue**: needed only for peers behind shared CGNAT
   (where direct UDP can never punch). For peers with public IPs the
   direct path covers all traffic.

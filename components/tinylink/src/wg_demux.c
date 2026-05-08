@@ -26,7 +26,15 @@ static const uint8_t DISCO_V1_MAGIC[6] = {
 #define WG_RESP_LEN        92
 #define WG_COOKIE_LEN      64
 #define WG_TRANSPORT_MIN   32   /* 16 B header + 16 B AEAD tag, empty payload */
-#define STUN_FIRST_TWO     2
+/* STUN per RFC 5389 §6: 20-byte header (msg_type 2 + length 2 + magic 4 +
+ * txid 12). The 4-byte magic cookie at offset 4 is what reliably tells
+ * STUN apart from anything else multiplexed on the same UDP socket — in
+ * our case, both DISCO (own magic at offset 0) and WG transport
+ * (msg_type byte that could collide with STUN's class+method on a
+ * first-byte-only check). */
+#define STUN_HEADER_MIN    20
+#define STUN_MAGIC_OFF      4
+static const uint8_t STUN_MAGIC[4] = { 0x21, 0x12, 0xa4, 0x42 };
 /* magic(6) + senderDiscoPub(32) + nonce(24) + AEAD tag(16) + msgType(1) +
  * msgVer(1) = 80 bytes — the smallest disco datagram that could possibly
  * decrypt and parse to a known message type. Anything shorter is junk. */
@@ -46,6 +54,19 @@ wg_demux_kind_t wg_demux_classify(const uint8_t *buf, size_t len)
         return WG_DEMUX_DISCO;
     }
 
+    /* STUN by magic cookie at offset 4. Catches BOTH binding requests
+     * (msg_type 0x0001, byte 0 = 0x00) and binding success/error
+     * responses (msg_type 0x0101 / 0x0111, byte 0 = 0x01). The
+     * response case must be handled here before the WG type switch,
+     * because a STUN response's first byte (0x01) collides with WG
+     * MSG_RESPONSE — without the magic check, a STUN response would
+     * fall into the MSG_RESPONSE arm, fail the WG_RESP_LEN size check,
+     * and get discarded. */
+    if (len >= STUN_HEADER_MIN &&
+        memcmp(buf + STUN_MAGIC_OFF, STUN_MAGIC, sizeof(STUN_MAGIC)) == 0) {
+        return WG_DEMUX_STUN;
+    }
+
     /* WG types are identified by a single byte. WG message format
      * mandates reserved[3] all zero — we don't enforce that here (the
      * cheap check is on the caller side / parser side), but we DO
@@ -62,16 +83,6 @@ wg_demux_kind_t wg_demux_classify(const uint8_t *buf, size_t len)
         return (len >= WG_TRANSPORT_MIN) ? WG_DEMUX_TRANSPORT : WG_DEMUX_DISCARD;
     default:
         break;
-    }
-
-    /* STUN binding request: first 2 bits of msg_type are 00 (per
-     * RFC 5389 §6: "two zero bits at the start of every STUN msg
-     * allow STUN to be multiplexed with other protocols"). The
-     * binding-request method has class+method = 0x0001 in the first
-     * 16 bits. We only need to recognize "looks like STUN" cheaply
-     * here; the actual STUN parser does the rest. */
-    if (len >= STUN_FIRST_TWO && buf[0] == 0x00 && buf[1] == 0x01) {
-        return WG_DEMUX_STUN;
     }
 
     return WG_DEMUX_DISCARD;

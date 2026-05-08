@@ -162,6 +162,12 @@ static struct {
     wg_netif_rx_cb_t        rx_cb;
     void                   *rx_cb_user;
 
+    /* Periodic STUN re-probe dispatch. tinylink.c arms this with a
+     * callback that parses the response, matches the in-flight txid,
+     * and signals the reprobe task. NULL = drop (legacy behavior). */
+    wg_netif_stun_cb_t      stun_cb;
+    void                   *stun_cb_user;
+
     bool                    stop_requested;
 } g;
 
@@ -438,12 +444,19 @@ static void rx_task(void *arg)
             case WG_DEMUX_DISCO:
                 handle_disco_direct(buf, (size_t)n, &src);
                 break;
+            case WG_DEMUX_STUN:
+                /* Periodic STUN re-probe lives on the WG socket so
+                 * the public AddrPort the server returns lines up
+                 * with the WG NAT mapping. tinylink.c arms the cb at
+                 * boot; if it's NULL we fall through to drop (which
+                 * is the legacy behavior — used to be the only path). */
+                if (g.stun_cb != NULL) {
+                    g.stun_cb(buf, (size_t)n, g.stun_cb_user);
+                }
+                break;
             case WG_DEMUX_HANDSHAKE_INIT:
             case WG_DEMUX_HANDSHAKE_COOKIE:
-            case WG_DEMUX_STUN:
-                /* Initiator-only on INIT/COOKIE; STUN response landed
-                 * after the boot prober closed (re-probe lives on its
-                 * own ephemeral socket). Drop. */
+                /* Initiator-only on INIT/COOKIE — drop. */
                 break;
             case WG_DEMUX_DISCARD:
             default:
@@ -730,6 +743,12 @@ void wg_netif_set_rx_callback(wg_netif_rx_cb_t cb, void *user)
 {
     g.rx_cb      = cb;
     g.rx_cb_user = user;
+}
+
+void wg_netif_set_stun_callback(wg_netif_stun_cb_t cb, void *user)
+{
+    g.stun_cb      = cb;
+    g.stun_cb_user = user;
 }
 
 bool wg_netif_is_up(void)
