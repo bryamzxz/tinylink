@@ -131,3 +131,62 @@ Distilled from the protocol research artifact §L.
   subtle state-transition rules (e.g., responder cannot send WG
   transport data until it receives one from initiator — §5.4.5 of the
   WG paper). Follow the papers verbatim.
+
+## Constant-time review (M7-6, post-AEAD-perf-sprint)
+
+Disassembled all crypto primitives (`xtensa-esp-elf-objdump -d -S`)
+on the post-#51 build to verify no secret-dependent branches survived
+the optimizer, particularly after the AEAD perf sprint that added
+`__builtin_memcpy` + aligned-u32 paths. Reviewed:
+`chacha20`, `chacha20poly1305`, `blake2s`, `curve25519`, `poly1305_donna`.
+
+**Clean (verified branch-free at the ASM level):**
+
+- **`poly1305_finish` mask select** (the documented high-risk site):
+  the `mask = (g4 >> 31) - 1` + `g[0..4] &= mask` + `mask = ~mask` +
+  `h[0..4] = (h[i] & mask) | g[i]` block compiled to a straight run of
+  `extui` / `addi` / `srai` / `and` / `or` — zero branches in the
+  selection region (offsets 0x93–0xc5 in the disasm).
+- **`sel25519`** (curve25519 conditional swap): the `c = ~(b - 1)`
+  mask compiled to `neg` + `srai 31` (sign-extend) — branch-free —
+  followed by 16 iterations of pure `xor`/`and`/`store`. Only branch
+  in the function is the `i ≤ 15` loop counter.
+- **`chacha20_block`** quarter-round and the post-sprint
+  `xor_block_u32`: branches are exclusively the `i < 16` row loop and
+  the byte-tail length compare. The fallback path (4× `l8ui` + `xor`
+  + 4× `s8i`) is the conservative branch-free shape — slower than the
+  aligned-u32 path but the alignment-prove fast path doesn't trigger
+  for `uint8_t *` callers, which is fine.
+- **`blake2s_compress`** G function: the secret-state mixing (XOR /
+  ADD / rotate) is branch-free; the only branches are the fixed-size
+  loops (`i < 16`, `i < 8`).
+- **`curve25519_scalarmult`** Montgomery ladder body: the bit-by-bit
+  ladder uses `sel25519` (verified above) for conditional swaps; the
+  ladder iteration count is a fixed loop bound, not a secret bit. The
+  final low-order-output reject (`for (i=0;i<32;i++) nonzero |= q[i];
+  return nonzero == 0 ? -1 : 0`) does have a branch on `nonzero`, but
+  that bit is the result the protocol caller receives — no
+  side-channel beyond what the protocol itself reveals.
+
+**One residual finding, low severity:**
+
+- **`poly1305_finish` 64-bit-add carry detection** (offsets 0xef,
+  0xfc, 0x105, 0x110, 0x119): the four `f = (uint64_t)h[i] +
+  st->pad[i] + (f >> 32)` lines compile, on Xtensa LX6, to a 32-bit
+  `add.n` followed by `bgeu Aresult, Aoperand, +5` to detect the
+  carry — the LX6 ISA has no add-with-carry, so GCC falls back to the
+  branched form. The branch decides the carry between two
+  secret-derived 32-bit values (`h` from message+key, `pad` from key).
+  Leak: 1 bit per add × 4 adds = 4 bits per MAC. Threat-model impact:
+  - WG keys rotate every 110 s (initiator-side proactive rekey, see
+    `ARCHITECTURE.md` § "WireGuard handshake lifecycle"), so an
+    attacker has at most ~22 MACs per session worth of timing samples
+    on the same key.
+  - The branch is the difference between one taken and one
+    not-taken path in straight-line code — a sub-cycle timing delta
+    on the LX6 (no branch predictor, no caches that could amplify).
+  - Mitigation would require either inline asm or a
+    branch-free carry idiom (`carry = ((a | b) >> 31) & ~(c >> 31) |
+    ((a >> 31) & (b >> 31))`) plus re-validation against the host
+    KAT. Not landed in this review pass; tracked as a residual risk
+    rather than a blocker.

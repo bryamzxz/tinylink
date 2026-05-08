@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+- **Constant-time disassembly review of crypto primitives.** Walked
+  the post-#51 compiled `.o` for `chacha20`, `chacha20poly1305`,
+  `blake2s`, `curve25519`, `poly1305_donna` with
+  `xtensa-esp-elf-objdump -d -S`. All hot paths — including the
+  high-risk `poly1305_finish` mask select (`g[i] &= mask; h[i] = (h[i]
+  & ~mask) | g[i]`) and `sel25519` — confirmed branch-free at the ASM
+  level: the optimizer respected the constant-time idioms in source.
+  One residual finding, low severity: `poly1305_finish`'s 64-bit
+  add-with-carry compiles to four `bgeu` carry-detect branches on
+  Xtensa LX6 because the ISA has no add-with-carry instruction. Leak:
+  ~4 bits per MAC; the WG key rotates every 110 s (initiator-side
+  proactive rekey from PR #46), so the attack window per key is
+  small. Documented in `docs/SECURITY-MODEL.md` § "Constant-time
+  review (M7-6, post-AEAD-perf-sprint)" with the branch-free carry
+  idiom that would close it if a future deployment needs a stricter
+  side-channel posture. Closes M7 within the in-scope items; eFuse-
+  NVS-encryption and Secure-Boot V2 are intentionally out of scope
+  for this project (irreversible per-device operations) — see
+  `docs/ROADMAP.md` § "M7 — Hardening".
+
 ### Added
 - **TAI64N handshake-timestamp persistence across reboots.**
   `wg_proto.c::wg_tai64n_now` previously fell back to
