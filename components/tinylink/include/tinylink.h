@@ -39,6 +39,21 @@ typedef struct {
  */
 esp_err_t tinylink_init(void);
 
+/* Load the persisted TAI64N floor from NVS namespace "tl_state" key
+ * "tai_floor" (default 0 on first ever boot), pre-reserve a 1-day
+ * chunk forward, persist that, and install it into wg_proto.c so the
+ * first post-reboot handshake's TAI64N timestamp is strictly greater
+ * than what the responder saw before reboot. Without this, a reboot
+ * rewinds monotonic_seconds to 0 and the responder rejects our next
+ * handshake as out-of-order against the peer that knew us pre-reboot.
+ * Idempotent. Must be called after app_nvs_init() and before any
+ * code path that fires a WG handshake (i.e. before
+ * tinylink_dataplane_start). Returns ESP_OK on success or the NVS
+ * error otherwise; on NVS failure wg_tai64n_now() falls back to the
+ * pre-fix legacy behavior so a transient NVS error doesn't brick the
+ * device. */
+esp_err_t tinylink_tai64n_floor_init(void);
+
 /* Run the ts2021 Noise IK handshake and POST /machine/register. Reads the
  * Tailscale auth key from NVS namespace "tl_creds", key "auth_key".
  * Blocks until either MachineAuthorized=true (returns ESP_OK) or a hard

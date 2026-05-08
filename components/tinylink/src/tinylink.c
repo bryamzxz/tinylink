@@ -34,6 +34,7 @@
 #include "ts2021_client.h"
 #include "wg_dataplane.h"
 #include "wg_netif.h"
+#include "wg_proto.h"
 
 #define STR_HELPER(x) #x
 #define STR(x) STR_HELPER(x)
@@ -104,6 +105,81 @@ esp_err_t tinylink_get_keys(tinylink_keys_t *out)
     if (out == NULL) return ESP_ERR_INVALID_ARG;
     if (!s_initialized) return ESP_ERR_INVALID_STATE;
     memcpy(out, &s_keys, sizeof(*out));
+    return ESP_OK;
+}
+
+/* TAI64N reservation lives in its own NVS namespace so wear from
+ * boot-time writes is isolated from credentials and pinned keys. */
+#define TAI64N_NVS_NS    "tl_state"
+#define TAI64N_NVS_KEY   "tai_floor"
+
+static int tai64n_persist_cb(uint64_t reservation_secs)
+{
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(TAI64N_NVS_NS, NVS_READWRITE, &h);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "tai64n: nvs_open(%s) failed: 0x%x",
+                 TAI64N_NVS_NS, err);
+        return -1;
+    }
+    err = nvs_set_u64(h, TAI64N_NVS_KEY, reservation_secs);
+    if (err == ESP_OK) {
+        err = nvs_commit(h);
+    }
+    nvs_close(h);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "tai64n: nvs_set/commit failed: 0x%x", err);
+        return -1;
+    }
+    return 0;
+}
+
+esp_err_t tinylink_tai64n_floor_init(void)
+{
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(TAI64N_NVS_NS, NVS_READWRITE, &h);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "tai64n_floor_init: nvs_open(%s) failed 0x%x — "
+                      "falling back to legacy unprotected behavior",
+                 TAI64N_NVS_NS, err);
+        wg_tai64n_init(0, 0, NULL);
+        return err;
+    }
+
+    uint64_t persisted = 0;
+    err = nvs_get_u64(h, TAI64N_NVS_KEY, &persisted);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        persisted = 0;
+        err = ESP_OK;
+    }
+    nvs_close(h);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "tai64n_floor_init: nvs_get_u64 failed 0x%x — "
+                      "falling back to legacy unprotected behavior", err);
+        wg_tai64n_init(0, 0, NULL);
+        return err;
+    }
+
+    /* Pre-reserve a chunk forward so the inline extend in
+     * wg_tai64n_now does NOT fire on every boot's first handshake.
+     * If the persist write fails here we still install the loaded
+     * floor (cross-boot monotonicity preserved within the chunk we
+     * already wrote on the previous boot) but mark s_persist_fn NULL
+     * so the inline extend doesn't keep retrying a broken NVS. */
+    uint64_t reservation = persisted + WG_TAI64N_RESERVE_CHUNK_SECS;
+    int prst = tai64n_persist_cb(reservation);
+    if (prst != 0) {
+        ESP_LOGW(TAG, "tai64n_floor_init: pre-reserve persist failed — "
+                      "in-RAM floor only; next reboot may rewind");
+        wg_tai64n_init(persisted, persisted, NULL);
+        return ESP_FAIL;
+    }
+
+    wg_tai64n_init(persisted, reservation, tai64n_persist_cb);
+    ESP_LOGI(TAG, "tai64n_floor: persisted=%llu reservation=%llu (chunk=%llu)",
+             (unsigned long long)persisted,
+             (unsigned long long)reservation,
+             (unsigned long long)WG_TAI64N_RESERVE_CHUNK_SECS);
     return ESP_OK;
 }
 
