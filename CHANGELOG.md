@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **`CONFIG_TINYLINK_TELEMETRY_DEST` default points at a real tailnet
+  peer.** The Kconfig default was `100.64.0.1:9000`, a placeholder IP
+  in the `100.64.0.0/10` CGNAT range that wasn't assigned to any
+  device — telemetry datagrams were dropped at the tailnet routing
+  layer (no peer claimed the address) before reaching anyone, so a
+  fresh build would silently emit into a black hole. Updated to
+  `100.88.250.54:27821`, the actual tailnet IP of the receiving host
+  in the reference deployment. Port moved off `9000` (already in use
+  on the receiver) to `27821`: `> 9000` and below the Linux ephemeral
+  range (`32768-60999`), so the receiver's bind survives daemon
+  restarts without colliding with a transient outbound socket. Also
+  fixed an internal comment in `long_poll_handler` that referenced
+  `100.64.0.1` as a stand-in for "the telemetry destination" —
+  replaced with generic "tailnet IP" since the comment was about WG
+  route ordering, not the specific destination. Verified end-to-end
+  on hardware: serial log shows `telemetry → 100.88.250.54:27821
+  every 5000 ms` followed by `tx seq=N temp=...°C (47 B)` lines from
+  `seq=2` onwards (`seq=0/1` fail with `errno=-1` while the WG
+  dataplane is still coming up — known boot transient covered by the
+  surrounding `s_dataplane_started` gate). On the receiver,
+  `tcpdump -ni tailscale0 udp port 27821` captures
+  `100.67.60.92.<port> > 100.88.250.54.27821: UDP, length 47` with
+  the same JSON `{"host":"sensor-cali","seq":N,"temp_c":29.250}`
+  emitted by the firmware, at exactly 5 s cadence. Downstream
+  consumers of the UDP path (e.g. `sensor_app` running with
+  `PRIMARY_TRANSPORT=udp`) must align `UDP_BIND_HOST=100.88.250.54`
+  and `UDP_BIND_PORT=27821` in their `.env` to match.
+
 ### Changed
 - **STUN re-probe now runs via the live WG socket** (was: ephemeral
   socket). Pre-fix `stun_probe_run` opened its own UDP socket whose
