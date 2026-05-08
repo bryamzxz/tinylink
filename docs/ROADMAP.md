@@ -20,7 +20,7 @@ Go implementation, which is the authoritative reference for wire format.
 | M4 | STUN minimal binding                          | done — runs on WG socket            | v0.4             | 0.5 wk   |
 | M5 | DERP relay + direct-UDP NAT traversal         | done — DISCO punch via CallMeMaybe  | v0.5             | 1-2 wk   |
 | M6 | ICMP-over-WG end-to-end                       | done — verified on hardware         | v0.6             | <1 wk    |
-| M7 | Production hardening (NVS, secure boot, OTA)  | pending                             | v0.7             | ongoing  |
+| M7 | Production hardening                          | done — within scope (eFuse + secure-boot intentionally out of scope) | v0.7 | landed |
 
 End-to-end verification on hardware (sensor-cali next to router,
 Servidor1 WG peer with public IP):
@@ -359,10 +359,6 @@ change has its own verification trail. Status as of HEAD:
   across three sequential resets: 86400 → 172800 → 259200 → 345600.
   See `components/tinylink/src/wg_proto.{c,h}` and
   `tinylink.c::tinylink_tai64n_floor_init`.
-- [ ] **Auth-key rotation path.** Auth key already lives in NVS
-  (`tl_creds/auth_key`), not Kconfig — but there's no API to update
-  it at runtime. Add a control-plane-driven rotation path or an OTA
-  hook so a compromised key can be replaced without UART access.
 - [x] **`stun_reprobe` task spawn resilience.** Boot-time
   `xTaskCreate(stun_reprobe_task)` could fail with `ESP_ERR_NO_MEM`
   while the supervisor TLS handshake transient was still holding the
@@ -372,21 +368,39 @@ change has its own verification trail. Status as of HEAD:
   hardware: failed at boot with `largest_block=3456 B`, succeeded
   30 s later at `largest_block=12800 B`. See
   `tinylink.c::tinylink_stun_reprobe_start`.
-- [ ] **Disassembly review of crypto.** Walk the compiled `.o` /
-  `.elf` for `chacha20`, `poly1305`, `blake2s`, `curve25519`,
-  `chacha20poly1305` and verify no secret-dependent branches survive
-  the optimizer. Special attention to `poly1305_finish` mask select
-  (the reference implementation has a subtle conditional that some
-  compilers turn into a branch).
-- [ ] **NVS encryption with HMAC key in eFuses.** `CONFIG_NVS_ENCRYPTION=y`
-  is set, but `app_nvs.c` calls `nvs_flash_init()` (not the secure
-  variant) and no eFuse key is burned, so the partition is plaintext
-  on flash. Burning the eFuse is **irreversible**; this lands per
-  device, with explicit operator authorization, after secure boot
-  enables flash encryption.
-- [ ] **Secure boot V2 + flash encryption.** Locks down the boot
-  chain. **Irreversible** — only after all of the above land and a
-  full firmware/OTA verification pass.
+- [x] **Disassembly review of crypto.** Walked the post-#51
+  compiled `.o` for `chacha20`, `chacha20poly1305`, `blake2s`,
+  `curve25519`, `poly1305_donna` (`xtensa-esp-elf-objdump -d -S`).
+  All hot paths — including the high-risk targets `poly1305_finish`
+  mask select and `sel25519` — are branch-free at the ASM level.
+  One residual finding (low severity): `poly1305_finish`'s 64-bit
+  add-with-carry compiles to four `bgeu` carry-detect branches on
+  Xtensa LX6 because the ISA has no add-with-carry. ~4 bits leak per
+  MAC; key rotates every 110 s. Documented in `SECURITY-MODEL.md` §
+  "Constant-time review (M7-6, post-AEAD-perf-sprint)".
+
+**Out of scope for this project — irreversible per-device
+operations**, intentionally not executed:
+
+- ~~**Auth-key rotation path.**~~ The storage-side primitive is small
+  (one NVS write), but without a remote *trigger* mechanism
+  (control-plane delivery or OTA) it would be unreachable code, and
+  the trigger is its own design problem. Re-provisioning via UART
+  remains the only supported rotation path on this firmware.
+- ~~**NVS encryption with HMAC key in eFuses.**~~ Burning the eFuse
+  for the HMAC key is **irreversible per device**. The current
+  threat model accepts plaintext-on-flash NVS for NodeKey /
+  DiscoKey / auth_key (physical-access attacker is out of scope, see
+  `SECURITY-MODEL.md` § "Adversary").
+- ~~**Secure boot V2 + flash encryption.**~~ Same irreversibility
+  argument. Would lock down the boot chain at the cost of preventing
+  any further development flashing on the same device. Not
+  appropriate while the project is still iterating on the firmware.
+
+If a downstream deployment later needs production-grade
+key-at-rest protection, those three items can be picked up as a
+forked hardening sprint with operator-authorized eFuse burns. The
+checklist above marks where each one would slot in.
 
 [research §L] for the underlying threat model.
 

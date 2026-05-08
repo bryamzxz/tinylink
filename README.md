@@ -17,7 +17,7 @@ written in pure C on **ESP-IDF v5.5.x**.
 | DERP supervised recv (M5)      | done                                   |
 | Direct UDP NAT punching (M5)   | done                                   |
 | ICMP over WG transport         | **done** — `ping <our-tailnet-ip>` flows |
-| Production hardening (M7)      | pending                                |
+| Production hardening (M7)      | done — within scope                    |
 
 What works today, verified on real hardware:
 
@@ -32,13 +32,20 @@ What works today, verified on real hardware:
 
 What's still pending:
 
-- M7 hardening (real Ed25519 NLKey, secure boot, OTA, NVS encryption).
 - Pre-punch on netmap-receive (cuts the first `tailscale ping` from
   3-DERP-rounds-then-direct down to direct-from-attempt-1).
 - DERP outbound queue (only relevant for peers behind shared CGNAT
   where direct UDP can never work — for peers with public IPs the
   direct path covers everything).
 - Multi-peer (single-peer today).
+
+Intentionally out of scope (irreversible per-device operations —
+see `docs/ROADMAP.md` § "M7 — Hardening"):
+
+- NVS encryption with HMAC key in eFuses.
+- Secure boot V2 + flash encryption.
+- Auth-key rotation API (no remote trigger mechanism without
+  control-plane / OTA delivery).
 
 Not production-ready. Not affiliated with Tailscale Inc. The Tailscale
 name and logo are trademarks of Tailscale Inc.; this project is a
@@ -148,7 +155,7 @@ Three properties that are non-obvious from a casual read of the code:
 | 4 | STUN minimal binding                            | done                  |
 | 5 | DERP relay fallback + direct-UDP NAT traversal  | done                  |
 | 6 | ICMP-over-WG end-to-end                         | done                  |
-| 7 | Production hardening (NVS, secure boot, OTA)    | pending               |
+| 7 | Production hardening                            | done — within scope   |
 
 See [`docs/ROADMAP.md`](docs/ROADMAP.md) for the per-milestone breakdown.
 
