@@ -180,7 +180,7 @@ menu "tinylink application"
         config TINYLINK_TELEMETRY_DEST
             string "Telemetry UDP destination (host:port)"
             depends on TINYLINK_TELEMETRY_ENABLE
-            default "100.64.0.1:9000"
+            default "100.88.250.54:27821"
             help
                 IP:port to send JSON samples to. The IP must be reachable
                 through the WireGuard netif — typically the home peer's

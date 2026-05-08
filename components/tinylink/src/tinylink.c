@@ -795,7 +795,7 @@ static esp_err_t long_poll_handler(const tl_netmap_t *nm, void *ctx)
         s_dataplane_started = true;
         /* Now that the WG netif is up and the 100.64.0.0/10 route
          * exists, it's safe to start telemetry (it sendto's to a
-         * 100.64.0.1 address that would otherwise punt into the WiFi
+         * tailnet IP that would otherwise punt into the WiFi
          * default route). */
         esp_err_t terr = telemetry_start();
         if (terr != ESP_OK) {
