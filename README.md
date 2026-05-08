@@ -17,7 +17,7 @@ written in pure C on **ESP-IDF v5.5.x**.
 | DERP supervised recv (M5)      | done                                   |
 | Direct UDP NAT punching (M5)   | done                                   |
 | ICMP over WG transport         | **done** — `ping <our-tailnet-ip>` flows |
-| Production hardening (M6)      | pending                                |
+| Production hardening (M7)      | pending                                |
 
 What works today, verified on real hardware:
 
@@ -32,7 +32,7 @@ What works today, verified on real hardware:
 
 What's still pending:
 
-- M6 hardening (real Ed25519 NLKey, secure boot, OTA, NVS encryption).
+- M7 hardening (real Ed25519 NLKey, secure boot, OTA, NVS encryption).
 - Pre-punch on netmap-receive (cuts the first `tailscale ping` from
   3-DERP-rounds-then-direct down to direct-from-attempt-1).
 - DERP outbound queue (only relevant for peers behind shared CGNAT

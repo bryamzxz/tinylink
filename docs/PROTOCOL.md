@@ -109,7 +109,7 @@ JSON body, fields used today:
 | `Version`           | `1` — Noise transport `CapabilityVersion` (upstream pins this on the wire; feature gating is keyed on `Hostinfo`, not `Version`). |
 | `NodeKey`           | `"nodekey:" + 64-hex` of NodeKey public.           |
 | `OldNodeKey`        | `"nodekey:" + 64 zeros` on first registration.     |
-| `NLKey`             | `"nlpub:" + 64 zeros` for M1 (TKA disabled). Real Ed25519 NLPrivate generation lands in M6 hardening. The field has no `omitempty` upstream, so it must be present. |
+| `NLKey`             | `"nlpub:" + 64 zeros` for M1 (TKA disabled). Real Ed25519 NLPrivate generation lands in M7 hardening. The field has no `omitempty` upstream, so it must be present. |
 | `Hostinfo.OS`       | `"esp32"`.                                         |
 | `Hostinfo.Hostname` | from `CONFIG_TINYLINK_DEVICE_HOSTNAME`.            |
 | `Hostinfo.IPNVersion` | `"0.1.0-tinylink"`.                              |

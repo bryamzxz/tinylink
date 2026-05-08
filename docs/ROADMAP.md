@@ -64,7 +64,7 @@ established direct-UDP + ICMP path):
   end-to-end via DISCO and handled by `wg_netif_update_peer_endpoint`,
   so this is a long-tail item rather than a blocker.
 
-## M1 — ts2021 control plane (current)
+## M1 — ts2021 control plane
 
 EN: The device:
 1. Generates Curve25519 identities (MachineKey, NodeKey, DiscoKey) on first
@@ -72,7 +72,7 @@ EN: The device:
    them in NVS namespace `tl_keys` [research §L].
 2. Bootstraps the control plane public key via `GET /key?v=100`, pins it
    in NVS namespace `tl_pin`. Compile-in fallback pin recommended for
-   production (M6).
+   production (M7).
 3. Opens TLS to `controlplane.tailscale.com:443`, sends `POST /ts2021`
    with `Upgrade: tailscale-control-protocol`, `Connection: upgrade`,
    `Content-Length: 0`, and the 101-byte Noise IK initiation frame
@@ -90,7 +90,7 @@ EN: The device:
 6. Sends `POST /machine/register` (HTTP/2 inside the Noise channel via
    nghttp2) with the auth key from NVS. `Version` on the wire is `1`
    (the Noise transport `CapabilityVersion`); `NLKey` is sent as
-   `"nlpub:" + 64 zeros` until M6 hardening adds real Ed25519
+   `"nlpub:" + 64 zeros` until M7 hardening adds real Ed25519
    NLPrivate generation.
 7. Reads the response. On `MachineAuthorized=true` the device is registered
    and idle; on `false` it retries on a slow cadence.
@@ -108,7 +108,7 @@ M1 has no data plane.
   in `types/key/chal.go` but never calls them outside tests, so the
   EarlyPayload reaches no caller in production. tinylink mirrors that
   behavior by draining and discarding the sentinel.
-- `NLKey` is sent as 32 zero bytes until M6 hardening lands real
+- `NLKey` is sent as 32 zero bytes until M7 hardening lands real
   Ed25519 NLPrivate generation; this is tolerated because TKA is off.
 - The vendored crypto only has host-side KATs for BLAKE2s and X25519
   today (commit `358297f`). ChaCha20-Poly1305 / Salsa20 / Poly1305 KATs
