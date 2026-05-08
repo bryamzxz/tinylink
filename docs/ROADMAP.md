@@ -330,12 +330,48 @@ Verified on hardware: 10/10 ICMP echo packets, 0% packet loss,
 
 ## M7 — Hardening
 
-EN: TAI64N monotonicity tests across reboot scenarios (NVS-persisted
-epoch counter). NVS encryption with HMAC key in eFuses. Watchdog +
-reconnection with exponential backoff (cap 30 s). Auth-key rotation
-path. Compile-in fallback control plane pubkey. Constant-time
-Curve25519 swap (`trombik/esp_wireguard/src/crypto/x25519.c`). Disassembly
-review of all crypto functions to verify no secret-dependent branches
-[research §L].
+Production-readiness checklist. Items land one PR at a time so each
+change has its own verification trail. Status as of HEAD:
+
+- [x] **Exponential reconnect backoff (cap 30 s).** DERP supervisor
+  doubles `CONFIG_TINYLINK_DERP_SUPERVISED_BACKOFF_MS` on every
+  consecutive connect failure up to 30 s, resets to base on a
+  successful login. See `tinylink.c::derp_supervised_task`.
+- [x] **Constant-time Curve25519 conditional swap.** `sel25519` in
+  `components/tinylink/src/crypto/curve25519.c` already uses
+  `c = ~(b - 1)` mask + XOR, no secret-dependent branches. Verified
+  during the M7 review audit.
+- [ ] **Compile-in fallback control plane pubkey.** Today
+  `control_key.c` does TOFU on first boot — a MITM during the
+  initial `GET /key?v=100` can substitute the pin. Ship the known
+  Tailscale control pubkey as a `const uint8_t[32]` and refuse a
+  `/key` response that disagrees.
+- [ ] **TAI64N monotonicity across reboots.** `wg_proto.c::wg_tai64n_now`
+  falls back to `monotonic_seconds()` from boot when SNTP hasn't
+  synced — that resets to 0 on every reboot, so the responder may
+  reject our handshake as out-of-order against a peer that knew us
+  pre-reboot. Persist a monotonic epoch counter in NVS (or land
+  proper SNTP) so timestamps strictly increase across power cycles.
+- [ ] **Auth-key rotation path.** Auth key already lives in NVS
+  (`tl_creds/auth_key`), not Kconfig — but there's no API to update
+  it at runtime. Add a control-plane-driven rotation path or an OTA
+  hook so a compromised key can be replaced without UART access.
+- [ ] **Disassembly review of crypto.** Walk the compiled `.o` /
+  `.elf` for `chacha20`, `poly1305`, `blake2s`, `curve25519`,
+  `chacha20poly1305` and verify no secret-dependent branches survive
+  the optimizer. Special attention to `poly1305_finish` mask select
+  (the reference implementation has a subtle conditional that some
+  compilers turn into a branch).
+- [ ] **NVS encryption with HMAC key in eFuses.** `CONFIG_NVS_ENCRYPTION=y`
+  is set, but `app_nvs.c` calls `nvs_flash_init()` (not the secure
+  variant) and no eFuse key is burned, so the partition is plaintext
+  on flash. Burning the eFuse is **irreversible**; this lands per
+  device, with explicit operator authorization, after secure boot
+  enables flash encryption.
+- [ ] **Secure boot V2 + flash encryption.** Locks down the boot
+  chain. **Irreversible** — only after all of the above land and a
+  full firmware/OTA verification pass.
+
+[research §L] for the underlying threat model.
 
 ES: idem.

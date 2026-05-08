@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **DERP supervisor reconnect backoff is now exponential, capped at 30 s.**
+  `tinylink.c::derp_supervised_task` previously slept a fixed
+  `CONFIG_TINYLINK_DERP_SUPERVISED_BACKOFF_MS` (default 15 s) between
+  every connect failure, hammering a downed server at the same rate
+  whether it was the first failure or the hundredth. New behavior: the
+  Kconfig value is the *base* delay; the supervisor doubles it on every
+  consecutive failure up to a hardcoded 30 s cap, and resets to base on
+  a successful login. The Kconfig help text is updated to reflect the
+  new shape; the symbol name is unchanged so existing
+  `sdkconfig.defaults` overrides keep working. First M7 hardening item
+  (see `docs/ROADMAP.md` § "M7 — Hardening").
+
 ### Fixed
 - **WG session expiry at exactly 180 s of inactivity.** Symptoms: ICMP
   from a peer to the device's CGNAT IP started failing 100 % at
