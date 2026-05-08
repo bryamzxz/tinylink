@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **STUN re-probe now runs via the live WG socket** (was: ephemeral
+  socket). Pre-fix `stun_probe_run` opened its own UDP socket whose
+  source port differed from `g.sock`'s; the public AddrPort the STUN
+  server learned therefore couldn't be advertised to peers (their
+  DISCO punches would land on a closed port). Symptom on hardware:
+  `tailscale ping` reverted to `via DERP(...)` after a NAT rebind even
+  though ICMP kept working (Servidor1 learns the live port from the
+  source of `HANDSHAKE_INIT`, refreshed every 110 s by the proactive
+  rekey). Fix splits send/recv across the existing tasks: the reprobe
+  task `sendto`s the STUN binding request directly on `g.sock` (lwIP
+  `sendto` is thread-safe, no ownership transfer); `rx_task` already
+  classifies `WG_DEMUX_STUN`, now dispatches the response to a
+  callback registered via the new `wg_netif_set_stun_callback()`. The
+  callback parses, matches the in-flight txid, and signals a
+  semaphore. Zero packet loss in the dispatch path (RX task keeps
+  decoding DISCO + WG transport normally), no race (only one
+  recvfrom-er still). On endpoint change, a one-shot
+  `tinylink_ep_push` task (24 KiB stack) opens its own ts2021
+  channel, fires `mapreq_push_endpoints`, and exits — keeps the
+  long-poll's `s_conn` untouched. Also: `wg_demux_classify` upgraded
+  to detect STUN by the magic cookie at offset 4 (RFC 5389 §6),
+  catching both binding requests and responses (the prior shape only
+  caught requests; a STUN response with byte 0 = 0x01 collided with
+  WG `MSG_RESPONSE` and got DISCARDed). Verified on hardware: 7-min
+  capture shows `stun re-probe ok via wg socket: 190.109.12.37:53174`
+  (the WG socket's actual port), 3 clean rekey cycles, 80 telemetry
+  packets uninterrupted, 0 crashes. Removes the *"followup PR
+  re-probes via wg socket"* TODO from `tinylink.c`.
+
 ### Security
 - **Constant-time disassembly review of crypto primitives.** Walked
   the post-#51 compiled `.o` for `chacha20`, `chacha20poly1305`,
