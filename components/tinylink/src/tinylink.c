@@ -541,8 +541,17 @@ static int derp_sup_event_cb(const derp_event_t *e, void *ctx)
 static void derp_supervised_task(void *arg)
 {
     (void)arg;
-    const TickType_t backoff =
+    /* Exponential backoff: start at the Kconfig base, double on each
+     * consecutive connect failure, cap at 30 s (per WG/Tailscale
+     * convention — long enough that we don't hammer a server that's
+     * down, short enough that recovery from a transient outage feels
+     * snappy). Reset to base on a successful login so the *next*
+     * outage starts fresh instead of inheriting hours of accumulated
+     * doubling. */
+    const TickType_t base_backoff =
         pdMS_TO_TICKS(CONFIG_TINYLINK_DERP_SUPERVISED_BACKOFF_MS);
+    const TickType_t max_backoff = pdMS_TO_TICKS(30000);
+    TickType_t backoff = base_backoff;
 
     derp_sup_stats_t stats = {0};
     static uint8_t frame_buf[DERP_SUP_FRAME_CAP];
@@ -569,14 +578,21 @@ static void derp_supervised_task(void *arg)
                               "(after %u attempts)",
                          s_derp_sup.server_version, attempt);
                 attempt = 0;
+                backoff = base_backoff;
                 break;
             }
             ESP_LOGW(TAG, "derp supervisor: connect attempt #%u failed 0x%x — "
                           "backoff %u ms",
                      attempt, cerr,
-                     (unsigned)CONFIG_TINYLINK_DERP_SUPERVISED_BACKOFF_MS);
+                     (unsigned)pdTICKS_TO_MS(backoff));
             derp_client_close(&s_derp_sup);
             vTaskDelay(backoff);
+            /* Double for the next attempt, cap at max. The wrap guard
+             * (next < backoff) is paranoia — at 100 Hz tick rate the
+             * cap kicks in after 13 doublings, far below uint32 wrap. */
+            TickType_t next = backoff * 2;
+            backoff = (next > max_backoff || next < backoff)
+                      ? max_backoff : next;
         }
 
         ESP_LOGI(TAG, "derp supervisor: entering recv loop server-v=%d",

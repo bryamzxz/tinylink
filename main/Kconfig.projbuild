@@ -94,15 +94,18 @@ menu "tinylink application"
             no DERP relay path).
 
     config TINYLINK_DERP_SUPERVISED_BACKOFF_MS
-        int "DERP supervised reconnect backoff (ms)"
+        int "DERP supervised reconnect backoff base (ms)"
         depends on TINYLINK_DERP_SUPERVISED
         default 15000
         range 1000 600000
         help
-            Sleep between a stream end / connect failure and the next
-            connect attempt. Mirrors the long-poll's
-            TINYLINK_REGISTER_RETRY_MS shape — small enough to recover
-            quickly, large enough to avoid hammering the server.
+            Initial sleep between a stream end / connect failure and
+            the next connect attempt. The supervisor doubles this value
+            on every consecutive connect failure up to a hardcoded 30 s
+            cap, and resets it back to this base on successful login.
+            Mirrors the long-poll's TINYLINK_REGISTER_RETRY_MS shape —
+            small enough to recover quickly, large enough to avoid
+            hammering the server when it's down for an extended window.
 
     config TINYLINK_STUN_REPROBE_MS
         int "STUN re-probe cadence (ms, M4)"
