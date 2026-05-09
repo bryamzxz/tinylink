@@ -11,7 +11,8 @@
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_netif.h"
-#include "esp_netif_net_stack.h"
+#include "esp_netif_net_stack.h"        /* esp_netif_get_netif_impl */
+#include "lwip/esp_netif_net_stack.h"   /* struct esp_netif_netstack_config */
 #include "lwip/def.h"     /* lwip_htonl */
 #include "lwip/netif.h"
 #include "lwip/pbuf.h"
@@ -110,6 +111,78 @@ static void wg_rx_inject(const uint8_t *plaintext, size_t len, void *user)
     }
 }
 
+/* MTU pending — set in wg_lwip_attach() before esp_netif_action_start()
+ * triggers netif_add() → wg_lwip_netif_init() (where it's applied to
+ * the lwIP netif). Avoids passing it through the netstack init signature. */
+static uint16_t s_pending_mtu;
+
+/* Custom lwIP netif init for the WG raw-IP carrier. lwIP netif_add()
+ * (lwip/.../netif.c:321-339) zeros ip_addr/netmask/gw/output/mtu/flags
+ * BEFORE calling init_fn, then (line 392) re-applies ip_addr/netmask/gw
+ * from the netif_add() params (which esp_netif sourced from base.ip_info)
+ * BEFORE init_fn (line 396). Anything not in init_fn that we set on the
+ * netif before action_start is wiped.
+ *
+ * Avoids the two problems caused by ESP_NETIF_NETSTACK_DEFAULT_ETH:
+ *   1. ethernetif_init() sets netif->output = etharp_output and
+ *      netif->linkoutput = ethernet_low_level_output. ARP is meaningless
+ *      on a tunnel netif and would cause every outbound packet to wait
+ *      for an ARP response that never arrives.
+ *   2. ethernetif_init() raises NETIF_FLAG_ETHARP, which makes
+ *      tcpip_input() route inbound pbufs through ethernet_input
+ *      (lwip/api/tcpip.c:288-296). Our pbufs are raw IP without an
+ *      Ethernet header, so ethernet_input parses the first 14 bytes
+ *      as an Eth header, finds an EtherType derived from the IPv4
+ *      version+IHL byte (0x45..) instead of 0x0800, and silently drops.
+ *
+ * What this init_fn does:
+ *   - sets netif->name for diagnostics ("wg")
+ *   - applies the MTU (zeroed by netif_add)
+ *   - installs the WG-aware output and linkoutput (so ip4_output's
+ *     send chain reaches wg_netif_send_plaintext, not netif_null_output)
+ *   - brings the netif up at admin and link level so ip4_input_accept
+ *     accepts inbound pbufs delivered via tcpip_input from wg_rx_inject
+ *   - leaves NETIF_FLAG_ETHARP/ETHERNET unset so tcpip_input() dispatches
+ *     inbound to ip_input rather than ethernet_input
+ *   - caches the lwIP netif pointer for wg_rx_inject's tcpip_input call */
+static err_t wg_lwip_netif_init(struct netif *netif)
+{
+    netif->name[0] = 'w';
+    netif->name[1] = 'g';
+    netif->mtu        = s_pending_mtu;
+    netif->output     = wg_lwip_ip4_output;
+    netif->linkoutput = wg_lwip_linkoutput;
+    s_lwn = netif;
+    /* Intentionally NOT calling netif_set_up/netif_set_link_up here.
+     * netif_add() (lwip/.../netif.c:436-438) only links the netif into
+     * netif_list AFTER init_fn returns, so calling netif_set_up here
+     * fires ext_callbacks (LWIP_NSC_STATUS_CHANGED) on a netif that
+     * isn't reachable via the global list yet — observed empirically
+     * to correlate with multi-second jitter and ~23% ICMP loss.
+     * Bringing the netif up is done post-action_start in wg_lwip_attach. */
+    return ERR_OK;
+}
+
+/* Stub input_fn. RX never goes through esp_netif_receive — wg_rx_inject
+ * calls tcpip_input(p, s_lwn) directly. But esp_netif_start_api runs
+ * esp_netif_config_sanity_check (esp_netif_lwip.c:1171) which rejects
+ * a NULL lwip_input_fn with ESP_ERR_INVALID_STATE, so provide a stub
+ * that returns failure if anything ever does call it. */
+static esp_netif_recv_ret_t wg_lwip_netif_input(void *netif, void *buffer,
+                                                size_t len, void *eb)
+{
+    (void)netif; (void)buffer; (void)len; (void)eb;
+    return ESP_NETIF_OPTIONAL_RETURN_CODE(ESP_FAIL);
+}
+
+/* Custom netstack config: minimal init_fn, stub input_fn. */
+static const struct esp_netif_netstack_config s_wg_netstack_config = {
+    .lwip = {
+        .init_fn  = wg_lwip_netif_init,
+        .input_fn = wg_lwip_netif_input,
+    },
+};
+
 static esp_err_t wg_post_attach(esp_netif_t *netif, void *driver_handle)
 {
     wg_driver_t *drv = (wg_driver_t *)driver_handle;
@@ -128,12 +201,22 @@ esp_err_t wg_lwip_attach(uint32_t local_ip_be, uint16_t mtu)
 {
     if (s_netif != NULL) return ESP_ERR_INVALID_STATE;
 
-    /* Inherent (base) config: PPP flag tells esp_netif this is a
-     * point-to-point virtual link with no DHCP/ARP/ND. That sidesteps
-     * the IDF v5.5 panic in esp_netif_internal_dhcpc_cb that killed
-     * trombik's WG netif. */
+    /* Inherent (base) config. AUTOUP flag tells esp_netif to bring the
+     * netif up automatically on action_start; we still call
+     * netif_set_up/netif_set_link_up below as defense-in-depth.
+     *
+     * Pre-Build-C this used ESP_NETIF_FLAG_IS_PPP to sidestep the IDF
+     * v5.5 panic in esp_netif_internal_dhcpc_cb. That panic was the
+     * symptom of dhcp_ip_addr_store() being called on a netif with no
+     * DHCP started; with the IDF whitelist+null-guard patch
+     * (fix/dhcpc-cb-whitelist-and-null-guard) the panic is gated by
+     * ESP_NETIF_DHCP_CLIENT, so any non-DHCP netif (including this
+     * AUTOUP one) is safe. Removing IS_PPP saves the ~30 s of LCP
+     * Configure-Request retries the PPP FSM does at boot trying to
+     * negotiate against a non-existent serial peer, plus ~1-2 KB of
+     * heap (ppp_pcb). */
     esp_netif_inherent_config_t base = {
-        .flags     = (esp_netif_flags_t)(ESP_NETIF_FLAG_IS_PPP),
+        .flags     = (esp_netif_flags_t)(ESP_NETIF_FLAG_AUTOUP),
         .if_key    = "WG_DEF",
         .if_desc   = "wg",
         .route_prio = 5,
@@ -149,12 +232,14 @@ esp_err_t wg_lwip_attach(uint32_t local_ip_be, uint16_t mtu)
     ip.gw.addr      = 0;
     base.ip_info    = &ip;
 
-    /* Stack glue: PPP stack is the closest fit in IDF for "raw IP, no
-     * link-layer protocol". It still uses lwIP under the hood. */
+    /* Stack glue: custom no-op netstack defined above. Avoids
+     * ETH/PPP init clobbering our output overrides and avoids
+     * NETIF_FLAG_ETHARP redirecting inbound pbufs through
+     * ethernet_input. */
     esp_netif_config_t cfg = {
         .base    = &base,
         .driver  = NULL,
-        .stack   = ESP_NETIF_NETSTACK_DEFAULT_PPP,
+        .stack   = &s_wg_netstack_config,
     };
 
     s_netif = esp_netif_new(&cfg);
@@ -181,56 +266,15 @@ esp_err_t wg_lwip_attach(uint32_t local_ip_be, uint16_t mtu)
         return err;
     }
 
-    /* Apply MTU. esp_netif_set_mtu doesn't exist on PPP-flagged netifs
-     * in some IDF versions; we set it via the underlying lwIP netif.
-     *
-     * Force admin-UP and link-UP on the lwIP netif. esp_netif_action_start
-     * below dispatches via esp_netif_start_api → esp_netif_start_ppp for
-     * any netif with ESP_NETIF_FLAG_IS_PPP, and that path waits on a real
-     * PPP LCP/IPCP negotiation that never completes (we use the netif as
-     * a raw IP carrier, not as PPP). It returns before the AUTOUP block
-     * that would set both flags, so without these two calls
-     * netif_is_up() and netif_is_link_up() both stay 0 — egress still
-     * works (ip4_output resolves the route by subnet match against
-     * ip_info, doesn't gate hard on is_up), but ingress local-delivery
-     * fails: ip4_input_accept checks netif_is_up(inp) and drops inbound
-     * before ICMP can reply. Symptom: telemetry tx flows, real
-     * `ping <our-tailnet-ip>` from a peer goes 100% packet loss. */
-    struct netif *lwn = (struct netif *)esp_netif_get_netif_impl(s_netif);
-    if (lwn != NULL) {
-        lwn->mtu = mtu;
-        /* Force address application onto the lwIP netif. esp_netif's
-         * `ip_info` is consumed by `esp_netif_up_api` (line 1821 of
-         * `esp_netif_lwip.c`) but the PPP `start` path returns before
-         * that, so without an explicit `netif_set_addr` here lwn's
-         * ip_addr stays 0.0.0.0 and `ip4_input` fails to match
-         * inbound packets destined for our tailnet IP — they're
-         * delivered to lwIP via tcpip_input but ip4_input_accept
-         * has no matching local netif and the packet is dropped
-         * before the ICMP echo handler can reply. */
-        ip4_addr_t ip4_ip   = { .addr = local_ip_be };
-        ip4_addr_t ip4_mask = { .addr = lwip_htonl(0xFFC00000UL) };
-        ip4_addr_t ip4_gw   = { .addr = 0 };
-        netif_set_addr(lwn, &ip4_ip, &ip4_mask, &ip4_gw);
-        /* Override the egress chain so lwIP doesn't PPP-frame outbound
-         * IP packets. The default `output`/`linkoutput` for a PPP netif
-         * wraps each datagram in HDLC + PPP-protocol headers; we ship
-         * raw IP only. Without this, every reply (ICMP echo,
-         * application TCP/UDP) reached the peer encrypted but
-         * structurally garbled — peer's WireGuard decoded fine and
-         * dropped on inner-IP parse. */
-        lwn->output      = wg_lwip_ip4_output;
-        lwn->linkoutput  = wg_lwip_linkoutput;
-        netif_set_up(lwn);
-        netif_set_link_up(lwn);
-        s_lwn = lwn;   /* cache for wg_rx_inject's tcpip_input bypass */
-        ESP_LOGI(TAG, "lwn ip=%u.%u.%u.%u flags=0x%02x",
-                 (unsigned)((local_ip_be      ) & 0xFF),
-                 (unsigned)((local_ip_be >>  8) & 0xFF),
-                 (unsigned)((local_ip_be >> 16) & 0xFF),
-                 (unsigned)((local_ip_be >> 24) & 0xFF),
-                 (unsigned)lwn->flags);
-    }
+    /* Stash MTU for wg_lwip_netif_init() to apply. Doing the netif
+     * setup inside init_fn is mandatory because lwIP netif_add()
+     * (lwip/.../netif.c:321-339) zeros mtu/output/linkoutput/flags
+     * BEFORE init_fn runs — anything we set on the netif outside of
+     * init_fn would be wiped. ip_addr/netmask/gw are an exception:
+     * netif_add() applies them from its parameters (esp_netif sources
+     * them from base.ip_info above) at line 392, BEFORE init_fn,
+     * so they survive without a manual netif_set_addr in init_fn. */
+    s_pending_mtu = mtu;
 
     /* Register the RX callback on the WG protocol engine; from now on
      * decrypted plaintext IP is injected into this netif. */
@@ -243,8 +287,22 @@ esp_err_t wg_lwip_attach(uint32_t local_ip_be, uint16_t mtu)
      * the tunnel can't actually carry packets (no DISCO/STUN/DERP yet).
      * The /10 netmask above gives lwIP the subnet-match it needs to
      * route the 100.64.0.0/10 tailnet through this netif while leaving
-     * the default route on WiFi. */
+     * the default route on WiFi.
+     *
+     * action_start triggers esp_netif_lwip_add → lwIP netif_add →
+     * wg_lwip_netif_init() (our init_fn), which applies MTU + output
+     * overrides onto the freshly-zeroed netif and caches s_lwn. */
     esp_netif_action_start(s_netif, NULL, 0, NULL);
+
+    /* Bring the netif up AFTER action_start has returned and netif_add
+     * has linked it into netif_list. Calling netif_set_up from inside
+     * init_fn fires ext_callbacks while the netif is invisible to
+     * netif_list iteration — empirically this caused jitter and packet
+     * loss on the raw-IP ingress path. */
+    if (s_lwn != NULL) {
+        netif_set_up(s_lwn);
+        netif_set_link_up(s_lwn);
+    }
 
     ESP_LOGI(TAG, "WG netif up: ip=%u.%u.%u.%u/32 mtu=%u",
              (unsigned)((local_ip_be      ) & 0xFF),

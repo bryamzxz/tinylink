@@ -1,0 +1,76 @@
+From 00f03a4c5e153b29d3f3e9a7acb938fffa81ef2f Mon Sep 17 00:00:00 2001
+From: bryamzxz <bryamestebanvargas@gmail.com>
+Date: Sat, 9 May 2026 15:53:00 -0500
+Subject: [PATCH 1/2] fix(esp_netif): restore DHCP_CLIENT whitelist in dhcpc_cb
+ store path
+
+esp_netif_internal_dhcpc_cb is invoked for any LWIP_NSC_IPV4_*_CHANGED
+event, including a manual netif_set_addr() on a custom netif that never
+started DHCP. Calling dhcp_ip_addr_store() on such a netif dereferences
+netif_dhcp_data(netif), which is NULL unless dhcp_start() ran, and
+panics from the lwIP task with LoadProhibited at dhcp_state.c:52.
+
+The original 2018 implementation of dhcp_state.c gated all three
+state-store entry points on a VALID_NETIF_ID(netif) macro that checked
+ESP_NETIF_DHCP_CLIENT. That whitelist was removed silently during the
+refactor in 356bc603c4 ("lwip: Support DHCP restore last IP",
+2022-03-23) when the function signatures changed from void* to
+struct netif* and direct esp_netif access was dropped.
+
+The bug surfaced for PPPoS in 2024 (esp-protocols#800) and was
+band-aided in c8c10214f8 ("fix(esp_netif): Fix incorrect DHCP call for
+PPP interfaces", 2025-04-14) by adding a !_IS_NETIF_ANY_POINT2POINT_TYPE
+gate at the call site. That fix only covers PPP; non-PPP custom netifs
+that carry static IP without DHCP (e.g. raw-IP overlay carriers such as
+WireGuard tunnel netifs) still hit the same crash.
+
+Replace the PPP blacklist with the original DHCP_CLIENT whitelist. PPP
+netifs are still skipped because they do not have ESP_NETIF_DHCP_CLIENT
+set, so the regression closed by c8c10214f8 stays closed. Any future
+non-DHCP netif type is now also covered without needing per-type gates.
+
+Reproducer: create an esp_netif via esp_netif_new() without setting
+ESP_NETIF_FLAG_IS_PPP and without enabling ESP_NETIF_DHCP_CLIENT,
+attach a static IP, then call netif_set_addr() on the underlying lwIP
+netif. With CONFIG_LWIP_DHCP_RESTORE_LAST_IP=y the firmware crashes
+from the lwIP task with the same backtrace shape reported in
+esp-protocols#800.
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+---
+ components/esp_netif/lwip/esp_netif_lwip.c | 18 ++++++++++++++----
+ 1 file changed, 14 insertions(+), 4 deletions(-)
+
+diff --git a/components/esp_netif/lwip/esp_netif_lwip.c b/components/esp_netif/lwip/esp_netif_lwip.c
+index dcdbc53082..26f5dd9401 100644
+--- a/components/esp_netif/lwip/esp_netif_lwip.c
++++ b/components/esp_netif/lwip/esp_netif_lwip.c
+@@ -1456,11 +1456,21 @@ static void esp_netif_internal_dhcpc_cb(struct netif *netif)
+             }
+ #ifdef CONFIG_LWIP_DHCP_RESTORE_LAST_IP
+             /*
+-             * Store the IP address only for non-Point-to-Point interfaces.
+-             * P2P interfaces (like PPP) have dynamic addressing that shouldn't be stored
+-             * for later restoration, as they're negotiated on each connection.
++             * Store the IP address only for interfaces that actually run the
++             * DHCP client. dhcp_ip_addr_store() reads netif_dhcp_data(netif)
++             * which is NULL unless dhcp_start() ran for this netif, so calling
++             * it on any non-DHCP netif (PPP, raw-IP overlay carriers, etc.)
++             * dereferences NULL and panics from the lwIP task.
++             *
++             * This whitelist restores the invariant that existed in the
++             * original 2018 implementation of dhcp_state.c (macro
++             * VALID_NETIF_ID checking ESP_NETIF_DHCP_CLIENT) and was removed
++             * during the refactor in 356bc603c4. The PPP-specific gate added
++             * in c8c10214f8 (closes esp-protocols#800) was a partial
++             * restoration; this is the symmetric whitelist that covers all
++             * non-DHCP netif types.
+              */
+-            if (!_IS_NETIF_ANY_POINT2POINT_TYPE(esp_netif)) {
++            if (esp_netif->flags & ESP_NETIF_DHCP_CLIENT) {
+                 dhcp_ip_addr_store(netif);
+             }
+ #endif /* CONFIG_LWIP_DHCP_RESTORE_LAST_IP */
+-- 
+2.43.0
+

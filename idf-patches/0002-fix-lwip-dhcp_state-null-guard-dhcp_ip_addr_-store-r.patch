@@ -1,0 +1,64 @@
+From a84c78f34aa57ff8ce8513f1c7203cbbbdecd978 Mon Sep 17 00:00:00 2001
+From: bryamzxz <bryamestebanvargas@gmail.com>
+Date: Sat, 9 May 2026 15:53:40 -0500
+Subject: [PATCH 2/2] fix(lwip/dhcp_state): null-guard
+ dhcp_ip_addr_{store,restore} on dhcp data
+
+Defense in depth for the regression history captured by
+esp-protocols#800 and the partial fix in c8c10214f8: even after the
+call site in esp_netif_internal_dhcpc_cb is gated correctly, both
+dhcp_ip_addr_store() and dhcp_ip_addr_restore() still dereference
+netif_dhcp_data(netif) without a NULL check.
+
+netif_dhcp_data() returns NULL unless dhcp_start() ran for that netif
+(the pointer lives in netif->client_data[
+LWIP_NETIF_CLIENT_DATA_INDEX_DHCP], populated by dhcp_inform/dhcp_start
+in lwip/src/core/ipv4/dhcp.c). Any caller that forgets this invariant
+will crash with LoadProhibited at the first field access on dhcp.
+
+Add a NULL guard symmetric to the existing netif==NULL check. This is
+a callee-side safety net that does not depend on every call site
+remembering to gate by ESP_NETIF_DHCP_CLIENT, and protects against
+the same class of refactor regression that removed the original
+VALID_NETIF_ID gate in 356bc603c4 (2022).
+
+dhcp_ip_addr_erase() is intentionally not modified: it does not touch
+the dhcp pointer, only the NVS namespace, so a NULL dhcp is harmless
+there.
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+---
+ components/lwip/port/esp32xx/netif/dhcp_state.c | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/components/lwip/port/esp32xx/netif/dhcp_state.c b/components/lwip/port/esp32xx/netif/dhcp_state.c
+index b441c6df1f..28907332b9 100644
+--- a/components/lwip/port/esp32xx/netif/dhcp_state.c
++++ b/components/lwip/port/esp32xx/netif/dhcp_state.c
+@@ -30,6 +30,11 @@ bool dhcp_ip_addr_restore(struct netif *netif)
+         return false;
+     }
+     struct dhcp *dhcp = netif_dhcp_data(netif);
++    if (dhcp == NULL) {
++        /* netif_dhcp_data() is NULL unless dhcp_start() ran for this netif.
++         * Defensive guard against callers that don't pre-check DHCP state. */
++        return false;
++    }
+ 
+     uint32_t *ip_addr = &dhcp->offered_ip_addr.addr;
+     if (nvs_open(DHCP_NAMESPACE, NVS_READONLY, &nvs) == ESP_OK) {
+@@ -49,6 +54,11 @@ void dhcp_ip_addr_store(struct netif *netif)
+         return;
+     }
+     struct dhcp *dhcp = netif_dhcp_data(netif);
++    if (dhcp == NULL) {
++        /* netif_dhcp_data() is NULL unless dhcp_start() ran for this netif.
++         * Defensive guard against callers that don't pre-check DHCP state. */
++        return;
++    }
+     uint32_t ip_addr = dhcp->offered_ip_addr.addr;
+ 
+     if (nvs_open(DHCP_NAMESPACE, NVS_READWRITE, &nvs) == ESP_OK) {
+-- 
+2.43.0
+
