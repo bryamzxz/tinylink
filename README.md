@@ -45,6 +45,49 @@ see `docs/ROADMAP.md` § "M7 — Hardening"):
 - Auth-key rotation API (no remote trigger mechanism without
   control-plane / OTA delivery).
 
+## Possible future directions
+
+These are not commitments — they are bigger-than-QoL extensions that
+would meaningfully expand what tinylink can do. None are blocking the
+current sensor-→-collector use case. See
+[`docs/ROADMAP.md` § "Future directions"](docs/ROADMAP.md#future-directions)
+for the rationale and rough effort sketch for each.
+
+- **Streaming JSON parser** (yajl/jsmn-streaming style) to eliminate
+  the `RESPONSE_BUF_SZ` body buffer entirely — would unlock larger
+  tailnets without DRAM pressure and remove the BSS ceiling that
+  currently caps `TL_MAX_PEERS = 4` and `TL_MAX_DERP_REGIONS = 28`.
+- **Multi-peer support** — generalize the single-peer assumption in
+  `wg_netif.c` (one `g.peer`, one `g.transport` session) to a peer
+  table. Touches the replay window scheme (would need RFC 6479 2000-
+  entry windows per peer) and the netmap-driven peer add/remove path.
+- **PSRAM support** — moving lwIP pools, mbedtls handshake transients,
+  and the WG demux scratch out of internal DRAM into PSRAM would lift
+  the heap budget that today gates `CONFIG_TINYLINK_DERP_SUPERVISED`
+  on some boards.
+- **OTA over the tailnet** — fetch a signed firmware image from a
+  tailnet peer (HTTPS or DERP-relayed) without touching WiFi
+  credentials. Would close the "auth-key rotation needs a trigger
+  mechanism" gap by giving us a signed-update path.
+- **Power management with WG state preservation** — deep-sleep with
+  WG session checkpoint to NVS so the device wakes back into an
+  established tunnel without a fresh handshake. The TAI64N persistence
+  in PR #51 is the foundation; would need session-key serialization
+  + a re-establish-on-wake handshake budget.
+- **Other sensor families** — current TMP117 driver is single-purpose.
+  An I²C/SPI driver framework would let the same firmware base support
+  BME280, SCD30, ADS1115, etc. without rebuilding the WG stack.
+- **Mesh of devices** — once multi-peer lands, a sensor↔sensor topology
+  (rather than star → collector) becomes possible. Useful for
+  store-and-forward when the collector is offline.
+- **Diagnostics web endpoint** — a tiny HTTP server on the WG netif
+  that exposes `/stats` (heap, rekey count, RX-stale events,
+  endpoint roams) for inspection from any tailnet peer with a
+  browser.
+
+Each item below has a longer write-up in `docs/ROADMAP.md` with
+expected effort, dependencies, and what the firmware would unlock.
+
 Not production-ready. Not affiliated with Tailscale Inc. The Tailscale
 name and logo are trademarks of Tailscale Inc.; this project is a
 clean-room reimplementation of the documented wire protocols.
@@ -102,9 +145,11 @@ data plane (single UDP socket, demuxed):
    ├── wg_transport.c   ChaCha20-Poly1305 + counter
    └── handle_disco_direct  inbound DISCO ping → sealed pong via same socket
 
-  wg_lwip.c        lwIP integration (PPP-flagged esp_netif, but with
-                   linkoutput / output / input bypassed so it carries
-                   raw IP — see "WG netif as raw-IP carrier" in ARCHITECTURE.md)
+  wg_lwip.c        lwIP integration (custom no-op netstack with init_fn
+                   that installs raw-IP output/linkoutput; AUTOUP flag
+                   instead of IS_PPP — see "WG netif as raw-IP carrier"
+                   in ARCHITECTURE.md). REQUIRES idf-patches/ applied to
+                   ESP-IDF — see BUILDING.md.
 
   stun_probe.c     RFC 5389 binding probe; runs ON the wg_netif socket
                    so the public AddrPort matches the WG NAT mapping
@@ -130,13 +175,17 @@ Three properties that are non-obvious from a casual read of the code:
    control plane advertises lines up with the NAT mapping that WG
    keepalives keep pinned.
 
-2. **The WG netif is PPP-flagged but is NOT a PPP link.** The flag
-   tells esp_netif "no DHCP, no ARP, point-to-point" and sidesteps an
-   IDF-v5.5 `dhcpc_cb` panic; we then override the netif's
-   `input` / `output` / `linkoutput` so that ingress doesn't get
-   eaten by the PPP HDLC framer and egress doesn't get wrapped in PPP
-   protocol headers. End result: the netif carries raw IP both
-   directions, which is what WireGuard needs.
+2. **The WG netif is a raw-IP carrier with no PPP/Ethernet baggage.**
+   The IDF-v5.5 `dhcpc_cb` panic that historically forced an
+   `ESP_NETIF_FLAG_IS_PPP` workaround is now patched at the source —
+   the firmware ships two minimal patches in `idf-patches/` (a
+   DHCP_CLIENT whitelist in `esp_netif_lwip.c` plus a NULL-guard in
+   `dhcp_state.c`). With those applied, the netif uses
+   `ESP_NETIF_FLAG_AUTOUP` and a custom no-op netstack whose `init_fn`
+   installs WG-aware `output`/`linkoutput` directly into the lwIP
+   netif. End result: raw IP both directions, no PPP allocations, no
+   LCP retry storm at boot, ~4.4 KiB more heap free. See
+   `BUILDING.md` for the patch-apply step.
 
 3. **Endpoints are pushed via a "lite" MapRequest** (Stream=false +
    OmitPeers=true), the only shape modern Tailscale.com persists at
