@@ -395,7 +395,8 @@ The original M1-only layout, kept for historical reference:
 |  Vendored crypto (src/crypto/)                                 |
 |     blake2s.c        — RFC 7693 reference                      |
 |     hkdf_blake2s.c   — HMAC + Noise HKDF + RFC 5869 HKDF       |
-|     curve25519.c     — TweetNaCl-derived placeholder           |
+|     curve25519.c     — shim over donna (constant-time)         |
+|     curve25519_donna.c — agl curve25519-donna 1:1 (BSD-3)      |
 |     salsa20.c        — Salsa20 / HSalsa20 / XSalsa20           |
 |     nacl_box.c       — crypto_box / crypto_box_open            |
 +----------------------------------------------------------------+

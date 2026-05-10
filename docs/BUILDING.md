@@ -90,6 +90,32 @@ variance is roughly 1-2 % on the 1500 B path — treat smaller deltas as
 noise. Disable the flag for production builds (`# CONFIG_TINYLINK_BENCH_AEAD
 is not set`); the bench code drops out of the binary entirely.
 
+## Compiler optimization scope
+
+The firmware **does not** flip the global
+`CONFIG_COMPILER_OPTIMIZATION_PERF` Kconfig. The global stays at
+`CONFIG_COMPILER_OPTIMIZATION_DEBUG=y` (`-Og`), and per-component
+`-O2` is opted-in via `target_compile_options(${COMPONENT_LIB}
+PRIVATE -O2)` after `idf_component_register(...)` in:
+
+- `components/tinylink/CMakeLists.txt` (the entire tinylink component)
+- `main/CMakeLists.txt` (app_main + app_wifi + app_nvs)
+- `CMakeLists.txt` at the project root, for the IDF `mbedcrypto`
+  library target only — `mbedtls` + `mbedx509` are left at the
+  default
+
+This scopes the documented toolchain hangs around certain lwIP files
+at -O2 out of the build. If you add a new component to the perf-
+critical set, follow the same pattern (do not flip the global). If a
+toolchain upgrade ever resolves the lwIP hangs we can revisit and
+collapse to the global flip.
+
+-O2 also enables `-Wstringop-truncation` and a few related warnings
+that `-Og` doesn't trigger. `idf.py build` is configured with
+`-Werror` for the project, so an inadvertent `strncpy(dst, src,
+sizeof(dst))` will break the build. Use `memcpy + strnlen` (see
+`main/app_wifi.c` for the pattern).
+
 ## Common gotchas
 
 - **`CONFIG_LWIP_TCPIP_CORE_LOCKING` must stay `y`.** It is the IDF default

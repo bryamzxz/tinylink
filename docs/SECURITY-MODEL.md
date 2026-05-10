@@ -50,30 +50,49 @@ should be revoked from the admin panel. Because the device persists its
 NodeKey, future re-registrations would require a new auth key flashed
 into NVS.
 
-## Why the curve25519.c shipped today is not enough for production
+## X25519 — constant-time donna (landed in PR #61)
 
-The X25519 implementation in `components/tinylink/src/crypto/curve25519.c`
-is TweetNaCl-derived. TweetNaCl was designed to be constant-time, but it
-is small, less audited, and historically has been subject to compiler
-re-ordering caveats. The MachineKey and NodeKey private keys are exercised
-on every Noise IK handshake — an attacker who can co-locate or watch
-fine-grained timing on the local network can plausibly mount timing
-attacks against variable-time scalar multiplication.
+`components/tinylink/src/crypto/curve25519.c` is now a thin shim over
+`agl/curve25519-donna` (BSD-3, Google, see `curve25519_donna.c`). Donna
+is the canonical constant-time 32-bit X25519 implementation. The
+MachineKey and NodeKey private keys are exercised on every Noise IK
+handshake and every WG `handshake_init` (DH e/s, s/s); under donna the
+scalar multiplication has data-independent timing in both the ladder
+and the limb arithmetic, eliminating the timing-channel that the
+previous TweetNaCl-derived reference left open.
 
-For production, replace the file with the constant-time `curve25519-donna`
-implementation that ships in `trombik/esp_wireguard` at
-`src/crypto/x25519.c` (~600 LoC, BSD-3, MIT-compatible). Keep the public
-symbols (`curve25519_scalarmult`, `curve25519_keypair`,
-`curve25519_dh`, `curve25519_derive_pub`) so call sites compile unchanged.
+API unchanged: `curve25519_scalarmult`, `curve25519_keypair`,
+`curve25519_dh`, `curve25519_derive_pub` all behave identically modulo
+internal timing. RFC 7748 §5.2 (two single-scalarmult vectors) + §6.1
+(DH round-trip Alice↔Bob) are verified in
+`tools/test/test_curve25519.c`; the full host KAT battery stays
+green (452 OK / 0 FAIL).
 
-## Why constant-time Curve25519 from `donna`, not mbedTLS
+### Why donna, not mbedTLS
 
-The same argument applies even more strongly to mbedTLS: mbedTLS's
-Curve25519 path has not historically been written with the same
-constant-time discipline as donna. ChaCha20-Poly1305 stays on mbedTLS
-because the ESP32's hardware AES accelerator is irrelevant to ChaCha and
-the mbedTLS C path is already constant-time. BLAKE2s is small enough that
-vendoring is cheaper than dragging in another dependency.
+The same argument applies even more strongly to mbedTLS's curve25519
+path: it has not historically been written with the same constant-time
+discipline as donna, and on ESP32 the HW assistance is weaker than the
+generic "mbedTLS uses HW MPI" narrative suggests. IDF source review
+(v5.5.4):
+
+- `port/mbedtls/esp_config.h` defines `MBEDTLS_MPI_MUL_MPI_ALT` only —
+  there are **no** `_MXZ_ALT` hooks for the Montgomery-curve operations
+  (NORMALIZE_MXZ_ALT / DOUBLE_ADD_MXZ_ALT / RANDOMIZE_MXZ_ALT), so the
+  curve25519 ladder runs in pure SW with HW assist only on individual
+  modular multiplications.
+- `port/include/bignum_impl.h:8-14`: ESP32 sets `ESP_MPI_USE_MONT_EXP`
+  and uses SW Montgomery exponentiation because IDF documents the
+  ESP32 RSA peripheral as "slow for public key operations". So `exp_mod`
+  doesn't even hit hardware on ESP32.
+
+Net: mbedTLS X25519 on ESP32 would not be measurably faster than donna
+pure-C, and would cost `MBEDTLS_ECP_C` + `MBEDTLS_ECDH_C` flash + a
+non-constant-time risk profile. ChaCha20-Poly1305 stays on the
+in-tree vendored implementations because the ESP32's hardware AES
+accelerator is irrelevant to ChaCha and the implementations are
+already constant-time. BLAKE2s is small enough that vendoring is
+cheaper than dragging in another dependency.
 
 ## What we explicitly do not enforce on-device
 
