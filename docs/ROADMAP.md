@@ -77,6 +77,24 @@ established direct-UDP + ICMP path):
   re-initiate; in practice peer NAT rebindings are observed
   end-to-end via DISCO and handled by `wg_netif_update_peer_endpoint`,
   so this is a long-tail item rather than a blocker.
+- ~~**Peer-restart silent black-hole + permanent-FAILED recovery**~~ —
+  *landed*. Pre-fix scenarios that broke the firmware until ESP32
+  reboot:
+  (a) peer's tailscaled restarts mid-session → its session keys are
+  gone but the firmware's age-based proactive rekey only fires at
+  110 s, leaving up to 110 s of silent loss;
+  (b) peer offline longer than the 60 s handshake retry budget
+  (e.g. full OS reboot ~150-180 s) → state went to `WG_NETIF_FAILED`
+  permanently. Both fixed in `wg_netif.c`: an RX-stale watchdog
+  (`WG_RX_STALE_THRESHOLD_MS = 30 s`) detects "no transport decrypt
+  recently" and forces a rekey via the same make-before-break path,
+  closing (a). Handshake-burst exhaustion now backs off
+  `WG_HANDSHAKE_BACKOFF_MS = 30 s` and starts a fresh burst,
+  indefinitely, instead of transitioning to `WG_NETIF_FAILED`,
+  closing (b). Empirically: `sudo reboot` of Servidor1 with ~216 s
+  of downtime now recovers in ~130 s of observable telemetry outage,
+  fully autonomous. See `CHANGELOG.md` § "[Unreleased] / Added" for
+  full evidence.
 
 ## M1 — ts2021 control plane
 

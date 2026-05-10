@@ -48,6 +48,45 @@ static const char *TAG = "wg_netif";
  * (5 s × 12) covers transient losses. Keep this strictly below 120 s. */
 #define WG_REKEY_AFTER_MS    110000
 
+/* RX-stale watchdog threshold. Closes the "peer restarted" silent
+ * black-hole gap that the age-based proactive rekey above does NOT
+ * cover. Scenario: peer (e.g. Servidor1) reboots its tailscaled. The
+ * new process has fresh session keys but the same DiscoKey / NodeKey;
+ * our existing g.transport keys are now garbage to the peer. Outbound
+ * WG transport still encrypts and sendto's successfully (the wire
+ * works), but the peer drops every datagram on decrypt. We don't
+ * notice until WG_REKEY_AFTER_MS fires (worst case 110 s of silent
+ * loss after a peer restart that happens right after a rekey).
+ *
+ * Trigger: in steady-state (state == UP, no rekey in flight), if no
+ * successful transport decrypt has happened in WG_RX_STALE_THRESHOLD_MS,
+ * force a fresh handshake. 30 s is well above WG persistent-keepalive
+ * (25 s in the wireguard.conf default) and Tailscale's typical DISCO
+ * cadence (~3 s direct, ~1 s DERP), so 30 s of true RX silence is
+ * abnormal in practice. Below WG_REKEY_AFTER_MS so the watchdog wins
+ * the race when both would fire. Above WG_REKEY_TIMEOUT_MS (5 s) so
+ * a single packet loss doesn't trigger spurious rekey storms. */
+#define WG_RX_STALE_THRESHOLD_MS  30000
+
+/* Cool-down between handshake bursts after a budget exhaustion. The
+ * "12 × 5 s = 60 s" attempt budget covers transient packet loss but
+ * is too tight for a peer that's offline for longer (e.g. a full OS
+ * reboot of the peer machine takes 60-180 s for BIOS + kernel +
+ * service start). Pre-watchdog firmware would give up after the
+ * budget and stay in WG_NETIF_FAILED forever, requiring an ESP32
+ * reboot to recover.
+ *
+ * Instead of giving up, after exhaustion we wait this long and start
+ * a new burst. This gives unbounded recovery time — peer can be down
+ * for any duration and the firmware re-establishes the session
+ * automatically on its next handshake burst after peer returns.
+ *
+ * 30 s strikes a balance: long enough that a power-of-2 backoff
+ * during a 30-min outage doesn't spam (60 attempts in 30 min vs
+ * 360 attempts at 5 s each), short enough that peer-recovery is
+ * detected within ~30 s of when it actually returns. */
+#define WG_HANDSHAKE_BACKOFF_MS   30000
+
 /* RX task stack: WG decrypt path alone fits in 4 KiB, but the DISCO
  * direct branch adds NaCl-box open + a sealed Pong build + sendto on
  * the same socket — verified 2026-05-07 to overflow 4 KiB ("stack
@@ -103,7 +142,10 @@ typedef enum {
     WG_NETIF_IDLE = 0,
     WG_NETIF_HANDSHAKE_PENDING,
     WG_NETIF_UP,
-    WG_NETIF_FAILED,
+    WG_NETIF_FAILED,   /* unreachable in current code: handshake budget
+                        * exhaustion now backs off and retries
+                        * indefinitely (see WG_HANDSHAKE_BACKOFF_MS).
+                        * Kept for forward compatibility / external API. */
 } wg_netif_state_t;
 
 static struct {
@@ -136,6 +178,15 @@ static struct {
     int64_t                 last_handshake_completed_us;
     bool                    rekey_in_flight;
     int                     rekey_attempt;
+
+    /* RX-stale watchdog: timestamp of the last successful WG transport
+     * decrypt. Updated in handle_transport(). Compared against
+     * WG_RX_STALE_THRESHOLD_MS in the rx_task tick to detect a peer
+     * that has restarted (DiscoKey survives, transport keys don't, so
+     * outbound transport silently black-holes). Initialized to now_us()
+     * on session-up so the watchdog has a 30 s grace before it can fire
+     * on a fresh session. */
+    int64_t                 last_transport_recv_us;
 
     TaskHandle_t            rx_task;
     SemaphoreHandle_t       lock;
@@ -265,7 +316,7 @@ static int start_rekey(void)
 
 /* Process a MessageResponse arriving on the socket. Two valid paths:
  *
- *  - Cold path: state == HANDSHAKE_PENDING. Boot or post-FAILED retry.
+ *  - Cold path: state == HANDSHAKE_PENDING. Boot or post-budget-exhaustion retry.
  *    App traffic was paused until now; transition to UP.
  *  - Rekey path: state == UP && rekey_in_flight. Old transport session
  *    is still serving traffic; we atomically install the new keys and
@@ -307,6 +358,14 @@ static void handle_handshake_response(const uint8_t *buf, size_t len)
     wg_handshake_scrub(&g.handshake);
 
     g.last_handshake_completed_us = now_us();
+    /* Reset RX-stale watchdog clock on handshake (cold or rekey).
+     * A fresh session starts with no transport packets seen yet —
+     * setting last_transport_recv_us to now gives the watchdog a
+     * 30 s grace before it can fire on this session. Without this
+     * a peer-initiated rekey would immediately satisfy the stale
+     * predicate (last_transport_recv_us would be 0 or stale from
+     * the prior session). */
+    g.last_transport_recv_us = now_us();
     if (cold_path) {
         g.state = WG_NETIF_UP;
         g.handshake_attempt = 0;
@@ -331,6 +390,12 @@ static void handle_transport(const uint8_t *buf, size_t len)
                              plaintext, sizeof(plaintext), &plen) != 0) {
         return;  /* Replay / tamper / wrong index — silent drop. */
     }
+    /* Successful decrypt = peer's session keys still match ours. Update
+     * the RX-stale watchdog clock for both data packets AND zero-length
+     * keepalives, since both prove the WG transport keys are mutually
+     * valid. The watchdog cares about session liveness, not payload
+     * direction. */
+    g.last_transport_recv_us = now_us();
     if (plen == 0) {
         /* WG keepalive (zero plaintext) — peer is alive, nothing to
          * deliver upstream. */
@@ -527,13 +592,36 @@ static void rx_task(void *arg)
 retry_timer:;
 
         /* Handshake retry timer. Fires regardless of whether recvfrom
-         * timed out. */
+         * timed out.
+         *
+         * On budget exhaustion (12 × 5 s = 60 s of no response from
+         * peer), DO NOT transition to WG_NETIF_FAILED — that was
+         * terminal and required ESP32 reboot to recover from a peer
+         * outage longer than 60 s. Instead, sleep WG_HANDSHAKE_BACKOFF_MS
+         * and start a fresh burst. The peer can be down for any
+         * duration; the firmware recovers automatically on its next
+         * burst after peer returns. We back-date last_handshake_us so
+         * the next iteration of this block fires WG_HANDSHAKE_BACKOFF_MS
+         * from now (rather than the 5 s that the unmodified
+         * `now - last > REKEY_TIMEOUT` predicate would yield). */
         if (g.state == WG_NETIF_HANDSHAKE_PENDING &&
             (now_us() - g.last_handshake_us) > WG_REKEY_TIMEOUT_MS * 1000LL) {
             if (g.handshake_attempt >= WG_HANDSHAKE_MAX_RETRIES) {
-                ESP_LOGE(TAG, "handshake gave up after %d attempts",
-                         g.handshake_attempt);
-                g.state = WG_NETIF_FAILED;
+                ESP_LOGW(TAG, "handshake budget exhausted (%d × %ds = %ds) — "
+                              "backing off %ds before next burst (peer may be "
+                              "rebooting)",
+                         WG_HANDSHAKE_MAX_RETRIES,
+                         WG_REKEY_TIMEOUT_MS / 1000,
+                         (WG_HANDSHAKE_MAX_RETRIES * WG_REKEY_TIMEOUT_MS) / 1000,
+                         WG_HANDSHAKE_BACKOFF_MS / 1000);
+                g.handshake_attempt = 0;
+                /* Schedule the NEXT retry attempt to fire WG_HANDSHAKE_BACKOFF_MS
+                 * from now: pretend last_handshake_us is in the future, so the
+                 * `now - last > WG_REKEY_TIMEOUT_MS` predicate above evaluates
+                 * false until enough wall-clock time has elapsed. The +1 us
+                 * avoids the corner where the math evaluates exactly equal. */
+                g.last_handshake_us = now_us() +
+                    (WG_HANDSHAKE_BACKOFF_MS - WG_REKEY_TIMEOUT_MS) * 1000LL + 1;
             } else {
                 ESP_LOGW(TAG, "handshake retry %d", g.handshake_attempt + 1);
                 kick_off_handshake();
@@ -555,6 +643,40 @@ retry_timer:;
             g.rekey_attempt = 0;
             if (start_rekey() == 0) {
                 g.rekey_in_flight = true;
+            }
+        }
+
+        /* RX-stale watchdog. Detects "peer restarted" silent black-hole:
+         * peer's tailscaled lost session keys (e.g. reboot,
+         * `tailscale down && tailscale up`), our outbound transport
+         * encrypts cleanly but the peer drops every datagram. Symptom:
+         * we are sending (telemetry, ICMP replies) but receiving nothing
+         * back — neither data nor zero-plaintext keepalives. Without
+         * this watchdog, the firmware doesn't notice until the
+         * age-based rekey above fires (worst case 110 s of silent loss
+         * after a peer restart that lands right after a successful
+         * rekey). 30 s threshold is well above WG persistent-keepalive
+         * (25 s) and Tailscale's typical DISCO cadence, so genuine RX
+         * silence on the WG transport for 30 s is abnormal. Same
+         * make-before-break path as the proactive rekey — keys swap
+         * only when the response lands, no observable downtime if the
+         * peer is actually fine and just briefly silent. */
+        if (g.state == WG_NETIF_UP && !g.rekey_in_flight &&
+            g.last_transport_recv_us > 0 &&
+            (now_us() - g.last_transport_recv_us) >
+                WG_RX_STALE_THRESHOLD_MS * 1000LL) {
+            ESP_LOGW(TAG, "RX stale >%ds (no transport decrypt since) — "
+                          "forcing rekey (suspected peer restart)",
+                     WG_RX_STALE_THRESHOLD_MS / 1000);
+            g.rekey_attempt = 0;
+            if (start_rekey() == 0) {
+                g.rekey_in_flight = true;
+                /* Reset the watchdog clock so the rekey-in-flight has
+                 * its own grace window (the rekey-retry block below
+                 * handles rekey-itself-failed). Without this, if rekey
+                 * INIT also doesn't get a response, we'd keep tripping
+                 * this branch on every rx_task tick. */
+                g.last_transport_recv_us = now_us();
             }
         }
 
@@ -696,6 +818,7 @@ esp_err_t wg_netif_start(const struct wg_netif_peer_config *peer)
     g.rekey_attempt = 0;
     g.rekey_in_flight = false;
     g.last_handshake_completed_us = 0;
+    g.last_transport_recv_us = 0;  /* watchdog disarmed until session up */
     if (kick_off_handshake() != 0) return ESP_FAIL;
 
     BaseType_t ok = xTaskCreate(rx_task, "wg_rx",
