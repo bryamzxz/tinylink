@@ -148,6 +148,18 @@ esp_err_t register_emit(ts2021_conn_t *conn,
         ESP_LOGE(TAG, "control plane returned HTTP %d", status);
         return ESP_FAIL;
     }
+    /* h2_drive_request consumes the full body even past resp_len, but
+     * silently latches h2_resp_overflow=true (h2_client.c:163-171) when
+     * the response exceeds RESPONSE_BUF-1. Parsing a truncated JSON could
+     * succeed against attacker-shaped truncation and yield a misleading
+     * MachineAuthorized verdict. Refuse rather than risk it — Noise IK
+     * authenticates the control plane upstream, but defense-in-depth
+     * costs nothing here. */
+    if (conn->h2_resp_overflow) {
+        ESP_LOGE(TAG, "register response exceeded %u-byte buffer — refusing to parse",
+                 (unsigned)(sizeof(resp) - 1));
+        return ESP_ERR_INVALID_RESPONSE;
+    }
 
     cJSON *root = cJSON_Parse((const char *)resp);
     if (root == NULL) {

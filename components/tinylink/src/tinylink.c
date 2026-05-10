@@ -14,6 +14,7 @@
 #include "esp_log.h"
 #include "esp_system.h"
 #include "esp_timer.h"
+#include "mbedtls/platform_util.h"
 #include "nvs.h"
 #include "sdkconfig.h"
 
@@ -214,14 +215,16 @@ esp_err_t tinylink_register(void)
     err = ensure_control_conn();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "ts2021_connect failed: 0x%x", err);
-        memset(auth_key, 0, sizeof(auth_key));
+        mbedtls_platform_zeroize(auth_key, sizeof(auth_key));
         return err;
     }
 
     err = register_emit(&s_conn, &s_keys, auth_key);
 
-    /* Best-effort scrub of the auth key in stack memory. */
-    memset(auth_key, 0, sizeof(auth_key));
+    /* Scrub the auth key in stack memory. mbedtls_platform_zeroize is a
+     * compiler-barrier'd zero (won't be optimized out as a dead store the
+     * way a plain memset on a no-longer-read buffer can). */
+    mbedtls_platform_zeroize(auth_key, sizeof(auth_key));
 
     /* Drop the conn after register. Reusing the same ts2021 channel for
      * /machine/map fails because our h2_drive_request creates+destroys

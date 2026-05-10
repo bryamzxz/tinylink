@@ -21,6 +21,7 @@
 #include "lwip/sockets.h"
 
 #include "disco_handler.h"
+#include "disco_replay.h"
 #include "wg_demux.h"
 #include "wg_handshake.h"
 #include "wg_transport.h"
@@ -434,6 +435,21 @@ static void handle_disco_direct(const uint8_t *buf, size_t len,
          * prefix already matched so spam is bounded. */
         return;
     }
+
+    /* Replay rejection. The wire layout is fixed (disco.c:113-115):
+     *   [0..5]    DISCO_MAGIC
+     *   [6..37]   sender_pub
+     *   [38..61]  nonce
+     *   [62..]    NaCl box (tag||ct)
+     * The frame already passed disco_open's decrypt+auth so length checks
+     * are satisfied and the bytes at buf[6+32..6+32+24] are the nonce. */
+    const uint8_t *nonce = buf + DISCO_MAGIC_LEN + DISCO_KEY_LEN;
+    if (disco_replay_check_and_record(nonce)) {
+        ESP_LOGW(TAG, "disco replay dropped: nonce=%02x%02x%02x%02x.. type=%u",
+                 nonce[0], nonce[1], nonce[2], nonce[3], (unsigned)type);
+        return;
+    }
+
     /* Roaming gate: only DISCO frames sealed by OUR WG peer's DiscoKey
      * may roam g.peer.peer_endpoint. The same UDP socket also receives
      * DISCO from other Tailscale peers in the netmap (e.g. a laptop

@@ -100,12 +100,20 @@ static esp_err_t parse_keyed_hex(const char *s, size_t len,
     size_t plen = strlen(prefix);
     if (len != plen + 64) return ESP_ERR_INVALID_ARG;
     if (memcmp(s, prefix, plen) != 0) return ESP_ERR_INVALID_ARG;
+    /* Decode into a scratch buffer first so a malformed nibble at any
+     * position bails without ever publishing partial bytes to *out. The
+     * old shape wrote bytes 0..k-1 before returning ESP_ERR_INVALID_ARG
+     * on bad nibble at index k, and one call site (parse_one_peer "Key")
+     * ignores the return value — leaving peer->node_pub with attacker-hex
+     * bytes mixed with the previous memset(0)'d remainder. */
+    uint8_t tmp[TINYLINK_KEY_LEN];
     for (size_t i = 0; i < 32; i++) {
         int hi = hex_nibble(s[plen + 2 * i]);
         int lo = hex_nibble(s[plen + 2 * i + 1]);
         if (hi < 0 || lo < 0) return ESP_ERR_INVALID_ARG;
-        out[i] = (uint8_t)((hi << 4) | lo);
+        tmp[i] = (uint8_t)((hi << 4) | lo);
     }
+    memcpy(out, tmp, TINYLINK_KEY_LEN);
     return ESP_OK;
 }
 
