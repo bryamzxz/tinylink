@@ -17,6 +17,7 @@
 
 #include "esp_err.h"
 #include "esp_log.h"
+#include "esp_pm.h"
 
 #include "tinylink.h"
 #include "tinylink_bench.h"
@@ -27,6 +28,21 @@
 static const char *TAG = "tinylink";
 
 #define WIFI_TIMEOUT_MS 30000
+
+/* Enable automatic light-sleep entry from FreeRTOS tickless idle. Without
+ * this call, esp_pm/pm_impl.c:561+829 short-circuit the tickless idle
+ * sleep path (PM_MODE_LIGHT_SLEEP is never selected when
+ * s_light_sleep_en is false). Pair with esp_wifi_set_ps(WIFI_PS_MIN_MODEM)
+ * in app_wifi_start() so the WiFi modem also sleeps between DTIM beacons. */
+static esp_err_t configure_pm(void)
+{
+    esp_pm_config_t cfg = {
+        .max_freq_mhz       = 240,
+        .min_freq_mhz       = 80,
+        .light_sleep_enable = true,
+    };
+    return esp_pm_configure(&cfg);
+}
 
 static esp_err_t bringup(void)
 {
@@ -48,6 +64,20 @@ static esp_err_t bringup(void)
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "wifi did not connect within %d ms", WIFI_TIMEOUT_MS);
         return err;
+    }
+
+    /* Enable light-sleep PM only AFTER WiFi associates. If we enable it
+     * before assoc, tickless idle can put the chip to sleep during AUTH
+     * /ASSOC where the WiFi PS state machine isn't engaged yet, and the
+     * AP kicks us out after ~6 s of missed beacons. esp_wifi_set_ps()
+     * has been called in app_wifi_start() and takes effect on first
+     * assoc, so by the time wait_connected() returns the modem-sleep
+     * path is fully primed and safe for tickless light sleep to use. */
+    esp_err_t pm_err = configure_pm();
+    if (pm_err != ESP_OK) {
+        ESP_LOGW(TAG, "pm configure failed: 0x%x — continuing without light sleep", pm_err);
+    } else {
+        ESP_LOGI(TAG, "pm: light-sleep enabled, DFS 240/80 MHz");
     }
 
     err = tinylink_init();

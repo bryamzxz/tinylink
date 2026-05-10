@@ -13,5 +13,6 @@ idf_component_register(
         esp_netif
         esp_wifi
         esp_event
+        esp_pm
         tinylink
 )

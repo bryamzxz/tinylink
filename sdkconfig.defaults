@@ -28,16 +28,19 @@ CONFIG_ESP_WIFI_NVS_ENABLED=y
 # ---- Power management --------------------------------------------------------
 CONFIG_PM_ENABLE=y
 CONFIG_FREERTOS_USE_TICKLESS_IDLE=y
-# NOTE: CONFIG_ESP_WIFI_SLP_IRAM_OPT deliberately left disabled.
-# The Kconfig `select`s PM_SLP_DEFAULT_PARAMS_OPT, which IDF v5.5.4
-# gates behind `light_sleep_enable=true` (see
-# components/esp_hw_support/sleep_modem.c:243-255). tinylink never
-# calls esp_pm_configure(), so the timing-affecting select is dead
-# code in our build — the rest are pure IRAM placement attributes.
-# Per the protocol research artifact it still belongs paired with
-# CONFIG_ESP_WIFI_SLP_BEACON_LOST_OPT=y for an always-on station;
-# land both together with an explicit on-device A/B against the
-# 60-min mega-ping baseline (3.86 % loss / 154 ms avg).
+# main.c::configure_pm() (called AFTER WiFi associates) sets
+# light_sleep_enable=true, max=240, min=80. That call is what unlocks
+# PM_MODE_LIGHT_SLEEP in pm_impl.c:561 — without it, tickless idle never
+# enters light sleep at all.
+#
+# ESP_WIFI_SLP_IRAM_OPT and ESP_WIFI_SLP_BEACON_LOST_OPT are documented
+# as the "always-on station" pair, but with WPA2-PSK + PMF on
+# INTELCOM-CARDONA they break initial association — the AP kicks the
+# client between AUTH-ASSOC handshake and DHCP. Verified empirically:
+# enabling SLP_IRAM_OPT alone (which auto-selects PM_SLP_DEFAULT_PARAMS_OPT)
+# is enough to reproduce the disconnect-retry-loop seen in the previous
+# perf round. Stay disabled until we have an A/B against a less PMF-strict
+# AP, or until IDF documents the actual interaction.
 
 # ---- mbedTLS minimal config (TLS + crypto for ts2021/DERP) -------------------
 CONFIG_MBEDTLS_HARDWARE_AES=y
