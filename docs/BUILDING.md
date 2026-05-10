@@ -102,6 +102,15 @@ is not set`); the bench code drops out of the binary entirely.
   one-way switch.
 - **No PSRAM.** `sdkconfig.defaults.esp32` does not enable PSRAM; do not
   enable it through `menuconfig` — we keep the budget at zero PSRAM.
+- **IPv4-only build.** `CONFIG_LWIP_IPV6=n` and `CONFIG_LWIP_IP4_FRAG=n`
+  /`IP4_REASSEMBLY=n` are pinned in `sdkconfig.defaults`. Every socket
+  in the firmware (WG UDP, esp_tls to controlplane.tailscale.com, DERP,
+  STUN, telemetry) opens `AF_INET`. Flipping `LWIP_IPV6=y` back on
+  silently widens the surface and costs ~7 KiB RAM + ~36 KiB flash for
+  nothing — leave it off until a real IPv6 path lands. The IP-frag
+  flags stay off because WG sets its tunnel MTU to fit inside the
+  outer link without fragmenting, and inbound IP reassembly is a
+  classic teardrop / overlap DoS surface that nothing benign needs.
 
 ## Provisioning credentials
 
