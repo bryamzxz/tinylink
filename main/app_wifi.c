@@ -96,6 +96,17 @@ esp_err_t app_wifi_start(void)
     ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
     ESP_ERROR_CHECK(esp_wifi_start());
 
+    /* WIFI_PS_MIN_MODEM: wake on every DTIM beacon (does not skip
+     * beacons). Together with esp_pm_configure(light_sleep_enable=true)
+     * in main.c, this lets the modem sleep between beacons without
+     * losing inbound packets. WIFI_PS_MAX_MODEM (DTIM-skipping) is
+     * unsafe for tinylink because the sensor must receive WG/DISCO
+     * traffic reliably. */
+    esp_err_t ps_err = esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+    if (ps_err != ESP_OK) {
+        ESP_LOGW(TAG, "esp_wifi_set_ps(MIN_MODEM) failed: 0x%x", ps_err);
+    }
+
     return ESP_OK;
 }
 
