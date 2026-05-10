@@ -424,6 +424,106 @@ static bool disco_addr_is_v4_mapped(const uint8_t addr[16])
  * confirm a path is up, but the peer's magicsock tracks its own —
  * hence `tailscale ping` will report direct once any one of these
  * makes it through). */
+/* Pre-punch DISCO ping to each WG peer's advertised v4 endpoints, fired
+ * on every (non-KeepAlive) netmap that arrives. Counterpart to
+ * send_disco_pings_to_cmm_endpoints, which only fires when the peer
+ * sends us a CallMeMaybe — that path requires the peer to learn our
+ * endpoint first (a DERP-relayed round-trip) before they can ask us to
+ * punch. By the time the peer's first inbound DISCO ping reaches us,
+ * our NAT mapping for the WG socket may not exist yet (cold boot) or
+ * may have aged out (idle window > NAT timeout). Pre-punching here
+ * means every netmap arrival opens or refreshes mappings on our side
+ * to all peer endpoints we know, so an inbound first packet is much
+ * more likely to find a still-open path.
+ *
+ * No filtering on RFC1918 / hairpin: matches the CMM-driven path's
+ * behavior, where same-LAN endpoints are reachable and worth probing.
+ * Endpoints we can't reach (LAN advertised by an off-LAN peer) just
+ * fail silently in the WiFi default route — cheap. */
+static void prepunch_pings_to_peer_endpoints(const tl_netmap_t *nm)
+{
+    if (nm == NULL || nm->n_peers == 0) return;
+
+    int sock = wg_netif_get_socket();
+    if (sock < 0) return;  /* WG netif not yet bound: nothing to punch from */
+
+    size_t total_sent = 0;
+    for (size_t pi = 0; pi < nm->n_peers; pi++) {
+        const tl_peer_t *peer = &nm->peers[pi];
+        if (!peer->has_disco_pub) continue;        /* can't seal without DiscoKey */
+        if (peer->n_endpoints == 0) continue;
+
+        for (size_t ei = 0; ei < peer->n_endpoints; ei++) {
+            /* "ip:port" → split. Mirror of wg_dataplane.c::parse_endpoint
+             * (kept private to that TU; duplicating ~10 lines is cheaper
+             * than extending the public header for one more caller). */
+            const char *ep = peer->endpoints[ei].str;
+            const char *colon = strrchr(ep, ':');
+            if (colon == NULL) continue;
+            char host[64];
+            size_t hlen = (size_t)(colon - ep);
+            if (hlen == 0 || hlen + 1 > sizeof(host)) continue;
+            memcpy(host, ep, hlen);
+            host[hlen] = '\0';
+            int port = atoi(colon + 1);
+            if (port <= 0 || port > 65535) continue;
+
+            uint32_t v4_be = 0;
+#ifdef ESP_PLATFORM
+            if (inet_pton(AF_INET, host, &v4_be) != 1) continue;
+#else
+            (void)v4_be;
+            continue;
+#endif
+
+            /* Build a sealed DISCO ping. NodeKey is included so the peer's
+             * magicsock can correlate this probe with our WG peer entry
+             * even when its DiscoKey-to-NodeKey mapping is sparse. */
+            disco_ping_t ping = {0};
+            esp_fill_random(ping.txid, DISCO_TXID_LEN);
+            memcpy(ping.node_key, s_keys.node_pub, DISCO_NODEKEY_LEN);
+            ping.has_node_key = true;
+
+            uint8_t inner[DISCO_HANDLER_REPLY_MAX];
+            size_t inner_len = disco_encode_ping(inner, sizeof(inner), &ping);
+            if (inner_len == 0) continue;
+
+            uint8_t nonce[DISCO_NONCE_LEN];
+            esp_fill_random(nonce, sizeof(nonce));
+
+            uint8_t wire[DISCO_HANDLER_REPLY_MAX];
+            size_t wire_len = disco_seal(wire, sizeof(wire),
+                                         inner, inner_len, nonce,
+                                         s_keys.disco_pub, peer->disco_pub,
+                                         s_keys.disco_priv);
+            if (wire_len == 0) continue;
+
+#ifdef ESP_PLATFORM
+            struct sockaddr_in dst = {
+                .sin_family = AF_INET,
+                .sin_port   = htons((uint16_t)port),
+            };
+            dst.sin_addr.s_addr = v4_be;
+            ssize_t n = sendto(sock, wire, wire_len, 0,
+                               (struct sockaddr *)&dst, sizeof(dst));
+            if (n < 0) {
+                ESP_LOGW(TAG, "prepunch sendto: errno=%d (peer=%zu ep=%s)",
+                         errno, pi, ep);
+                continue;
+            }
+#endif
+            total_sent++;
+            ESP_LOGI(TAG, "prepunch ping → %s txid=%02x%02x%02x%02x..",
+                     ep, ping.txid[0], ping.txid[1],
+                     ping.txid[2], ping.txid[3]);
+        }
+    }
+    if (total_sent > 0) {
+        ESP_LOGI(TAG, "prepunch on netmap-receive: sent %zu pings across %zu peers",
+                 total_sent, nm->n_peers);
+    }
+}
+
 static void send_disco_pings_to_cmm_endpoints(const derp_event_t *e)
 {
     /* Re-decrypt + re-parse: handle_disco_relayed already did this
@@ -801,13 +901,26 @@ static esp_err_t long_poll_handler(const tl_netmap_t *nm, void *ctx)
         if (terr != ESP_OK) {
             ESP_LOGW(TAG, "telemetry_start failed: 0x%x — continuing", terr);
         }
+        /* Pre-punch immediately after dataplane up: opens our NAT mapping
+         * to every peer endpoint advertised in the bootstrap netmap so a
+         * cold-start `tailscale ping` from any peer has a fresh path
+         * available without waiting for a DERP-relayed CMM round trip. */
+        prepunch_pings_to_peer_endpoints(nm);
         return ESP_OK;
     }
     ESP_LOGI(TAG, "netmap (update): peers=%u derp_regions=%u",
              (unsigned)nm->n_peers, (unsigned)nm->n_derp_regions);
     /* wg_dataplane_update_peer already guards on n_peers==0 (rare server
      * push during a tailnet reconfigure). */
-    return wg_dataplane_update_peer(&s_keys, nm);
+    esp_err_t err = wg_dataplane_update_peer(&s_keys, nm);
+    /* Refresh NAT mappings on every netmap update too. Idle ages out
+     * mappings (typical UDP timeout 30-120 s); without a periodic punch
+     * the peer's first packet after silence finds a closed path and
+     * forces DERP fallback. Cheap to repeat — ~50-200 bytes per peer
+     * endpoint, fires only on non-KeepAlive netmaps (every minute or
+     * two on the Tailscale control plane). */
+    prepunch_pings_to_peer_endpoints(nm);
+    return err;
 }
 
 static void long_poll_task(void *arg)

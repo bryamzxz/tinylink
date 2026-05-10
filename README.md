@@ -32,8 +32,6 @@ What works today, verified on real hardware:
 
 What's still pending:
 
-- Pre-punch on netmap-receive (cuts the first `tailscale ping` from
-  3-DERP-rounds-then-direct down to direct-from-attempt-1).
 - DERP outbound queue (only relevant for peers behind shared CGNAT
   where direct UDP can never work — for peers with public IPs the
   direct path covers everything).

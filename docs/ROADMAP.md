@@ -40,11 +40,19 @@ project-lifetime ongoing.
 Remaining quality-of-life follow-ups (none blocking the
 established direct-UDP + ICMP path):
 
-- **Pre-punch on netmap-receive**: the first `tailscale ping` from a
-  fresh peer takes 3 DERP rounds before flipping to direct, because
-  the device only punches outbound DISCO when it receives a CMM. If
-  we punch every advertised peer endpoint on netmap-receive too, the
-  direct path is up by the time the peer first probes us.
+- ~~**Pre-punch on netmap-receive**~~ — *landed*.
+  `prepunch_pings_to_peer_endpoints` (`tinylink.c`) now fires sealed
+  DISCO pings to every v4 endpoint of every peer on every non-KeepAlive
+  netmap arrival. Combined with WG endpoint roaming via DISCO
+  direct-path observation in `handle_disco_direct` (gated by the WG
+  peer's DiscoKey so other Tailscale peers in the netmap don't flap
+  our transport target), the cold-start `direct connection not
+  established` window is closed: 38-min mega-ping from Servidor1
+  (n=2301) measured 4.95 % loss / 147 ms avg / 23 ms min RTT, vs the
+  prior 100 % DERP fallback observation that motivated this item.
+  Empirically Servidor1 starts replying with direct DISCO pongs ~9 s
+  after `netmap (initial)` lands at WG bring-up. See `CHANGELOG.md`
+  § "[Unreleased] / Added" for the full evidence.
 - **WG handshake init delay**: handshake retries 2–5× at boot before
   `session up`, because we fire the init at t≈15s while the peer's
   netmap may not yet contain our current AddrPort. Delaying init

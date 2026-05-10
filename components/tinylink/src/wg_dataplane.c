@@ -314,6 +314,10 @@ esp_err_t wg_dataplane_start(const tinylink_keys_t *keys,
 
     struct wg_netif_peer_config peer_cfg = {0};
     memcpy(peer_cfg.peer_static_pub, peer->node_pub, WG_KEY_LEN);
+    if (peer->has_disco_pub) {
+        memcpy(peer_cfg.peer_disco_pub, peer->disco_pub, WG_KEY_LEN);
+        peer_cfg.has_peer_disco_pub = true;
+    }
     peer_cfg.peer_endpoint_v4_be = peer_v4_be;
     peer_cfg.peer_endpoint_port  = s_endpoint_port;
     err = wg_netif_start(&peer_cfg);

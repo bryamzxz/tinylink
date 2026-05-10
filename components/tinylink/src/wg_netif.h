@@ -37,6 +37,21 @@ typedef void (*wg_netif_rx_cb_t)(const uint8_t *plaintext, size_t len,
 
 struct wg_netif_peer_config {
     uint8_t  peer_static_pub[WG_KEY_LEN];   /* WG static public of the peer */
+    uint8_t  peer_disco_pub[WG_KEY_LEN];    /* peer's DiscoKey; used to gate
+                                             * WG endpoint roaming via DISCO
+                                             * direct-path observation. Only
+                                             * DISCO frames sealed by THIS
+                                             * key trigger
+                                             * peer_endpoint_{v4_be,port}
+                                             * updates — frames from other
+                                             * peers in the netmap (e.g.
+                                             * a laptop with its own NodeKey)
+                                             * are valid DISCO but must NOT
+                                             * roam our WG transport target. */
+    bool     has_peer_disco_pub;            /* false → roaming permissive
+                                             * (fall back to legacy behavior:
+                                             * any direct DISCO ping/pong
+                                             * src is accepted). */
     uint8_t  preshared_key[WG_KEY_LEN];     /* zero if no PSK */
     uint32_t peer_endpoint_v4_be;           /* big-endian (network) IPv4 */
     uint16_t peer_endpoint_port;            /* host order */
