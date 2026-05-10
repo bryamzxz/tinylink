@@ -151,7 +151,12 @@ CONFIG_LOG_COLORS=y
 CONFIG_LOG_TIMESTAMP_SOURCE_RTOS=y
 
 # ---- FreeRTOS ----------------------------------------------------------------
-CONFIG_FREERTOS_HZ=1000
+# HZ=100 (10 ms tick granularity) reduces tick-ISR overhead vs the IDF
+# default 1000 (1 ms ticks) and lets tickless idle skip larger blocks
+# at once. Audited 2026-05-10: every pdMS_TO_TICKS(N) callsite in tinylink
+# uses N >= 100 ms, so no delay round-trips to 0 ticks. No bare integer
+# tick arguments to vTaskDelay / xQueue* / xSemaphoreTake in our code.
+CONFIG_FREERTOS_HZ=100
 CONFIG_FREERTOS_USE_TRACE_FACILITY=y
 CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS=y
 
