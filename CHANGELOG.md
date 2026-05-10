@@ -7,6 +7,72 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Pre-punch on netmap-receive + WG endpoint roaming via DISCO.** Two
+  coupled changes that together close the cold-start "direct connection
+  not established" QoL gap (the first 3-DERP-rounds-then-direct
+  observation in `docs/ROADMAP.md`).
+  - On every non-KeepAlive netmap arrival,
+    `prepunch_pings_to_peer_endpoints` (in `tinylink.c`) sends a sealed
+    DISCO ping to every v4 endpoint advertised for every peer. This
+    opens or refreshes our NAT mapping proactively, so the very first
+    inbound packet from any peer finds an open path instead of the
+    closed one that was the symptom previously. Boot evidence: 11 pings
+    fan-out across 3 peers ~1.5 s after `netmap (initial)`; Servidor1
+    starts replying with direct DISCO pongs ~9 s after that.
+  - `handle_disco_direct` (in `wg_netif.c`) now promotes the *src*
+    AddrPort of any DISCO ping/pong sealed by the WG peer's DiscoKey to
+    `g.peer.peer_endpoint_v4_be`+`peer_endpoint_port`. Prior code only
+    accepted `wg_netif_update_peer_endpoint` from netmap-driven
+    `pick_peer_endpoint` — the netmap-picked address is often a stale
+    public NAT mapping, so peer-side ICMP echo requests came in via
+    direct UDP but our echo replies went to the netmap endpoint and got
+    dropped or DERP-relayed. The roam migrates WG transport to the
+    verified-working AddrPort. Gated by DiscoKey: only frames from the
+    WG peer's DiscoKey trigger roaming, so other Tailscale peers in the
+    netmap (e.g. a laptop with its own NodeKey) cannot flap our WG
+    transport target.
+  - To enable the gate, `struct wg_netif_peer_config` gained
+    `peer_disco_pub[WG_KEY_LEN]` + `has_peer_disco_pub`; sourced from
+    `tl_peer_t::disco_pub` in `wg_dataplane.c`.
+  - Empirical results (Servidor1 → ESP32 ICMP, 38-min mega-ping
+    n=2301): 4.95 % loss, 23 ms min RTT, 147 ms avg, 2071 ms max,
+    170 ms mdev. Compare to prior IS_PPP+no-prepunch baseline: 4.2 %
+    loss, 156 ms avg, 60 ms mdev (n=71, ~1 min). Compare to no-IS_PPP
+    without prepunch (C.9, n=3445, 60 min): 3.86 % loss, 154 ms avg,
+    243 ms mdev, 4847 ms max. Net effect: avg RTT slightly lower
+    (direct UDP latency vs DERP+) and max RTT cut by 57 % vs the
+    pre-prepunch 60-min run.
+  - 30-min firmware-side capture during the mega-ping shows: 0 panics,
+    0 `tx queue full`, 0 `sendto failed` (steady state), 0 `endpoint
+    roam` events after boot lock-on (gate keeps the endpoint stable),
+    667 successful DISCO direct pong exchanges with Servidor1, 16
+    successful proactive rekeys, 360 telemetry tx (5 s cadence
+    preserved across all rekey cycles).
+
+### Changed
+- **WG netif no longer fakes PPP** (already on this branch since commit
+  `4a915df`, called out here for completeness). Replaced
+  `ESP_NETIF_FLAG_IS_PPP` + `ESP_NETIF_NETSTACK_DEFAULT_PPP` with a
+  custom static `s_wg_netstack_config` whose `init_fn` performs the
+  full netif setup (mtu / output / linkoutput) inside the
+  `netif_add()` callback rather than in `wg_lwip_attach()` (which
+  would have its work zeroed by `netif_add()` line 321-339 before
+  `init_fn` runs). `netif_set_up()` / `netif_set_link_up()` are
+  intentionally NOT called from `init_fn` — they are deferred to
+  post-`esp_netif_action_start()` because firing
+  `LWIP_NSC_STATUS_CHANGED` on a netif not yet linked into
+  `netif_list` (line 437-438 of `lwip/.../netif.c`) caused 23 % ICMP
+  loss and 1760 ms avg RTT in earlier iterations.
+  - **Requires** the two patches in `idf-patches/` applied to ESP-IDF
+    (whitelist+null-guard for `dhcp_ip_addr_store` against non-DHCP
+    custom netifs). Building against stock IDF panics in
+    `dhcp_state.c:52` from the lwIP task at WG bring-up.
+  - Net runtime improvements: -3 KiB binary (PPP/LCP/FSM linker-
+    dropped), +4.4 KiB heap free at boot (no `ppp_pcb`),
+    `stun_reprobe` task spawn succeeds first try (vs failure +
+    30 s retry under IS_PPP heap pressure pre-`#34`).
+
 ### Fixed
 - **`CONFIG_TINYLINK_TELEMETRY_DEST` default points at a real tailnet
   peer.** The Kconfig default was `100.64.0.1:9000`, a placeholder IP
