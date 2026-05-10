@@ -8,6 +8,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **RX-stale watchdog + indefinite handshake-burst backoff.** Closes the
+  "peer restart silent black-hole" gap that the existing age-based
+  proactive rekey at session_age=110 s did NOT cover, plus the
+  follow-on "permanent FAILED state" that a long peer outage triggered.
+  - `wg_netif.c::handle_transport` now stamps
+    `g.last_transport_recv_us` on every successful WG transport decrypt
+    (including zero-length keepalives — the watchdog cares about
+    session liveness, not payload direction). Initialized at
+    `session up` and `session rekeyed` so a fresh session has a 30 s
+    grace before the watchdog can fire.
+  - rx_task tick: if state == UP and no transport decrypt in
+    `WG_RX_STALE_THRESHOLD_MS = 30000`, force a rekey via the same
+    make-before-break path as the proactive rekey. Catches "peer
+    restarted, our transport keys are now garbage to the peer's fresh
+    process" scenarios that the age-based rekey would only notice up
+    to 110 s late.
+  - **`WG_NETIF_FAILED` is no longer terminal.** Pre-fix, after the
+    handshake retry budget (12 × 5 s = 60 s) exhausted, the firmware
+    transitioned to `WG_NETIF_FAILED` permanently — required an ESP32
+    reboot to recover from a peer outage longer than 60 s. Now,
+    exhaustion logs `W handshake budget exhausted ... backing off Ns
+    before next burst (peer may be rebooting)`, sleeps
+    `WG_HANDSHAKE_BACKOFF_MS = 30000`, and starts a fresh burst.
+    Repeats indefinitely. Recovery is fully autonomous regardless of
+    peer outage length. The `WG_NETIF_FAILED` enum value is retained
+    for forward compat / external-API stability but is unreachable in
+    current code.
+  - Empirical validation, `sudo reboot` of Servidor1 (~216 s downtime
+    incl. BIOS+kernel+services):
+      - Pre-fix (E.1): watchdog detected, rekey budget exhausted,
+        cold-handshake budget exhausted, state = FAILED, telemetry
+        `sendto failed errno=-1` continuous. Required ESP32 power-cycle.
+      - Post-fix (E.2): proactive rekey exhausted at firmware time
+        t=275 s → backoff 30 s → new burst at t=307 s → `session up`
+        at t=335 s (attempt 6 of new burst). 27 telemetry packets lost
+        during ~130 s observable outage; cadence resumed at seq=63
+        within 4.3 s of `session up`. Zero ESP32 intervention.
+
+### Added
 - **Pre-punch on netmap-receive + WG endpoint roaming via DISCO.** Two
   coupled changes that together close the cold-start "direct connection
   not established" QoL gap (the first 3-DERP-rounds-then-direct
