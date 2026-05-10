@@ -96,6 +96,200 @@ established direct-UDP + ICMP path):
   fully autonomous. See `CHANGELOG.md` § "[Unreleased] / Added" for
   full evidence.
 
+## Future directions
+
+These are bigger-than-QoL extensions that would meaningfully expand
+what tinylink can do. They are **not commitments** — they are listed
+here so contributors and downstream deployers know where the obvious
+extension points are, what dependencies they would need, and what
+each one would unlock. None block the current
+sensor-→-collector use case; the firmware on `main` is empirically
+stable for that workload (see `CHANGELOG.md` for the validation
+runs).
+
+Effort is rated as *small* (1-3 days), *medium* (1-2 weeks), or
+*large* (≥ 1 month) for one engineer working part-time. Dependencies
+are flagged because some items unblock others.
+
+### Streaming JSON parser to eliminate `RESPONSE_BUF_SZ`
+
+**What**: Replace the current `jsmn`-based parser in `mapreq.c` (which
+needs the entire MapResponse JSON in a single contiguous buffer
+`RESPONSE_BUF_SZ = 32 KiB`) with a streaming parser (yajl, sajson,
+or a hand-rolled jsmn-streaming variant). The parser would emit
+events as bytes arrive on the long-poll socket, accumulating only the
+small fields we actually need (`tl_netmap_t` is ~8 KiB).
+
+**Unlocks**: tailnets larger than ~30 peers / 4 DERP regions without
+DRAM pressure. Today the `RESPONSE_BUF_SZ` ceiling caps how large a
+MapResponse can be parsed, which indirectly caps `TL_MAX_PEERS = 4`
+and `TL_MAX_DERP_REGIONS = 28` — the BSS for those structs is what
+lets us allocate `RESPONSE_BUF_SZ` from the heap. Removing the body
+buffer frees ~32 KiB of contiguous heap that other paths
+(supervisor=y TLS handshake transient, multi-peer tables) currently
+contend for.
+
+**Effort**: medium. The parser swap is mechanical; the hard part is
+field-by-field re-validation against the host KAT corpus
+(`tools/test/test_mapresp.c`), which currently asserts on a fully-
+parsed `tl_netmap_t`.
+
+**Dependency**: none — can land standalone. **Unblocks**: Multi-peer
+support (below) and PSRAM-free larger tailnets.
+
+### Multi-peer support
+
+**What**: Generalize `wg_netif.c::g.peer` (single struct) to a peer
+table indexed by NodeKey. Each entry needs its own
+`wg_transport_session`, replay window, last_transport_recv_us,
+peer_endpoint, and DiscoKey. The netmap-driven update path
+(`wg_dataplane_update_peer`) becomes a peer-set diff.
+
+**Unlocks**: any topology beyond sensor-→-single-collector. Notably:
+mesh of devices, sensor groups talking to each other for
+store-and-forward, or a single device serving multiple downstream
+collectors.
+
+**Effort**: large. Touches `wg_netif.c`, `wg_demux.c`,
+`wg_dataplane.c`, `wg_lwip.c`, the replay window scheme (would need
+RFC 6479 2000-entry sliding windows per peer), the WG endpoint
+roaming gate (DiscoKey-keyed lookup instead of single comparison),
+and every memory budget decision in `sdkconfig.defaults`. The
+streaming JSON parser above is a soft prerequisite — without it the
+peer table is BSS-bound to TL_MAX_PEERS = 4.
+
+**Dependency**: streaming JSON parser (soft).
+**Unblocks**: Mesh of devices, diagnostics web endpoint serving multiple
+viewers, downstream sensor topologies.
+
+### PSRAM support
+
+**What**: Move the heap-heavy components — lwIP pools (`MEMP_*`),
+mbedtls handshake transients, WG demux scratch, telemetry queue —
+from internal DRAM to PSRAM. ESP-IDF supports `MALLOC_CAP_SPIRAM`
+allocation hints; the work is identifying which components benefit
+and reconfiguring their alloc policies via Kconfig.
+
+**Unlocks**: `CONFIG_TINYLINK_DERP_SUPERVISED=y` works on every board
+regardless of DRAM headroom (today it's gated by the supervisor's
+TLS handshake transient holding the largest contiguous block). Also
+unlocks the larger BSS budget multi-peer would need.
+
+**Effort**: small (config-level changes) for the easy wins, medium
+for the ones requiring code changes (some lwIP pools assume
+internal-DRAM access patterns).
+
+**Dependency**: PSRAM-equipped board. **Unblocks**: large tailnets,
+multi-peer.
+
+### OTA firmware updates over the tailnet
+
+**What**: Fetch a signed firmware image from a tailnet peer (HTTPS to
+a known peer, or DERP-relayed for peers behind CGNAT) using the
+existing `esp_ota_*` IDF APIs. Signature verification with a
+build-time-burned public key (RSA or ECDSA). On success, swap the OTA
+slot and reboot into the new image.
+
+**Unlocks**: closes the "auth-key rotation needs a remote trigger"
+gap that currently blocks PR #49's pre-known-control-pubkey provision
+mechanism from also rotating the WG/Disco/auth keys. With a signed-
+update path, key rotation becomes an OTA-triggered NVS rewrite. Also
+unlocks operator-controlled feature toggles without UART access.
+
+**Effort**: medium (esp_ota_* is well-trodden, but the peer-side
+signed-image distribution and key management are their own design
+problems).
+
+**Dependency**: none for the fetch path; requires operator decision on
+how to host signed images.
+**Unblocks**: Auth-key rotation API (currently out-of-scope).
+
+### Power management with WG session preservation
+
+**What**: Light-sleep / deep-sleep modes that preserve enough WG
+session state across wake to skip the full handshake. Today every
+boot pays ~30 s for WiFi associate + ts2021 handshake + first
+MapRequest + WG handshake; deep-sleeping for telemetry-idle windows
+would reset all of that. The fix: serialize `g.transport` (sender
+index, receiver index, send/recv counters, send/recv keys) to NVS
+before sleep, restore on wake, and send a "ping" transport packet to
+verify the session is still accepted by the peer (handshake fallback
+on rejection).
+
+**Unlocks**: battery-powered sensor deployments with multi-day life
+on a 2000 mAh cell at 1-minute telemetry cadence. Today the WiFi-up
+duration dominates power draw; deep-sleep with preserved session
+would cut active time per telemetry cycle from ~30 s to ~200 ms.
+
+**Effort**: medium. Foundation pieces in place: TAI64N persistence
+(PR #51) handles the monotonicity invariant across reboots; the
+RX-stale watchdog (PR #56) handles peer-side session loss. The new
+work is the serialize/restore + verify-ping path in `wg_netif.c`.
+
+**Dependency**: TAI64N persistence (✓ landed in #51), RX-stale
+watchdog (✓ landed in #56).
+**Unblocks**: battery-powered remote sensors.
+
+### Sensor driver framework
+
+**What**: Refactor `tmp117.c` from a single hard-wired driver into a
+small driver framework (init, sample, scale, report) that supports
+adding BME280, SCD30, ADS1115, etc. without touching the WG/control-
+plane layers. Per-sensor Kconfig + a registry pattern in `main.c`.
+
+**Unlocks**: same firmware base for environmental monitoring, air
+quality, soil moisture, etc. Today every new sensor type requires a
+firmware fork.
+
+**Effort**: small (driver framework) + per-sensor work (which is
+sensor-specific, not tinylink-specific).
+
+**Dependency**: none. **Unblocks**: domain expansion.
+
+### Mesh of devices (sensor ↔ sensor)
+
+**What**: Once multi-peer lands, devices can talk to each other over
+their tailnet IPs. Useful patterns: store-and-forward (sensor A
+buffers when collector is offline, sensor B picks up when it sees
+the collector); voting (3 sensors agree on a measurement before
+emitting); local aggregation (5-minute averages computed on device).
+
+**Unlocks**: deployments where collector connectivity is intermittent
+(remote sites, mobile collectors) or where local quorum matters
+(safety-critical readings).
+
+**Effort**: small once multi-peer is in (the WG plumbing is the same;
+the topology logic is a few hundred lines of `tinylink.c`).
+
+**Dependency**: multi-peer support.
+**Unblocks**: degraded-mode deployments.
+
+### Diagnostics web endpoint
+
+**What**: A tiny HTTP server on the WG netif (e.g. `mongoose` or
+hand-rolled, running at `100.x.y.z:80` on the tailnet IP) exposing
+read-only endpoints: `/stats` (heap, rekey count, RX-stale events,
+endpoint roam history, telemetry tx counter), `/log/recent` (last N
+log lines), `/peer` (current peer endpoint, session age, last
+transport recv timestamp). HTML rendering for browser viewing,
+`?format=json` for scripts.
+
+**Unlocks**: production debugging without a serial cable. Today
+diagnosing a misbehaving deployment requires UART access; a tailnet-
+local web endpoint means anyone with `tailscale ssh` to the device's
+LAN can see what's going on.
+
+**Effort**: small. Most of the data is already in `wg_netif_*` getters
+(rekey count, etc.); the work is HTTP server scaffolding + JSON
+serialization.
+
+**Dependency**: none for read-only stats. A write endpoint (toggle
+log level, force rekey, etc.) needs auth — would benefit from the OTA
+signed-update infrastructure above.
+**Unblocks**: production observability.
+
+---
+
 ## M1 — ts2021 control plane
 
 EN: The device:

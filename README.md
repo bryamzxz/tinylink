@@ -45,6 +45,49 @@ see `docs/ROADMAP.md` § "M7 — Hardening"):
 - Auth-key rotation API (no remote trigger mechanism without
   control-plane / OTA delivery).
 
+## Possible future directions
+
+These are not commitments — they are bigger-than-QoL extensions that
+would meaningfully expand what tinylink can do. None are blocking the
+current sensor-→-collector use case. See
+[`docs/ROADMAP.md` § "Future directions"](docs/ROADMAP.md#future-directions)
+for the rationale and rough effort sketch for each.
+
+- **Streaming JSON parser** (yajl/jsmn-streaming style) to eliminate
+  the `RESPONSE_BUF_SZ` body buffer entirely — would unlock larger
+  tailnets without DRAM pressure and remove the BSS ceiling that
+  currently caps `TL_MAX_PEERS = 4` and `TL_MAX_DERP_REGIONS = 28`.
+- **Multi-peer support** — generalize the single-peer assumption in
+  `wg_netif.c` (one `g.peer`, one `g.transport` session) to a peer
+  table. Touches the replay window scheme (would need RFC 6479 2000-
+  entry windows per peer) and the netmap-driven peer add/remove path.
+- **PSRAM support** — moving lwIP pools, mbedtls handshake transients,
+  and the WG demux scratch out of internal DRAM into PSRAM would lift
+  the heap budget that today gates `CONFIG_TINYLINK_DERP_SUPERVISED`
+  on some boards.
+- **OTA over the tailnet** — fetch a signed firmware image from a
+  tailnet peer (HTTPS or DERP-relayed) without touching WiFi
+  credentials. Would close the "auth-key rotation needs a trigger
+  mechanism" gap by giving us a signed-update path.
+- **Power management with WG state preservation** — deep-sleep with
+  WG session checkpoint to NVS so the device wakes back into an
+  established tunnel without a fresh handshake. The TAI64N persistence
+  in PR #51 is the foundation; would need session-key serialization
+  + a re-establish-on-wake handshake budget.
+- **Other sensor families** — current TMP117 driver is single-purpose.
+  An I²C/SPI driver framework would let the same firmware base support
+  BME280, SCD30, ADS1115, etc. without rebuilding the WG stack.
+- **Mesh of devices** — once multi-peer lands, a sensor↔sensor topology
+  (rather than star → collector) becomes possible. Useful for
+  store-and-forward when the collector is offline.
+- **Diagnostics web endpoint** — a tiny HTTP server on the WG netif
+  that exposes `/stats` (heap, rekey count, RX-stale events,
+  endpoint roams) for inspection from any tailnet peer with a
+  browser.
+
+Each item below has a longer write-up in `docs/ROADMAP.md` with
+expected effort, dependencies, and what the firmware would unlock.
+
 Not production-ready. Not affiliated with Tailscale Inc. The Tailscale
 name and logo are trademarks of Tailscale Inc.; this project is a
 clean-room reimplementation of the documented wire protocols.
