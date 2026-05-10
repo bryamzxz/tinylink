@@ -252,8 +252,19 @@ static esp_err_t parse_one_peer(const char *js, const jsmntok_t *toks,
             }
         } else if (tok_eq(js, key, "Key") && tok_is_str(&toks[val_idx])) {
             int slen = toks[val_idx].end - toks[val_idx].start;
-            parse_keyed_hex(js + toks[val_idx].start, (size_t)slen,
-                            "nodekey:", peer->node_pub);
+            /* parse_keyed_hex's own header documents this used to be the
+             * call site that "ignored the return value, leaving node_pub
+             * with attacker-hex bytes". PR #58 made the function itself
+             * safe (scratch buffer, memcpy only on success), so a parse
+             * failure now leaves node_pub at its memset(0) value above.
+             * Still gate explicitly so the failure is observable and the
+             * call shape matches DiscoKey below. */
+            if (parse_keyed_hex(js + toks[val_idx].start, (size_t)slen,
+                                "nodekey:", peer->node_pub) != ESP_OK) {
+#ifdef ESP_PLATFORM
+                ESP_LOGW(TAG, "parse_one_peer: malformed Key — node_pub zeroed");
+#endif
+            }
         } else if (tok_eq(js, key, "DiscoKey") && tok_is_str(&toks[val_idx])) {
             int slen = toks[val_idx].end - toks[val_idx].start;
             if (parse_keyed_hex(js + toks[val_idx].start, (size_t)slen,
