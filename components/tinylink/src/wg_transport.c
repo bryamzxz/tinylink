@@ -70,14 +70,15 @@ void wg_transport_session_init(struct wg_transport_session *s,
 }
 
 /* Build the 12-byte AEAD nonce from a 64-bit counter: 4 zero bytes
- * followed by the 8-byte LE counter (per WG whitepaper §5.4.6). */
+ * followed by the 8-byte LE counter (per WG whitepaper §5.4.6).
+ * Xtensa LX6 + every supported host build is little-endian, so the
+ * __builtin_memcpy of `counter` is byte-identical to a manual LE
+ * pack — same correctness rationale as chacha20.c. */
 static void counter_to_nonce(uint64_t counter,
                              uint8_t nonce[CHACHA20POLY1305_NONCE_LEN])
 {
     memset(nonce, 0, 4);
-    for (int i = 0; i < 8; i++) {
-        nonce[4 + i] = (uint8_t)(counter >> (8 * i));
-    }
+    __builtin_memcpy(nonce + 4, &counter, sizeof(counter));
 }
 
 /* Wire-format header layout:
@@ -92,25 +93,28 @@ static void counter_to_nonce(uint64_t counter,
 #define HDR_COUNTER_OFF 8
 #define HDR_PAYLOAD_OFF 16
 
+/* LE pack/unpack helpers. Xtensa LX6 + host builds are all little-endian,
+ * so __builtin_memcpy is byte-identical to a manual LE loop and folds to
+ * 1× l32i/s32i (aligned) or 4× l8ui/s8i (unaligned) — same rationale as
+ * chacha20.c's U8TO32_LITTLE / U32TO8_LITTLE. */
 static void store_u32_le(uint8_t out[4], uint32_t v)
 {
-    for (int i = 0; i < 4; i++) out[i] = (uint8_t)(v >> (8 * i));
+    __builtin_memcpy(out, &v, sizeof(v));
 }
 static void store_u64_le(uint8_t out[8], uint64_t v)
 {
-    for (int i = 0; i < 8; i++) out[i] = (uint8_t)(v >> (8 * i));
+    __builtin_memcpy(out, &v, sizeof(v));
 }
 static uint32_t load_u32_le(const uint8_t in[4])
 {
-    return ((uint32_t)in[0])       |
-           ((uint32_t)in[1] <<  8) |
-           ((uint32_t)in[2] << 16) |
-           ((uint32_t)in[3] << 24);
+    uint32_t v;
+    __builtin_memcpy(&v, in, sizeof(v));
+    return v;
 }
 static uint64_t load_u64_le(const uint8_t in[8])
 {
-    uint64_t v = 0;
-    for (int i = 0; i < 8; i++) v |= ((uint64_t)in[i]) << (8 * i);
+    uint64_t v;
+    __builtin_memcpy(&v, in, sizeof(v));
     return v;
 }
 
