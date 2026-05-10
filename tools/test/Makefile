@@ -27,8 +27,8 @@ all: $(TARGETS)
 test_blake2s: test_blake2s.c $(CRYPTO)/blake2s.c $(CRYPTO)/blake2s.h
 	$(CC) $(CFLAGS) -I$(CRYPTO) -o $@ test_blake2s.c $(CRYPTO)/blake2s.c
 
-test_curve25519: test_curve25519.c $(CRYPTO)/curve25519.c $(CRYPTO)/curve25519.h
-	$(CC) $(CFLAGS) -I$(CRYPTO) -o $@ test_curve25519.c $(CRYPTO)/curve25519.c
+test_curve25519: test_curve25519.c $(CRYPTO)/curve25519.c $(CRYPTO)/curve25519_donna.c $(CRYPTO)/curve25519.h
+	$(CC) $(CFLAGS) -I$(CRYPTO) -o $@ test_curve25519.c $(CRYPTO)/curve25519.c $(CRYPTO)/curve25519_donna.c
 
 # mapreq.c builds on host because its ESP-IDF-specific code is guarded
 # by #ifdef ESP_PLATFORM; the mapresp_parse() entry point we test here
@@ -68,12 +68,12 @@ test_hkdf_noise: test_hkdf_noise.c \
 test_wg_handshake: test_wg_handshake.c \
                   $(TL_SRC)/wg_handshake.c $(TL_SRC)/wg_handshake.h \
                   $(TL_SRC)/wg_proto.c $(TL_SRC)/wg_proto.h \
-                  $(CRYPTO)/blake2s.c $(CRYPTO)/curve25519.c \
+                  $(CRYPTO)/blake2s.c $(CRYPTO)/curve25519.c $(CRYPTO)/curve25519_donna.c \
                   $(CRYPTO)/hkdf_blake2s.c $(CRYPTO)/chacha20.c \
                   $(CRYPTO)/poly1305_donna.c $(CRYPTO)/chacha20poly1305.c
 	$(CC) $(CFLAGS) -I$(TL_SRC) -I$(CRYPTO) -o $@ test_wg_handshake.c \
 	    $(TL_SRC)/wg_handshake.c $(TL_SRC)/wg_proto.c \
-	    $(CRYPTO)/blake2s.c $(CRYPTO)/curve25519.c \
+	    $(CRYPTO)/blake2s.c $(CRYPTO)/curve25519.c $(CRYPTO)/curve25519_donna.c \
 	    $(CRYPTO)/hkdf_blake2s.c $(CRYPTO)/chacha20.c \
 	    $(CRYPTO)/poly1305_donna.c $(CRYPTO)/chacha20poly1305.c
 
@@ -88,12 +88,12 @@ test_wg_demux: test_wg_demux.c $(TL_SRC)/wg_demux.c $(TL_SRC)/wg_demux.h
 test_disco: test_disco.c \
             $(TL_SRC)/disco.c $(TL_SRC)/disco.h \
             $(CRYPTO)/nacl_box.c $(CRYPTO)/nacl_box.h \
-            $(CRYPTO)/curve25519.c $(CRYPTO)/salsa20.c \
+            $(CRYPTO)/curve25519.c $(CRYPTO)/curve25519_donna.c $(CRYPTO)/salsa20.c \
             $(CRYPTO)/poly1305_donna.c host_mbedtls_shim.c \
             host_include/mbedtls/poly1305.h
 	$(CC) $(CFLAGS) -I$(TL_SRC) -I$(CRYPTO) -Ihost_include -o $@ \
 	    test_disco.c $(TL_SRC)/disco.c \
-	    $(CRYPTO)/nacl_box.c $(CRYPTO)/curve25519.c $(CRYPTO)/salsa20.c \
+	    $(CRYPTO)/nacl_box.c $(CRYPTO)/curve25519.c $(CRYPTO)/curve25519_donna.c $(CRYPTO)/salsa20.c \
 	    $(CRYPTO)/poly1305_donna.c host_mbedtls_shim.c
 
 # STUN binding client (RFC 5389) — public-endpoint discovery for
@@ -117,13 +117,13 @@ test_disco_handler: test_disco_handler.c \
                     $(TL_SRC)/disco_handler.c $(TL_SRC)/disco_handler.h \
                     $(TL_SRC)/disco.c $(TL_SRC)/disco.h \
                     $(CRYPTO)/nacl_box.c $(CRYPTO)/nacl_box.h \
-                    $(CRYPTO)/curve25519.c $(CRYPTO)/salsa20.c \
+                    $(CRYPTO)/curve25519.c $(CRYPTO)/curve25519_donna.c $(CRYPTO)/salsa20.c \
                     $(CRYPTO)/poly1305_donna.c host_mbedtls_shim.c \
                     host_include/mbedtls/poly1305.h
 	$(CC) $(CFLAGS) -I$(TL_SRC) -I$(CRYPTO) -Ihost_include -o $@ \
 	    test_disco_handler.c \
 	    $(TL_SRC)/disco_handler.c $(TL_SRC)/disco.c \
-	    $(CRYPTO)/nacl_box.c $(CRYPTO)/curve25519.c $(CRYPTO)/salsa20.c \
+	    $(CRYPTO)/nacl_box.c $(CRYPTO)/curve25519.c $(CRYPTO)/curve25519_donna.c $(CRYPTO)/salsa20.c \
 	    $(CRYPTO)/poly1305_donna.c host_mbedtls_shim.c
 
 # DISCO replay window (M3 hardening) — nonce-based dedup that defeats
@@ -143,13 +143,13 @@ test_derp: test_derp.c \
            $(TL_SRC)/derp.c $(TL_SRC)/derp.h \
            $(TL_SRC)/tls_io.c $(TL_SRC)/tls_io.h \
            $(CRYPTO)/nacl_box.c $(CRYPTO)/nacl_box.h \
-           $(CRYPTO)/curve25519.c $(CRYPTO)/salsa20.c \
+           $(CRYPTO)/curve25519.c $(CRYPTO)/curve25519_donna.c $(CRYPTO)/salsa20.c \
            $(CRYPTO)/poly1305_donna.c host_mbedtls_shim.c \
            host_include/mbedtls/poly1305.h \
            host_include/mbedtls/ssl.h
 	$(CC) $(CFLAGS) -I$(TL_SRC) -I$(CRYPTO) -Ihost_include -o $@ \
 	    test_derp.c $(TL_SRC)/derp.c $(TL_SRC)/tls_io.c \
-	    $(CRYPTO)/nacl_box.c $(CRYPTO)/curve25519.c $(CRYPTO)/salsa20.c \
+	    $(CRYPTO)/nacl_box.c $(CRYPTO)/curve25519.c $(CRYPTO)/curve25519_donna.c $(CRYPTO)/salsa20.c \
 	    $(CRYPTO)/poly1305_donna.c host_mbedtls_shim.c
 
 # WG transport (data plane) — encrypt/decrypt + RFC 6479 anti-replay.

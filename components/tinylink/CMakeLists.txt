@@ -31,6 +31,7 @@ idf_component_register(
         "src/telemetry.c"
         "src/crypto/blake2s.c"
         "src/crypto/curve25519.c"
+        "src/crypto/curve25519_donna.c"
         "src/crypto/hkdf_blake2s.c"
         "src/crypto/salsa20.c"
         "src/crypto/nacl_box.c"

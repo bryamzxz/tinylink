@@ -3,24 +3,11 @@
 //
 // X25519 (Curve25519 Diffie-Hellman) wrapper.
 //
-// IMPLEMENTATION NOTE — READ BEFORE PRODUCTION:
-//
-//   The curve25519.c file shipped here is a TweetNaCl-derived reference.
-//   TweetNaCl was *designed* to be constant-time, but it is not as
-//   carefully audited as the canonical "donna" implementation.
-//
-//   For production use, drop in the constant-time curve25519-donna
-//   sources from trombik/esp_wireguard (src/crypto/x25519.c, ~600 LoC,
-//   BSD-3) by replacing this file. Keep the public symbols
-//   (curve25519_scalarmult, curve25519_keypair, curve25519_dh,
-//   curve25519_derive_pub) so call sites compile unchanged.
-//
-//   tinylink uses X25519 on every ts2021 handshake, so the long-term
-//   MachineKey private key is exposed to timing-channel attacks if this
-//   placeholder is shipped to a production sensor. See
-//   docs/SECURITY-MODEL.md.
-//
-// VERIFY against RFC 7748 §6 test vectors before trusting in production.
+// The scalarmult primitive is curve25519-donna (Adam Langley, Google
+// BSD-3, see crypto/curve25519_donna.c). Donna is the canonical
+// constant-time 32-bit X25519 implementation and is the right fit for
+// the Xtensa LX6. RFC 7748 §5.2 / §6.1 vectors are checked in
+// tools/test/test_curve25519.c.
 
 #pragma once
 
