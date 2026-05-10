@@ -7,6 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+- **DISCO replay window — fixes WireGuard endpoint hijack DoS.** NaCl
+  box (XSalsa20-Poly1305) is a stateless AEAD: `nacl_box_open(peer_pub,
+  my_priv, nonce, ct)` is deterministic. `wg_netif::handle_disco_direct`
+  used a successful `disco_open` plus a DiscoKey match as sufficient
+  authorisation to roam `g.peer.peer_endpoint_*` to the source AddrPort
+  of the inbound frame, applying both to PING (line ~471) and PONG
+  (line ~502) branches under the same `roam_allowed` gate. An attacker
+  who passively captured one DISCO PING or PONG (peer→tinylink) could
+  replay the bytes from a spoofed/owned source AddrPort and force the
+  WireGuard transport target to that AddrPort — black-holing outbound
+  WG transport, while the rx_task source filter (`wg_netif.c:556-561`)
+  silently dropped legit peer's WG packets from the original AddrPort.
+  Capture surface includes both peer-initiated PINGs AND peer-side
+  PONGs answering tinylink's own prepunch/CMM PINGs (which fire on
+  every netmap arrival), so capture windows recur ~1-2/min in steady
+  state. Fix: new `disco_replay.{c,h}` module — sliding window of last
+  128 nonces seen on inbound DISCO frames (~3 KiB BSS).
+  `handle_disco_direct` consults it post-decrypt, before any side-effect
+  (no roam, no Pong emit on replay). Host KAT in
+  `tools/test/test_disco_replay.c` covers first-arrival, immediate
+  replay, distinct-non-collide, ring-buffer eviction, and reset
+  semantics. On-device verified with 30 s of normal traffic
+  (peer 191.89.194.5:3176 + 192.168.1.38:41641 LAN endpoint,
+  ~2-3 PING→Pong/s, all unique txids → all unique nonces → zero false
+  positives).
+- **`parse_keyed_hex` partial-write hardening (mapreq.c).** On a
+  malformed hex nibble at position `k>0`, the parser previously wrote
+  bytes `0..k-1` to the output buffer before returning
+  `ESP_ERR_INVALID_ARG`. The "Key" → `peer->node_pub` call site at
+  `parse_one_peer` ignores the return value, so a malformed control-
+  plane MapResponse could land attacker-hex-prefix bytes into the
+  WireGuard static peer pubkey. (Mitigated upstream by Noise IK auth
+  to the control plane, but defense-in-depth costs nothing.) Now
+  decodes into a scratch buffer and `memcpy`s into the caller-provided
+  output only on full success.
+- **`auth_key` memzero hardened (tinylink.c).** Replaced the post-use
+  `memset(auth_key, 0, sizeof(auth_key))` with
+  `mbedtls_platform_zeroize` so the compiler cannot eliminate the zero
+  as a dead store on a no-longer-read buffer.
+- **`register_emit` refuses truncated responses (register.c).** The
+  `h2_drive_request` path silently latches
+  `conn->h2_resp_overflow=true` when `/machine/register` answers with
+  more than `RESPONSE_BUF-1` bytes (`h2_client.c:163-171`). The
+  previous code parsed the truncated JSON, where attacker-shaped
+  truncation could yield a misleading `MachineAuthorized` verdict.
+  Now the overflow flag is checked before `cJSON_Parse` and the
+  request is failed with `ESP_ERR_INVALID_RESPONSE`.
+
 ### Added
 - **RX-stale watchdog + indefinite handshake-burst backoff.** Closes the
   "peer restart silent black-hole" gap that the existing age-based

@@ -227,6 +227,19 @@ anyone bisecting an unrelated regression to before the netstack switch.
    peer's DiscoKey roam — DISCO pongs from other Tailscale peers in
    the netmap (e.g. a laptop that ran our prepunch ping) cannot flap
    our WG transport target.
+8. **DISCO replay window** (`disco_replay.{c,h}`) — NaCl box
+   (XSalsa20-Poly1305) is a stateless AEAD: `nacl_box_open` is
+   deterministic, so an attacker who passively captures one DISCO
+   PING/PONG can replay it from a spoofed/owned source AddrPort and
+   trigger the roam in (7) toward an attacker-chosen target,
+   black-holing the WG transport. The replay window dedups on the
+   24-byte NaCl-box nonce of inbound DISCO frames (post-decrypt-
+   success) — last 128 entries, ~3 KiB BSS, single-peer scope. A
+   replay matches the recorded nonce → frame dropped before any
+   side-effect (no roam, no Pong emit). The DiscoKey gate from (7)
+   already filters out frames from non-WG-peers; this layer adds
+   resilience against replay of frames from the legitimate peer's
+   DiscoKey.
 
 Conditions 1-5 landed in PR #42; condition (1) was also touched by
 PR #53 (STUN re-probe via WG socket); the netif ICMP carrier (raw IP

@@ -64,3 +64,4 @@ tools/test/test_tls_io
 tools/test/test_derp
 tools/test/test_disco
 tools/test/test_disco_handler
+tools/test/test_disco_replay
