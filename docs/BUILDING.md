@@ -21,6 +21,41 @@ cd ~/dev/tinylink
 idf.py set-target esp32
 ```
 
+### REQUIRED: apply IDF patches
+
+The firmware uses `ESP_NETIF_FLAG_AUTOUP` + a custom netstack on the WG
+netif (no `IS_PPP` workaround). That triggers an IDF v5.5 panic in
+`esp_netif_internal_dhcpc_cb` → `dhcp_ip_addr_store(NULL)` at WG
+bring-up unless the two patches in `idf-patches/` are applied to
+ESP-IDF. **Without these patches the firmware compiles cleanly but
+panics with `LoadProhibited` at `dhcp_state.c:52` from the lwIP task
+the first time `wg_lwip_attach()` calls `netif_set_addr()`.**
+
+```bash
+cd ~/esp/esp-idf-v5.5.4   # or wherever your IDF checkout lives
+git apply --check ~/dev/tinylink/idf-patches/0001-*.patch ~/dev/tinylink/idf-patches/0002-*.patch
+git am          ~/dev/tinylink/idf-patches/0001-*.patch ~/dev/tinylink/idf-patches/0002-*.patch
+```
+
+If `git am` fails on whitespace, fall back to:
+
+```bash
+cd ~/esp/esp-idf-v5.5.4
+git apply ~/dev/tinylink/idf-patches/0001-*.patch ~/dev/tinylink/idf-patches/0002-*.patch
+git add -A && git commit -m "tinylink: apply DHCP_CLIENT whitelist patches"
+```
+
+To revert (e.g. to test against stock IDF — expect the panic):
+
+```bash
+cd ~/esp/esp-idf-v5.5.4
+git reset --hard v5.5.4
+```
+
+See [`idf-patches/README.md`](../idf-patches/README.md) for the full
+diagnostic history (esp-protocols#800, commit `c8c10214f8`, and the
+2018→2022 regression that introduced the bug).
+
 ## Build / flash / monitor
 
 ```bash

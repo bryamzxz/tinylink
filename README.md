@@ -145,9 +145,11 @@ data plane (single UDP socket, demuxed):
    ├── wg_transport.c   ChaCha20-Poly1305 + counter
    └── handle_disco_direct  inbound DISCO ping → sealed pong via same socket
 
-  wg_lwip.c        lwIP integration (PPP-flagged esp_netif, but with
-                   linkoutput / output / input bypassed so it carries
-                   raw IP — see "WG netif as raw-IP carrier" in ARCHITECTURE.md)
+  wg_lwip.c        lwIP integration (custom no-op netstack with init_fn
+                   that installs raw-IP output/linkoutput; AUTOUP flag
+                   instead of IS_PPP — see "WG netif as raw-IP carrier"
+                   in ARCHITECTURE.md). REQUIRES idf-patches/ applied to
+                   ESP-IDF — see BUILDING.md.
 
   stun_probe.c     RFC 5389 binding probe; runs ON the wg_netif socket
                    so the public AddrPort matches the WG NAT mapping
@@ -173,13 +175,17 @@ Three properties that are non-obvious from a casual read of the code:
    control plane advertises lines up with the NAT mapping that WG
    keepalives keep pinned.
 
-2. **The WG netif is PPP-flagged but is NOT a PPP link.** The flag
-   tells esp_netif "no DHCP, no ARP, point-to-point" and sidesteps an
-   IDF-v5.5 `dhcpc_cb` panic; we then override the netif's
-   `input` / `output` / `linkoutput` so that ingress doesn't get
-   eaten by the PPP HDLC framer and egress doesn't get wrapped in PPP
-   protocol headers. End result: the netif carries raw IP both
-   directions, which is what WireGuard needs.
+2. **The WG netif is a raw-IP carrier with no PPP/Ethernet baggage.**
+   The IDF-v5.5 `dhcpc_cb` panic that historically forced an
+   `ESP_NETIF_FLAG_IS_PPP` workaround is now patched at the source —
+   the firmware ships two minimal patches in `idf-patches/` (a
+   DHCP_CLIENT whitelist in `esp_netif_lwip.c` plus a NULL-guard in
+   `dhcp_state.c`). With those applied, the netif uses
+   `ESP_NETIF_FLAG_AUTOUP` and a custom no-op netstack whose `init_fn`
+   installs WG-aware `output`/`linkoutput` directly into the lwIP
+   netif. End result: raw IP both directions, no PPP allocations, no
+   LCP retry storm at boot, ~4.4 KiB more heap free. See
+   `BUILDING.md` for the patch-apply step.
 
 3. **Endpoints are pushed via a "lite" MapRequest** (Stream=false +
    OmitPeers=true), the only shape modern Tailscale.com persists at
