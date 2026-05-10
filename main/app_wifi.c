@@ -86,8 +86,15 @@ esp_err_t app_wifi_start(void)
     }
 
     wifi_config_t wifi_cfg = {0};
-    strncpy((char *)wifi_cfg.sta.ssid, ssid, sizeof(wifi_cfg.sta.ssid));
-    strncpy((char *)wifi_cfg.sta.password, pass, sizeof(wifi_cfg.sta.password));
+    /* memcpy + strnlen instead of strncpy(dst, src, sizeof(dst)) — the
+     * classic form trips -Wstringop-truncation at -O2 because gcc can't
+     * prove src is NUL-terminated even when app_nvs_read_str() guarantees
+     * it. The struct is zero-init'd above, so a shorter copy leaves the
+     * tail at 0 which is what the WiFi driver expects. */
+    memcpy(wifi_cfg.sta.ssid, ssid,
+           strnlen(ssid, sizeof(wifi_cfg.sta.ssid)));
+    memcpy(wifi_cfg.sta.password, pass,
+           strnlen(pass, sizeof(wifi_cfg.sta.password)));
     wifi_cfg.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
     wifi_cfg.sta.pmf_cfg.capable = true;
 

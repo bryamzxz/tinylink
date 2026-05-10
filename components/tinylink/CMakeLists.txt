@@ -57,3 +57,11 @@ idf_component_register(
     PRIV_REQUIRES
         espressif__nghttp
 )
+
+# -O2 for the entire tinylink component. This is the perf-critical
+# code: WG transport, ChaCha20-Poly1305 AEAD, Curve25519, BLAKE2s,
+# HKDF, the DISCO/STUN/DERP codecs, and the netif fast path. The
+# global default is CONFIG_COMPILER_OPTIMIZATION_DEBUG=y (-Og); the
+# override here scopes -O2 to our own code only, so the documented
+# toolchain hangs on certain lwIP files at -O2 are not in scope.
+target_compile_options(${COMPONENT_LIB} PRIVATE -O2)

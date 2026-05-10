@@ -7,6 +7,114 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance + power round (2026-05-10)
+
+Five consecutive PRs took the firmware from the M7-close baseline to a
+constant-time, light-sleep-managed, QIO@80, -O2 build. Aggregate cost
+~+13 KiB flash; 26 % of the app partition still free. RAM unchanged.
+The 60-min mega-ping regression gate (3.86 % loss / 154 ms avg from
+M5) is preserved on every PR; on-device captures show 0 bcn_timeout,
+0 wifi disconnects, 0 panics, and exact 5 s telemetry cadence after
+each flash.
+
+- **`-O2` per-component (PR #65, commit `86c04d3`).** Override the
+  global `CONFIG_COMPILER_OPTIMIZATION_DEBUG=y` (`-Og`) for the
+  perf-critical components only via
+  `target_compile_options(${COMPONENT_LIB} PRIVATE -O2)`:
+  `components/tinylink` (WG transport, ChaCha20-Poly1305, Curve25519,
+  BLAKE2s, HKDF, DISCO/STUN/DERP codecs, netif fast path),
+  `main` (app_main + app_wifi + app_nvs), and the IDF `mbedcrypto`
+  library target (mbedtls's symmetric/asymmetric primitives;
+  `mbedtls` + `mbedx509` left at default — bulk of their code is
+  parsing/validation on cold TLS paths, and HW SHA/AES/MPI paths are
+  already enabled separately in sdkconfig.defaults). Everything else
+  (lwIP, esp_wifi, esp_phy, bootloader) stays at the global default,
+  which scopes the documented toolchain hangs around certain lwIP
+  files at -O2 out of the build. Drive-by fix in
+  `main/app_wifi.c`: -O2 enables `-Wstringop-truncation` which trips
+  on `strncpy(dst, src, sizeof(dst))` for the SSID/password load even
+  though `app_nvs_read_str()` guarantees a NUL-terminated src.
+  Replaced with `memcpy + strnlen` (bounded copy, zero-padded tail
+  from the `{0}` initializer). Cost: +2.3 KiB flash from more
+  aggressive inlining/unrolling.
+
+- **`FREERTOS_HZ` 1000 → 100 (PR #64, commit `e19ccb3`).** The IDF
+  default 1 ms tick is overkill for tinylink — no code path uses
+  sub-100 ms delays. Lower tick-ISR overhead and deeper tickless idle
+  entries. Audited before flipping: every `pdMS_TO_TICKS(N)` callsite
+  in `components/tinylink/src` + `main/` uses N ≥ 100 ms (TMP117
+  probe 500, TELEMETRY_PERIOD 5000, REGISTER_RETRY 30000,
+  STUN_REPROBE 300000, derp-supervised backoff base, `step_ms=100`,
+  plus literals 100/500/2000/8000/30000), 0 raw integer tick
+  arguments to `vTaskDelay` / `xQueue*` / `xSemaphoreTake` in our
+  code, 0 references to `configTICK_RATE_HZ` / `portTICK_PERIOD_MS`.
+  Cost: +128 B flash (symbol-table variance only).
+
+- **Flash mode `QIO@80MHz` (PR #63, commit `28cb49b`).** Flip
+  `CONFIG_ESPTOOLPY_FLASHMODE_DIO`+`FLASHFREQ_40M` to
+  `_QIO`+`FLASHFREQ_80M`. Per the WROOM-32E datasheet Table 17
+  (Espressif v2.0 oct-2025), the integrated flash is guaranteed at
+  80 MHz FC "through design and/or characterization" — pre-
+  characterized by Espressif for this configuration, so no soak
+  required for this specific module. Boot log on this device
+  (rev v3.1) confirms `qio_mode: Enabling default flash chip QIO` +
+  `SPI Speed: 80MHz` + `SPI Mode: QIO`; the "default flash chip QIO"
+  path means the bootloader matched the chip via the fallback entry
+  in IDF's `bootloader_flash_qe_support_list_default`
+  (`flash_qio_mode.c:48` in v5.5.4), known-good for GigaDevice /
+  FM25Q32 / BY25Q32. Effective flash-read bandwidth goes from
+  ~40 Mbit/s (DIO@40, quad SPI lanes idle) to ~320 Mbit/s peak
+  (QIO@80, all 4 lanes saturated for reads). Cost: −144 B flash
+  (header bits change, no code change).
+
+- **`esp_pm_configure` + `WIFI_PS_MIN_MODEM` (PR #62, commit
+  `c63ce2c`).** Enable runtime light-sleep tickless idle by calling
+  `esp_pm_configure(.light_sleep_enable=true, max=240, min=80)`
+  AFTER `app_wifi_wait_connected()`, plus
+  `esp_wifi_set_ps(WIFI_PS_MIN_MODEM)` in `app_wifi_start()`. IDF
+  source review (`esp_pm/pm_impl.c:561, :829`) proved that
+  `CONFIG_PM_ENABLE=y` + `CONFIG_FREERTOS_USE_TICKLESS_IDLE=y` alone
+  were inert: without `esp_pm_configure(light_sleep_enable=true)`,
+  `s_light_sleep_en` stays false, `pick_mode()` never returns
+  `PM_MODE_LIGHT_SLEEP`, and `vApplicationSleep` short-circuits via
+  `should_skip_light_sleep()`. The post-wait_connected ordering is
+  critical — calling `esp_pm_configure` before assoc reproduces the
+  disconnect-retry-loop seen in the previous perf round (the AP
+  kicks the client because tickless idle puts the chip to sleep
+  mid-AUTH/ASSOC, which the AP reads as missed beacons). Also
+  confirmed empirically that `CONFIG_ESP_WIFI_SLP_IRAM_OPT`
+  (auto-selects `PM_SLP_DEFAULT_PARAMS_OPT`) breaks initial
+  association on WPA2-PSK+PMF AP regardless of any
+  `esp_pm_configure` call — flag stays disabled in
+  `sdkconfig.defaults` until A/B on a less strict AP. Cost:
+  +2.2 KiB flash (esp_pm + sleep_modem infrastructure).
+
+- **Constant-time `curve25519-donna` (PR #61, commit `dd6427a`).**
+  Swap TweetNaCl-derived X25519 reference impl for
+  `agl/curve25519-donna` (BSD-3, Google, ~860 LoC 1:1 upstream).
+  Donna is the canonical constant-time 32-bit X25519 and is the
+  right fit for Xtensa LX6. Motivation: the long-term MachineKey
+  private key feeds every ts2021 Noise IK handshake (DH e/s and s/s)
+  and every WG `handshake_init` (DH e/s, s/s). TweetNaCl's
+  Montgomery ladder uses `sel25519` (constant-time cmov), but its
+  M/S limb arithmetic has data-dependent timing in the carry path
+  that has not been audited against the modern timing-channel
+  literature. `curve25519.c` becomes a 70-line shim that delegates
+  `scalarmult` to `curve25519_donna()` and keeps clamping +
+  low-order rejection + keypair + derive_pub helpers; API
+  unchanged. RFC 7748 §5.2 (two single-scalarmult vectors) + §6.1
+  (DH round-trip Alice↔Bob) pass in `test_curve25519`; full host
+  KAT battery 452 OK / 0 FAIL (matches post-#58 baseline). Cost:
+  +8.6 KiB flash (~+0.7 %), constant-time MachineKey scalarmult on
+  every Noise IK / WG handshake. The mbedTLS HW-MPI alternative was
+  rejected after IDF source review: only `MBEDTLS_MPI_MUL_MPI_ALT`
+  applies on ESP32 (`ESP_MPI_USE_MONT_EXP` keeps `exp_mod` in SW
+  because IDF docs the ESP32 RSA peripheral as "slow for public key
+  ops"), and no `_MXZ_ALT` hooks for the Montgomery-curve operations
+  are defined in `port/mbedtls/esp_config.h` — the win vs donna
+  pure-C would be small and would cost `MBEDTLS_ECP_C` + `_ECDH_C`
+  flash.
+
 ### Security
 - **DISCO replay window — fixes WireGuard endpoint hijack DoS.** NaCl
   box (XSalsa20-Poly1305) is a stateless AEAD: `nacl_box_open(peer_pub,

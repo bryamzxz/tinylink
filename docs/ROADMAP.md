@@ -563,10 +563,16 @@ change has its own verification trail. Status as of HEAD:
   doubles `CONFIG_TINYLINK_DERP_SUPERVISED_BACKOFF_MS` on every
   consecutive connect failure up to 30 s, resets to base on a
   successful login. See `tinylink.c::derp_supervised_task`.
-- [x] **Constant-time Curve25519 conditional swap.** `sel25519` in
-  `components/tinylink/src/crypto/curve25519.c` already uses
-  `c = ~(b - 1)` mask + XOR, no secret-dependent branches. Verified
-  during the M7 review audit.
+- [x] **Constant-time Curve25519.** PR #61 swapped the TweetNaCl-
+  derived reference for `agl/curve25519-donna` (BSD-3, ~860 LoC 1:1
+  upstream — see `components/tinylink/src/crypto/curve25519_donna.c`).
+  `curve25519.c` is now a 70-line shim that delegates `scalarmult`
+  to `curve25519_donna()` and keeps clamping + low-order rejection +
+  keypair + derive_pub. Donna is the canonical constant-time 32-bit
+  X25519 implementation. RFC 7748 §5.2 + §6.1 vectors verified in
+  `tools/test/test_curve25519.c`. The earlier inline review of
+  `sel25519` (`c = ~(b - 1)` mask + XOR) is also preserved in the
+  shim's low-order zero check.
 - [x] **Compile-in fallback control plane pubkey.** Optional
   `CONFIG_TINYLINK_CONTROL_PUB_FALLBACK_HEX` (64 hex chars). When
   set, `control_key_get()` installs the fallback as the NVS pin on
@@ -629,5 +635,51 @@ forked hardening sprint with operator-authorized eFuse burns. The
 checklist above marks where each one would slot in.
 
 [research §L] for the underlying threat model.
+
+ES: idem.
+
+## M8 — Perf + power round (2026-05-10)
+
+Five consecutive PRs after M7-close took the firmware from `-Og`
+DIO@40 / no-light-sleep to the current `-O2` QIO@80 / light-sleep
+build. Each landed independently with its own on-device verification.
+The `CHANGELOG.md` "Performance + power round" section has the full
+per-PR write-up; this is the milestone-view tracking entry.
+
+- [x] **PR #61 — `curve25519-donna`** (constant-time scalarmult).
+  Eliminates the timing channel against MachineKey/NodeKey on every
+  Noise IK and WG handshake. +8.6 KiB flash.
+- [x] **PR #62 — `esp_pm_configure` + `WIFI_PS_MIN_MODEM`**
+  (tickless idle actually enters light sleep). IDF source review of
+  `pm_impl.c:561` + `:829` confirmed the pre-PR `PM_ENABLE=y` +
+  `USE_TICKLESS_IDLE=y` were inert without the runtime
+  `esp_pm_configure(.light_sleep_enable=true)` call. Critical
+  ordering caught: call must run AFTER `app_wifi_wait_connected()`
+  or the AP kicks the client mid-AUTH/ASSOC. +2.2 KiB flash.
+- [x] **PR #63 — Flash mode `QIO@80MHz`** (was DIO@40).
+  WROOM-32E datasheet Table 17 guarantees the spec for the
+  integrated flash. Boot log confirms `mode:QIO, clock div:1`.
+  ~8× effective flash-read bandwidth on cold-cache / boot paths.
+  −144 B flash.
+- [x] **PR #64 — `FREERTOS_HZ` 1000 → 100** (10 ms tick).
+  Pre-audit: every `pdMS_TO_TICKS(N)` callsite in our code uses
+  N ≥ 100 ms, 0 raw integer tick arguments to `vTaskDelay` /
+  `xQueue*`, 0 references to `configTICK_RATE_HZ` /
+  `portTICK_PERIOD_MS`. Lower tick-ISR overhead + deeper tickless
+  sleeps. +128 B flash.
+- [x] **PR #65 — `-O2` per-component** (`tinylink` + `main` +
+  `mbedcrypto` via `target_compile_options`). Global stays at
+  `-Og` to scope the documented toolchain hangs around certain
+  lwIP files out of the build. Drive-by `memcpy + strnlen`
+  refactor in `app_wifi.c` to satisfy `-Wstringop-truncation`.
+  +2.3 KiB flash.
+
+Aggregate cost: ~+13 KiB flash on top of the M7-close baseline.
+26 % of the app partition still free. RAM unchanged.
+
+Regression gate (preserved on every PR): on-device 60-min mega-ping
+baseline of 3.86 % loss / 154 ms avg from M5 → no regression at any
+intermediate state; on-device boot captures show 0 `bcn_timeout`,
+0 wifi disconnects, 0 panics, exact 5 s telemetry cadence.
 
 ES: idem.

@@ -5,7 +5,8 @@ written in pure C on **ESP-IDF v5.5.x**.
 
 ## Status
 
-**Pre-alpha — direct UDP + ICMP-over-WG live end-to-end.**
+**Stable — direct UDP + ICMP-over-WG live end-to-end on real hardware,
+M1–M7 all landed, perf round 2026-05-10 closed.**
 
 | Layer                          | State                                  |
 |--------------------------------|----------------------------------------|
@@ -18,6 +19,7 @@ written in pure C on **ESP-IDF v5.5.x**.
 | Direct UDP NAT punching (M5)   | done                                   |
 | ICMP over WG transport         | **done** — `ping <our-tailnet-ip>` flows |
 | Production hardening (M7)      | done — within scope                    |
+| Perf + power round (2026-05-10)| done — constant-time crypto, light-sleep PM, QIO@80, -O2 |
 
 What works today, verified on real hardware:
 
@@ -36,6 +38,29 @@ What's still pending:
   where direct UDP can never work — for peers with public IPs the
   direct path covers everything).
 - Multi-peer (single-peer today).
+
+## Performance + power round (2026-05-10)
+
+Five consecutive PRs took the firmware from the M7-close baseline to
+a constant-time, power-managed, QIO@80, -O2 build. The CHANGELOG has
+the per-PR detail; one-liner summary:
+
+| PR  | Change                          | Flash Δ  | What it unlocks                                                  |
+|-----|---------------------------------|----------|------------------------------------------------------------------|
+| #61 | `curve25519-donna` swap         | +8.6 KiB | Constant-time MachineKey scalarmult (eliminates timing channel) |
+| #62 | `esp_pm_configure` + `WIFI_PS_MIN_MODEM` | +2.2 KiB | Tickless idle actually enters light sleep; DTIM-paced modem sleep |
+| #63 | Flash `QIO@80` (was DIO@40)     | −0.1 KiB | ~8× effective flash-read bandwidth (boot + cold-cache paths)    |
+| #64 | `FREERTOS_HZ` 1000 → 100        | +0.1 KiB | Lower tick-ISR overhead, deeper tickless sleeps                  |
+| #65 | `-O2` per-component (`tinylink` + `main` + `mbedcrypto`) | +2.3 KiB | Aggressive inlining/unrolling on the hot crypto + WG paths      |
+
+Total cost: ~+13 KiB flash on top of the M7-close baseline.
+26 % of the app partition is still free.
+RAM unchanged.
+
+The 60-min mega-ping regression gate (3.86 % loss / 154 ms avg from
+the M5 baseline) is preserved across every PR; on-device captures
+show 0 `bcn_timeout`, 0 disconnects, 0 panics, and exact 5 s
+telemetry cadence on every flash.
 
 Intentionally out of scope (irreversible per-device operations —
 see `docs/ROADMAP.md` § "M7 — Hardening"):
@@ -203,6 +228,7 @@ Three properties that are non-obvious from a casual read of the code:
 | 5 | DERP relay fallback + direct-UDP NAT traversal  | done                  |
 | 6 | ICMP-over-WG end-to-end                         | done                  |
 | 7 | Production hardening                            | done — within scope   |
+| 8 | Perf + power round (2026-05-10)                 | done                  |
 
 See [`docs/ROADMAP.md`](docs/ROADMAP.md) for the per-milestone breakdown.
 
@@ -227,9 +253,13 @@ for t in test_*; do ./$t; done   # 15 KAT binaries, all should report ALL OK
 
 On-device AEAD micro-bench (opt-in via `CONFIG_TINYLINK_BENCH_AEAD`,
 off by default — see [`docs/BUILDING.md`](docs/BUILDING.md#benchmarking-aead)).
-Used to measure the ChaCha20-Poly1305 hot path; current numbers on
-ESP32 LX6 are ~660 µs/encrypt and ~654 µs/decrypt at 1500 B
-(`CHANGELOG.md` has the full change log).
+Used to measure the ChaCha20-Poly1305 hot path. The pre-perf-round
+baseline on ESP32 LX6 was ~660 µs/encrypt and ~654 µs/decrypt at
+1500 B; the post-`-O2` build (PR #65) ships the same code with
+component-scoped `-O2` and donna-backed curve25519 — re-measure with
+`CONFIG_TINYLINK_BENCH_AEAD=y` if you need hard numbers for your
+build. `CHANGELOG.md` has the full change log including the perf
+round detail.
 
 ## Provisioning
 

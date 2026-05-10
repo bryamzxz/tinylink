@@ -16,3 +16,7 @@ idf_component_register(
         esp_pm
         tinylink
 )
+
+# -O2 for app_main / app_wifi / app_nvs. Tiny code surface but no reason
+# to leave it at -Og when the rest of tinylink runs -O2 (see above).
+target_compile_options(${COMPONENT_LIB} PRIVATE -O2)
