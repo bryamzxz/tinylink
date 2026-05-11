@@ -124,6 +124,22 @@ static esp_err_t bringup(void)
         return err;
     }
 
+    /* Persistent endpoint-updater task. Spawned NOW — before any TLS
+     * handshake (register, long-poll, derp supervisor) lands and
+     * fragments the heap — so the 16 KiB stack allocation lands on a
+     * still-pristine arena. Doing this lazily at first NAT-rebind time
+     * was the bug we just fixed: after hours of mbedtls + nghttp2 churn,
+     * largest_free_block drops below 16 KiB and xTaskCreate fails. The
+     * task just sleeps on a semaphore until the STUN re-probe path
+     * signals it, so spawning early costs nothing observable but
+     * guarantees the task exists when needed. */
+    esp_err_t epuerr = tinylink_endpoint_updater_start();
+    if (epuerr != ESP_OK) {
+        ESP_LOGW(TAG, "endpoint updater start failed: 0x%x — "
+                      "STUN re-probe will log dropped pushes",
+                 epuerr);
+    }
+
     /* M4 — best-effort STUN probe. Runs once before the first
      * MapRequest so HostInfo.Endpoints can advertise our reflexive
      * AddrPort to the control plane (which forwards it to peers).
@@ -212,19 +228,6 @@ static esp_err_t bringup(void)
         ESP_LOGW(TAG, "telemetry start failed: 0x%x — continuing", err);
         /* fall through: telemetry isn't load-bearing for the rest of
          * the system. */
-    }
-
-    /* Persistent endpoint-updater task. MUST be spawned BEFORE the STUN
-     * re-probe task, since the re-probe signals it on every public
-     * AddrPort change. Allocates 16 KiB stack at boot — done now while
-     * heap is still relatively unfragmented (post-long-poll-handshake +
-     * post-derp-supervisor); spawning lazily on first re-probe risks the
-     * heap-fragmentation failure that motivated this refactor. */
-    esp_err_t epuerr = tinylink_endpoint_updater_start();
-    if (epuerr != ESP_OK) {
-        ESP_LOGW(TAG, "endpoint updater start failed: 0x%x — "
-                      "STUN re-probe will log dropped pushes",
-                 epuerr);
     }
 
     /* Periodic STUN re-probe so HostInfo.Endpoints stays fresh against
