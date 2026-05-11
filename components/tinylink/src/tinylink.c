@@ -443,16 +443,20 @@ static bool disco_addr_is_v4_mapped(const uint8_t addr[16])
  * behavior, where same-LAN endpoints are reachable and worth probing.
  * Endpoints we can't reach (LAN advertised by an off-LAN peer) just
  * fail silently in the WiFi default route — cheap. */
-static void prepunch_pings_to_peer_endpoints(const tl_netmap_t *nm)
+/* Refactored from `(const tl_netmap_t *nm)` so the path-stale callback
+ * can cache JUST the peers array (~1 KiB) instead of the full netmap
+ * struct (~7.5 KiB; derp_regions[28] dominates). The function only
+ * ever reads n_peers + peers[] anyway. */
+static void prepunch_pings_to_peers(const tl_peer_t *peers, size_t n_peers)
 {
-    if (nm == NULL || nm->n_peers == 0) return;
+    if (peers == NULL || n_peers == 0) return;
 
     int sock = wg_netif_get_socket();
     if (sock < 0) return;  /* WG netif not yet bound: nothing to punch from */
 
     size_t total_sent = 0;
-    for (size_t pi = 0; pi < nm->n_peers; pi++) {
-        const tl_peer_t *peer = &nm->peers[pi];
+    for (size_t pi = 0; pi < n_peers; pi++) {
+        const tl_peer_t *peer = &peers[pi];
         if (!peer->has_disco_pub) continue;        /* can't seal without DiscoKey */
         if (peer->n_endpoints == 0) continue;
 
@@ -523,8 +527,15 @@ static void prepunch_pings_to_peer_endpoints(const tl_netmap_t *nm)
     }
     if (total_sent > 0) {
         ESP_LOGI(TAG, "prepunch on netmap-receive: sent %zu pings across %zu peers",
-                 total_sent, nm->n_peers);
+                 total_sent, n_peers);
     }
+}
+
+/* Thin wrapper for callers that already have a tl_netmap_t handy. */
+static inline void prepunch_pings_to_peer_endpoints(const tl_netmap_t *nm)
+{
+    if (nm == NULL) return;
+    prepunch_pings_to_peers(nm->peers, nm->n_peers);
 }
 
 static void send_disco_pings_to_cmm_endpoints(const derp_event_t *e)
@@ -879,19 +890,19 @@ static void update_derp_host_from_netmap(const tl_netmap_t *nm)
 }
 #endif
 
-/* Cache the latest netmap for path-stale active probing. wg_netif's
- * stale callback (registered below) needs access to the peer endpoint
- * list to send DISCO pings without going through long_poll_handler;
- * stashing the full netmap here is the cheapest way (~8 KiB BSS) to
- * avoid threading the peer list through wg_netif's public API.
+/* Cache the latest netmap PEERS for path-stale active probing.
+ * tl_peer_t[TL_MAX_PEERS] is ~1 KiB; the full tl_netmap_t is ~7.5 KiB
+ * (derp_regions[28] dominates). Caching just the peers BSS keeps the
+ * total static-allocation footprint inside the DRAM budget WiFi init
+ * needs contiguous (verified: caching the full netmap pushed boot
+ * into vApplicationGetTimerTaskMemory pvPortMalloc-NULL asserts).
  *
  * Updated under no lock — long_poll_handler is the only writer, and
- * readers (the wg_netif stale callback) tolerate a torn struct: at
- * worst they send DISCO to a half-old, half-new endpoint list, which
- * is harmless (mismatched entries fail to elicit a sealed pong and
- * are silently ignored by the peer). */
-static tl_netmap_t s_last_netmap;
-static bool        s_last_netmap_valid;
+ * the path-stale callback tolerates a torn array: at worst it sends
+ * DISCO to a half-old, half-new endpoint list, which is harmless
+ * (mismatched entries fail to elicit a sealed pong). */
+static tl_peer_t  s_last_peers[TL_MAX_PEERS];
+static size_t     s_last_peers_count;
 
 /* Called from wg_netif's rx_task when the WG transport has been silent
  * past WG_RX_STALE_THRESHOLD_MS. Re-runs prepunch against the latest
@@ -903,20 +914,20 @@ static bool        s_last_netmap_valid;
 static void on_wg_path_stale(void *user)
 {
     (void)user;
-    if (!s_last_netmap_valid || s_last_netmap.n_peers == 0) {
-        return;
-    }
-    prepunch_pings_to_peer_endpoints(&s_last_netmap);
+    if (s_last_peers_count == 0) return;
+    prepunch_pings_to_peers(s_last_peers, s_last_peers_count);
 }
 
 static esp_err_t long_poll_handler(const tl_netmap_t *nm, void *ctx)
 {
     (void)ctx;
-    /* Snapshot for the path-stale probe path. Deep struct-copy: every
-     * field we need (peers + endpoints + disco_pub) is inlined into
-     * tl_netmap_t, no nested heap pointers. */
-    memcpy(&s_last_netmap, nm, sizeof(s_last_netmap));
-    s_last_netmap_valid = true;
+    /* Snapshot just the peer array for the path-stale probe. */
+    size_t n = nm->n_peers;
+    if (n > TL_MAX_PEERS) n = TL_MAX_PEERS;
+    if (n > 0) {
+        memcpy(s_last_peers, nm->peers, n * sizeof(tl_peer_t));
+    }
+    s_last_peers_count = n;
 #if CONFIG_TINYLINK_DERP_SUPERVISED
     update_derp_host_from_netmap(nm);
 #endif
@@ -1098,9 +1109,25 @@ esp_err_t tinylink_wg_socket_init(void)
  * difference vs the legacy code is reliability: we're running in a
  * persistent task, so the stack is already there. */
 
-#define TINYLINK_EP_PUSH_TASK_STACK    16384
+/* Stack: 12 KiB. ts2021_connect peak (~10 KiB mbedtls cert verify +
+ * ~1 KiB Noise IK + locals) fits with ~1 KiB margin. Tighter than the
+ * legacy 24 KiB but adequate because this task ONLY does
+ * connect+push+close — no nghttp2 streaming state, no concurrent work.
+ * 12 KiB also keeps the BSS impact bounded (every KiB we lock in BSS
+ * comes directly out of the DRAM heap arena WiFi init draws from —
+ * verified 2026-05-11_validate_optB_v2 where 16 KiB tipped DRAM under
+ * the WiFi driver's contiguous-block requirement and the boot CPU
+ * asserted in esp_startup_start_app). */
+#define TINYLINK_EP_PUSH_TASK_STACK    12288
 #define TINYLINK_EP_PUSH_WAIT_MS        2000
 #define TINYLINK_EP_PUSH_ERR_BACKOFF_MS 3000
+
+/* Stack + TCB in BSS — keeps the 12 KiB out of the heap arena that
+ * long-poll's nghttp2 + mbedtls session init competes for. The only
+ * post-boot heap cost is the semaphore (~80 B). xTaskCreateStatic can
+ * never return NULL on memory grounds — predictable boot. */
+static StaticTask_t s_endpoint_push_tcb;
+static StackType_t  s_endpoint_push_stack[TINYLINK_EP_PUSH_TASK_STACK / sizeof(StackType_t)];
 
 static SemaphoreHandle_t s_endpoint_push_sem;
 static volatile uint32_t s_endpoint_push_gen;
@@ -1174,11 +1201,18 @@ esp_err_t tinylink_endpoint_updater_start(void)
         return ESP_ERR_NO_MEM;
     }
 
-    BaseType_t ok = xTaskCreate(endpoint_updater_task, "tinylink_ep_up",
-                                TINYLINK_EP_PUSH_TASK_STACK, NULL,
-                                tskIDLE_PRIORITY + 2, NULL);
-    if (ok != pdPASS) {
-        ESP_LOGE(TAG, "endpoint_updater: xTaskCreate failed at boot");
+    /* Static allocation: stack/TCB live in BSS, NOT in the heap arena
+     * that long-poll's TLS+nghttp2 init draws from. Can never fail
+     * (no allocator involved). */
+    TaskHandle_t h = xTaskCreateStatic(endpoint_updater_task,
+                                       "tinylink_ep_up",
+                                       sizeof(s_endpoint_push_stack) / sizeof(StackType_t),
+                                       NULL,
+                                       tskIDLE_PRIORITY + 2,
+                                       s_endpoint_push_stack,
+                                       &s_endpoint_push_tcb);
+    if (h == NULL) {
+        ESP_LOGE(TAG, "endpoint_updater: xTaskCreateStatic returned NULL");
         vSemaphoreDelete(s_endpoint_push_sem);
         s_endpoint_push_sem = NULL;
         return ESP_ERR_NO_MEM;
