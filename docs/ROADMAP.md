@@ -57,15 +57,34 @@ established direct-UDP + ICMP path):
   `session up`, because we fire the init at t≈15s while the peer's
   netmap may not yet contain our current AddrPort. Delaying init
   until the first inbound DISCO observation cuts the retry cost.
-- ~~**stun_reprobe → fetch_once trigger**~~ — *landed*. The
-  periodic re-probe now runs over the live WG socket
-  (`stun_reprobe_via_wg_socket` in `tinylink.c`, dispatched through
-  the new `wg_netif_set_stun_callback()` hook), so the port it
-  learns is the one peers can actually reach. On detected change a
-  one-shot `tinylink_ep_push` task pushes a fresh
-  `mapreq_push_endpoints` over its own ts2021 channel without
-  perturbing the long-poll's `s_conn`. See `wg_demux.c` for the
+- ~~**stun_reprobe → fetch_once trigger**~~ — *landed (initial M5),
+  hardened 2026-05-11*. The periodic re-probe runs over the live WG
+  socket (`stun_reprobe_via_wg_socket` in `tinylink.c`, dispatched
+  through `wg_netif_set_stun_callback()`), so the port it learns is
+  the one peers can actually reach. The endpoint push to the control
+  plane is now handled by a **persistent** `tinylink_ep_up` task
+  (replaces the one-shot pattern that died on a fragmented heap after
+  hours of operation — see `CHANGELOG.md` § "Recovery after peer NAT
+  rebind"). The persistent worker sleeps on a semaphore, coalesces
+  rapid signals via a monotonic gen counter, and uses
+  `xTaskCreateStatic` (BSS-backed stack) so it can never fail to
+  spawn at boot. Mirrors upstream tailscale's
+  `controlclient.Auto.updateRoutine`. See `wg_demux.c` for the
   STUN-response classification fix (magic cookie at offset 4).
+- ~~**DISCO-driven path probe on RX-stale**~~ — *landed 2026-05-11*.
+  When WG transport stays silent >30 s, `wg_netif`'s rx_task fires a
+  registered callback that sends sealed DISCO pings to every known
+  peer endpoint. If the peer responds from a different AddrPort
+  (post-reboot with a fresh NAT mapping is the common case), the
+  existing roaming in `handle_disco_direct` swaps the WG transport
+  target to the live address BEFORE the next handshake INIT goes
+  out. Cuts recovery-after-peer-NAT-rebind from ~9 min (hammer the
+  stale endpoint until a netmap update arrives + prepunch fires) to
+  <10 s (one probe burst → pong → roam → INIT lands). Modeled on
+  upstream `wgengine/magicsock/endpoint.go::setBestAddrLocked`:
+  DISCO pong is the canonical path-liveness signal. Cooldown
+  `WG_PATH_PROBE_COOLDOWN_MS = 10 s` bounds the rate during a long
+  outage.
 - **DERP outbound queue**: needed only for peers behind shared CGNAT
   (where direct UDP can never punch). For peers with public IPs the
   direct path covers all traffic.

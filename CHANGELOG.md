@@ -7,6 +7,88 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Recovery after peer NAT rebind (2026-05-11)
+
+Four commits fixing a "sometimes the device doesn't reconnect after
+servidor1 reboots" pattern. Forensics in
+`/tmp/tinylink_capture_2026-05-11_validate_v2.log` (pre-fix capture)
+showed three independent failure modes stacking on the same trigger
+(peer's outbound NAT mapping rotating during a brief outage):
+
+1. **Endpoint-push `xTaskCreate` failed on fragmented heap.** After
+   hours of operation the legacy
+   `tinylink_endpoint_push_async` couldn't find a contiguous 24 KiB
+   block to spawn its one-shot ts2021+push task. The push was dropped
+   silently; the control plane kept the device's stale public AddrPort
+   and the peer kept sending WG to a NAT mapping that no longer routed
+   to the WG socket. Pattern reproduced at uptime 2716 s:
+   `stun re-probe: endpoint changed :60697 → :40959` immediately
+   followed by `endpoint_push: xTaskCreate failed`.
+2. **Peer-endpoint selection sticky on stale.**
+   `wg_dataplane.c::pick_peer_endpoint` selects the first public
+   candidate from the peer's netmap-advertised endpoint list. After
+   the peer's tailscale rebound to a new outbound port, the control
+   plane often kept the stale entry at index 0 for a while; the device
+   then hammered handshake INITs at the dead AddrPort indefinitely
+   (60 s rekey budget + 60 s cold-handshake budget + 30 s backoff,
+   repeating). LAN-direct (`192.168.1.x:41641`) was usually in the
+   same list but never tried because the first public matched.
+3. **wg_tx stack overflow at the moment of recovery.** When a
+   handshake finally landed on a working endpoint, the first
+   legitimate packet through the now-UP transport tripped a stack
+   overflow in the wg_tx worker: `wg_netif: session up` immediately
+   followed by `***ERROR*** A stack overflow in task wg_tx`
+   + SW_CPU_RESET. The 4 KiB stack was marginal pre-#65 and
+   insufficient post-#65 (per-component -O2 inlines more aggressively
+   in the sendto → WiFi-TX chain). WG_TX_QUEUE_LEN=3 rules out a
+   recovery-flood story; the crash fires on the first send.
+
+**Fix (PR #66, 4 commits on branch `fix/endpoint-push-persistent-task`):**
+
+- **Persistent endpoint-updater task** (`tinylink.c`). Replaces the
+  one-shot `xTaskCreate` per re-probe with a single persistent worker
+  signaled via semaphore + monotonic generation counter. Coalesces
+  rapid concurrent triggers (multiple STUN re-probes during a flap
+  fire only one push). Pattern mirrors upstream tailscale
+  `controlclient.Auto.updateRoutine` in `auto.go:55-99`. Static
+  allocation (`xTaskCreateStatic` with BSS-backed stack/TCB) so the
+  spawn-vs-heap-fragmentation failure mode is eliminated entirely.
+  Documents the `s_conn == NULL` path: if long-poll hasn't yet
+  established the control-plane channel, the worker re-enqueues and
+  waits (no fresh TLS handshake while the network path is unhealthy).
+- **DISCO-driven path probe on transport-stale** (`wg_netif.c` +
+  `wg_netif.h`). New callback fires from rx_task when WG transport
+  has been silent past `WG_RX_STALE_THRESHOLD_MS` (30 s) AND the
+  cooldown (`WG_PATH_PROBE_COOLDOWN_MS` = 10 s) has elapsed.
+  Tinylink's handler runs `prepunch_pings_to_peers` against the
+  latest known peer endpoints, sending sealed DISCO pings to all of
+  them. The peer's pong from a different AddrPort is roamed by the
+  existing `handle_disco_direct` PONG branch — so the next rekey or
+  cold-handshake INIT lands on a live address instead of hammering
+  the stale one for the full handshake budget. Modeled on upstream
+  `wgengine/magicsock/endpoint.go::addrForSendLocked` +
+  `setBestAddrLocked`: DISCO pong is the canonical path-liveness
+  signal, not WG handshake.
+- **wg_tx stack 4 KiB → 8 KiB**. Match `WG_RX_TASK_STACK_BYTES`,
+  absorb the -O2 frame growth. +4 KiB permanent RAM cost.
+- **Static-allocation + shrunk peers cache**. The persistent task's
+  stack lives in BSS via `xTaskCreateStatic`, NOT in the DRAM heap
+  arena that long-poll's nghttp2 + mbedtls draws from at boot. The
+  path-stale callback caches `tl_peer_t[TL_MAX_PEERS]` (~1 KiB) not
+  the full `tl_netmap_t` (~7.5 KiB; `derp_regions[28]` dominates)
+  so total BSS impact fits WiFi init's contiguous-DRAM budget.
+
+Net cost: ~13 KiB BSS + ~80 B heap (semaphore) + ~+4 KiB on wg_tx
+task. Net runtime allocation: zero — once boot completes, neither
+the persistent task nor the path probe touches the allocator.
+
+The DERP-relay fallback that upstream tailscale's `addrForSendLocked`
+provides (send to both direct + DERP while trust expires) is NOT in
+this PR — it depends on M5-step-3 work (wiring DERP-relayed traffic
+back into wg_demux from the supervisor task). The path-stale probe
+already cuts recovery from ~9 min to <10 s in the validation
+capture, so the DERP fallback is a longer-tail enhancement.
+
 ### Performance + power round (2026-05-10)
 
 Five consecutive PRs took the firmware from the M7-close baseline to a
