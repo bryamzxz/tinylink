@@ -102,13 +102,27 @@ static const char *TAG = "wg_netif";
  * the lwIP TCPIP context (calling sendto from there re-enters the
  * lwIP socket API and posts a tcpip_callback that the TCPIP task
  * itself would have to drain — guaranteed deadlock). One step below
- * the RX task so packet decode wins under load. 4 KiB matches the
- * RX task budget — sendto recursing into the WiFi driver TX
- * callback chain alone needed >2 KiB on first measurement (canary
- * tripped on 3 KiB), and we keep the 1.5 KiB queue item OFF this
- * stack (in g.tx_worker_scratch) so the budget covers actual call
- * frames. */
-#define WG_TX_TASK_STACK_BYTES 4096
+ * the RX task so packet decode wins under load.
+ *
+ * Stack: 8 KiB. Earlier budget was 4 KiB (sendto recursing into the
+ * WiFi driver TX callback chain measured >2 KiB; canary tripped at
+ * 3 KiB on first sizing). That margin was marginal pre-PR-#65 and
+ * insufficient post-#65 where the tinylink + main + mbedcrypto
+ * components compile at -O2: aggressive inlining grows the effective
+ * stack frame of the sendto path (lwIP linkoutput → wg_transport
+ * encrypt → sendto → WiFi driver TX queue) past the 4 KiB ceiling.
+ * Caught 2026-05-11 in /tmp/tinylink_capture_2026-05-11_validate_v2.log
+ * at uptime 880578 ms: `wg_netif: session up` (a single legitimate
+ * telemetry packet hitting the path after a 9-minute outage)
+ * immediately followed by
+ * `***ERROR*** A stack overflow in task wg_tx has been detected.`
+ * + SW_CPU_RESET. The queue length (WG_TX_QUEUE_LEN=3) makes a real
+ * flood impossible — drops happen at xQueueSend(..., 0) when full.
+ * 8 KiB matches WG_RX_TASK_STACK_BYTES, gives ~5 KiB headroom over
+ * the empirical 3 KiB peak, and absorbs the -O2 frame growth without
+ * needing per-component tuning. The 1.5 KiB queue item still stays
+ * OFF this stack (in g.tx_worker_scratch). */
+#define WG_TX_TASK_STACK_BYTES 8192
 #define WG_TX_TASK_PRIO        (tskIDLE_PRIORITY + 2)
 
 /* Outbound TX queue depth. At 1.5 KiB per item, 3 items = 4.7 KiB
