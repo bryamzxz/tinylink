@@ -214,6 +214,19 @@ static esp_err_t bringup(void)
          * the system. */
     }
 
+    /* Persistent endpoint-updater task. MUST be spawned BEFORE the STUN
+     * re-probe task, since the re-probe signals it on every public
+     * AddrPort change. Allocates 16 KiB stack at boot — done now while
+     * heap is still relatively unfragmented (post-long-poll-handshake +
+     * post-derp-supervisor); spawning lazily on first re-probe risks the
+     * heap-fragmentation failure that motivated this refactor. */
+    esp_err_t epuerr = tinylink_endpoint_updater_start();
+    if (epuerr != ESP_OK) {
+        ESP_LOGW(TAG, "endpoint updater start failed: 0x%x — "
+                      "STUN re-probe will log dropped pushes",
+                 epuerr);
+    }
+
     /* Periodic STUN re-probe so HostInfo.Endpoints stays fresh against
      * NAT rebinds and WAN address changes. Best-effort, silent on
      * transient failures (cached value remains in use). */

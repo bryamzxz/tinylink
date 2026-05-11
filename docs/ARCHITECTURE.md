@@ -38,6 +38,9 @@ primitives we did, see [`SECURITY-MODEL.md`](SECURITY-MODEL.md).
 |     tinylink_long_poll_start  ← stream=true read-only poll    |
 |     tinylink_derp_supervised_start                            |
 |     tinylink_telemetry_start                                  |
+|     tinylink_endpoint_updater_start ← persistent task, BSS    |
+|                                       stack; signaled by STUN |
+|                                       reprobe on NAT rebind   |
 |     tinylink_stun_reprobe_start                               |
 +---------------------------------------------------------------+
         │
@@ -227,7 +230,40 @@ anyone bisecting an unrelated regression to before the netstack switch.
    peer's DiscoKey roam — DISCO pongs from other Tailscale peers in
    the netmap (e.g. a laptop that ran our prepunch ping) cannot flap
    our WG transport target.
-8. **DISCO replay window** (`disco_replay.{c,h}`) — NaCl box
+8. **DISCO-driven path probe on transport-stale** — when WG transport
+   stays silent past `WG_RX_STALE_THRESHOLD_MS` (30 s) and the
+   cooldown (`WG_PATH_PROBE_COOLDOWN_MS` = 10 s) has elapsed, `rx_task`
+   fires a callback registered by `tinylink.c`. The handler sends
+   sealed DISCO pings to every peer endpoint in the latest netmap.
+   A peer reply from a different AddrPort triggers the roam in (7) —
+   so the next handshake INIT lands on a verified-live address
+   instead of hammering whatever was first in the netmap's endpoint
+   list. Models the upstream tailscale path-liveness scheme
+   (`wgengine/magicsock/endpoint.go::setBestAddrLocked`): DISCO
+   pong is the canonical signal, not WG handshake. Recovery after
+   peer-NAT-rebind: ~9 min → <10 s in validation. Triggered
+   independently of rekey state — both `UP` + `HANDSHAKE_PENDING`
+   benefit, so a long outage that's already fallen to cold-handshake
+   retries also gets the probe.
+9. **Endpoint-push updater task** (`tinylink.c::endpoint_updater_task`)
+   — persistent worker spawned at boot via `xTaskCreateStatic` with
+   stack + TCB in BSS (12 KiB, sized to the ts2021_connect mbedtls
+   peak). Signaled via semaphore + monotonic generation counter from
+   `tinylink_endpoint_push_async`, which the STUN re-probe path calls
+   on detected NAT rebind. When the worker wakes it opens its own
+   ts2021 channel (h2_client is single-stream-per-conn, so it cannot
+   multiplex over `s_conn`), runs `mapreq_push_endpoints`, closes,
+   sleeps again. When `s_conn_open` is false (long-poll has not yet
+   established the channel, or is in backoff after a network error),
+   the worker re-enqueues itself with a short delay rather than
+   opening a redundant TLS handshake — the path will likely fail with
+   the same error long-poll keeps hitting. Mirrors upstream tailscale
+   `controlclient.Auto.updateRoutine` (`auto.go:55-99`): one
+   long-lived goroutine, signal channel, generation counter
+   coalesces concurrent triggers. Replaces the legacy one-shot
+   `xTaskCreate` per re-probe that started failing on a fragmented
+   heap after hours of operation.
+10. **DISCO replay window** (`disco_replay.{c,h}`) — NaCl box
    (XSalsa20-Poly1305) is a stateless AEAD: `nacl_box_open` is
    deterministic, so an attacker who passively captures one DISCO
    PING/PONG can replay it from a spoofed/owned source AddrPort and

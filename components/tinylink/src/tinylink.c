@@ -443,16 +443,20 @@ static bool disco_addr_is_v4_mapped(const uint8_t addr[16])
  * behavior, where same-LAN endpoints are reachable and worth probing.
  * Endpoints we can't reach (LAN advertised by an off-LAN peer) just
  * fail silently in the WiFi default route — cheap. */
-static void prepunch_pings_to_peer_endpoints(const tl_netmap_t *nm)
+/* Refactored from `(const tl_netmap_t *nm)` so the path-stale callback
+ * can cache JUST the peers array (~1 KiB) instead of the full netmap
+ * struct (~7.5 KiB; derp_regions[28] dominates). The function only
+ * ever reads n_peers + peers[] anyway. */
+static void prepunch_pings_to_peers(const tl_peer_t *peers, size_t n_peers)
 {
-    if (nm == NULL || nm->n_peers == 0) return;
+    if (peers == NULL || n_peers == 0) return;
 
     int sock = wg_netif_get_socket();
     if (sock < 0) return;  /* WG netif not yet bound: nothing to punch from */
 
     size_t total_sent = 0;
-    for (size_t pi = 0; pi < nm->n_peers; pi++) {
-        const tl_peer_t *peer = &nm->peers[pi];
+    for (size_t pi = 0; pi < n_peers; pi++) {
+        const tl_peer_t *peer = &peers[pi];
         if (!peer->has_disco_pub) continue;        /* can't seal without DiscoKey */
         if (peer->n_endpoints == 0) continue;
 
@@ -523,8 +527,15 @@ static void prepunch_pings_to_peer_endpoints(const tl_netmap_t *nm)
     }
     if (total_sent > 0) {
         ESP_LOGI(TAG, "prepunch on netmap-receive: sent %zu pings across %zu peers",
-                 total_sent, nm->n_peers);
+                 total_sent, n_peers);
     }
+}
+
+/* Thin wrapper for callers that already have a tl_netmap_t handy. */
+static inline void prepunch_pings_to_peer_endpoints(const tl_netmap_t *nm)
+{
+    if (nm == NULL) return;
+    prepunch_pings_to_peers(nm->peers, nm->n_peers);
 }
 
 static void send_disco_pings_to_cmm_endpoints(const derp_event_t *e)
@@ -879,9 +890,44 @@ static void update_derp_host_from_netmap(const tl_netmap_t *nm)
 }
 #endif
 
+/* Cache the latest netmap PEERS for path-stale active probing.
+ * tl_peer_t[TL_MAX_PEERS] is ~1 KiB; the full tl_netmap_t is ~7.5 KiB
+ * (derp_regions[28] dominates). Caching just the peers BSS keeps the
+ * total static-allocation footprint inside the DRAM budget WiFi init
+ * needs contiguous (verified: caching the full netmap pushed boot
+ * into vApplicationGetTimerTaskMemory pvPortMalloc-NULL asserts).
+ *
+ * Updated under no lock — long_poll_handler is the only writer, and
+ * the path-stale callback tolerates a torn array: at worst it sends
+ * DISCO to a half-old, half-new endpoint list, which is harmless
+ * (mismatched entries fail to elicit a sealed pong). */
+static tl_peer_t  s_last_peers[TL_MAX_PEERS];
+static size_t     s_last_peers_count;
+
+/* Called from wg_netif's rx_task when the WG transport has been silent
+ * past WG_RX_STALE_THRESHOLD_MS. Re-runs prepunch against the latest
+ * known peer endpoints — any peer that's now reachable via a different
+ * AddrPort (e.g. post-reboot with a fresh NAT mapping) will reply with
+ * a DISCO pong from the new AddrPort, and wg_netif's handle_disco_direct
+ * will roam g.peer.peer_endpoint to it before the next handshake INIT
+ * goes out. */
+static void on_wg_path_stale(void *user)
+{
+    (void)user;
+    if (s_last_peers_count == 0) return;
+    prepunch_pings_to_peers(s_last_peers, s_last_peers_count);
+}
+
 static esp_err_t long_poll_handler(const tl_netmap_t *nm, void *ctx)
 {
     (void)ctx;
+    /* Snapshot just the peer array for the path-stale probe. */
+    size_t n = nm->n_peers;
+    if (n > TL_MAX_PEERS) n = TL_MAX_PEERS;
+    if (n > 0) {
+        memcpy(s_last_peers, nm->peers, n * sizeof(tl_peer_t));
+    }
+    s_last_peers_count = n;
 #if CONFIG_TINYLINK_DERP_SUPERVISED
     update_derp_host_from_netmap(nm);
 #endif
@@ -999,58 +1045,193 @@ esp_err_t tinylink_wg_socket_init(void)
     memcpy(local.disco_priv,  s_keys.disco_priv, TINYLINK_KEY_LEN);
     memcpy(local.disco_pub,   s_keys.disco_pub,  TINYLINK_KEY_LEN);
     local.bind_port = 0;  /* kernel picks; STUN learns whatever it is */
-    return wg_netif_init(&local);
+    esp_err_t err = wg_netif_init(&local);
+    if (err != ESP_OK) return err;
+
+    /* Wire the path-stale probe. Done here (not later) because wg_netif's
+     * rx_task may start as soon as wg_netif_start (called from
+     * wg_dataplane_start) runs, and that can fire the stale watchdog
+     * before any later registration. The callback reads s_last_netmap;
+     * until the first netmap arrives s_last_netmap_valid is false and
+     * the callback is a no-op — safe. */
+    wg_netif_set_path_stale_callback(on_wg_path_stale, NULL);
+    return ESP_OK;
 }
 
-/* --- One-shot endpoint-push task ---------------------------------------
+/* --- Persistent endpoint-updater task ---------------------------------
  *
  * After a STUN re-probe finds a new public AddrPort, we need to tell
  * the control plane via a Stream=false MapRequest. The long-poll's
  * Stream=true cycle is read-only (tailcfg.go:1408+1436), and we can't
- * touch s_conn while the long-poll is mid-stream. Solution: spawn a
- * task that opens its OWN ts2021 channel, fires one mapreq_push_endpoints,
- * closes the channel, and self-deletes.
+ * multiplex our lite request over s_conn because the h2_client tracks
+ * a single stream_id per ts2021_conn (see h2_client.c, conn->h2_stream_id).
  *
- * Stack: 24 KiB matches the long-poll task — ts2021_connect peaks at
- * ~12 KiB during the mbedtls cert chain verify + Noise IK init. The
- * spawn cost is bounded because re-probes only fire on a 5-minute
- * cadence and the push only runs when the endpoint actually changed
- * (residential NATs rebind every few hours at worst). */
-static void endpoint_push_task(void *arg)
+ * Pattern mirrors upstream tailscale `controlclient.Auto.updateRoutine`
+ * (control/controlclient/auto.go:55-99): one persistent worker that
+ * sleeps on a signal, with a monotonic generation counter that coalesces
+ * rapid changes — only the latest state is pushed.
+ *
+ * Why persistent: the legacy `endpoint_push_task` was spawned per
+ * re-probe with a 24 KiB stack. After hours of operation with mbedtls +
+ * nghttp2 + long-poll churn, heap fragmentation prevented
+ * `xTaskCreate` from finding a contiguous 24 KiB block. The push then
+ * never fired, the control plane kept the stale endpoint, the peer kept
+ * sending WG to a dead NAT mapping, and the device entered an indefinite
+ * handshake-retry loop. Reproduced in serial capture
+ * /tmp/tinylink_capture_2026-05-11_0233_longrun.log around uptime 2716 s.
+ *
+ * The persistent task allocates its stack ONCE at boot (when heap is
+ * plenty), so the spawn-failure path is eliminated.
+ *
+ * --- HOW WE HANDLE s_conn NOT-YET-ESTABLISHED ---
+ *
+ * When this task wakes and `s_conn_open == false` (the long-poll task
+ * has not yet established the control-plane TLS+Noise channel, either
+ * at cold boot or during a long-poll backoff after a network error),
+ * we DO NOT open our own ts2021 connection. Two reasons:
+ *
+ *   1. If long-poll can't bring s_conn up, the network path to the
+ *      control plane is probably also unreachable from here. Opening
+ *      our own TLS handshake would just burn ~12 KiB of heap peak and
+ *      ~5 s of wall time only to fail with the same error long-poll
+ *      keeps hitting.
+ *
+ *   2. Once long-poll comes back up, the next STUN re-probe (or a
+ *      manually-bumped gen) will signal us and we'll push then —
+ *      cheaper and more likely to succeed.
+ *
+ * So in that case we re-enqueue: brief vTaskDelay, give the semaphore
+ * back to ourselves, and loop. The wait is bounded by long-poll's own
+ * reconnect backoff (CONFIG_TINYLINK_REGISTER_RETRY_MS, default 30 s).
+ *
+ * When `s_conn_open == true` we still open our own ts2021 conn for the
+ * push (cannot share s_conn — single-stream h2_client; see above). The
+ * difference vs the legacy code is reliability: we're running in a
+ * persistent task, so the stack is already there. */
+
+/* Stack: 12 KiB. ts2021_connect peak (~10 KiB mbedtls cert verify +
+ * ~1 KiB Noise IK + locals) fits with ~1 KiB margin. Tighter than the
+ * legacy 24 KiB but adequate because this task ONLY does
+ * connect+push+close — no nghttp2 streaming state, no concurrent work.
+ * 12 KiB also keeps the BSS impact bounded (every KiB we lock in BSS
+ * comes directly out of the DRAM heap arena WiFi init draws from —
+ * verified 2026-05-11_validate_optB_v2 where 16 KiB tipped DRAM under
+ * the WiFi driver's contiguous-block requirement and the boot CPU
+ * asserted in esp_startup_start_app). */
+#define TINYLINK_EP_PUSH_TASK_STACK    12288
+#define TINYLINK_EP_PUSH_WAIT_MS        2000
+#define TINYLINK_EP_PUSH_ERR_BACKOFF_MS 3000
+
+/* Stack + TCB in BSS — keeps the 12 KiB out of the heap arena that
+ * long-poll's nghttp2 + mbedtls session init competes for. The only
+ * post-boot heap cost is the semaphore (~80 B). xTaskCreateStatic can
+ * never return NULL on memory grounds — predictable boot. */
+static StaticTask_t s_endpoint_push_tcb;
+static StackType_t  s_endpoint_push_stack[TINYLINK_EP_PUSH_TASK_STACK / sizeof(StackType_t)];
+
+static SemaphoreHandle_t s_endpoint_push_sem;
+static volatile uint32_t s_endpoint_push_gen;
+static uint32_t          s_endpoint_push_last_informed;
+
+static void endpoint_updater_task(void *arg)
 {
     (void)arg;
-    ts2021_conn_t conn;
-    esp_err_t err = ts2021_connect(&conn, s_keys.machine_priv,
-                                   s_keys.machine_pub, s_control_pub);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "endpoint_push: ts2021_connect failed: 0x%x", err);
-        vTaskDelete(NULL);
-        return;
-    }
-    err = mapreq_push_endpoints(&conn, &s_keys);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "endpoint_push: mapreq_push_endpoints failed: 0x%x", err);
-    } else {
+    for (;;) {
+        xSemaphoreTake(s_endpoint_push_sem, portMAX_DELAY);
+
+        const uint32_t gen = s_endpoint_push_gen;
+        if (gen == s_endpoint_push_last_informed) {
+            /* Stale signal: latest gen already pushed (coalesce). */
+            continue;
+        }
+
+        if (!s_conn_open) {
+            ESP_LOGI(TAG, "endpoint_push: s_conn not yet established — "
+                          "re-enqueueing (waiting for long_poll, gen=%u)",
+                     (unsigned)gen);
+            vTaskDelay(pdMS_TO_TICKS(TINYLINK_EP_PUSH_WAIT_MS));
+            xSemaphoreGive(s_endpoint_push_sem);
+            continue;
+        }
+
+        /* s_conn is up but owned by long_poll_task in a blocking stream
+         * read; open our own ts2021 conn for the lite request. */
+        ts2021_conn_t conn;
+        esp_err_t err = ts2021_connect(&conn, s_keys.machine_priv,
+                                       s_keys.machine_pub, s_control_pub);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "endpoint_push: ts2021_connect failed: 0x%x "
+                          "— retrying gen=%u",
+                     err, (unsigned)gen);
+            vTaskDelay(pdMS_TO_TICKS(TINYLINK_EP_PUSH_ERR_BACKOFF_MS));
+            xSemaphoreGive(s_endpoint_push_sem);
+            continue;
+        }
+
+        err = mapreq_push_endpoints(&conn, &s_keys);
+        ts2021_close(&conn);
+
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "endpoint_push: mapreq_push_endpoints failed: "
+                          "0x%x — retrying gen=%u",
+                     err, (unsigned)gen);
+            vTaskDelay(pdMS_TO_TICKS(TINYLINK_EP_PUSH_ERR_BACKOFF_MS));
+            xSemaphoreGive(s_endpoint_push_sem);
+            continue;
+        }
+
+        s_endpoint_push_last_informed = gen;
         uint8_t  ep_addr[4];
         uint16_t ep_port = 0;
         if (tinylink_get_public_endpoint(ep_addr, &ep_port)) {
-            ESP_LOGI(TAG, "endpoint_push: pushed %u.%u.%u.%u:%u to control plane",
+            ESP_LOGI(TAG, "endpoint_push: pushed %u.%u.%u.%u:%u (gen=%u)",
                      ep_addr[0], ep_addr[1], ep_addr[2], ep_addr[3],
-                     (unsigned)ep_port);
+                     (unsigned)ep_port, (unsigned)gen);
         }
     }
-    ts2021_close(&conn);
-    vTaskDelete(NULL);
 }
 
+esp_err_t tinylink_endpoint_updater_start(void)
+{
+    if (s_endpoint_push_sem != NULL) return ESP_OK;  /* idempotent */
+
+    s_endpoint_push_sem = xSemaphoreCreateBinary();
+    if (s_endpoint_push_sem == NULL) {
+        ESP_LOGE(TAG, "endpoint_updater: xSemaphoreCreateBinary failed");
+        return ESP_ERR_NO_MEM;
+    }
+
+    /* Static allocation: stack/TCB live in BSS, NOT in the heap arena
+     * that long-poll's TLS+nghttp2 init draws from. Can never fail
+     * (no allocator involved). */
+    TaskHandle_t h = xTaskCreateStatic(endpoint_updater_task,
+                                       "tinylink_ep_up",
+                                       sizeof(s_endpoint_push_stack) / sizeof(StackType_t),
+                                       NULL,
+                                       tskIDLE_PRIORITY + 2,
+                                       s_endpoint_push_stack,
+                                       &s_endpoint_push_tcb);
+    if (h == NULL) {
+        ESP_LOGE(TAG, "endpoint_updater: xTaskCreateStatic returned NULL");
+        vSemaphoreDelete(s_endpoint_push_sem);
+        s_endpoint_push_sem = NULL;
+        return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
+}
+
+/* Signal the updater that the public endpoint has changed. Coalesces
+ * rapid concurrent calls via the gen counter (non-blocking semaphore
+ * give; if the updater is already pending the second give is a no-op). */
 static void tinylink_endpoint_push_async(void)
 {
-    BaseType_t ok = xTaskCreate(endpoint_push_task, "tinylink_ep_push",
-                                24576, NULL, tskIDLE_PRIORITY + 2, NULL);
-    if (ok != pdPASS) {
-        ESP_LOGW(TAG, "endpoint_push: xTaskCreate failed — endpoint not "
-                      "pushed; next reprobe will retry");
+    if (s_endpoint_push_sem == NULL) {
+        ESP_LOGW(TAG, "endpoint_push: updater task not started — "
+                      "endpoint change ignored");
+        return;
     }
+    s_endpoint_push_gen++;
+    xSemaphoreGive(s_endpoint_push_sem);
 }
 
 /* --- STUN reprobe via the live WG socket -------------------------------
