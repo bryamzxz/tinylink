@@ -69,6 +69,18 @@ static const char *TAG = "wg_netif";
  * a single packet loss doesn't trigger spurious rekey storms. */
 #define WG_RX_STALE_THRESHOLD_MS  30000
 
+/* Cooldown between active DISCO probes of the peer's alternate
+ * endpoints. Fires from rx_task when WG transport stays silent past
+ * WG_RX_STALE_THRESHOLD_MS — but only once per cooldown window so a
+ * persistent outage doesn't burst-spam DISCO at every rx_task tick.
+ *
+ * 10 s matches upstream tailscale's "endpoint heartbeat" cadence for
+ * an unhealthy session (heartbeatInterval ~3-15 s in
+ * wgengine/magicsock/endpoint.go). Short enough to react quickly when
+ * the peer comes back via a new NAT mapping, long enough that 10 min
+ * of total outage produces ~60 probes, not 3000. */
+#define WG_PATH_PROBE_COOLDOWN_MS 10000
+
 /* Cool-down between handshake bursts after a budget exhaustion. The
  * "12 × 5 s = 60 s" attempt budget covers transient packet loss but
  * is too tight for a peer that's offline for longer (e.g. a full OS
@@ -233,6 +245,16 @@ static struct {
      * and signals the reprobe task. NULL = drop (legacy behavior). */
     wg_netif_stun_cb_t      stun_cb;
     void                   *stun_cb_user;
+
+    /* Path-stale probe dispatch. Tinylink registers a handler that
+     * sends DISCO pings to all known peer endpoints (from the latest
+     * netmap). Fires from rx_task when transport stays silent past
+     * WG_RX_STALE_THRESHOLD_MS, throttled by last_path_probe_us +
+     * WG_PATH_PROBE_COOLDOWN_MS. NULL = no probe (legacy behavior:
+     * just retry handshakes against the current stale endpoint). */
+    wg_netif_path_stale_cb_t path_stale_cb;
+    void                    *path_stale_cb_user;
+    int64_t                  last_path_probe_us;
 
     bool                    stop_requested;
 } g;
@@ -676,6 +698,44 @@ retry_timer:;
             }
         }
 
+        /* Active DISCO probe of alternate peer endpoints. Fires when
+         * the WG transport has been silent for WG_RX_STALE_THRESHOLD_MS,
+         * INDEPENDENTLY of which handshake state we're in (UP +
+         * rekey-in-flight, HANDSHAKE_PENDING during cold retries — both
+         * benefit). Throttled to WG_PATH_PROBE_COOLDOWN_MS so a long
+         * outage doesn't burst-spam at every rx_task tick.
+         *
+         * The callback (registered by tinylink.c) sends DISCO pings to
+         * every endpoint in the latest netmap's peers list. If the peer
+         * responds from an AddrPort other than the one we're currently
+         * targeting, handle_disco_direct's PONG branch swaps
+         * g.peer.peer_endpoint to the live address — so the NEXT rekey
+         * or cold-handshake INIT goes to a reachable place rather than
+         * a stale NAT mapping. Without this the device hammers a dead
+         * endpoint for the full handshake budget (60 s rekey + 60 s
+         * cold + 30 s backoff = 2.5 min minimum), even when alternative
+         * endpoints (LAN-direct, fresh STUN-learned port) are listed
+         * in the netmap and immediately reachable.
+         *
+         * Modeled on upstream tailscale (endpoint.go:
+         * setBestAddrLocked): the DISCO pong is the authoritative
+         * liveness signal; we use it to pick a working path
+         * before/instead of relying on WG handshake to surface a dead
+         * one. */
+        if ((g.state == WG_NETIF_UP || g.state == WG_NETIF_HANDSHAKE_PENDING) &&
+            g.path_stale_cb != NULL &&
+            g.last_transport_recv_us > 0 &&
+            (now_us() - g.last_transport_recv_us) >
+                WG_RX_STALE_THRESHOLD_MS * 1000LL &&
+            (now_us() - g.last_path_probe_us) >
+                WG_PATH_PROBE_COOLDOWN_MS * 1000LL) {
+            g.last_path_probe_us = now_us();
+            ESP_LOGI(TAG, "path stale (>%ds no transport decrypt) — "
+                          "probing alternate peer endpoints via DISCO",
+                     WG_RX_STALE_THRESHOLD_MS / 1000);
+            g.path_stale_cb(g.path_stale_cb_user);
+        }
+
         /* RX-stale watchdog. Detects "peer restarted" silent black-hole:
          * peer's tailscaled lost session keys (e.g. reboot,
          * `tailscale down && tailscale up`), our outbound transport
@@ -963,6 +1023,12 @@ void wg_netif_set_stun_callback(wg_netif_stun_cb_t cb, void *user)
 {
     g.stun_cb      = cb;
     g.stun_cb_user = user;
+}
+
+void wg_netif_set_path_stale_callback(wg_netif_path_stale_cb_t cb, void *user)
+{
+    g.path_stale_cb      = cb;
+    g.path_stale_cb_user = user;
 }
 
 bool wg_netif_is_up(void)

@@ -107,6 +107,27 @@ void wg_netif_set_rx_callback(wg_netif_rx_cb_t cb, void *user);
 typedef void (*wg_netif_stun_cb_t)(const uint8_t *buf, size_t len, void *user);
 void wg_netif_set_stun_callback(wg_netif_stun_cb_t cb, void *user);
 
+/* Callback invoked from the RX task when the WG transport has been
+ * silent (no successful decrypt) for WG_RX_STALE_THRESHOLD_MS AND we
+ * have a registered probe handler. Tinylink's handler iterates the
+ * latest known peer endpoints and sends DISCO pings to all of them;
+ * if the peer responds from a different AddrPort, the existing roaming
+ * in handle_disco_direct swaps g.peer.peer_endpoint to the live one
+ * BEFORE the next rekey/cold-handshake INIT goes out — so the INIT
+ * lands on a working address instead of hammering a stale NAT mapping.
+ *
+ * Mirrors the upstream tailscale model (wgengine/magicsock/endpoint.go:
+ * setBestAddrLocked + addrForSendLocked): DISCO ping/pong, not WG
+ * handshake, is the canonical path-liveness signal. Rotating to the
+ * next endpoint blindly is strictly worse than asking "which of these
+ * is alive right now?" — that's what this callback enables.
+ *
+ * Throttled internally to WG_PATH_PROBE_COOLDOWN_MS so the probe rate
+ * is bounded even when the stale condition persists (e.g. peer offline
+ * for an extended window). Setting cb=NULL disables. */
+typedef void (*wg_netif_path_stale_cb_t)(void *user);
+void wg_netif_set_path_stale_callback(wg_netif_path_stale_cb_t cb, void *user);
+
 /* Returns true once the handshake has produced transport keys and we
  * can send/receive. */
 bool wg_netif_is_up(void);

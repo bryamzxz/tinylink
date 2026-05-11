@@ -879,9 +879,44 @@ static void update_derp_host_from_netmap(const tl_netmap_t *nm)
 }
 #endif
 
+/* Cache the latest netmap for path-stale active probing. wg_netif's
+ * stale callback (registered below) needs access to the peer endpoint
+ * list to send DISCO pings without going through long_poll_handler;
+ * stashing the full netmap here is the cheapest way (~8 KiB BSS) to
+ * avoid threading the peer list through wg_netif's public API.
+ *
+ * Updated under no lock — long_poll_handler is the only writer, and
+ * readers (the wg_netif stale callback) tolerate a torn struct: at
+ * worst they send DISCO to a half-old, half-new endpoint list, which
+ * is harmless (mismatched entries fail to elicit a sealed pong and
+ * are silently ignored by the peer). */
+static tl_netmap_t s_last_netmap;
+static bool        s_last_netmap_valid;
+
+/* Called from wg_netif's rx_task when the WG transport has been silent
+ * past WG_RX_STALE_THRESHOLD_MS. Re-runs prepunch against the latest
+ * known peer endpoints — any peer that's now reachable via a different
+ * AddrPort (e.g. post-reboot with a fresh NAT mapping) will reply with
+ * a DISCO pong from the new AddrPort, and wg_netif's handle_disco_direct
+ * will roam g.peer.peer_endpoint to it before the next handshake INIT
+ * goes out. */
+static void on_wg_path_stale(void *user)
+{
+    (void)user;
+    if (!s_last_netmap_valid || s_last_netmap.n_peers == 0) {
+        return;
+    }
+    prepunch_pings_to_peer_endpoints(&s_last_netmap);
+}
+
 static esp_err_t long_poll_handler(const tl_netmap_t *nm, void *ctx)
 {
     (void)ctx;
+    /* Snapshot for the path-stale probe path. Deep struct-copy: every
+     * field we need (peers + endpoints + disco_pub) is inlined into
+     * tl_netmap_t, no nested heap pointers. */
+    memcpy(&s_last_netmap, nm, sizeof(s_last_netmap));
+    s_last_netmap_valid = true;
 #if CONFIG_TINYLINK_DERP_SUPERVISED
     update_derp_host_from_netmap(nm);
 #endif
@@ -999,7 +1034,17 @@ esp_err_t tinylink_wg_socket_init(void)
     memcpy(local.disco_priv,  s_keys.disco_priv, TINYLINK_KEY_LEN);
     memcpy(local.disco_pub,   s_keys.disco_pub,  TINYLINK_KEY_LEN);
     local.bind_port = 0;  /* kernel picks; STUN learns whatever it is */
-    return wg_netif_init(&local);
+    esp_err_t err = wg_netif_init(&local);
+    if (err != ESP_OK) return err;
+
+    /* Wire the path-stale probe. Done here (not later) because wg_netif's
+     * rx_task may start as soon as wg_netif_start (called from
+     * wg_dataplane_start) runs, and that can fire the stale watchdog
+     * before any later registration. The callback reads s_last_netmap;
+     * until the first netmap arrives s_last_netmap_valid is false and
+     * the callback is a no-op — safe. */
+    wg_netif_set_path_stale_callback(on_wg_path_stale, NULL);
+    return ESP_OK;
 }
 
 /* --- Persistent endpoint-updater task ---------------------------------
