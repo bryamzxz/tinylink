@@ -199,6 +199,22 @@ esp_err_t tinylink_stun_probe(void);
  * the task itself; callers get ESP_OK if the task spawned. */
 esp_err_t tinylink_stun_reprobe_start(void);
 
+/* Spawn the persistent endpoint-updater task. The task sleeps on a
+ * semaphore signaled internally from the STUN re-probe path whenever
+ * the public AddrPort changes; on wake it pushes the new endpoint to
+ * the control plane via a Stream=false MapRequest.
+ *
+ * Must be called BEFORE tinylink_stun_reprobe_start (the re-probe
+ * signals this task; if the task isn't up the signal is dropped with a
+ * warning). Idempotent — second call returns ESP_OK without re-spawning.
+ *
+ * Stack: TINYLINK_EP_PUSH_TASK_STACK (16 KiB) — sized for the mbedtls
+ * cert chain verify + Noise IK init peak (~12 KiB) plus margin. Allocated
+ * once at boot to avoid the heap-fragmentation failure that took out the
+ * legacy one-shot-task design (see endpoint_updater_task comment in
+ * tinylink.c for the failure capture). */
+esp_err_t tinylink_endpoint_updater_start(void);
+
 /* Read-only accessor for the cached STUN result. Returns true and
  * fills *addr_v4 / *port if a successful probe has run; returns false
  * otherwise. mapreq.c queries this when building the HostInfo block. */
