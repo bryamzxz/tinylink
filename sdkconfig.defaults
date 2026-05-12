@@ -186,3 +186,16 @@ CONFIG_ESP_MAIN_TASK_STACK_SIZE=24576
 # (LoadStoreError) immediately after the control-key fetch path,
 # classic stack-overflow corruption. 6144 gives ~2x headroom.
 CONFIG_ESP_TIMER_TASK_STACK_SIZE=6144
+
+# ---- Production: silent error paths ------------------------------------------
+# Asserts still abort (level=1) but don't print the message string + __FILE__
+# + __LINE__. Same crash safety, ~10 KiB flash saved across the error-handling
+# surface. Re-enable (=2) in a "diag" overlay if field-debugging a panic.
+CONFIG_COMPILER_OPTIMIZATION_ASSERTIONS_SILENT=y
+# ESP_RETURN_ON_ERROR / ESP_GOTO_ON_ERROR drop their format-string parameter
+# when CHECKS_SILENT=y. The check still triggers the goto/return; only the
+# log line on error is elided.
+CONFIG_COMPILER_OPTIMIZATION_CHECKS_SILENT=y
+# Drops the ~7 KiB esp_err_msg_table[] rodata; esp_err_to_name() returns
+# "UNKNOWN ERROR" plus the hex code. Operationally readable, just lookup-free.
+# CONFIG_ESP_ERR_TO_NAME_LOOKUP is not set
