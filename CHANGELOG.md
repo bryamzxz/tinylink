@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Control-plane key bootstrap: explicit production profile (2026-05-12)
+
+Closes deferred item #6 from the 2026-05-10 security audit. New
+`TINYLINK_CONTROL_PROFILE` Kconfig choice:
+
+- **Custom / development** (default): legacy behavior, empty
+  `_FALLBACK_HEX` allowed → first boot does TOFU via
+  `GET /key?v=100`. Suitable for Headscale / development.
+- **Official / production**: a `_Static_assert` in `control_key.c`
+  rejects builds with empty / wrong-length
+  `CONFIG_TINYLINK_CONTROL_PUB_FALLBACK_HEX` at compile time, so
+  production firmware cannot silently fall through to TOFU.
+
+New overlay `sdkconfig.defaults.prod.example` documents the
+discovery flow (curl /key?v=100, strip `mkey:` prefix, paste 64 hex)
+and the canonical build invocation. Runtime path
+(`parse_fallback`, `control_key_get`) unchanged — the production
+profile is purely a compile-time gate on what hex value can ship.
+
+Negative test verified: setting OFFICIAL profile with an empty
+fallback fails the build with
+
+    control_key.c: error: static assertion failed:
+      "CONFIG_TINYLINK_CONTROL_PROFILE_OFFICIAL requires
+       CONFIG_TINYLINK_CONTROL_PUB_FALLBACK_HEX to be exactly
+       64 hex chars."
+
+Smoke validation (`/tmp/tinylink_pr_epsilon_smoke_2026-05-12.log`):
+0 panics, boot picks up pin from NVS unchanged.
+
 ### DISCO AEAD CPU-DoS defense (2026-05-12)
 
 Closes the deferred item #4 from the 2026-05-10 security audit
