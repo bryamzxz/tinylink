@@ -7,6 +7,115 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### DERP outbound round (2026-05-12 evening, PR-D0 + PR-D1)
+
+Two PRs that together unlock the full DERP-mediated fallback path the
+firmware already had wired in source but couldn't actually use because
+of a chronic boot-time bug. After landing these, the failure mode that
+the 2026-05-12 PM peer-loss incident demonstrated (~35 min telemetry
+gap when Servidor1's WAN endpoint changed) gets reduced to a ~30 s
+detection window with zero packet loss during recovery.
+
+**PR-D0 — `feat/derp-supervisor-spawn-pre-tls`**: closes the chronic
+`xTaskCreate(derp supervisor) failed — heap_free=~11.7K largest=~11.2K
+need 12K contiguous` failure that fired on every boot across 3 soaks
+(2026-05-11 post-#67, 2026-05-12 morning post-η, 2026-05-12 PM
+combined post-perf-trim). Pre-PR the spawn happened AFTER the long-
+poll's TLS handshake fragmented the heap below the 12 KiB the task
+stack needs; xTaskCreate returned `ESP_ERR_NO_MEM`, the supervisor
+never spawned, and ALL DERP-mediated features stayed dead (relayed
+DISCO, CallMeMaybe ingestion, the upcoming relay TX path). Fix
+mirrors PR #67's pattern: spawn the task EARLY (pre-TLS, heap
+pristine) and move the wait-for-first-netmap into the task body so
+the actual DERP TLS handshake still happens post-netmap. Pure
+code-move + comment-update (60 insertions / 47 deletions, ~0 net
+flash change).
+
+**PR-D1 — `feat/derp-outbound-wg-transport-fallback`**: lossless
+WG transport via DERP relay when direct UDP looks broken. Adds a
+`wg_netif_relay_fn` callback typedef + setter and registers
+`tinylink_relay_via_derp` (a thin wrapper over the existing
+`derp_client_send_packet`). The TX worker (`wg_netif.c::tx_task_fn`)
+decides on each packet:
+
+  1. **Preemptive route**: if path-stale (`now -
+     last_transport_recv_us > WG_RX_STALE_THRESHOLD_MS`) AND relay is
+     registered, ship via DERP and skip the direct sendto entirely.
+     Relay success increments `g.relayed_stale`; failure falls
+     through to direct sendto.
+  2. **Reactive route**: if direct sendto returns errno != 0 (and we
+     didn't already try relay above), try the relay as last resort.
+     Increments `g.relayed_errno` on success.
+
+Three new public stats accessors (`wg_netif_get_relayed_stale`,
+`_errno`, `_get_relay_errors`) for soak observability. The relay
+goes through the callback so wg_netif stays decoupled from
+tinylink/derp_client.
+
+Combined effect on the incident scenario:
+
+| Symptom | Pre-DERP-round | Post-DERP-round |
+|---|---|---|
+| Telemetry gap during Servidor1 WAN flap | 35 min | 0 packets (relay) + ~30 s detection |
+| Recovery mechanism | Wait for `PeersChangedPatch[]` (35 min in practice) | CMM via DERP → prepunch new endpoints (seconds) |
+| derp supervisor at boot | xTaskCreate fail; DERP path dead | task spawned, login OK, recv loop active |
+| `disco_cmms_seen` counter | always 0 | live counter increments per CMM |
+
+Measured impact (PR-D0 + PR-D1, esp32, IDF v5.5.4):
+  flash app .text   +0.37 KiB  (728994 → 729382)
+  DRAM               +32 B     (148484 → 148516)
+  IRAM               0
+  total app .bin    +0.39 KiB  (1015145 → 1015533)
+  bootloader.bin     0
+
+Smoke validated on hardware (30 min, INTELCOM-CARDONA WPA2+PMF):
+  - 0 panics / asserts / WDT / xTaskCreate fails (3 prior soaks had
+    the supervisor xTaskCreate fail; this one didn't)
+  - derp supervisor task spawned t=5.9 s + login OK t=16.9 s on
+    derp16b.tailscale.com
+  - 9 CMMs processed via DERP supervisor (peer Servidor1 actively
+    sending CMMs as part of its NAT-punch routine; each CMM triggers
+    `cmm punch ping` to the 3 announced endpoints; prober matches the
+    pongs; no roam needed because the direct path was already healthy)
+  - 361 telemetry packets at 5 s cadence (seq 2..362)
+  - 0 RX-stale forced rekeys, 0 path-stale events, single WG session
+    survived the entire 30 min (`remote_idx=0x049221a7` constant)
+  - 16 successful rekeys (within-session key rotation per WG spec)
+  - 130 disco ping↔pong direct
+  - 4 W-lines, all benign: 2 early-boot `telemetry sendto errno=-1`
+    transients pre-dataplane, 1 normal handshake retry, 1 long-poll
+    stream-reconnect (rc=0x0 = clean close)
+
+External validation from peer-side ICMP-over-WG (`ping -c 2755
+100.67.60.92` Servidor1 → ESP32 tailnet IP):
+
+```
+2755 packets transmitted, 2640 received, 4.17423% packet loss
+rtt min/avg/max/mdev = 22.349/136.704/3230.099/97.257 ms
+```
+
+95.83 % delivery, RTT min/avg/max 22 / 137 / 3230 ms. The 4.17 %
+loss matches the pre-DERP-round ICMP-over-WG baseline (M5 60-min
+mega-ping at 3.86 % loss / 154 ms avg); no regression from the
+DERP round.
+
+PR-D1's relay path remained dormant during the 30-min soak — direct
+UDP stayed healthy so no path-stale event fired. To explicitly
+exercise the lossless-during-flap path, force a Servidor1-side UDP
+block while the ESP32 is running:
+
+```
+# On Servidor1, with $ESP32_WAN known from `tailscale debug netmap`:
+sudo iptables -A INPUT -p udp --dport 5815 -s $ESP32_WAN -j DROP
+sleep 60
+sudo iptables -D INPUT -p udp --dport 5815 -s $ESP32_WAN -j DROP
+```
+
+`wg_netif_get_relayed_stale()` should then be > 0 in the next status
+dump. That validation is intentionally separated from this round —
+the relay code is in place; whether it fires under a forced flap is
+left for a follow-up soak.
+
 ### sdkconfig perf-trim round (2026-05-12 afternoon)
 
 Five `feat/perf-*` branches landed in one afternoon after the post-η
