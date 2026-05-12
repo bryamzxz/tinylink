@@ -7,6 +7,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### WG persistent keepalive + long-poll `KeepAlive:true` (2026-05-12)
+
+Two upstream-tailscale alignment fixes for keepalive primitives at
+different layers (WG data plane + control-plane long-poll).
+
+**WG persistent keepalive originator** (`wg_netif.c`). Pre-PR tinylink
+relied entirely on the peer to keep the upstream NAT mapping warm:
+peer's keepalives flowed in, ours never went out unless we had data.
+In normal operation the 5 s telemetry cadence keeps the mapping warm,
+but if telemetry pauses (sensor disabled, I²C stall, app paused) the
+mapping expires after ~30-60 s of CGNAT idle and the next packet is
+silently dropped at the peer's upstream NAT until our path-stale
+machinery kicks in 30 s later. Matches the typical wireguard.conf
+`PersistentKeepalive=25` recommendation.
+
+- New constant `WG_PERSISTENT_KEEPALIVE_MS = 25000`.
+- New field `g.last_tx_us` (int64, 8 B BSS) updated by every successful
+  `wg_netif_send_plaintext`.
+- `wg_netif_send_plaintext` now accepts `pkt=NULL, len=0` and wraps
+  encrypt+enqueue under the existing `g.lock` mutex — required because
+  the rx_task-driven keepalive path becomes a SECOND writer to
+  `g.transport.send_counter`, which is read-modify-written and NOT
+  atomic on ESP32-LX6.
+- Rx_task tick triggers the keepalive when `state == UP &&
+  now - last_tx_us > 25 s`.
+
+Mutex cost: ~1 µs per send (negligible vs ChaCha20 of ~25 µs / 1.4 KB).
+No new threads, no new heap, +8 B BSS.
+
+**Long-poll `KeepAlive:true`** (`mapreq.c`). Pre-PR the MapRequest body
+omitted the `KeepAlive` field (Go default `false`). Upstream sets
+`KeepAlive:true` on every MapRequest (direct.go:1078) to request
+periodic server-emitted KeepAlive frames on the long-poll stream — an
+application-layer liveness signal beyond TCP keepalives. Tinylink's
+existing parser already handles `KeepAlive=true` frames
+(`mapreq.c:746-799`); only the request flag was missing. One-line
+change.
+
+Smoke validation (`/tmp/tinylink_pr_eta_smoke_2026-05-12.log`):
+0 panics / 0 errors / boot + session-up / 5 telemetry tx in 35 s
+(5 s cadence preserved) / 0 keepalive sends (expected — telemetry
+keeps the NAT mapping warm) / 2 server-emitted KeepAlive=true frames
+received on the long-poll (validates the new request field worked
+end-to-end without breaking the response parser).
+
+The keepalive path is exercised in operation only when telemetry pauses
+for more than 25 s. The user's 4-hour soak will confirm under realistic
+conditions; a forced test would be disabling
+`CONFIG_TINYLINK_TELEMETRY_ENABLE` for a build.
+
 ### Endpoint-updater exponential backoff (2026-05-12)
 
 Closes the "fixed 3 s retry" gap surfaced by the 2026-05-12

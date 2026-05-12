@@ -568,6 +568,13 @@ static int build_request_body(const tinylink_keys_t *keys,
                  stun_ok ? "\"WorkingUDP\":true" : "");
     }
 
+    /* `KeepAlive:true` requests the server to emit periodic
+     * KeepAlive=true frames on the long-poll stream so we have a
+     * liveness signal beyond TCP keepalives. Upstream tailscale sets
+     * this unconditionally on every MapRequest (direct.go:1078); we
+     * match for the streaming path (no effect for the lite Stream=false
+     * paths). Matches the in-source comment at L746 documenting the
+     * server's KeepAlive=true behaviour we already parse on receipt. */
     int n = snprintf(out, out_size,
         "{"
         "\"Version\":138,"
@@ -575,6 +582,7 @@ static int build_request_body(const tinylink_keys_t *keys,
         "\"NodeKey\":\"%s\","
         "\"DiscoKey\":\"%s\","
         "\"Stream\":%s,"
+        "\"KeepAlive\":true,"
         "%s"
         "\"Hostinfo\":{\"OS\":\"esp32\",\"Hostname\":\"%s\",\"IPNVersion\":\"0.1.0-tinylink\"%s}"
         "%s"

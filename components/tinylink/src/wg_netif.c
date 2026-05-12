@@ -93,6 +93,18 @@ static const char *TAG = "wg_netif";
  * endpoint), long enough to coalesce close-following pong events. */
 #define WG_DISCO_FAST_INIT_MIN_MS 500
 
+/* WG persistent keepalive cadence (host-order ms). When the device has
+ * been UP and silent on the outbound transport for this long, we send
+ * a zero-byte WG transport packet to refresh the NAT mapping at our
+ * upstream NAT and any intermediate stateful firewall (CGNAT, ISP
+ * carrier-grade router). Tailscale defaults to 25 s for the same
+ * reason; matches the typical wireguard.conf PersistentKeepalive
+ * recommendation. Above the 5 s telemetry cadence so it normally
+ * never fires (sensor app keeps the path warm). Active only when
+ * telemetry pauses (sensor disabled / I²C error) and we'd otherwise
+ * burn the NAT mapping after CGNAT's 30-60 s UDP idle timeout. */
+#define WG_PERSISTENT_KEEPALIVE_MS 25000
+
 /* Cool-down between handshake bursts after a budget exhaustion. The
  * "12 × 5 s = 60 s" attempt budget covers transient packet loss but
  * is too tight for a peer that's offline for longer (e.g. a full OS
@@ -238,6 +250,15 @@ static struct {
      * on session-up so the watchdog has a 30 s grace before it can fire
      * on a fresh session. */
     int64_t                 last_transport_recv_us;
+
+    /* Timestamp of the most recent successful outbound transport send
+     * (telemetry, ICMP echo replies, persistent keepalive). Drives the
+     * WG persistent-keepalive trigger: when state == UP and no
+     * outbound has happened in WG_PERSISTENT_KEEPALIVE_MS, the rx_task
+     * tick sends a zero-byte transport packet to refresh the NAT
+     * mapping. Stays 0 until the first send so the keepalive logic
+     * doesn't fire spuriously before any real traffic. */
+    int64_t                 last_tx_us;
 
     TaskHandle_t            rx_task;
     SemaphoreHandle_t       lock;
@@ -882,6 +903,30 @@ retry_timer:;
                 start_rekey();
             }
         }
+
+        /* Persistent-keepalive trigger. WG NAT mappings on the
+         * outbound path decay after ~30-60 s of idle (CGNAT being the
+         * common offender). In normal operation telemetry tick at 5 s
+         * keeps it warm; if telemetry pauses (sensor disabled, I²C
+         * stall) the mapping silently expires and the next packet
+         * lands at an unallocated port on the peer's NAT — dropped.
+         * Send a zero-byte WG transport packet after
+         * WG_PERSISTENT_KEEPALIVE_MS of outbound silence; the peer
+         * accepts it (legitimate WG keepalive) and the sendto refreshes
+         * the upstream NAT mapping. wg_netif_send_plaintext is mutex-
+         * protected so this rx_task path does not race with TCPIP-side
+         * encrypts on g.transport.send_counter. */
+        if (g.state == WG_NETIF_UP && g.last_tx_us > 0 &&
+            (now_us() - g.last_tx_us) >
+                WG_PERSISTENT_KEEPALIVE_MS * 1000LL) {
+            esp_err_t err = wg_netif_send_plaintext(NULL, 0);
+            if (err == ESP_OK) {
+                ESP_LOGD(TAG, "persistent keepalive sent (0 B)");
+            } else {
+                ESP_LOGW(TAG,
+                    "persistent keepalive failed: 0x%x", err);
+            }
+        }
     }
 
     ESP_LOGI(TAG, "rx task exiting");
@@ -1099,18 +1144,32 @@ esp_err_t wg_netif_send_plaintext(const uint8_t *pkt, size_t len)
      * TCPIP task's small stack doesn't have to absorb the 1.5 KiB
      * wire buffer alongside its own frames. xQueueSend memcpys the
      * full sizeof(wg_tx_item_t) into the queue's internal storage,
-     * so it's safe to reuse the scratch on the next call. */
+     * so it's safe to reuse the scratch on the next call.
+     *
+     * Wrap the encrypt+enqueue critical section under g.lock so a
+     * concurrent caller (lwIP TCPIP for app traffic vs rx_task for the
+     * persistent-keepalive path) cannot race on g.transport.send_counter
+     * — `wg_transport_encrypt` reads-modifies-writes the 64-bit
+     * counter, which is NOT atomic on ESP32-LX6. Same lock also
+     * protects g.tx_scratch since both callers reuse it. */
+    xSemaphoreTake(g.lock, portMAX_DELAY);
     int wlen = wg_transport_encrypt(&g.transport,
                                     g.tx_scratch.buf, sizeof(g.tx_scratch.buf),
                                     pkt, len);
-    if (wlen < 0) return ESP_FAIL;
+    if (wlen < 0) {
+        xSemaphoreGive(g.lock);
+        return ESP_FAIL;
+    }
     g.tx_scratch.len = (size_t)wlen;
     /* Snapshot the dest sockaddr at enqueue time so a concurrent
      * wg_netif_update_peer_endpoint after we release can't redirect a
      * frame whose counter is already committed. */
     g.tx_scratch.dst = g.peer_addr;
 
-    if (xQueueSend(g.tx_queue, &g.tx_scratch, 0) != pdTRUE) {
+    BaseType_t qrc = xQueueSend(g.tx_queue, &g.tx_scratch, 0);
+    xSemaphoreGive(g.lock);
+
+    if (qrc != pdTRUE) {
         /* Queue full. Drop this frame; lwIP treats any non-OK return
          * as a TX failure and discards its pbuf. The worker is either
          * starving (priority) or stuck in sendto — log throttled so
@@ -1122,6 +1181,7 @@ esp_err_t wg_netif_send_plaintext(const uint8_t *pkt, size_t len)
         }
         return ESP_FAIL;
     }
+    g.last_tx_us = now_us();
     return ESP_OK;
 }
 
