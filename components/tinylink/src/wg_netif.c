@@ -82,6 +82,17 @@ static const char *TAG = "wg_netif";
  * of total outage produces ~60 probes, not 3000. */
 #define WG_PATH_PROBE_COOLDOWN_MS 10000
 
+/* Anti-burst throttle for the "fast-INIT-on-pong-driven-roam" fast path.
+ * When handle_disco_direct's PONG branch swaps g.peer.peer_endpoint to a
+ * new working AddrPort, we want to kick INIT/rekey immediately instead
+ * of waiting for the next rx_task tick. But the tick may already have
+ * fired an INIT 100 ms before the pong arrived; a second INIT in the
+ * same window is wasteful. This min-interval gates the fast path
+ * against the existing g.last_handshake_us timestamp. 500 ms is short
+ * enough that recovery still feels instant (~1 RTT to the new
+ * endpoint), long enough to coalesce close-following pong events. */
+#define WG_DISCO_FAST_INIT_MIN_MS 500
+
 /* Cool-down between handshake bursts after a budget exhaustion. The
  * "12 × 5 s = 60 s" attempt budget covers transient packet loss but
  * is too tight for a peer that's offline for longer (e.g. a full OS
@@ -269,6 +280,13 @@ static struct {
     void                    *path_stale_cb_user;
     int64_t                  last_path_probe_us;
 
+    /* Anti-burst gate for the fast-INIT-on-pong-driven-roam fast path.
+     * Tracks only fast-INITs (not all INITs) so that an rx_task tick
+     * INIT to a stale endpoint immediately followed by a pong from a
+     * working endpoint still gets the fast-INIT — only suppresses
+     * back-to-back fast-INITs from multiple endpoints roaming in burst. */
+    int64_t                 last_fast_init_us;
+
     bool                    stop_requested;
 } g;
 
@@ -300,6 +318,22 @@ static int send_to_peer(const uint8_t *buf, size_t len)
                        (struct sockaddr *)&g.peer_addr, sizeof(g.peer_addr));
     if (n < 0) {
         ESP_LOGW(TAG, "sendto: errno=%d", errno);
+        /* Kernel-level negative signal: ENETUNREACH means there is no
+         * route at all to the destination (Wi-Fi disconnected, default
+         * gateway gone). EHOSTUNREACH means the destination host did
+         * not respond to ARP / IPv6 ND. Either way the current
+         * g.peer.peer_endpoint is dead; the existing 30 s
+         * WG_RX_STALE_THRESHOLD_MS wait is wasted. Backdate
+         * last_transport_recv_us and zero the path-probe cooldown so
+         * rx_task fires path_stale_cb on its next iteration (≤1 s),
+         * triggering DISCO probes of the peer's alternate endpoints.
+         * Models upstream tailscale magicsock noteBadEndpoint
+         * (endpoint.go:1634-1641). */
+        if (errno == ENETUNREACH || errno == EHOSTUNREACH) {
+            g.last_transport_recv_us =
+                now_us() - (WG_RX_STALE_THRESHOLD_MS + 1) * 1000LL;
+            g.last_path_probe_us = 0;
+        }
         return -1;
     }
     return (int)n;
@@ -605,6 +639,36 @@ static void handle_disco_direct(const uint8_t *buf, size_t len,
                 g.peer.peer_endpoint_v4_be = src_v4_be;
                 g.peer.peer_endpoint_port  = src_port;
                 rebuild_peer_sockaddr();
+
+                /* Fast-INIT fast path. We just learned a working
+                 * AddrPort via the pong; if a handshake/rekey was
+                 * already pending against the stale endpoint, don't
+                 * wait for the 5 s rx_task retry tick — fire INIT
+                 * immediately at the new address. State machine guard
+                 * ensures we only fire when an INIT is genuinely
+                 * wanted. The anti-burst gate uses a separate
+                 * timestamp (g.last_fast_init_us) so that a regular
+                 * tick-driven INIT to a stale endpoint at T=0 does NOT
+                 * suppress a productive fast-INIT triggered by a pong
+                 * from a different endpoint at T+50 ms — only
+                 * back-to-back FAST INITs from multiple-endpoint roam
+                 * bursts get coalesced. */
+                const int64_t now = now_us();
+                if ((now - g.last_fast_init_us) >
+                        WG_DISCO_FAST_INIT_MIN_MS * 1000LL) {
+                    if (g.state == WG_NETIF_HANDSHAKE_PENDING) {
+                        ESP_LOGI(TAG,
+                            "fast INIT on pong-driven endpoint roam");
+                        g.last_fast_init_us = now;
+                        kick_off_handshake();
+                    } else if (g.state == WG_NETIF_UP &&
+                               g.rekey_in_flight) {
+                        ESP_LOGI(TAG,
+                            "fast rekey INIT on pong-driven endpoint roam");
+                        g.last_fast_init_us = now;
+                        start_rekey();
+                    }
+                }
             }
         }
         return;

@@ -50,10 +50,6 @@ static size_t finish_disco_recv(uint8_t *out_reply, size_t out_cap,
         return 0;
     }
 
-    if (out_txid != NULL) {
-        memcpy(out_txid, msg.u.ping.txid, DISCO_TXID_LEN);
-    }
-
     /* Build the Pong inner. src_addr / src_port left zero — see
      * note in the header. The originator still accepts by TxID match. */
     disco_pong_t pong = {0};
