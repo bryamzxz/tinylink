@@ -22,7 +22,7 @@
 
 #include "crypto/nacl_box.h"
 #include "disco_handler.h"
-#include "disco_replay.h"
+#include "disco_prober.h"
 #include "wg_demux.h"
 #include "wg_handshake.h"
 #include "wg_transport.h"
@@ -550,20 +550,6 @@ static void handle_disco_direct(const uint8_t *buf, size_t len,
         return;
     }
 
-    /* Replay rejection. The wire layout is fixed (disco.c:113-115):
-     *   [0..5]    DISCO_MAGIC
-     *   [6..37]   sender_pub
-     *   [38..61]  nonce
-     *   [62..]    NaCl box (tag||ct)
-     * The frame already passed disco_open's decrypt+auth so length checks
-     * are satisfied and the bytes at buf[6+32..6+32+24] are the nonce. */
-    const uint8_t *nonce = buf + DISCO_MAGIC_LEN + DISCO_KEY_LEN;
-    if (disco_replay_check_and_record(nonce)) {
-        ESP_LOGW(TAG, "disco replay dropped: nonce=%02x%02x%02x%02x.. type=%u",
-                 nonce[0], nonce[1], nonce[2], nonce[3], (unsigned)type);
-        return;
-    }
-
     /* Roaming gate: only DISCO frames sealed by OUR WG peer's DiscoKey
      * may roam g.peer.peer_endpoint. The same UDP socket also receives
      * DISCO from other Tailscale peers in the netmap (e.g. a laptop
@@ -571,12 +557,29 @@ static void handle_disco_direct(const uint8_t *buf, size_t len,
      * reach us). Without this gate, those frames would flap our WG
      * transport target between unrelated peers. has_peer_disco_pub is
      * false on legacy bringups that didn't pass the DiscoKey through
-     * — there we fall back to permissive (legacy) behavior. */
+     * — there we fall back to permissive (legacy) behavior.
+     *
+     * The pre-AEAD gate above (when has_peer_disco_pub is true) already
+     * dropped non-peer DiscoKeys before disco_handle_recv, so this
+     * post-decrypt check is now mostly belt-and-suspenders — useful
+     * during the legacy permissive boot window before peer config has
+     * propagated. */
     const bool roam_allowed =
         !g.peer.has_peer_disco_pub ||
         memcmp(peer_disco_pub, g.peer.peer_disco_pub, WG_KEY_LEN) == 0;
 
     if (type == DISCO_TYPE_PING && reply_len > 0) {
+        /* Reply to the peer's Ping with our sealed Pong on the same UDP
+         * socket. Note: this does NOT trigger a WG endpoint roam —
+         * since M3-step-3 (this PR) the roam decision lives in the
+         * PONG branch, gated by disco_prober_match_and_remove, so only
+         * Pongs we actually solicited can roam. Replying to a Ping
+         * remains valuable (lets the peer discover that our AddrPort
+         * is reachable), but accepting a Ping as a roam trigger was
+         * the weaker primary control upstream tailscale never had.
+         * Models upstream `endpoint.handlePingLocked` (endpoint.go) —
+         * answer the ping, defer the bestAddr decision to the round-
+         * trip pong. */
         ssize_t n = sendto(g.sock, reply, reply_len, 0,
                            (const struct sockaddr *)src, sizeof(*src));
         if (n < 0) {
@@ -587,48 +590,26 @@ static void handle_disco_direct(const uint8_t *buf, size_t len,
             ESP_LOGI(TAG, "disco ping→pong (direct): src=%s:%u txid=%02x%02x%02x%02x..",
                      src_ip, (unsigned)ntohs(src->sin_port),
                      txid[0], txid[1], txid[2], txid[3]);
-            /* WG endpoint roaming via DISCO direct-path observation.
-             * The peer demonstrated this AddrPort is reachable in BOTH
-             * directions (we got a sealed ping FROM there, our pong
-             * sendto succeeded), so future WG transport replies should
-             * target it instead of g.peer.peer_endpoint_v4_be (the
-             * netmap-picked address, often a stale public NAT mapping
-             * or a value that only worked at handshake time). Without
-             * this, peer-side ICMP echo requests come in via direct
-             * UDP but our ICMP echo replies go to the netmap endpoint
-             * — peer's NAT may have no reverse mapping at that port,
-             * and the response gets DERP-routed or lost. */
-            if (roam_allowed) {
-                uint32_t src_v4_be = (uint32_t)src->sin_addr.s_addr;
-                uint16_t src_port  = ntohs(src->sin_port);
-                if (src_v4_be != g.peer.peer_endpoint_v4_be ||
-                    src_port  != g.peer.peer_endpoint_port) {
-                    ESP_LOGI(TAG, "WG endpoint roam → %s:%u (was %u.%u.%u.%u:%u)",
-                             src_ip, (unsigned)src_port,
-                             (unsigned)((g.peer.peer_endpoint_v4_be      ) & 0xFF),
-                             (unsigned)((g.peer.peer_endpoint_v4_be >>  8) & 0xFF),
-                             (unsigned)((g.peer.peer_endpoint_v4_be >> 16) & 0xFF),
-                             (unsigned)((g.peer.peer_endpoint_v4_be >> 24) & 0xFF),
-                             (unsigned)g.peer.peer_endpoint_port);
-                    g.peer.peer_endpoint_v4_be = src_v4_be;
-                    g.peer.peer_endpoint_port  = src_port;
-                    rebuild_peer_sockaddr();
-                }
-            }
         }
         return;
     }
     if (type == DISCO_TYPE_PONG) {
-        /* Peer responded to one of our (prepunch / DISCO outbound) pings.
-         * The src is also a verified-working AddrPort — apply the same
-         * roaming policy so the WG transport benefits. Same DiscoKey
-         * gate as PING: don't migrate WG endpoint based on a non-WG
-         * peer's pong. */
+        /* Peer responded to one of our outbound Pings (prepunch /
+         * CMM-driven). The disco_prober txid table records every
+         * outbound Ping we send; a Pong whose txid is NOT in the
+         * table is either a replay of a captured frame or a probe
+         * we never sent — either way, do NOT roam. */
         char src_ip[INET_ADDRSTRLEN];
         inet_ntop(AF_INET, &src->sin_addr, src_ip, sizeof(src_ip));
         ESP_LOGI(TAG, "disco pong (direct): src=%s:%u txid=%02x%02x%02x%02x..",
                  src_ip, (unsigned)ntohs(src->sin_port),
                  txid[0], txid[1], txid[2], txid[3]);
+        if (!disco_prober_match_and_remove(txid, now_us())) {
+            ESP_LOGD(TAG,
+                "disco pong: txid not in prober table — ignoring "
+                "(replay or stale)");
+            return;
+        }
         if (roam_allowed) {
             uint32_t src_v4_be = (uint32_t)src->sin_addr.s_addr;
             uint16_t src_port  = ntohs(src->sin_port);
@@ -946,6 +927,11 @@ esp_err_t wg_netif_init(const struct wg_netif_local_config *local)
 
     memset(&g, 0, sizeof(g));
     memcpy(&g.local, local, sizeof(*local));
+
+    /* Prepare the outbound-prober txid table. Both the supervisor task
+     * (record outbound pings) and wg_rx (match inbound pongs) will use
+     * it; idempotent so a second wg_netif_init / re-init is safe. */
+    disco_prober_init();
 
     g.lock = xSemaphoreCreateMutex();
     if (g.lock == NULL) return ESP_ERR_NO_MEM;

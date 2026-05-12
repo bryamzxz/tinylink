@@ -20,7 +20,7 @@ TARGETS := test_blake2s test_curve25519 test_mapresp \
            test_chacha20 test_poly1305 test_chacha20poly1305 \
            test_hkdf_noise test_wg_handshake test_wg_transport \
            test_wg_demux test_disco test_stun test_tls_io test_derp \
-           test_disco_handler test_disco_replay
+           test_disco_handler test_disco_prober
 
 all: $(TARGETS)
 
@@ -126,14 +126,16 @@ test_disco_handler: test_disco_handler.c \
 	    $(CRYPTO)/nacl_box.c $(CRYPTO)/curve25519.c $(CRYPTO)/curve25519_donna.c $(CRYPTO)/salsa20.c \
 	    $(CRYPTO)/poly1305_donna.c host_mbedtls_shim.c
 
-# DISCO replay window (M3 hardening) — nonce-based dedup that defeats
-# passive-capture-and-replay attacks against the WG endpoint roam path
-# in wg_netif::handle_disco_direct. Standalone module, no crypto.
-test_disco_replay: test_disco_replay.c \
-                   $(TL_SRC)/disco_replay.c $(TL_SRC)/disco_replay.h \
+# DISCO outbound prober (M3 step 3) — tx-id table that binds inbound
+# Pongs to outbound Pings; defeats the same capture-and-replay attack
+# class that the deleted disco_replay.c targeted, but with a tighter
+# control (a replayed Pong with no matching outstanding Ping is dropped
+# silently). Standalone module, no crypto.
+test_disco_prober: test_disco_prober.c \
+                   $(TL_SRC)/disco_prober.c $(TL_SRC)/disco_prober.h \
                    $(TL_SRC)/disco.h
 	$(CC) $(CFLAGS) -I$(TL_SRC) -o $@ \
-	    test_disco_replay.c $(TL_SRC)/disco_replay.c
+	    test_disco_prober.c $(TL_SRC)/disco_prober.c
 
 # DERP wire codec + recv loop — frame header + login handshake +
 # packet relay + ping/pong + control frames + the M5 step 2b dispatch
@@ -169,13 +171,13 @@ test_wg_transport: test_wg_transport.c \
         test_chacha20.run test_poly1305.run test_chacha20poly1305.run \
         test_hkdf_noise.run test_wg_handshake.run test_wg_transport.run \
         test_wg_demux.run test_disco.run test_stun.run test_tls_io.run \
-        test_derp.run test_disco_handler.run test_disco_replay.run clean
+        test_derp.run test_disco_handler.run test_disco_prober.run clean
 
 test: test_blake2s.run test_curve25519.run test_mapresp.run \
       test_chacha20.run test_poly1305.run test_chacha20poly1305.run \
       test_hkdf_noise.run test_wg_handshake.run test_wg_transport.run \
       test_wg_demux.run test_disco.run test_stun.run test_tls_io.run \
-      test_derp.run test_disco_handler.run test_disco_replay.run
+      test_derp.run test_disco_handler.run test_disco_prober.run
 
 test_blake2s.run: test_blake2s
 	./test_blake2s
@@ -222,8 +224,8 @@ test_derp.run: test_derp
 test_disco_handler.run: test_disco_handler
 	./test_disco_handler
 
-test_disco_replay.run: test_disco_replay
-	./test_disco_replay
+test_disco_prober.run: test_disco_prober
+	./test_disco_prober
 
 clean:
 	rm -f $(TARGETS)

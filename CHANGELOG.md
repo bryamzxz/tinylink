@@ -7,6 +7,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### DISCO outbound prober + tx-id binding (M3 step 3, 2026-05-12)
+
+Closes deferred item #5 from the 2026-05-10 security audit. Pre-PR
+behavior: `handle_disco_direct` roamed `g.peer.peer_endpoint_*` on
+EITHER an inbound PING or PONG, gated only by the DiscoKey match and
+the post-decrypt `disco_replay_check_and_record` nonce window (PR
+#58). Upstream tailscale never accepted a PING as a roam trigger;
+its `endpoint.handlePongConnLocked` (`endpoint.go:1706-1798`) is
+keyed on a `sentPing` map populated when the local node *sent* the
+corresponding probe — a Pong whose txid isn't there returns false
+and no state changes.
+
+This PR ports that primary control to tinylink:
+
+- **New `disco_prober.{c,h}`** module. 16-entry table of
+  `{txid, dst_v4_be, dst_port, sent_us, valid}` (~512 B BSS). On
+  ESP-IDF the table is protected by a `portMUX_TYPE` so the
+  supervisor task (recording records) and the wg_rx task (looking
+  up + removing on inbound pong) don't tear slots mid-update. Host
+  build uses no-op locks (single-threaded). Eviction is LRU with a
+  fresh-entries-only cap: an in-flight slot is evicted only when no
+  free or expired slot is available.
+
+- **`tinylink.c`**: every successful `sendto` in
+  `prepunch_pings_to_peers` and `send_disco_pings_to_cmm_endpoints`
+  now records the outbound txid via `disco_prober_record`.
+
+- **`wg_netif.c::handle_disco_direct`**:
+    - PING branch: sends the sealed PONG reply as before but no
+      longer roams `g.peer.peer_endpoint_*`. Replying to a ping
+      remains useful (lets the peer learn that our AddrPort works)
+      but the roam decision is deferred to the round-trip pong.
+    - PONG branch: now gated by `disco_prober_match_and_remove`.
+      A pong whose txid is not in the table is dropped silently;
+      a fresh match removes the entry and triggers the existing
+      roam + fast-INIT logic.
+
+- **Deletes `disco_replay.{c,h}` + `test_disco_replay.c`**. The
+  txid-table is a strictly stronger primary control: a replayed
+  pong with no matching outstanding ping fails the `match_and_remove`
+  check. (PR #58's window was defense-in-depth post-decrypt against
+  replayed pings; with PING-roam removed the window has no remaining
+  consumer.)
+
+Net BSS: -2 560 bytes (-3 072 disco_replay + +512 prober). Flash:
++~290 B for the new module. CMakeLists / tools/test/Makefile
+updated to match.
+
+End-to-end validation
+(`/tmp/tinylink_pr_delta_smoke_2026-05-12.log`): boot prepunch sends
+11 pings across 3 peers, peer responds with a pong whose txid
+matches the original `txid=960459a3..` prepunch, prober matches and
+removes the entry, would-have-roamed but src == current endpoint so
+no log. 0 panics, 0 errors, telemetry 5 s cadence preserved.
+
+Host KAT 464 → 466 (16 new prober tests in
+`tools/test/test_disco_prober.c` covering roundtrip, multi-txid,
+timeout, LRU eviction, unknown txid, NULL safety; 14 deleted
+`disco_replay` tests).
+
 ### Control-plane key bootstrap: explicit production profile (2026-05-12)
 
 Closes deferred item #6 from the 2026-05-10 security audit. New
