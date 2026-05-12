@@ -28,6 +28,23 @@ static const char *TAG = "ctrl_key";
 #define KEY_PREFIX "mkey:"
 #define KEY_HEX_LEN 64
 #define KEY_PATH   "/key?v=100"
+
+/* Production-profile guard: when the operator opted into the
+ * "official" control-pub bootstrap profile (TOFU window closed at
+ * compile time), refuse to build firmware that still has an empty
+ * fallback hex — that would silently fall through to the network
+ * fetch and defeat the whole point of the profile. The string
+ * literal "" has sizeof == 1; a populated 64-hex value has
+ * sizeof == 65. Anything else is also rejected via the runtime
+ * length check below, but at runtime is too late for production
+ * firmware. */
+#if defined(CONFIG_TINYLINK_CONTROL_PROFILE_OFFICIAL)
+_Static_assert(sizeof(CONFIG_TINYLINK_CONTROL_PUB_FALLBACK_HEX) == 65,
+               "CONFIG_TINYLINK_CONTROL_PROFILE_OFFICIAL requires "
+               "CONFIG_TINYLINK_CONTROL_PUB_FALLBACK_HEX to be exactly "
+               "64 hex chars. See sdkconfig.defaults.prod.example for "
+               "how to populate it from a curl of /key?v=100.");
+#endif
 #define BODY_MAX   512
 
 static int hex_nibble(char c)

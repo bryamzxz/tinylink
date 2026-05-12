@@ -22,6 +22,37 @@ menu "tinylink application"
         default 443
         range 1 65535
 
+    choice TINYLINK_CONTROL_PROFILE
+        prompt "Control-plane key bootstrap profile"
+        default TINYLINK_CONTROL_PROFILE_CUSTOM
+        help
+            How the compile-in fallback control pubkey
+            (CONFIG_TINYLINK_CONTROL_PUB_FALLBACK_HEX below) is
+            sourced:
+
+              * "Custom / development" leaves it empty by default. The
+                first boot does TOFU via GET /key?v=100 — convenient for
+                Headscale / development but exposes a one-shot MITM
+                window during that fetch.
+
+              * "Official / production" requires the operator to fill
+                CONFIG_TINYLINK_CONTROL_PUB_FALLBACK_HEX in a
+                sdkconfig.defaults overlay (see
+                sdkconfig.defaults.prod.example) with the published
+                control plane key. control_key.c then installs the pin
+                without ever contacting the network, closing the TOFU
+                window entirely. control_key_refresh() additionally
+                rejects any later-fetched key that disagrees with this
+                value, so rotation attempts cannot silently downgrade.
+
+        config TINYLINK_CONTROL_PROFILE_CUSTOM
+            bool "Custom / development (allow first-boot TOFU)"
+
+        config TINYLINK_CONTROL_PROFILE_OFFICIAL
+            bool "Official / production (require compile-in pubkey)"
+
+    endchoice
+
     config TINYLINK_CONTROL_PUB_FALLBACK_HEX
         string "Compile-in fallback control plane pubkey (64 hex chars, empty = TOFU)"
         default ""
@@ -38,6 +69,12 @@ menu "tinylink application"
             empty to keep the legacy first-boot TOFU behavior (suitable
             for development; for production use ship the operator's
             known control pubkey here).
+
+            When TINYLINK_CONTROL_PROFILE_OFFICIAL is selected, a
+            BUILD-time assertion in control_key.c rejects an empty
+            value to prevent shipping production firmware that still
+            does TOFU. Use sdkconfig.defaults.prod.example as a
+            template.
 
     config TINYLINK_REGISTER_RETRY_MS
         int "Retry interval after MachineAuthorized=false (ms)"

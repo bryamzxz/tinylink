@@ -1,0 +1,32 @@
+# Production profile overlay — closes the control-plane key bootstrap
+# TOFU window at compile time.
+#
+# Usage:
+#
+#   1. Discover the current control-plane pubkey of the server you trust
+#      (run on a machine that has trusted DNS + cert bundle):
+#
+#        curl -s "https://controlplane.tailscale.com/key?v=100" \
+#          | python3 -c 'import sys, json; print(json.load(sys.stdin)["publicKey"])'
+#
+#      Output looks like: mkey:abcdef0123...64hex...
+#      Copy the 64-hex portion (drop the "mkey:" prefix).
+#
+#   2. Replace the placeholder below with the 64-hex value (no quotes
+#      stripping, keep the surrounding quotes).
+#
+#   3. Build with this overlay:
+#
+#        idf.py -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.esp32;sdkconfig.defaults.prod" \
+#               reconfigure build
+#
+# control_key.c contains a _Static_assert that the fallback hex is
+# exactly 64 chars when CONFIG_TINYLINK_CONTROL_PROFILE_OFFICIAL is
+# selected, so a typo / missing value fails the build instead of
+# silently producing a TOFU-vulnerable image.
+
+CONFIG_TINYLINK_CONTROL_PROFILE_OFFICIAL=y
+CONFIG_TINYLINK_CONTROL_PROFILE_CUSTOM=n
+
+# REPLACE WITH THE ACTUAL 64-HEX VALUE FROM STEP 1.
+CONFIG_TINYLINK_CONTROL_PUB_FALLBACK_HEX="0000000000000000000000000000000000000000000000000000000000000000"
