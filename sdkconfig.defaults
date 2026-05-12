@@ -31,6 +31,19 @@ CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=16
 CONFIG_ESP_WIFI_AMPDU_TX_ENABLED=y
 CONFIG_ESP_WIFI_AMPDU_RX_ENABLED=y
 CONFIG_ESP_WIFI_NVS_ENABLED=y
+# Station-only build: tinylink never runs as an AP (no WIFI_MODE_AP,
+# no esp_wifi_set_mode(WIFI_MODE_AP), no softap_start call site).
+# Drops the entire AP-side code path: beacon scheduler, AID table,
+# DTIM management on AP side, AP-side WPS handshake, AP-side WPA
+# supplicant fragment.
+# CONFIG_ESP_WIFI_SOFTAP_SUPPORT is not set
+# WPA3-Personal (SAE) handshake codepath: not needed; the production
+# AP (INTELCOM-CARDONA) is WPA2-PSK-SHA256 + PMF, not WPA3-Personal.
+# Removes SAE-PWE Dragonfly + SAE-H2E variants.
+# CONFIG_ESP_WIFI_ENABLE_WPA3_SAE is not set
+# WPA3-OWE-STA (Opportunistic Wireless Encryption for open networks).
+# tinylink never associates to open APs; the production AP is WPA2.
+# CONFIG_ESP_WIFI_ENABLE_WPA3_OWE_STA is not set
 
 # ---- Power management --------------------------------------------------------
 CONFIG_PM_ENABLE=y
