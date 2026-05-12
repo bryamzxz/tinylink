@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Diagnostic + defense-in-depth fixes (2026-05-12)
+
+Two small fixes uncovered by the 2026-05-12 comparative audit against
+upstream tailscale (`magicsock/endpoint.go`, `wgengine/`):
+
+- **`disco_handler.c`: populate `out_txid` for PONG inputs.** Before
+  this patch `disco_handle_recv` only wrote `out_txid` inside the PING
+  short-circuit, so an inbound PONG left the caller's zero-initialised
+  buffer untouched. The `wg_netif.c:551` log "disco pong (direct): …
+  txid=00000000.." was therefore always all-zeros even though the
+  probing was working. Diagnostic only; no behavioural change.
+  Locked in by new host-test assertion `pong-in/txid-extracted` in
+  `tools/test/test_disco_handler.c`.
+
+- **`wg_handshake.c`: validate `reserved[3]` on inbound RESPONSE.**
+  `wg_handshake_process_response` only checked `message_type` and
+  `receiver_index`; `wg_transport_decrypt` already enforces the same
+  three reserved bytes on data frames (`wg_transport.c:157-159`), so
+  the asymmetry was an oversight. One-line check, no crypto cost
+  (runs pre-DH). Locked in by `full/reserved-nonzero` in
+  `tools/test/test_wg_handshake.c`.
+
+Host KAT count: 452 → 454. ESP32 image size unchanged. Validation:
+5-minute on-device serial capture showed 0 panics, telemetry flowing
+at 5 s cadence, DISCO ping→pong logs now show real txid (was already
+correct on PING-reply path; this PR fixes the PONG-receive path).
+
 ### Recovery after peer NAT rebind (2026-05-11)
 
 Four commits fixing a "sometimes the device doesn't reconnect after

@@ -153,8 +153,11 @@ int wg_handshake_process_response(struct wg_handshake_state *st,
 
     memset(nonce, 0, sizeof(nonce));
 
-    /* Validate message header before doing any crypto. */
+    /* Validate message header before doing any crypto. Reserved bytes
+     * must be zero per WireGuard whitepaper §5.4.2; wg_transport_decrypt
+     * already enforces this on data frames, so mirror the check here. */
     if (msg->message_type != WG_MSG_RESPONSE) goto out_scrub;
+    if (msg->reserved[0] | msg->reserved[1] | msg->reserved[2]) goto out_scrub;
     if (msg->receiver_index != st->local_index) goto out_scrub;
 
     /* Ci = KDF1(Ci, E_pub_responder).

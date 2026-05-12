@@ -175,12 +175,15 @@ static void test_pong_no_reply(void) {
 
     uint8_t reply[DISCO_HANDLER_REPLY_MAX];
     disco_msg_type_t got_type = (disco_msg_type_t)0xff;
+    uint8_t got_txid[DISCO_TXID_LEN] = {0xff};
     size_t reply_len = disco_handle_recv(reply, sizeof(reply),
                                          wire, wire_len,
                                          me_priv, me_pub,
-                                         &got_type, NULL, NULL);
+                                         &got_type, NULL, got_txid);
     fails += ok("pong-in/no-reply", reply_len == 0);
     fails += ok("pong-in/observed-type", got_type == DISCO_TYPE_PONG);
+    fails += ok("pong-in/txid-extracted",
+                memcmp(got_txid, pong.txid, DISCO_TXID_LEN) == 0);
 }
 
 static void test_callmemaybe_no_reply(void) {
