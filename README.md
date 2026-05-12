@@ -7,7 +7,9 @@ written in pure C on **ESP-IDF v5.5.x**.
 
 **Stable — direct UDP + ICMP-over-WG live end-to-end on real hardware,
 M1–M7 all landed, perf round 2026-05-10 closed, sdkconfig perf-trim
-round 2026-05-12 PM pushed to `feat/perf-*` branches (awaiting merge).**
+round 2026-05-12 PM merged (5 PRs), DERP outbound round 2026-05-12
+evening merged (PR-D0 + PR-D1: lossless transport during peer NAT
+flap).**
 
 | Layer                          | State                                  |
 |--------------------------------|----------------------------------------|
@@ -21,7 +23,8 @@ round 2026-05-12 PM pushed to `feat/perf-*` branches (awaiting merge).**
 | ICMP over WG transport         | **done** — `ping <our-tailnet-ip>` flows |
 | Production hardening (M7)      | done — within scope                    |
 | Perf + power round (2026-05-10)| done — constant-time crypto, light-sleep PM, QIO@80, -O2 |
-| sdkconfig perf-trim (2026-05-12 PM) | 5 `feat/perf-*` PRs pushed: −158.7 KiB flash · DRAM −2.9 KiB · IRAM −30.5 KiB (80%→56%) |
+| sdkconfig perf-trim (2026-05-12 PM) | 5 PRs merged: −158.7 KiB flash · DRAM −2.9 KiB · IRAM −30.5 KiB (80%→56%) |
+| DERP outbound round (2026-05-12 evening) | 2 PRs merged: derp supervisor finally spawns + WG transport relay fallback (lossless on path-stale or sendto errno) |
 
 What works today, verified on real hardware:
 
@@ -115,6 +118,68 @@ see `docs/ROADMAP.md` § "M7 — Hardening"):
 - Secure boot V2 + flash encryption.
 - Auth-key rotation API (no remote trigger mechanism without
   control-plane / OTA delivery).
+
+## DERP outbound round (2026-05-12 evening)
+
+Two PRs that unlock the full DERP-mediated fallback path. Motivated
+by a 2026-05-12 PM incident where Servidor1's WAN endpoint changed
+(HA-failover ISP setup), the ESP32's cached endpoints went stale,
+and direct UDP went into a 35-minute blackhole because the ESP32
+had no fallback channel to learn the peer's new endpoints.
+
+| PR (branch)                                            | Function                                                                            |
+|--------------------------------------------------------|--------------------------------------------------------------------------------------|
+| `feat/derp-supervisor-spawn-pre-tls` (**PR-D0**)       | Move derp supervisor xTaskCreate to pre-TLS bringup (heap pristine, 12 KiB contig OK); wait-for-netmap moves into the task body. Closes the chronic `xTaskCreate(derp supervisor) failed` that fired on every boot. |
+| `feat/derp-outbound-wg-transport-fallback` (**PR-D1**) | Lossless WG transport via DERP relay when direct UDP looks broken (path-stale watchdog OR sendto errno). Adds `wg_netif_relay_fn` callback + `tinylink_relay_via_derp` glue. |
+
+Combined size impact: flash **+0.39 KiB**, DRAM **+32 B**, IRAM 0.
+
+Architectural insight: most of the recovery machinery (CMM ingestion
+via DERP, `send_disco_pings_to_cmm_endpoints`, the disco_prober that
+matches txids on response pongs) already existed in source from
+prior PRs. PR-D0 was the unblocker — the supervisor was the missing
+piece because its xTaskCreate kept failing. Once the supervisor
+spawned, the existing flow lit up:
+
+```
+peer NAT changes → peer's tailscaled detects new endpoint
+   → CMM via DERP to our supervisor       ← PR-D0 enables this
+      → handle_disco_relayed (CMM case)   ← existed
+         → send_disco_pings_to_cmm_endpoints(new endpoints)
+            → disco_prober tracks new txids
+               → peer responds → prober matches → endpoint roam
+                  → direct UDP resumes (recovery time: seconds)
+```
+
+PR-D1 then closes the "telemetry during recovery window" gap:
+while the prober is still matching the new endpoint, the TX worker
+ships any outbound packets through DERP instead of letting them
+blackhole at the stale endpoint. The TX path checks
+`last_transport_recv_us > WG_RX_STALE_THRESHOLD_MS` preemptively;
+on a match it routes via `g.relay_cb` and skips direct sendto
+entirely. Three new stats (`relayed_stale`, `relayed_errno`,
+`relay_errors`) for soak observability.
+
+Smoke validated (30-min capture, INTELCOM-CARDONA WPA2+PMF):
+- 0 panics / xTaskCreate fails / WDT
+- derp supervisor task spawned t=5.9 s + login OK at t=16.9 s
+- **9 CMMs processed via DERP** (peer Servidor1 sending them as
+  part of its NAT-punch routine; observable evidence the supervisor
+  recv loop is actually delivering frames)
+- 361 telemetry packets at 5 s cadence, single WG session whole
+  window (`remote_idx=0x049221a7` constant)
+- Relay paths dormant — direct UDP stayed healthy throughout, no
+  path-stale event fired. The relay is in place; whether it fires
+  under a forced flap is a follow-up soak.
+- External validation: peer-side `ping 100.67.60.92` for 2755
+  packets returned 95.83 % delivery / RTT avg 137 ms — matches
+  pre-DERP-round baseline (no regression).
+
+The combined recovery time for a real Servidor1 WAN flap is now
+estimated **~30 s** (path-stale watchdog) instead of **35 min**
+(waiting for `PeersChangedPatch[]` via long-poll), with zero
+packets lost during the recovery window when PR-D1's relay path
+activates.
 
 ## Possible future directions
 
@@ -275,7 +340,8 @@ Three properties that are non-obvious from a casual read of the code:
 | 6 | ICMP-over-WG end-to-end                         | done                  |
 | 7 | Production hardening                            | done — within scope   |
 | 8 | Perf + power round (2026-05-10)                 | done                  |
-| 9 | sdkconfig perf-trim round (2026-05-12 PM)       | 5 `feat/perf-*` PRs pushed, awaiting merge + combined soak |
+| 9 | sdkconfig perf-trim round (2026-05-12 PM)       | done — 5 PRs merged (#76-#80) |
+| 10 | DERP outbound round (2026-05-12 evening)       | done — PR-D0 + PR-D1 merged (#82, #83), 30-min smoke OK, relay dormant pending forced flap test |
 
 See [`docs/ROADMAP.md`](docs/ROADMAP.md) for the per-milestone breakdown.
 

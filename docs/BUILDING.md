@@ -95,23 +95,24 @@ is not set`); the bench code drops out of the binary entirely.
 Reference `idf.py size` numbers for the ESP32-WROOM-32E (no PSRAM)
 target on ESP-IDF v5.5.4:
 
-| Region        | Post-η baseline (4bd5b0f) | Projected post-perf-trim (all `feat/perf-*` merged) |
-|---------------|--------------------------:|-----------------------------------------------------:|
-| Flash app     | 1 173 717 B (74.6 % of 1.5 MiB) | ~1 015 010 B (~64.5 %)                  |
-| DRAM static   | 151 412 B (**83.78 %**)   | ~148 500 B (**~82.2 %**)                |
-| IRAM          | 104 383 B (**79.64 %**)   | ~73 900 B (**~56.4 %**)                 |
-| Bootloader    | 27 808 B                  | 19 584 B                                |
-| RTC SLOW      | 56 B                      | 56 B                                    |
+| Region        | Post-η baseline (`4bd5b0f`) | Post-perf-trim merged | Post-DERP-round merged (`7a45269`) |
+|---------------|----------------------------:|----------------------:|------------------------------------:|
+| Flash app     | 1 173 717 B (74.6 %)        | 1 015 145 B (64.5 %)  | **1 015 533 B (64.5 %)**           |
+| DRAM static   | 151 412 B (83.78 %)         | 148 484 B (82.16 %)   | **148 516 B (82.17 %)**            |
+| IRAM          | 104 383 B (79.64 %)         | 75 079 B (57.28 %)    | **75 079 B (57.28 %)**             |
+| Bootloader    | 27 808 B                    | 18 176 B              | 18 176 B                            |
+| RTC SLOW      | 56 B                        | 56 B                  | 56 B                                |
 
-Post-perf-trim figures assume all five `feat/perf-*` branches
-land cleanly. Re-measure after the combined merge — the per-PR
-deltas are independent on paper but cross-PR linker behaviour can
-shift `±` a few hundred bytes.
+Headline of the cumulative work from baseline to post-DERP-round:
+**flash −154.6 KiB, DRAM −2.9 KiB, IRAM −29.3 KiB (80 % → 57 %),
+bootloader −9.4 KiB**. The IRAM relief is what enables the DERP
+outbound work to land without crowding the 128 KiB IRAM budget.
 
-The IRAM relief (80 % → ~56 %) is the headline of the perf-trim
-round. The original perf+power round (#61-#65) is per-PR additive
-flash (+13 KiB); the perf-trim round (`feat/perf-*` 2026-05-12 PM)
-is per-PR subtractive sdkconfig (−158.7 KiB flash, −30.5 KiB IRAM).
+The DERP-round adds only +0.39 KiB flash + 32 B DRAM on top of
+post-perf-trim, but unlocks an entirely new transport path
+(WG-over-DERP relay) plus inbound CMM ingestion that was wired in
+source but dormant before PR-D0 made the supervisor actually
+spawn.
 
 ## Compiler optimization scope
 
