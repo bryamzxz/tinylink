@@ -140,6 +140,29 @@ static esp_err_t bringup(void)
                  epuerr);
     }
 
+#if CONFIG_TINYLINK_DERP_SUPERVISED
+    /* Spawn the DERP supervisor task NOW — before any TLS handshake
+     * (register, long-poll, supervisor's own DERP TLS) lands and
+     * fragments the heap below the 12 KiB contiguous needed for the
+     * task stack. Without this move the spawn fails with
+     * `heap_free=~11.7K largest=~11.2K need 12K contiguous` (observed
+     * across 3 soaks) and ALL DERP-dependent features (CMM ingestion,
+     * relayed DISCO, future DERP outbound fallback) stay dead.
+     *
+     * The task body itself waits internally for the first netmap
+     * (tinylink_wait_dataplane_ms) before opening its TLS conn to the
+     * DERP relay, so we still respect the "long-poll handshake gets a
+     * pristine arena" + "PreferredDERP region known before connecting"
+     * invariants documented in the previous wait-then-spawn shape.
+     * Spawn-now-connect-later separates the two concerns cleanly:
+     * xTaskCreate gets a clean heap, TLS handshake gets a known region. */
+    esp_err_t derp_sup_err = tinylink_derp_supervised_start();
+    if (derp_sup_err != ESP_OK) {
+        ESP_LOGW(TAG, "derp supervised start failed: 0x%x — continuing",
+                 derp_sup_err);
+    }
+#endif
+
     /* M4 — best-effort STUN probe. Runs once before the first
      * MapRequest so HostInfo.Endpoints can advertise our reflexive
      * AddrPort to the control plane (which forwards it to peers).
@@ -188,40 +211,6 @@ static esp_err_t bringup(void)
         ESP_LOGE(TAG, "long-poll start failed: 0x%x", err);
         return err;
     }
-
-#if CONFIG_TINYLINK_DERP_SUPERVISED
-    /* Wait for the long-poll's first netmap before we bring up the
-     * supervised DERP conn. Two reasons:
-     *
-     *   1. Heap order: the long-poll's mbedtls cert verify needs ~12
-     *      KiB contiguous; if we let DERP supervisor's TLS conn fragment
-     *      the heap first, the long-poll handshake fails (we observed
-     *      the "Certificate matched but signature verification failed"
-     *      pattern this triggers).
-     *
-     *   2. Reachability: the FIRST MapRequest is what tells the
-     *      control plane our PreferredDERP region. Before that lands,
-     *      a remote peer doing `tailscale ping <us>` doesn't know
-     *      which DERP region to relay through — its ping never
-     *      arrives at the supervisor. Bringing up DERP after the
-     *      first MapResponse means our HostInfo.NetInfo is already
-     *      registered when DERP starts taking traffic.
-     *
-     * 30 s is generous: register + first MapRequest typically lands
-     * in 5-10 s on this hardware. On timeout we still try to start
-     * the supervisor — best-effort, the recv loop will reconnect on
-     * its own backoff cadence. */
-    esp_err_t wait_err = tinylink_wait_dataplane_ms(30000);
-    if (wait_err != ESP_OK) {
-        ESP_LOGW(TAG, "dataplane did not come up in 30 s — "
-                      "starting supervised DERP anyway");
-    }
-    esp_err_t derp_sup_err = tinylink_derp_supervised_start();
-    if (derp_sup_err != ESP_OK) {
-        ESP_LOGW(TAG, "derp supervised start failed: 0x%x — continuing",
-                 derp_sup_err);
-    }
-#endif
 
     err = tinylink_telemetry_start();
     if (err != ESP_OK) {
