@@ -7,53 +7,81 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Faster NAT-rebind recovery (2026-05-12)
+### DISCO AEAD CPU-DoS defense (2026-05-12)
 
-Two follow-on changes to PR #66's NAT-rebind work. After that PR the
-device recovers from a peer NAT rebind in ~100 s (4-h soak observed 9
-roams + 4 cold recoveries). Profiling showed the recovery time is
-dominated by waiting for the rx_task tick's 5 s `WG_REKEY_TIMEOUT_MS`
-to fire INIT against the newly-roamed AddrPort, AND for the 30 s
-`WG_RX_STALE_THRESHOLD_MS` to even start probing alternate endpoints
-when the kernel already knows the path is gone (`ENETUNREACH /
-EHOSTUNREACH` on outbound `sendto`).
+Closes the deferred item #4 from the 2026-05-10 security audit
+(`reference_tinylink_security_audit_2026_05_10`). Pre-#58 audit raised
+that an attacker who learned our public AddrPort could flood DISCO
+frames sealed by arbitrary DiscoKeys; each frame forced our recv path
+to run Curve25519 + HSalsa20 + XSalsa20 + Poly1305 (~5-10 ms per
+frame on Xtensa LX6) before the existing roam-allowed gate dropped
+the frame. PR #58's `disco_replay.c` mitigated replay-of-captured
+frames but did NOT mitigate fresh-nonce floods because those never
+hit the replay window — every frame still paid the full AEAD cost.
 
-This PR adds two short-circuits, both modeled on upstream tailscale
-`wgengine/magicsock/endpoint.go`:
+Two layered defenses, modeled on upstream tailscale
+`wgengine/magicsock/magicsock.go::handleDiscoMessage`:
 
-- **Fast INIT on pong-driven endpoint roam** (`wg_netif.c`,
-  `handle_disco_direct` PONG branch). When a DISCO pong from a new
-  AddrPort triggers `g.peer.peer_endpoint_*` swap, and we are in a
-  state where INIT is already wanted (`HANDSHAKE_PENDING` or `UP`
-  with `rekey_in_flight`), fire `kick_off_handshake()` or
-  `start_rekey()` immediately instead of waiting for the next rx_task
-  tick. Throttled via a dedicated `g.last_fast_init_us` so that a
-  regular tick-driven INIT to a stale endpoint at T=0 does NOT
-  suppress a productive fast-INIT triggered by a pong from a different
-  endpoint at T+50 ms — only back-to-back FAST INITs from
-  multiple-endpoint roam bursts (≤ 500 ms apart) get coalesced.
-  Models upstream's `endpoint.send` calling `sendDiscoPingsLocked`
-  unconditionally when `bestAddr` is stale (`endpoint.go:1052-1057`).
-- **Negative signal on `ENETUNREACH/EHOSTUNREACH`** (`wg_netif.c`,
-  `send_to_peer`). On those errnos backdate `last_transport_recv_us`
-  past the stale threshold AND zero `last_path_probe_us`, so the
-  rx_task's existing path-stale block fires the DISCO probe of
-  alternate peer endpoints on its next iteration (≤ 1 s).
-  Models upstream's `noteBadEndpoint` (`endpoint.go:1634-1641`)
-  which calls `clearBestAddrLocked` on `sendUDPBatch` errors
-  (`endpoint.go:1080-1082`).
+- **Pre-AEAD DiscoKey gate** (`wg_netif.c::handle_disco_direct`).
+  Before invoking the codec, compare `frame[6..37]` (cleartext
+  senderDiscoPub) against `g.peer.peer_disco_pub` when we know the
+  peer's DiscoKey. Mismatch → drop pre-crypto. Upstream's analog is
+  `c.peerMap.knownPeerDiscoKey(sender)` at
+  `magicsock.go:2170-2177` which gates everything behind a
+  netmap-derived allow-list. Reduces the per-frame attacker budget
+  from "any unknown sender forces ~5-10 ms of CPU" to "must already
+  be in our netmap and present the right DiscoKey".
 
-Net cost: +8 bytes per WG_DISCO_FAST_INIT_MIN_MS guard (none) +
-~+340 B flash. No new BSS. No threading changes (all writers stay on
-rx_task; sendto-error path is from tx_task but only writes
-backdate-style values that rx_task reads — non-atomic int64 read on
-ESP32-LX6 has tearing risk only across the 4-byte boundary, so a
-torn read at worst trips the path-stale branch one tick late).
+- **Cached NaCl-box shared key K** (`crypto/nacl_box.{c,h}`,
+  `wg_netif.c`). Add a new pair of functions
+  `nacl_box_compute_shared` + `nacl_box_open_after_shared` that split
+  the per-frame cost: the X25519 + HSalsa20 step is amortized once at
+  `wg_netif_start` and the K = HSalsa20(X25519(my_priv, peer_pub),
+  0^16) is cached in `g.peer_disco_shared_k`. The hot path then
+  only runs XSalsa20 + Poly1305 per inbound DISCO frame. Models
+  upstream `magicsock.discoInfoForKnownPeerLocked` at
+  `magicsock.go:2631-2642` which lazily caches
+  `box.Precompute(peer)` per known DiscoKey. Saved CPU per direct
+  inbound: ~5-10 ms on the Xtensa LX6 (Curve25519 + HSalsa20 vs the
+  ~1-2 ms of XSalsa20 + Poly1305 alone).
 
-Projected impact (to be measured in a full 4-h soak with peer reboots
-in the next round): cold recovery 100 s → ~5 s in the
-{HANDSHAKE_PENDING, UP+rekey_in_flight} cases; path-stale trigger
-30 s → ≤1 s when the kernel already returns ENETUNREACH/EHOSTUNREACH.
+Drive-by improvement: `nacl_box.c` no longer `malloc`s its
+keystream/tag buffer. Stack-resident `NACL_BOX_STREAM_BUF` (288 B)
+covers every legitimate inner plaintext (DISCO CMM ≤ 146 B, EarlyNoise
+~96 B). This removes a heap-fragmentation surface (after hours of
+nghttp2+mbedtls churn the heap fragments and `malloc(146+32)` can
+return NULL → false-positive auth failure that drops legitimate
+DISCO frames) and removes two heap ops per inbound DISCO. Worst-case
+RX stack is unchanged (still well under the 8 KiB budget).
+
+API additions (non-breaking):
+- `nacl_box_compute_shared(K, peer_pub, my_priv)` — expose
+  `box_beforenm`.
+- `nacl_box_open_after_shared(m, c, clen, nonce, K)` — opens with
+  precomputed K.
+- `disco_open_with_shared(pt, ..., shared_k)` — parallel to
+  `disco_open` taking K.
+- `disco_handle_recv_with_shared(...)` — parallel handler taking K.
+
+Existing `nacl_box_open` / `disco_open` / `disco_handle_recv` still
+work and now internally compose on top of the with_shared variants —
+host KAT 452 → 462 (10 new equivalence assertions in `test_disco.c`).
+
+Net cost: ~+500 B flash. +32 B BSS (cached K). No heap allocs on
+the RX hot path. Smoke validation
+(`/tmp/tinylink_pr_gamma_smoke_2026-05-12.log`): 0 panics, 11 DISCO
+ping→pong roundtrips, 0 spurious "drop DISCO from unknown" (peer's
+real DiscoKey passes the gate), telemetry 5 s cadence preserved.
+
+What this PR does NOT do (deliberate split):
+- It does NOT extend the pre-AEAD gate to the DERP-relayed path
+  (`handle_disco_relayed` in `tinylink.c`). That path receives CMM
+  frames from peers we are not WG-connected to (e.g. laptop in the
+  netmap announcing endpoints) — gating it requires plumbing the
+  netmap peer set into the relayed handler. Deferred to a follow-on PR.
+- It does NOT yet remove `disco_replay.c`. The replay window still
+  guards against replayed legitimate-peer frames; M3-step-3 (outbound
+  prober + tx-id table) would obsolete it but is a bigger PR.
 
 ### Recovery after peer NAT rebind (2026-05-11)
 

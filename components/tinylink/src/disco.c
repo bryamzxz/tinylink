@@ -147,6 +147,32 @@ size_t disco_open(uint8_t *pt, size_t pt_cap,
     return plen;
 }
 
+size_t disco_open_with_shared(uint8_t *pt, size_t pt_cap,
+                              uint8_t out_sender_pub[DISCO_KEY_LEN],
+                              const uint8_t *in, size_t ilen,
+                              const uint8_t shared_k[DISCO_KEY_LEN])
+{
+    if (pt == NULL || out_sender_pub == NULL ||
+        in == NULL || shared_k == NULL) {
+        return 0;
+    }
+    if (!disco_looks_like(in, ilen)) return 0;
+    if (ilen < DISCO_OVERHEAD) return 0;
+    const size_t plen = ilen - DISCO_OVERHEAD;
+    if (pt_cap < plen) return 0;
+
+    const uint8_t *sender = in + DISCO_MAGIC_LEN;
+    const uint8_t *nonce  = sender + DISCO_KEY_LEN;
+    const uint8_t *box    = nonce + DISCO_NONCE_LEN;
+    const size_t  boxlen  = DISCO_TAG_LEN + plen;
+
+    if (nacl_box_open_after_shared(pt, box, boxlen, nonce, shared_k) != 0) {
+        return 0;
+    }
+    memcpy(out_sender_pub, sender, DISCO_KEY_LEN);
+    return plen;
+}
+
 /* ------------------------------------------------------------------ */
 /* Parser                                                             */
 /* ------------------------------------------------------------------ */

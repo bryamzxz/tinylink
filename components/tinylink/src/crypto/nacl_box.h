@@ -37,6 +37,22 @@ int nacl_box_open(uint8_t *m,
                   const uint8_t peer_pub[NACL_BOX_KEY_LEN],
                   const uint8_t my_priv[NACL_BOX_KEY_LEN]);
 
+/* Compute the NaCl-box shared key K = HSalsa20(X25519(my_priv, peer_pub), 0^16).
+ * Once computed K can be cached and reused for all (peer_pub, my_priv) pairs,
+ * skipping the per-message X25519 + HSalsa20. Returns 0 on success, -1 if the
+ * X25519 produces an all-zero shared (low-order peer_pub). */
+int nacl_box_compute_shared(uint8_t k[NACL_BOX_KEY_LEN],
+                            const uint8_t peer_pub[NACL_BOX_KEY_LEN],
+                            const uint8_t my_priv[NACL_BOX_KEY_LEN]);
+
+/* Equivalent to nacl_box_open but starts from a precomputed shared key
+ * (from nacl_box_compute_shared). Saves the X25519 + HSalsa20 per call.
+ * Returns 0 on success, -1 on auth failure (constant-time tag compare). */
+int nacl_box_open_after_shared(uint8_t *m,
+                               const uint8_t *c, size_t clen,
+                               const uint8_t nonce[NACL_BOX_NONCE_LEN],
+                               const uint8_t k[NACL_BOX_KEY_LEN]);
+
 #ifdef __cplusplus
 }
 #endif

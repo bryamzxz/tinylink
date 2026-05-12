@@ -18,6 +18,7 @@
 
 #include "disco.h"
 #include "crypto/curve25519.h"
+#include "crypto/nacl_box.h"
 
 /* Stub esp_fill_random — deterministic xorshift, mirrors the pattern
  * used by test_wg_handshake.c. We never test cryptographic randomness
@@ -405,6 +406,58 @@ static void test_call_me_maybe_seal_open(void) {
                       cmm.endpoints[0].addr, 16);
 }
 
+/* Equivalence test: disco_open_with_shared on a precomputed K must
+ * produce the same plaintext + sender pubkey as disco_open with the
+ * fresh-DH path. Locks in the refactor so a future change to
+ * nacl_box_open_after_shared cannot diverge from nacl_box_open. */
+static void test_open_with_shared(void) {
+    uint8_t alice_priv[32], alice_pub[32];
+    uint8_t bob_priv[32],   bob_pub[32];
+    fails += ok("shared/alice-keygen",
+                curve25519_keypair(alice_priv, alice_pub) == 0);
+    fails += ok("shared/bob-keygen",
+                curve25519_keypair(bob_priv, bob_pub) == 0);
+
+    /* Encode a Ping inner. */
+    disco_ping_t pi = {0};
+    for (int i = 0; i < DISCO_TXID_LEN; i++) pi.txid[i] = (uint8_t)(0xa0 + i);
+    uint8_t pt[64];
+    size_t plen = disco_encode_ping(pt, sizeof(pt), &pi);
+
+    uint8_t nonce[DISCO_NONCE_LEN];
+    for (int i = 0; i < DISCO_NONCE_LEN; i++) nonce[i] = (uint8_t)(0x77 + i);
+
+    uint8_t wire[256];
+    size_t wlen = disco_seal(wire, sizeof(wire), pt, plen, nonce,
+                             alice_pub, bob_pub, alice_priv);
+    fails += ok("shared/seal-ok", wlen > 0);
+
+    /* Compute K = HSalsa20(X25519(bob_priv, alice_pub), 0^16). */
+    uint8_t k[32];
+    fails += ok("shared/compute-ok",
+                nacl_box_compute_shared(k, alice_pub, bob_priv) == 0);
+
+    /* Open with K vs open with priv must agree. */
+    uint8_t pt1[64], sender1[32];
+    uint8_t pt2[64], sender2[32];
+    size_t got1 = disco_open(pt1, sizeof(pt1), sender1,
+                             wire, wlen, bob_priv);
+    size_t got2 = disco_open_with_shared(pt2, sizeof(pt2), sender2,
+                                         wire, wlen, k);
+    fails += ok("shared/lens-equal",     got1 == got2 && got1 == plen);
+    fails += eq_bytes("shared/pt-equal", pt1, pt2, plen);
+    fails += eq_bytes("shared/sender-equal",
+                      sender1, sender2, DISCO_KEY_LEN);
+    fails += eq_bytes("shared/pt-matches-orig", pt1, pt, plen);
+
+    /* Tamper: flip one byte of the ciphertext. Both opens must fail. */
+    wire[wlen - 1] ^= 0x01;
+    got1 = disco_open(pt1, sizeof(pt1), sender1, wire, wlen, bob_priv);
+    got2 = disco_open_with_shared(pt2, sizeof(pt2), sender2, wire, wlen, k);
+    fails += ok("shared/tamper-disco_open-fail",         got1 == 0);
+    fails += ok("shared/tamper-disco_open_with_shared-fail", got2 == 0);
+}
+
 int main(void) {
     test_ping_basic();
     test_ping_with_nodekey_and_padding();
@@ -417,6 +470,7 @@ int main(void) {
     test_wrong_recipient();
     test_short_and_bad_magic();
     test_call_me_maybe_seal_open();
+    test_open_with_shared();
 
     if (fails == 0) printf("\nALL OK\n");
     else printf("\n%d FAIL(S)\n", fails);
