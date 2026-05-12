@@ -160,6 +160,33 @@ CONFIG_FREERTOS_HZ=100
 CONFIG_FREERTOS_USE_TRACE_FACILITY=y
 CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS=y
 
+# ---- IRAM-to-flash placement (production trim) -------------------------------
+# ESP32-WROOM-32E has only 128 KiB IRAM total; the post-η firmware was
+# at 80% IRAM (104 KiB used, 27 KiB free). These three knobs move
+# never-from-ISR code paths out of IRAM and into flash-XIP. Real-time
+# behaviour is unchanged because none of these functions are reachable
+# while flash is suspended (auto-suspend disabled in tinylink) or from
+# cache-disabled ISRs (we have no such ISR). Documented cost: WiFi
+# RX throughput drops a few percent because every RX packet now incurs
+# a flash cache miss on its first call. Tinylink's load (1 Hz
+# telemetry + ~6/min long-poll inbound + WG handshake every ~85 s) is
+# 3 orders of magnitude below the WiFi ceiling, so the throughput
+# hit is invisible.
+
+# WiFi RX path: the biggest single IRAM mover (~15 KiB).
+# CONFIG_ESP_WIFI_RX_IRAM_OPT is not set
+# FreeRTOS scheduler hot path: moves vTaskSwitchContext / xQueue*
+# helpers / xSemaphore* into flash. Safe because we never call them
+# from a cache-disabled ISR.
+CONFIG_FREERTOS_PLACE_FUNCTIONS_INTO_FLASH=y
+# RingBuffer helpers: tinylink doesn't have an ISR producer/consumer
+# for any RingBuffer.
+CONFIG_RINGBUF_PLACE_FUNCTIONS_INTO_FLASH=y
+# newlib lock helpers (`__retarget_lock_*`): only need to be in IRAM
+# if newlib state is mutated from a cache-disabled ISR, which tinylink
+# does not do (no SPI_FLASH_AUTO_SUSPEND, no IRAM_ATTR newlib touch).
+# CONFIG_LIBC_LOCKS_PLACE_IN_IRAM is not set
+
 # ---- TLS to control plane ----------------------------------------------------
 # tinylink talks ts2021 over TLS to controlplane.tailscale.com. We use
 # esp_tls on top of mbedtls and verify against the IDF certificate bundle.
