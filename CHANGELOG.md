@@ -7,6 +7,131 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### sdkconfig perf-trim round (2026-05-12 afternoon)
+
+Five `feat/perf-*` branches landed in one afternoon after the post-η
+4-h NAT-rebind soak was cut at t=35 min (clean baseline: 0 panics,
+telemetry @ 5 s, PR #75 `KeepAlive:true` confirmed on-wire). The
+round targets sdkconfig only — no `.c`/`.h` changes, no API surface
+change. Each PR was validated independently by a 60-120 s smoke
+(boot + register + initial netmap + ≥5 telemetry @ 5 s + 0 panic /
+assert / WDT) on the same INTELCOM-CARDONA WPA2+PMF AP, then
+pushed.
+
+| PR (branch) | Δ flash app | Δ DRAM | Δ IRAM | Other |
+|---|---:|---:|---:|---|
+| `feat/perf-error-strings-and-assertions` | **−75.6 KiB** | −2.6 KiB (83.78%→82.32%) | −3.4 KiB (79.64%→77.02%) | – |
+| `feat/perf-vfs-trim` | −9.4 KiB | 0 | −1.1 KiB | – |
+| `feat/perf-bootloader-log-none` | 0 | 0 | 0 | bootloader.bin −8 KiB (27808→19584) |
+| `feat/perf-wifi-station-only-no-wpa3` | **−74.6 KiB** | −0.3 KiB | −0.1 KiB | wifi assoc 10s→2.7s |
+| `feat/perf-iram-to-flash-moves` | +0.9 KiB | 0 | **−25.9 KiB (79.64%→59.42%)** | – |
+| **Combined (projected)** | **−158.7 KiB** | **−2.9 KiB (~82.2%)** | **−30.5 KiB (~56.4%)** | bootloader.bin −8 KiB |
+
+The IRAM relief is the headline: from ~80 % used down to ~56 %
+unlocks future work that needs IRAM (a second persistent TLS
+connection, selective IRAM_ATTR on hot WG paths, multi-peer state)
+without crowding wifi/rtos/lwip.
+
+**`feat/perf-error-strings-and-assertions`** flips three Kconfig
+knobs that all attack the panic + error-return path while leaving
+panic/abort behaviour itself intact:
+- `CONFIG_COMPILER_OPTIMIZATION_ASSERTIONS_SILENT=y` (level 2→1).
+  `assert()` still aborts on failure but does not print the message
+  + `__FILE__` + `__LINE__` literal. Re-enable to level 2 in a
+  "diag" overlay for field repro.
+- `CONFIG_COMPILER_OPTIMIZATION_CHECKS_SILENT=y`. ESP_RETURN_ON_ERROR
+  and ESP_GOTO_ON_ERROR drop their format-string parameter — error
+  goto/return still taken, only the per-callsite log line elided.
+  Removes a ~30 KiB cluster of "%s:%d at <fn>" literals scattered
+  across IDF + components.
+- `CONFIG_ESP_ERR_TO_NAME_LOOKUP not set`. Removes the ~7 KiB
+  `esp_err_msg_table[]` rodata; `esp_err_to_name()` now returns
+  "UNKNOWN ERROR" plus the hex code, which is still greppable
+  against `include/esp_err.h`.
+- `CONFIG_HAL_DEFAULT_ASSERTION_LEVEL` follows the compiler level
+  via `HAL_ASSERTION_EQUALS_SYSTEM=y`, so the HAL surface inherits
+  the new level=1 automatically.
+
+**`feat/perf-vfs-trim`** turns off `VFS_SUPPORT_TERMIOS` and
+`VFS_SUPPORT_DIR` (keeps `IO` for newlib stdout and `SELECT` for
+lwIP socket select). Audited that tinylink has no `opendir`,
+`readdir`, `tcsetattr`, `tcgetattr`, `isatty`, or any other VFS-
+TERMIOS/DIR caller. Drops the dispatch tables (~1 KiB IRAM) plus
+the backing implementations.
+
+**`feat/perf-bootloader-log-none`** sets `BOOTLOADER_LOG_LEVEL_NONE
+=y`. The bootloader's UART chatter (`ets Jul 29 2019…` reset banner,
+partition table dump, `boot:` lines, `esp_image: segment` per-
+segment load lines) disappears. The bootloader still runs the same
+code; only the log prints compile out. Bootloader binary slot is
+separate from the app partition so the app .bin is unchanged.
+Recovery on a stuck boot is still possible by re-flashing with a
+"diag" overlay that flips this back to INFO.
+
+**`feat/perf-wifi-station-only-no-wpa3`** drops three WiFi feature
+families that tinylink never exercises (audit: zero hits across
+`main/` + `components/` for `WIFI_MODE_AP`, `esp_wifi_set_mode
+(WIFI_MODE_AP)`, `softap_start`, `SAE`, `OWE`, `WPA3`):
+- `CONFIG_ESP_WIFI_SOFTAP_SUPPORT not set` — removes the AP-side
+  state machine (beacon scheduler, AID table, DTIM management on AP
+  side, AP-side WPA supplicant, AP-side WPS). The bulk of the
+  savings (~65 KiB of code only reachable through
+  `esp_wifi_set_mode(WIFI_MODE_AP)`).
+- `CONFIG_ESP_WIFI_ENABLE_WPA3_SAE not set` — drops the SAE-PWE
+  Dragonfly + SAE-H2E handshake variants (~10 KiB). The production
+  AP is WPA2-PSK-SHA256 + PMF, not WPA3-Personal.
+- `CONFIG_ESP_WIFI_ENABLE_WPA3_OWE_STA not set` — drops the OWE
+  handshake (open networks with encryption). Tinylink never
+  associates to open APs.
+
+Side effect: WiFi assoc is faster post-trim (2.7 s vs ~10 s in the
+post-η baseline) because there's less init code to walk.
+
+**`feat/perf-iram-to-flash-moves`** trades 0.9 KiB of net flash for
+25.9 KiB of IRAM by moving never-from-cache-disabled-ISR code paths
+into flash-XIP:
+- `CONFIG_ESP_WIFI_RX_IRAM_OPT not set` — biggest single mover
+  (~15 KiB). WiFi RX path runs from flash. Documented cost: WiFi
+  RX throughput drops a few percent on the first call after a quiet
+  window (flash cache miss). Tinylink's load (1 Hz telemetry +
+  ~6/min long-poll inbound + WG handshake every ~85 s) is 3 orders
+  of magnitude below the WiFi ceiling — invisible.
+- `CONFIG_FREERTOS_PLACE_FUNCTIONS_INTO_FLASH=y` — vTaskSwitchContext
+  / xQueue* / xSemaphore* into flash. Safe: tinylink never calls
+  FreeRTOS from a cache-disabled ISR, and SPI flash auto-suspend is
+  off (no IRAM-only critical sections).
+- `CONFIG_RINGBUF_PLACE_FUNCTIONS_INTO_FLASH=y` — no ISR
+  producer/consumer for any RingBuffer in tinylink (`esp_event`
+  queue's producer is a regular task).
+- `CONFIG_LIBC_LOCKS_PLACE_IN_IRAM not set` — newlib lock helpers
+  leave IRAM. Same justification: no cache-disabled ISR mutates
+  newlib state.
+
+**Skipped after measurement** (the optimization research had
+suggested these, but the build proved them wrong or harmful for
+this target):
+- `CONFIG_COMPILER_SAVE_RESTORE_LIBCALLS=y` — Kconfig does NOT
+  exist in IDF v5.5.4 for Xtensa LX6. It's a GCC RISC-V flag
+  (`-msave-restore`) only relevant for ESP32-C3/C6.
+- `CONFIG_MBEDTLS_PEM_WRITE_C not set` — Δ = 8 B (noise). Section
+  GC already strips PEM_WRITE because the cert-bundle path only
+  needs PEM_PARSE.
+- `CONFIG_MBEDTLS_ERROR_STRINGS not set` — Δ = 0. `nm tinylink.elf`
+  shows zero references to `mbedtls_strerror`; the table is
+  already dead-stripped by section GC.
+- `CONFIG_LOG_MAXIMUM_LEVEL=ESP_LOG_WARN` — IDF's Kconfig clamps
+  `LOG_MAXIMUM_LEVEL_X` with `depends on LOG_DEFAULT_LEVEL < N`,
+  so with `DEFAULT=INFO` the MAXIMUM is already 3. The only real
+  win is lowering DEFAULT to WARN, which strips every `ESP_LOGI`
+  call site — and breaks tinylink's serial-grep smoke (no more
+  "tinylink up", "telemetry tx seq", "netmap (initial)"). Deferred
+  until the smoke can verify operation via Servidor1 tcpdump
+  instead of UART logs.
+
+A 4-hour soak with the COMBINED set is the remaining validation.
+Each PR was 60-120 s smoke individually; cross-PR interaction is
+unlikely (no .c changes, no API surface) but unverified.
+
 ### WG persistent keepalive + long-poll `KeepAlive:true` (2026-05-12)
 
 Two upstream-tailscale alignment fixes for keepalive primitives at

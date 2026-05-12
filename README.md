@@ -6,7 +6,8 @@ written in pure C on **ESP-IDF v5.5.x**.
 ## Status
 
 **Stable — direct UDP + ICMP-over-WG live end-to-end on real hardware,
-M1–M7 all landed, perf round 2026-05-10 closed.**
+M1–M7 all landed, perf round 2026-05-10 closed, sdkconfig perf-trim
+round 2026-05-12 PM pushed to `feat/perf-*` branches (awaiting merge).**
 
 | Layer                          | State                                  |
 |--------------------------------|----------------------------------------|
@@ -20,6 +21,7 @@ M1–M7 all landed, perf round 2026-05-10 closed.**
 | ICMP over WG transport         | **done** — `ping <our-tailnet-ip>` flows |
 | Production hardening (M7)      | done — within scope                    |
 | Perf + power round (2026-05-10)| done — constant-time crypto, light-sleep PM, QIO@80, -O2 |
+| sdkconfig perf-trim (2026-05-12 PM) | 5 `feat/perf-*` PRs pushed: −158.7 KiB flash · DRAM −2.9 KiB · IRAM −30.5 KiB (80%→56%) |
 
 What works today, verified on real hardware:
 
@@ -61,6 +63,50 @@ The 60-min mega-ping regression gate (3.86 % loss / 154 ms avg from
 the M5 baseline) is preserved across every PR; on-device captures
 show 0 `bcn_timeout`, 0 disconnects, 0 panics, and exact 5 s
 telemetry cadence on every flash.
+
+## sdkconfig perf-trim round (2026-05-12 afternoon)
+
+Five `feat/perf-*` branches pushed to GitHub the same day as the
+audit-driven round closed. **sdkconfig only — no `.c`/`.h` changes,
+no API surface change.** Each PR validated by a 60-120 s smoke
+(boot + register + initial netmap + ≥5 telemetry @ 5 s + 0 panic).
+The CHANGELOG `[Unreleased]` section has the per-PR detail;
+one-liner summary:
+
+| PR (branch)                                | Δ flash app | Δ DRAM | Δ IRAM   |
+|--------------------------------------------|------------:|-------:|---------:|
+| `feat/perf-error-strings-and-assertions`   | −75.6 KiB   | −2.6 KiB | −3.4 KiB |
+| `feat/perf-vfs-trim`                       | −9.4 KiB    | 0      | −1.1 KiB |
+| `feat/perf-bootloader-log-none`            | 0 (bootloader.bin −8 KiB) | 0 | 0 |
+| `feat/perf-wifi-station-only-no-wpa3`      | −74.6 KiB   | −0.3 KiB | −0.1 KiB |
+| `feat/perf-iram-to-flash-moves`            | +0.9 KiB    | 0      | **−25.9 KiB** |
+| **Combined (projected)**                   | **−158.7 KiB** | **−2.9 KiB** | **−30.5 KiB** |
+
+The IRAM relief is the headline: 79.64 % → ~56.4 % unlocks future
+work that needs IRAM (a second persistent TLS connection, selective
+IRAM_ATTR on hot WG paths, multi-peer state) without crowding wifi/
+rtos/lwip.
+
+Skipped after measurement (research-suggested but no-op on this
+target):
+- `COMPILER_SAVE_RESTORE_LIBCALLS` — Kconfig does not exist for
+  Xtensa LX6 in IDF v5.5.4 (it's a GCC RISC-V flag, ESP32-C3/C6
+  only).
+- `MBEDTLS_PEM_WRITE_C off` — section GC already strips it (cert
+  bundle path needs only PEM_PARSE). Δ = 8 B.
+- `MBEDTLS_ERROR_STRINGS off` — `nm tinylink.elf` shows zero
+  references to `mbedtls_strerror`; the table is already dead-
+  stripped. Δ = 0.
+- `LOG_MAXIMUM_LEVEL=WARN` — Kconfig clamps `MAXIMUM ≥ DEFAULT`
+  (`depends on LOG_DEFAULT_LEVEL < N`), so the only real win is
+  dropping DEFAULT to WARN. That strips every `ESP_LOGI` call site
+  and breaks the serial-grep smoke (no more "tinylink up",
+  "telemetry tx seq", "netmap (initial)"). Deferred until the
+  smoke can verify operation via tcpdump on the sensor_app
+  receiver instead of UART logs.
+
+A 4-hour soak with the COMBINED set is the remaining validation
+gate before declaring the round closed.
 
 Intentionally out of scope (irreversible per-device operations —
 see `docs/ROADMAP.md` § "M7 — Hardening"):
@@ -229,6 +275,7 @@ Three properties that are non-obvious from a casual read of the code:
 | 6 | ICMP-over-WG end-to-end                         | done                  |
 | 7 | Production hardening                            | done — within scope   |
 | 8 | Perf + power round (2026-05-10)                 | done                  |
+| 9 | sdkconfig perf-trim round (2026-05-12 PM)       | 5 `feat/perf-*` PRs pushed, awaiting merge + combined soak |
 
 See [`docs/ROADMAP.md`](docs/ROADMAP.md) for the per-milestone breakdown.
 
