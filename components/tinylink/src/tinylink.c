@@ -22,6 +22,7 @@
 #include "derp_client.h"
 #include "disco.h"
 #include "disco_handler.h"
+#include "disco_prober.h"
 #include "keys.h"
 #include "esp_random.h"
 
@@ -518,6 +519,10 @@ static void prepunch_pings_to_peers(const tl_peer_t *peers, size_t n_peers)
                          errno, pi, ep);
                 continue;
             }
+            /* Record the outbound probe so handle_disco_direct can
+             * match the resulting Pong's txid (M3-step-3 binding). */
+            disco_prober_record(ping.txid, v4_be, (uint16_t)port,
+                                esp_timer_get_time());
 #endif
             total_sent++;
             ESP_LOGI(TAG, "prepunch ping → %s txid=%02x%02x%02x%02x..",
@@ -599,6 +604,10 @@ static void send_disco_pings_to_cmm_endpoints(const derp_event_t *e)
             ESP_LOGW(TAG, "cmm ping sendto: errno=%d", errno);
             continue;
         }
+        /* Record the outbound CMM-punch probe so the Pong's txid is
+         * matchable (M3-step-3). */
+        disco_prober_record(ping.txid, dst.sin_addr.s_addr, ep->port,
+                            esp_timer_get_time());
 #endif
         sent++;
         ESP_LOGI(TAG, "cmm punch ping → %u.%u.%u.%u:%u txid=%02x%02x%02x%02x..",

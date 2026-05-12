@@ -20,7 +20,7 @@ idf_component_register(
         "src/wg_demux.c"
         "src/disco.c"
         "src/disco_handler.c"
-        "src/disco_replay.c"
+        "src/disco_prober.c"
         "src/stun.c"
         "src/stun_probe.c"
         "src/derp.c"
