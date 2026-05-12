@@ -301,6 +301,17 @@ static struct {
     void                    *path_stale_cb_user;
     int64_t                  last_path_probe_us;
 
+    /* DERP-relay TX callback. When non-NULL and direct UDP looks
+     * unusable (RX-stale path OR sendto errno), the TX worker ships
+     * the encrypted WG transport frame through this callback instead
+     * of (or in addition to) direct sendto. See wg_netif.h for the
+     * full callback contract. */
+    wg_netif_relay_fn        relay_cb;
+    void                    *relay_cb_user;
+    uint64_t                 relayed_stale;
+    uint64_t                 relayed_errno;
+    uint64_t                 relay_errors;
+
     /* Anti-burst gate for the fast-INIT-on-pong-driven-roam fast path.
      * Tracks only fast-INITs (not all INITs) so that an rx_task tick
      * INIT to a stale endpoint immediately followed by a pong from a
@@ -949,12 +960,59 @@ static void tx_task_fn(void *arg)
                           pdMS_TO_TICKS(500)) != pdTRUE) {
             continue;
         }
+
+        /* Preemptive DERP relay when the path-stale watchdog has fired
+         * (RX has been silent past WG_RX_STALE_THRESHOLD_MS). Direct
+         * UDP is almost certainly going to a black hole at this point
+         * (peer NAT mapping aged out, peer changed WAN endpoint, etc.).
+         * Skipping the direct sendto when the relay accepts the bytes
+         * is the lossless-during-recovery property — without it, those
+         * 30 s of telemetry packets between path-goes-stale and
+         * peer-roam-handshake-completes are dropped silently. */
+        bool path_stale =
+            g.relay_cb != NULL &&
+            g.state == WG_NETIF_UP &&
+            g.last_transport_recv_us > 0 &&
+            (now_us() - g.last_transport_recv_us) >
+                (int64_t)WG_RX_STALE_THRESHOLD_MS * 1000LL;
+        if (path_stale) {
+            esp_err_t rerr = g.relay_cb(g.peer.peer_static_pub,
+                                        g.tx_worker_scratch.buf,
+                                        g.tx_worker_scratch.len,
+                                        g.relay_cb_user);
+            if (rerr == ESP_OK) {
+                g.relayed_stale++;
+                continue;  /* skip direct sendto: already shipped via relay */
+            }
+            /* relay declined (e.g. supervisor not connected) — fall
+             * through to direct sendto. Errors logged once per worker
+             * iteration cap below to avoid UART spam during sustained
+             * relay-unavailable windows. */
+            g.relay_errors++;
+        }
+
         ssize_t n = sendto(g.sock,
                            g.tx_worker_scratch.buf, g.tx_worker_scratch.len, 0,
                            (struct sockaddr *)&g.tx_worker_scratch.dst,
                            sizeof(g.tx_worker_scratch.dst));
         if (n < 0) {
             ESP_LOGW(TAG, "tx sendto: errno=%d", errno);
+            /* Direct UDP outright failed (ENETUNREACH, EHOSTUNREACH,
+             * EAGAIN under load). Try the relay as a last resort. The
+             * path_stale branch above already attempted it if relevant,
+             * so we only re-try here when path wasn't yet marked stale
+             * (i.e. errno arrived before the watchdog tripped). */
+            if (!path_stale && g.relay_cb != NULL) {
+                esp_err_t rerr = g.relay_cb(g.peer.peer_static_pub,
+                                            g.tx_worker_scratch.buf,
+                                            g.tx_worker_scratch.len,
+                                            g.relay_cb_user);
+                if (rerr == ESP_OK) {
+                    g.relayed_errno++;
+                } else {
+                    g.relay_errors++;
+                }
+            }
         }
     }
     if (g.tx_done_sem != NULL) {
@@ -1203,6 +1261,12 @@ void wg_netif_set_path_stale_callback(wg_netif_path_stale_cb_t cb, void *user)
     g.path_stale_cb_user = user;
 }
 
+void wg_netif_set_relay_callback(wg_netif_relay_fn cb, void *user)
+{
+    g.relay_cb      = cb;
+    g.relay_cb_user = user;
+}
+
 bool wg_netif_is_up(void)
 {
     return g.initialized && g.state == WG_NETIF_UP;
@@ -1248,6 +1312,21 @@ void wg_netif_stop(void)
 uint64_t wg_netif_get_tx_drops(void)
 {
     return g.tx_drops;
+}
+
+uint64_t wg_netif_get_relayed_stale(void)
+{
+    return g.relayed_stale;
+}
+
+uint64_t wg_netif_get_relayed_errno(void)
+{
+    return g.relayed_errno;
+}
+
+uint64_t wg_netif_get_relay_errors(void)
+{
+    return g.relay_errors;
 }
 
 int wg_netif_get_socket(void)

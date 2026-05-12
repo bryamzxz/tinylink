@@ -161,6 +161,29 @@ esp_err_t tinylink_derp_smoke(void);
  * fallback) once DISCO peer-pub bookkeeping exists. */
 esp_err_t tinylink_derp_supervised_start(void);
 
+/* Ship an opaque encrypted packet to `dst_node_pub` via the DERP
+ * supervisor's TLS conn. The caller (wg_netif's TX worker) treats the
+ * relay as fallback transport when the direct UDP path looks broken
+ * (RX-stale path or sendto errno). The packet bytes are NOT touched —
+ * they are already encrypted with the active WG session keys, and the
+ * DERP server treats them as opaque payload to forward to the peer's
+ * NodeKey.
+ *
+ * Returns:
+ *   ESP_OK on successful enqueue at the DERP TLS layer
+ *   ESP_ERR_INVALID_STATE if the supervisor isn't currently connected
+ *   ESP_ERR_NOT_SUPPORTED if CONFIG_TINYLINK_DERP_SUPERVISED=n
+ *   ESP_FAIL on TLS write error
+ *
+ * Wired into wg_netif via wg_netif_set_relay_callback at startup. The
+ * signature matches wg_netif_relay_fn so it can be registered
+ * directly. Safe to call from any task; serialized by the DERP client's
+ * write_lock mutex internally. */
+esp_err_t tinylink_relay_via_derp(const uint8_t *dst_node_pub,
+                                  const uint8_t *packet,
+                                  size_t len,
+                                  void *user);
+
 /* Bring up the WireGuard UDP socket early — bind only, no handshake.
  * Must be called after tinylink_init (so the local node identity is
  * loaded from NVS) and before tinylink_stun_probe (so STUN can probe
