@@ -850,6 +850,37 @@ static void derp_supervised_task(void *arg)
 
 #endif /* CONFIG_TINYLINK_DERP_SUPERVISED */
 
+esp_err_t tinylink_relay_via_derp(const uint8_t *dst_node_pub,
+                                  const uint8_t *packet,
+                                  size_t len,
+                                  void *user)
+{
+    (void)user;  /* registered with user=NULL; supervisor lives in BSS */
+#if CONFIG_TINYLINK_DERP_SUPERVISED
+    if (dst_node_pub == NULL || packet == NULL || len == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    /* derp_client_send_packet returns ESP_ERR_INVALID_STATE itself
+     * when the supervisor isn't connected; we short-circuit ahead of
+     * it here so the wg_netif TX worker can read the state in a
+     * single field-load and skip the function-call cost on the hot
+     * path when DERP isn't usable. The .connected flag is set/cleared
+     * by the supervisor task under its own mutex; reads outside that
+     * mutex are racy in the strict sense but the racy window is
+     * harmless — at worst we attempt one extra send (which fails fast
+     * inside derp_client_send_packet's own state guard) or skip one
+     * send that was about to be accepted (which the next packet
+     * picks up). */
+    if (!s_derp_sup.connected) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    return derp_client_send_packet(&s_derp_sup, dst_node_pub, packet, len);
+#else
+    (void)dst_node_pub; (void)packet; (void)len;
+    return ESP_ERR_NOT_SUPPORTED;
+#endif
+}
+
 esp_err_t tinylink_derp_supervised_start(void)
 {
 #if CONFIG_TINYLINK_DERP_SUPERVISED
@@ -1088,6 +1119,20 @@ esp_err_t tinylink_wg_socket_init(void)
      * until the first netmap arrives s_last_netmap_valid is false and
      * the callback is a no-op — safe. */
     wg_netif_set_path_stale_callback(on_wg_path_stale, NULL);
+
+    /* Wire DERP TX relay as the wg_netif TX-worker fallback. The
+     * callback short-circuits to ESP_ERR_INVALID_STATE when the
+     * supervisor isn't yet connected, so registering this BEFORE
+     * tinylink_derp_supervised_start has spawned the supervisor task
+     * is safe — the TX worker will just continue with direct sendto.
+     * Once the supervisor's TLS handshake completes (post-netmap),
+     * the callback starts accepting WG transport frames and the TX
+     * worker switches transports when the path-stale watchdog or
+     * sendto errno indicates direct UDP is broken. */
+#if CONFIG_TINYLINK_DERP_SUPERVISED
+    wg_netif_set_relay_callback(tinylink_relay_via_derp, NULL);
+#endif
+
     return ESP_OK;
 }
 

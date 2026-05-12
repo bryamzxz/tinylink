@@ -158,6 +158,57 @@ void wg_netif_stop(void);
  * priority + WiFi RF stalls). Read-only, monotonically increasing. */
 uint64_t wg_netif_get_tx_drops(void);
 
+/* Relay callback for the encrypted WG transport frame when the direct
+ * UDP path looks broken. Invoked by the TX worker BEFORE sendto if
+ * the RX-stale watchdog says no transport packet has decrypted in
+ * WG_RX_STALE_THRESHOLD_MS, AND ALSO after sendto if it returns
+ * errno != 0. The relay is responsible for shipping the bytes to the
+ * peer via an alternate transport (e.g. DERP); the WG transport bytes
+ * are already encrypted with the session keys, so the relay just
+ * carries opaque ciphertext.
+ *
+ * Arguments:
+ *   dst_node_pub:  the peer's WG static public key (also their NodeKey
+ *                  in Tailscale's model). Stable across the lifetime
+ *                  of the netif, sourced from the peer config passed
+ *                  to wg_netif_start.
+ *   packet:        encrypted WG transport frame bytes (data message
+ *                  type 0x04 + key idx + counter + ciphertext + tag).
+ *   len:           packet length.
+ *
+ * Returns ESP_OK to mean "relay accepted the bytes for transmission".
+ * Returns ESP_ERR_INVALID_STATE if the relay isn't currently usable
+ * (e.g. underlying TLS conn not up) — the TX worker treats this the
+ * same as no callback registered and falls back to direct sendto.
+ * Other non-OK returns are logged but otherwise treated identically.
+ *
+ * The callback may be invoked from the TX worker context — must not
+ * call back into wg_netif_send_plaintext or block longer than ~100 ms.
+ *
+ * cb=NULL (the default) disables all relay paths; the TX worker only
+ * does direct UDP sendto. */
+typedef esp_err_t (*wg_netif_relay_fn)(const uint8_t *dst_node_pub,
+                                       const uint8_t *packet,
+                                       size_t len,
+                                       void *user);
+void wg_netif_set_relay_callback(wg_netif_relay_fn cb, void *user);
+
+/* Cumulative count of WG transport frames that the TX worker shipped
+ * via the relay callback (DERP fallback) instead of — or in addition
+ * to — direct sendto. Two-counter split:
+ *
+ *   _stale: relay used because path-stale watchdog said direct
+ *           transport hadn't decrypted in WG_RX_STALE_THRESHOLD_MS.
+ *           Preemptive route; direct sendto skipped on relay success.
+ *   _errno: relay used because sendto returned errno != 0. Reactive
+ *           route; direct sendto was attempted first.
+ *
+ * Both counters increment only on relay success; relay failures count
+ * separately via wg_netif_get_relay_errors(). Read-only. */
+uint64_t wg_netif_get_relayed_stale(void);
+uint64_t wg_netif_get_relayed_errno(void);
+uint64_t wg_netif_get_relay_errors(void);
+
 /* Returns the bound UDP socket descriptor, or -1 if wg_netif has not
  * been initialized yet. Exposed so STUN can run on the same socket the
  * data plane uses — that way the public AddrPort the STUN response
