@@ -20,6 +20,7 @@
 #include "lwip/inet.h"
 #include "lwip/sockets.h"
 
+#include "crypto/nacl_box.h"
 #include "disco_handler.h"
 #include "disco_replay.h"
 #include "wg_demux.h"
@@ -185,6 +186,18 @@ static struct {
     struct wg_netif_local_config local;
     struct wg_netif_peer_config  peer;
     struct sockaddr_in            peer_addr;
+
+    /* Cached NaCl-box shared key K = HSalsa20(X25519(local.disco_priv,
+     * peer.peer_disco_pub), 0^16). Computed once in wg_netif_start when
+     * the peer is configured with a DiscoKey, reused for every inbound
+     * DISCO frame on the direct path — skipping the per-frame X25519 +
+     * HSalsa20 chain. Invalidated in wg_netif_stop. AEAD CPU-DoS
+     * defense follows upstream tailscale's pattern of caching shared
+     * keys per known peer (`wgengine/magicsock/magicsock.go`
+     * discoInfoForKnownPeerLocked at 2631-2642, sharedKey via
+     * `Shared` -> `box.Precompute`). */
+    uint8_t                       peer_disco_shared_k[WG_KEY_LEN];
+    bool                          peer_disco_shared_k_valid;
 
     struct wg_handshake_state    handshake;
     struct wg_transport_session  transport;
@@ -461,10 +474,41 @@ static void handle_disco_direct(const uint8_t *buf, size_t len,
     uint8_t txid[DISCO_TXID_LEN] = {0};
     /* peer_disco_pub used below as the roaming gate. */
 
-    size_t reply_len = disco_handle_recv(reply, sizeof(reply),
-                                         buf, len,
-                                         g.local.disco_priv, g.local.disco_pub,
-                                         &type, peer_disco_pub, txid);
+    /* Pre-AEAD DiscoKey gate. The DISCO wire format places the sender's
+     * 32-byte DiscoKey in the cleartext header at offset 6 (after the
+     * magic). When we know the WG peer's DiscoKey, drop frames sealed
+     * by any other key BEFORE running the Curve25519 + HSalsa20 +
+     * XSalsa20 + Poly1305 stack — those frames cannot legitimately
+     * roam the WG transport target and would only burn ~5-10 ms of CPU
+     * per packet under a UDP flood at our public AddrPort. Models
+     * upstream tailscale's `c.peerMap.knownPeerDiscoKey(sender)` check
+     * at `wgengine/magicsock/magicsock.go:2170-2177`. */
+    if (g.peer.has_peer_disco_pub &&
+        len >= DISCO_MAGIC_LEN + DISCO_KEY_LEN) {
+        const uint8_t *sender_pub = buf + DISCO_MAGIC_LEN;
+        if (memcmp(sender_pub, g.peer.peer_disco_pub, DISCO_KEY_LEN) != 0) {
+            ESP_LOGD(TAG,
+                "drop DISCO from unknown DiscoKey (pre-AEAD)");
+            return;
+        }
+    }
+
+    /* Hot path: use the cached shared K if available (skips X25519 +
+     * HSalsa20 per frame). Falls back to the per-frame compute path
+     * for the (rare) bringup where peer_disco_pub wasn't supplied. */
+    size_t reply_len;
+    if (g.peer_disco_shared_k_valid) {
+        reply_len = disco_handle_recv_with_shared(
+            reply, sizeof(reply), buf, len,
+            g.peer_disco_shared_k,
+            g.local.disco_priv, g.local.disco_pub,
+            &type, peer_disco_pub, txid);
+    } else {
+        reply_len = disco_handle_recv(
+            reply, sizeof(reply), buf, len,
+            g.local.disco_priv, g.local.disco_pub,
+            &type, peer_disco_pub, txid);
+    }
     if (type == 0) {
         /* Decrypt failed: someone sealed against the wrong DiscoKey, or
          * the bytes weren't actually a DISCO frame. Silent drop — magic
@@ -904,6 +948,24 @@ esp_err_t wg_netif_start(const struct wg_netif_peer_config *peer)
     memcpy(&g.peer, peer, sizeof(*peer));
     rebuild_peer_sockaddr();
 
+    /* Precompute the NaCl-box shared key for the direct DISCO RX hot
+     * path. Done here (not at init time) because the peer DiscoKey is
+     * peer config, not local config. If the X25519 yields zero (peer
+     * pub is low-order) we mark the cache invalid and fall through to
+     * the per-frame compute path — the same path also handles bringups
+     * that don't pass a DiscoKey at all (has_peer_disco_pub == false). */
+    g.peer_disco_shared_k_valid = false;
+    if (g.peer.has_peer_disco_pub) {
+        if (nacl_box_compute_shared(g.peer_disco_shared_k,
+                                    g.peer.peer_disco_pub,
+                                    g.local.disco_priv) == 0) {
+            g.peer_disco_shared_k_valid = true;
+        } else {
+            ESP_LOGW(TAG,
+                "peer_disco_pub low-order; shared-K cache disabled");
+        }
+    }
+
     g.handshake_attempt = 0;
     g.rekey_attempt = 0;
     g.rekey_in_flight = false;
@@ -1066,6 +1128,10 @@ void wg_netif_stop(void)
     }
     wg_handshake_scrub(&g.handshake);
     memset(&g.transport, 0, sizeof(g.transport));
+    /* Scrub the cached shared-K so a future wg_netif_start with a
+     * different peer DiscoKey can't accidentally reuse stale K. */
+    memset(g.peer_disco_shared_k, 0, sizeof(g.peer_disco_shared_k));
+    g.peer_disco_shared_k_valid = false;
     g.initialized = false;
 }
 

@@ -7,6 +7,82 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### DISCO AEAD CPU-DoS defense (2026-05-12)
+
+Closes the deferred item #4 from the 2026-05-10 security audit
+(`reference_tinylink_security_audit_2026_05_10`). Pre-#58 audit raised
+that an attacker who learned our public AddrPort could flood DISCO
+frames sealed by arbitrary DiscoKeys; each frame forced our recv path
+to run Curve25519 + HSalsa20 + XSalsa20 + Poly1305 (~5-10 ms per
+frame on Xtensa LX6) before the existing roam-allowed gate dropped
+the frame. PR #58's `disco_replay.c` mitigated replay-of-captured
+frames but did NOT mitigate fresh-nonce floods because those never
+hit the replay window — every frame still paid the full AEAD cost.
+
+Two layered defenses, modeled on upstream tailscale
+`wgengine/magicsock/magicsock.go::handleDiscoMessage`:
+
+- **Pre-AEAD DiscoKey gate** (`wg_netif.c::handle_disco_direct`).
+  Before invoking the codec, compare `frame[6..37]` (cleartext
+  senderDiscoPub) against `g.peer.peer_disco_pub` when we know the
+  peer's DiscoKey. Mismatch → drop pre-crypto. Upstream's analog is
+  `c.peerMap.knownPeerDiscoKey(sender)` at
+  `magicsock.go:2170-2177` which gates everything behind a
+  netmap-derived allow-list. Reduces the per-frame attacker budget
+  from "any unknown sender forces ~5-10 ms of CPU" to "must already
+  be in our netmap and present the right DiscoKey".
+
+- **Cached NaCl-box shared key K** (`crypto/nacl_box.{c,h}`,
+  `wg_netif.c`). Add a new pair of functions
+  `nacl_box_compute_shared` + `nacl_box_open_after_shared` that split
+  the per-frame cost: the X25519 + HSalsa20 step is amortized once at
+  `wg_netif_start` and the K = HSalsa20(X25519(my_priv, peer_pub),
+  0^16) is cached in `g.peer_disco_shared_k`. The hot path then
+  only runs XSalsa20 + Poly1305 per inbound DISCO frame. Models
+  upstream `magicsock.discoInfoForKnownPeerLocked` at
+  `magicsock.go:2631-2642` which lazily caches
+  `box.Precompute(peer)` per known DiscoKey. Saved CPU per direct
+  inbound: ~5-10 ms on the Xtensa LX6 (Curve25519 + HSalsa20 vs the
+  ~1-2 ms of XSalsa20 + Poly1305 alone).
+
+Drive-by improvement: `nacl_box.c` no longer `malloc`s its
+keystream/tag buffer. Stack-resident `NACL_BOX_STREAM_BUF` (288 B)
+covers every legitimate inner plaintext (DISCO CMM ≤ 146 B, EarlyNoise
+~96 B). This removes a heap-fragmentation surface (after hours of
+nghttp2+mbedtls churn the heap fragments and `malloc(146+32)` can
+return NULL → false-positive auth failure that drops legitimate
+DISCO frames) and removes two heap ops per inbound DISCO. Worst-case
+RX stack is unchanged (still well under the 8 KiB budget).
+
+API additions (non-breaking):
+- `nacl_box_compute_shared(K, peer_pub, my_priv)` — expose
+  `box_beforenm`.
+- `nacl_box_open_after_shared(m, c, clen, nonce, K)` — opens with
+  precomputed K.
+- `disco_open_with_shared(pt, ..., shared_k)` — parallel to
+  `disco_open` taking K.
+- `disco_handle_recv_with_shared(...)` — parallel handler taking K.
+
+Existing `nacl_box_open` / `disco_open` / `disco_handle_recv` still
+work and now internally compose on top of the with_shared variants —
+host KAT 452 → 462 (10 new equivalence assertions in `test_disco.c`).
+
+Net cost: ~+500 B flash. +32 B BSS (cached K). No heap allocs on
+the RX hot path. Smoke validation
+(`/tmp/tinylink_pr_gamma_smoke_2026-05-12.log`): 0 panics, 11 DISCO
+ping→pong roundtrips, 0 spurious "drop DISCO from unknown" (peer's
+real DiscoKey passes the gate), telemetry 5 s cadence preserved.
+
+What this PR does NOT do (deliberate split):
+- It does NOT extend the pre-AEAD gate to the DERP-relayed path
+  (`handle_disco_relayed` in `tinylink.c`). That path receives CMM
+  frames from peers we are not WG-connected to (e.g. laptop in the
+  netmap announcing endpoints) — gating it requires plumbing the
+  netmap peer set into the relayed handler. Deferred to a follow-on PR.
+- It does NOT yet remove `disco_replay.c`. The replay window still
+  guards against replayed legitimate-peer frames; M3-step-3 (outbound
+  prober + tx-id table) would obsolete it but is a bigger PR.
+
 ### Recovery after peer NAT rebind (2026-05-11)
 
 Four commits fixing a "sometimes the device doesn't reconnect after

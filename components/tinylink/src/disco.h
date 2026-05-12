@@ -127,6 +127,18 @@ size_t disco_open(uint8_t *pt, size_t pt_cap,
                   const uint8_t *in, size_t ilen,
                   const uint8_t my_priv[DISCO_KEY_LEN]);
 
+/* Open a wire-format disco frame using a precomputed shared key. Caller
+ * is responsible for verifying that the frame's cleartext sender pubkey
+ * matches the K it provides — disco_open_with_shared does not re-check
+ * (in particular, an attacker who knows our public AddrPort can send a
+ * frame with a chosen sender pubkey in the cleartext header that won't
+ * match our K → AEAD auth fails → frame is dropped). On success copies
+ * the sender pubkey from the cleartext header into out_sender_pub. */
+size_t disco_open_with_shared(uint8_t *pt, size_t pt_cap,
+                              uint8_t out_sender_pub[DISCO_KEY_LEN],
+                              const uint8_t *in, size_t ilen,
+                              const uint8_t shared_k[DISCO_KEY_LEN]);
+
 /* Parse an already-decrypted inner payload. Returns 0 on success,
  * -1 on unknown type / short / malformed. */
 int disco_parse(const uint8_t *pt, size_t plen, disco_msg_t *out);

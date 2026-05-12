@@ -73,6 +73,20 @@ size_t disco_handle_recv(uint8_t *out_reply, size_t out_cap,
                          uint8_t out_peer_disco_pub[DISCO_KEY_LEN],
                          uint8_t out_txid[DISCO_TXID_LEN]);
 
+/* Same as disco_handle_recv but uses a precomputed shared key for the
+ * inbound open (skipping the per-frame X25519+HSalsa20). my_disco_priv
+ * is still required for sealing the outbound Pong reply on the Ping
+ * path. Caller is responsible for invalidating shared_k whenever the
+ * peer DiscoKey or our disco_priv changes. */
+size_t disco_handle_recv_with_shared(uint8_t *out_reply, size_t out_cap,
+                                     const uint8_t *frame, size_t frame_len,
+                                     const uint8_t shared_k[DISCO_KEY_LEN],
+                                     const uint8_t my_disco_priv[DISCO_KEY_LEN],
+                                     const uint8_t my_disco_pub[DISCO_KEY_LEN],
+                                     disco_msg_type_t *out_type,
+                                     uint8_t out_peer_disco_pub[DISCO_KEY_LEN],
+                                     uint8_t out_txid[DISCO_TXID_LEN]);
+
 #ifdef __cplusplus
 }
 #endif
