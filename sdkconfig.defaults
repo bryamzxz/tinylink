@@ -149,6 +149,13 @@ CONFIG_NVS_ENCRYPTION=y
 CONFIG_LOG_DEFAULT_LEVEL_INFO=y
 CONFIG_LOG_COLORS=y
 CONFIG_LOG_TIMESTAMP_SOURCE_RTOS=y
+# Production bootloader: no UART chatter (`ets Jul 29 2019…`, partition
+# table dump, `boot:` lines, `esp_image:` segments). The bootloader
+# still runs the same code; only the log prints are compiled out via
+# Kconfig. Recovery on a stuck boot is still possible by re-flashing
+# with a "diag" overlay that flips this back to INFO. Saves ~3 KiB in
+# the bootloader binary slot (no impact on app slot).
+CONFIG_BOOTLOADER_LOG_LEVEL_NONE=y
 
 # ---- FreeRTOS ----------------------------------------------------------------
 # HZ=100 (10 ms tick granularity) reduces tick-ISR overhead vs the IDF
