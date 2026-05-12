@@ -485,6 +485,28 @@ static void test_full_handshake_roundtrip(void) {
         } else { printf("[full/wrong-msg-type] OK\n"); }
     }
 
+    /* Tamper detection: non-zero reserved bytes. Must be rejected before
+     * any crypto runs (mirrors wg_transport_decrypt's reserved check). */
+    {
+        struct wg_handshake_state ist5;
+        wg_handshake_init(&ist5, init_priv, init_pub, resp_pub, psk);
+        struct wg_msg_initiation init_msg5;
+        wg_handshake_create_initiation(&ist5, 0xCAFEBABE, &init_msg5);
+
+        struct sim_responder rsim5;
+        memcpy(rsim5.static_priv, resp_priv, 32);
+        memcpy(rsim5.static_pub,  resp_pub,  32);
+        struct wg_msg_response resp_msg5;
+        sim_resp_process_initiation_and_build_response(
+            &rsim5, &init_msg5, &resp_msg5, 0xFEEDF00D, psk);
+        resp_msg5.reserved[1] = 0x01;
+
+        uint8_t s[32], r[32]; uint32_t ri;
+        if (wg_handshake_process_response(&ist5, &resp_msg5, s, r, &ri) == 0) {
+            printf("[full/reserved-nonzero] FAIL: accepted\n"); fails++;
+        } else { printf("[full/reserved-nonzero] OK\n"); }
+    }
+
     wg_handshake_scrub(&ist);
 }
 

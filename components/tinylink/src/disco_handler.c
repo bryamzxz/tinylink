@@ -61,15 +61,22 @@ size_t disco_handle_recv(uint8_t *out_reply, size_t out_cap,
 
     if (out_type != NULL) *out_type = msg.type;
 
+    /* Populate out_txid for both PING and PONG so callers see the real
+     * transaction id (callers zero-init their txid buffer; without this
+     * a PONG would log txid=00000000). CMM has no txid. */
+    if (out_txid != NULL) {
+        if (msg.type == DISCO_TYPE_PING) {
+            memcpy(out_txid, msg.u.ping.txid, DISCO_TXID_LEN);
+        } else if (msg.type == DISCO_TYPE_PONG) {
+            memcpy(out_txid, msg.u.pong.txid, DISCO_TXID_LEN);
+        }
+    }
+
     /* Step 4: only Pings produce a reply right now. Pong matching for
      * our outbound probes lands when M3 step 3 wires up the prober;
      * CallMeMaybe handling lands with M5 step 3 magicsock fallback. */
     if (msg.type != DISCO_TYPE_PING) {
         return 0;
-    }
-
-    if (out_txid != NULL) {
-        memcpy(out_txid, msg.u.ping.txid, DISCO_TXID_LEN);
     }
 
     /* Build the Pong inner. src_addr / src_port left zero — see
