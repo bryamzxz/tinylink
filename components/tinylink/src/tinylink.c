@@ -744,6 +744,31 @@ static int derp_sup_event_cb(const derp_event_t *e, void *ctx)
 static void derp_supervised_task(void *arg)
 {
     (void)arg;
+
+    /* This task is spawned PRE-TLS-bringup (main.c) so the
+     * 12 KiB xTaskCreate stack lands on a still-pristine heap arena.
+     * But we delay the actual TLS handshake to the DERP relay until
+     * the long-poll's first netmap arrives. Two reasons documented
+     * by the previous wait-then-spawn shape, still valid:
+     *
+     *   1. Heap order: the long-poll's mbedtls cert verify needs ~12
+     *      KiB contiguous; opening our own TLS conn first fragments
+     *      that arena and the long-poll handshake fails.
+     *   2. Reachability: PreferredDERP region is only known after the
+     *      first MapResponse. Connecting earlier would dial the
+     *      Kconfig-fallback region; the netmap-resolved hostname (read
+     *      by the connect loop below from s_derp_host) wouldn't take
+     *      effect until the next reconnect cycle.
+     *
+     * 30 s is generous: register + first MapRequest typically lands
+     * in 5-10 s on this hardware. On timeout we still proceed to the
+     * connect loop — best-effort with the fallback host. */
+    esp_err_t wait_err = tinylink_wait_dataplane_ms(30000);
+    if (wait_err != ESP_OK) {
+        ESP_LOGW(TAG, "derp supervisor: dataplane wait timeout (0x%x) — "
+                      "connecting anyway", wait_err);
+    }
+
     /* Exponential backoff: start at the Kconfig base, double on each
      * consecutive connect failure, cap at 30 s (per WG/Tailscale
      * convention — long enough that we don't hammer a server that's
@@ -844,19 +869,18 @@ esp_err_t tinylink_derp_supervised_start(void)
      * tl_netmap_t in its frame; the supervisor doesn't, so half the
      * budget is enough.
      *
-     * On stock ESP32-WROOM-32E the heap at this point of bringup is
-     * already claimed by the long-poll's TLS conn + nghttp2 session
-     * + WG netif state, leaving < 12 KiB largest contiguous block.
-     * xTaskCreate returning ESP_ERR_NO_MEM here is the expected
-     * failure mode and the function returns the error so main.c
-     * can log + continue. The retry/backoff inside
-     * derp_supervised_task only fires once xTaskCreate succeeds —
-     * spawning the task itself requires heap we may not have. The
-     * static-stack alternative was tested on-device 2026-05-06 and
-     * pushed BSS past the DRAM threshold, crashing startup with
-     * `esp_startup_start_app: res == pdTRUE` assertion. Fixing this
-     * properly needs BSS shrink (streaming JSON parser frees ~48
-     * KiB) or PSRAM. */
+     * This start function MUST be called pre-TLS-bringup (i.e.
+     * BEFORE tinylink_register / dataplane_start / long_poll_start in
+     * main.c::bringup) so the heap arena is still pristine when
+     * xTaskCreate looks for 12 KiB contiguous. The task body itself
+     * waits internally for the first netmap before doing any TLS
+     * work, so this re-ordering does not regress the previous
+     * "DERP handshake after long-poll netmap" invariant — it only
+     * separates `xTaskCreate-needs-pristine-heap` from
+     * `DERP-TLS-needs-netmap`. Without the re-order, xTaskCreate
+     * fails with ESP_ERR_NO_MEM after long-poll fragments the
+     * arena and ALL DERP-dependent features stay dead (observed
+     * across 3 soaks pre-PR). */
     BaseType_t ok = xTaskCreate(derp_supervised_task, "tinylink_derp",
                                 12288, NULL, tskIDLE_PRIORITY + 3, NULL);
     if (ok != pdPASS) {
