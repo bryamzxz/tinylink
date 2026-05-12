@@ -7,6 +7,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Endpoint-updater exponential backoff (2026-05-12)
+
+Closes the "fixed 3 s retry" gap surfaced by the 2026-05-12
+comparative audit (Agent C against upstream
+`controlclient.Auto.updateRoutine`). Pre-PR behavior: any failure of
+`ts2021_connect` or `mapreq_push_endpoints` slept exactly
+`TINYLINK_EP_PUSH_ERR_BACKOFF_MS = 3000 ms` before re-enqueueing —
+sustained server unreachability meant 200 connect attempts in 10
+minutes, hammering the unreachable host with no headroom.
+
+Replace with an exponential capped backoff modeled on upstream
+`auto.go:57` `backoff.NewBackoff("updateRoutine", c.logf,
+30*time.Second)`:
+
+- Base: `TINYLINK_EP_PUSH_ERR_BACKOFF_BASE_MS = 1000` ms.
+- Cap:  `TINYLINK_EP_PUSH_ERR_BACKOFF_MAX_MS  = 30000` ms.
+- On each consecutive failure (either failure path), double until
+  hitting the cap.
+- On first success after one or more failures, reset to base —
+  matches `bo.Reset()` (auto.go:91-94) so a fresh outage starts the
+  ramp over.
+
+Result: in a 10-minute server outage the device now spends roughly
+`1 + 2 + 4 + 8 + 16 + 30·N` seconds across retries (≈ 20 attempts)
+instead of 200. The fastest path back to a healthy state on a
+transient blip is unchanged (1 s — actually faster than the pre-PR
+3 s).
+
+Cost: +4 bytes BSS (the int counter). No new logs in steady state
+(only logs on failure with the current backoff value).
+
+Smoke validation (`/tmp/tinylink_pr_zeta_smoke_2026-05-12.log`):
+0 panics, 0 errors, telemetry 5 s cadence preserved. Behaviour
+under sustained outage is not yet measured — full validation is
+the user's 4-h soak.
+
+What this PR does NOT do (deferred):
+- The CMM endpoint freshness cache (Agent B item #12) — marginal
+  benefit for the single-peer model (CMM endpoints merge into the
+  next netmap update), defer until a multi-peer scenario surfaces.
+- `trustBestAddrUntil` analog (Agent B item #8) — overlaps with
+  the RX-stale watchdog for tinylink's always-transmitting-telemetry
+  workload, defer.
+
 ### DISCO outbound prober + tx-id binding (M3 step 3, 2026-05-12)
 
 Closes deferred item #5 from the 2026-05-10 security audit. Pre-PR
