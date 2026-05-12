@@ -1129,7 +1129,16 @@ esp_err_t tinylink_wg_socket_init(void)
  * asserted in esp_startup_start_app). */
 #define TINYLINK_EP_PUSH_TASK_STACK    12288
 #define TINYLINK_EP_PUSH_WAIT_MS        2000
-#define TINYLINK_EP_PUSH_ERR_BACKOFF_MS 3000
+
+/* Exponential capped backoff for endpoint-push retries. Pre-PR the
+ * task slept a fixed 3 s on every failure, so a server unreachable
+ * for 10 minutes meant 200 connect attempts in that window. Mirrors
+ * upstream tailscale `controlclient.Auto.updateRoutine` which uses
+ * `backoff.NewBackoff("updateRoutine", c.logf, 30*time.Second)`
+ * (auto.go:57): start at 1 s, double on each consecutive failure
+ * until capped at 30 s, reset to the base on first success. */
+#define TINYLINK_EP_PUSH_ERR_BACKOFF_BASE_MS  1000
+#define TINYLINK_EP_PUSH_ERR_BACKOFF_MAX_MS   30000
 
 /* Stack + TCB in BSS — keeps the 12 KiB out of the heap arena that
  * long-poll's nghttp2 + mbedtls session init competes for. The only
@@ -1141,6 +1150,17 @@ static StackType_t  s_endpoint_push_stack[TINYLINK_EP_PUSH_TASK_STACK / sizeof(S
 static SemaphoreHandle_t s_endpoint_push_sem;
 static volatile uint32_t s_endpoint_push_gen;
 static uint32_t          s_endpoint_push_last_informed;
+static int               s_endpoint_push_backoff_ms =
+                            TINYLINK_EP_PUSH_ERR_BACKOFF_BASE_MS;
+
+/* Bump the backoff after a failure: double, cap at MAX_MS. */
+static void endpoint_push_bump_backoff(void)
+{
+    s_endpoint_push_backoff_ms *= 2;
+    if (s_endpoint_push_backoff_ms > TINYLINK_EP_PUSH_ERR_BACKOFF_MAX_MS) {
+        s_endpoint_push_backoff_ms = TINYLINK_EP_PUSH_ERR_BACKOFF_MAX_MS;
+    }
+}
 
 static void endpoint_updater_task(void *arg)
 {
@@ -1170,9 +1190,10 @@ static void endpoint_updater_task(void *arg)
                                        s_keys.machine_pub, s_control_pub);
         if (err != ESP_OK) {
             ESP_LOGW(TAG, "endpoint_push: ts2021_connect failed: 0x%x "
-                          "— retrying gen=%u",
-                     err, (unsigned)gen);
-            vTaskDelay(pdMS_TO_TICKS(TINYLINK_EP_PUSH_ERR_BACKOFF_MS));
+                          "— retrying gen=%u in %d ms",
+                     err, (unsigned)gen, s_endpoint_push_backoff_ms);
+            vTaskDelay(pdMS_TO_TICKS(s_endpoint_push_backoff_ms));
+            endpoint_push_bump_backoff();
             xSemaphoreGive(s_endpoint_push_sem);
             continue;
         }
@@ -1182,14 +1203,19 @@ static void endpoint_updater_task(void *arg)
 
         if (err != ESP_OK) {
             ESP_LOGW(TAG, "endpoint_push: mapreq_push_endpoints failed: "
-                          "0x%x — retrying gen=%u",
-                     err, (unsigned)gen);
-            vTaskDelay(pdMS_TO_TICKS(TINYLINK_EP_PUSH_ERR_BACKOFF_MS));
+                          "0x%x — retrying gen=%u in %d ms",
+                     err, (unsigned)gen, s_endpoint_push_backoff_ms);
+            vTaskDelay(pdMS_TO_TICKS(s_endpoint_push_backoff_ms));
+            endpoint_push_bump_backoff();
             xSemaphoreGive(s_endpoint_push_sem);
             continue;
         }
 
         s_endpoint_push_last_informed = gen;
+        /* Reset backoff on first success after a failure run — fresh
+         * outage gets the full 1→30 s ramp again, matches upstream
+         * auto.go:91-94 `bo.Reset()` after a successful SendUpdate. */
+        s_endpoint_push_backoff_ms = TINYLINK_EP_PUSH_ERR_BACKOFF_BASE_MS;
         uint8_t  ep_addr[4];
         uint16_t ep_port = 0;
         if (tinylink_get_public_endpoint(ep_addr, &ep_port)) {
