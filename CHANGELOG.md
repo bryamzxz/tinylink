@@ -7,32 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Diagnostic + defense-in-depth fixes (2026-05-12)
+### Faster NAT-rebind recovery (2026-05-12)
 
-Two small fixes uncovered by the 2026-05-12 comparative audit against
-upstream tailscale (`magicsock/endpoint.go`, `wgengine/`):
+Two follow-on changes to PR #66's NAT-rebind work. After that PR the
+device recovers from a peer NAT rebind in ~100 s (4-h soak observed 9
+roams + 4 cold recoveries). Profiling showed the recovery time is
+dominated by waiting for the rx_task tick's 5 s `WG_REKEY_TIMEOUT_MS`
+to fire INIT against the newly-roamed AddrPort, AND for the 30 s
+`WG_RX_STALE_THRESHOLD_MS` to even start probing alternate endpoints
+when the kernel already knows the path is gone (`ENETUNREACH /
+EHOSTUNREACH` on outbound `sendto`).
 
-- **`disco_handler.c`: populate `out_txid` for PONG inputs.** Before
-  this patch `disco_handle_recv` only wrote `out_txid` inside the PING
-  short-circuit, so an inbound PONG left the caller's zero-initialised
-  buffer untouched. The `wg_netif.c:551` log "disco pong (direct): …
-  txid=00000000.." was therefore always all-zeros even though the
-  probing was working. Diagnostic only; no behavioural change.
-  Locked in by new host-test assertion `pong-in/txid-extracted` in
-  `tools/test/test_disco_handler.c`.
+This PR adds two short-circuits, both modeled on upstream tailscale
+`wgengine/magicsock/endpoint.go`:
 
-- **`wg_handshake.c`: validate `reserved[3]` on inbound RESPONSE.**
-  `wg_handshake_process_response` only checked `message_type` and
-  `receiver_index`; `wg_transport_decrypt` already enforces the same
-  three reserved bytes on data frames (`wg_transport.c:157-159`), so
-  the asymmetry was an oversight. One-line check, no crypto cost
-  (runs pre-DH). Locked in by `full/reserved-nonzero` in
-  `tools/test/test_wg_handshake.c`.
+- **Fast INIT on pong-driven endpoint roam** (`wg_netif.c`,
+  `handle_disco_direct` PONG branch). When a DISCO pong from a new
+  AddrPort triggers `g.peer.peer_endpoint_*` swap, and we are in a
+  state where INIT is already wanted (`HANDSHAKE_PENDING` or `UP`
+  with `rekey_in_flight`), fire `kick_off_handshake()` or
+  `start_rekey()` immediately instead of waiting for the next rx_task
+  tick. Throttled via a dedicated `g.last_fast_init_us` so that a
+  regular tick-driven INIT to a stale endpoint at T=0 does NOT
+  suppress a productive fast-INIT triggered by a pong from a different
+  endpoint at T+50 ms — only back-to-back FAST INITs from
+  multiple-endpoint roam bursts (≤ 500 ms apart) get coalesced.
+  Models upstream's `endpoint.send` calling `sendDiscoPingsLocked`
+  unconditionally when `bestAddr` is stale (`endpoint.go:1052-1057`).
+- **Negative signal on `ENETUNREACH/EHOSTUNREACH`** (`wg_netif.c`,
+  `send_to_peer`). On those errnos backdate `last_transport_recv_us`
+  past the stale threshold AND zero `last_path_probe_us`, so the
+  rx_task's existing path-stale block fires the DISCO probe of
+  alternate peer endpoints on its next iteration (≤ 1 s).
+  Models upstream's `noteBadEndpoint` (`endpoint.go:1634-1641`)
+  which calls `clearBestAddrLocked` on `sendUDPBatch` errors
+  (`endpoint.go:1080-1082`).
 
-Host KAT count: 452 → 454. ESP32 image size unchanged. Validation:
-5-minute on-device serial capture showed 0 panics, telemetry flowing
-at 5 s cadence, DISCO ping→pong logs now show real txid (was already
-correct on PING-reply path; this PR fixes the PONG-receive path).
+Net cost: +8 bytes per WG_DISCO_FAST_INIT_MIN_MS guard (none) +
+~+340 B flash. No new BSS. No threading changes (all writers stay on
+rx_task; sendto-error path is from tx_task but only writes
+backdate-style values that rx_task reads — non-atomic int64 read on
+ESP32-LX6 has tearing risk only across the 4-byte boundary, so a
+torn read at worst trips the path-stale branch one tick late).
+
+Projected impact (to be measured in a full 4-h soak with peer reboots
+in the next round): cold recovery 100 s → ~5 s in the
+{HANDSHAKE_PENDING, UP+rekey_in_flight} cases; path-stale trigger
+30 s → ≤1 s when the kernel already returns ENETUNREACH/EHOSTUNREACH.
 
 ### Recovery after peer NAT rebind (2026-05-11)
 
