@@ -93,6 +93,41 @@ const char *tinylink_version_string(void)
     return k_version;
 }
 
+void tinylink_diag_dump_stacks(void)
+{
+    /* MAX_TASKS sized for the IDF default startup set (15-20 tasks:
+     * FreeRTOS internals + lwIP tcpip_thread + WiFi MAC + esp_timer +
+     * idle task per core + our 6-7 app tasks + esp_event loop). 32
+     * gives slack. If uxTaskGetSystemState returns 0 the buffer was
+     * too small — log a warning so we know to bump this constant
+     * rather than silently truncating the dump. */
+    enum { TL_DIAG_MAX_TASKS = 32 };
+    static TaskStatus_t snap[TL_DIAG_MAX_TASKS];
+    UBaseType_t n = uxTaskGetSystemState(snap, TL_DIAG_MAX_TASKS, NULL);
+    if (n == 0) {
+        ESP_LOGW(TAG, "stack diag: uxTaskGetSystemState overflow "
+                      "(>%d tasks — bump TL_DIAG_MAX_TASKS)",
+                 TL_DIAG_MAX_TASKS);
+        return;
+    }
+    ESP_LOGI(TAG, "stack diag: tasks=%u heap_free=%lu largest=%lu",
+             (unsigned)n,
+             (unsigned long)esp_get_free_heap_size(),
+             (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
+    for (UBaseType_t i = 0; i < n; i++) {
+        /* usStackHighWaterMark is in StackType_t units. The ESP-IDF
+         * Xtensa port defines StackType_t = uint8_t (1 B), so the
+         * returned value is already in bytes — DO NOT multiply by
+         * sizeof(StackType_t) / sizeof(unsigned long) etc. Verified
+         * empirically against on-target stack allocations: e.g.
+         * tinylink_tlm (alloc=4 KiB) reports hwm ≤ 4096; wg_tx
+         * (alloc=8 KiB) ≤ 8192; tinylink_lp (alloc=24 KiB) ≤ 24576. */
+        ESP_LOGI(TAG, "stack diag:   %-16s hwm=%5u B free",
+                 snap[i].pcTaskName,
+                 (unsigned)snap[i].usStackHighWaterMark);
+    }
+}
+
 esp_err_t tinylink_init(void)
 {
     esp_err_t err = keys_load_or_generate(&s_keys);

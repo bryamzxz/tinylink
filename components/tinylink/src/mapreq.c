@@ -434,6 +434,15 @@ esp_err_t mapresp_parse(const char *json, size_t json_len, tl_netmap_t *out)
         return ESP_ERR_INVALID_RESPONSE;
     }
 
+    /* Soak observability: per-parse jsmn token usage. Grep `mapresp peak`
+     * across a multi-hour log and take the max to size MAX_TOKENS down
+     * to (peak + 20 % margin). Currently MAX_TOKENS=2500 → 40 KiB BSS;
+     * 4-peer netmaps almost certainly use a small fraction of that. */
+#ifdef ESP_PLATFORM
+    ESP_LOGI(TAG, "mapresp peak: tokens=%d/%d body=%u",
+             n, MAX_TOKENS, (unsigned)json_len);
+#endif
+
     int fields = toks[0].size;
     int next = 1;
     for (int k = 0; k < fields; k++) {
@@ -805,6 +814,15 @@ static void stream_dispatch(stream_state_t *s)
                  has_node, has_peers, has_peers_changed,
                  has_peers_patch, has_peers_removed, has_keepalive);
     }
+
+    /* Soak observability: per-dispatch assembled body size. Grep
+     * `stream peak: body` over a multi-hour log and take the max to
+     * size RESPONSE_BUF_SZ (currently 32 KiB BSS for body_buf) down
+     * to (peak + 20 % margin). The frame[] hex line above also carries
+     * this number but as a hex-prefixed string; this is the explicit
+     * grep target. */
+    ESP_LOGI(TAG, "stream peak: body=%u (cap=%u)",
+             (unsigned)s->body_have, (unsigned)s->body_cap);
 
     static tl_netmap_t nm;  /* ~1 KiB; reused across messages */
     esp_err_t pe = mapresp_parse((const char *)s->body_buf, s->body_have, &nm);
