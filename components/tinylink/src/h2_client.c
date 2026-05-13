@@ -13,6 +13,7 @@
 #include "esp_log.h"
 #include "nghttp2/nghttp2.h"
 
+#include "h2_retry_after.h"
 #include "ts2021_client.h"
 
 static const char *TAG = "h2";
@@ -28,6 +29,7 @@ static void h2_request_reset(ts2021_conn_t *conn)
     conn->h2_stream_id     = -1;
     conn->h2_stream_closed = false;
     conn->h2_stream_error  = 0;
+    conn->h2_retry_after_s = 0;
     conn->h2_resp_buf      = NULL;
     conn->h2_resp_cap      = 0;
     conn->h2_resp_len      = 0;
@@ -141,6 +143,12 @@ static int header_cb(nghttp2_session *session, const nghttp2_frame *frame,
                        ? valuelen : sizeof(status_str) - 1;
         memcpy(status_str, value, copy);
         conn->h2_status = atoi(status_str);
+    } else if (namelen == 11 && memcmp(name, "retry-after", 11) == 0) {
+        /* HTTP/2 normalizes header names to lowercase (RFC 7540 §8.1.2),
+         * so an exact match is sufficient. Parser clamps and rejects
+         * malformed input — see h2_retry_after.h. Captured unconditionally
+         * here; callers gate on h2_status ∈ {429, 503}. */
+        conn->h2_retry_after_s = h2_parse_retry_after_seconds(value, valuelen);
     }
     return 0;
 }

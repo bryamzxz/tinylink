@@ -145,7 +145,13 @@ esp_err_t register_emit(ts2021_conn_t *conn,
     ESP_LOGI(TAG, "/machine/register status=%d body=%u bytes",
              status, (unsigned)resp_len);
     if (status != 200) {
-        ESP_LOGE(TAG, "control plane returned HTTP %d", status);
+        if (status == 429 || status == 503) {
+            ESP_LOGW(TAG, "control plane throttled register: HTTP %d "
+                          "(Retry-After=%d s)",
+                     status, conn->h2_retry_after_s);
+        } else {
+            ESP_LOGE(TAG, "control plane returned HTTP %d", status);
+        }
         return ESP_FAIL;
     }
     /* h2_drive_request consumes the full body even past resp_len, but
