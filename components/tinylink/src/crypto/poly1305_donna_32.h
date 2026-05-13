@@ -153,7 +153,6 @@ poly1305_finish(poly1305_context *ctx, unsigned char mac[16]) {
     poly1305_state_internal_t *st = (poly1305_state_internal_t *)ctx;
     unsigned long h0,h1,h2,h3,h4,c;
     unsigned long g0,g1,g2,g3,g4;
-    unsigned long long f;
     unsigned long mask;
 
     /* process the remaining block */
@@ -207,11 +206,56 @@ poly1305_finish(poly1305_context *ctx, unsigned char mac[16]) {
     h2 = ((h2 >> 12) | (h3 << 14)) & 0xffffffff;
     h3 = ((h3 >> 18) | (h4 <<  8)) & 0xffffffff;
 
-    /* mac = (h + pad) % (2^128) */
-    f = (unsigned long long)h0 + st->pad[0]            ; h0 = (unsigned long)f;
-    f = (unsigned long long)h1 + st->pad[1] + (f >> 32); h1 = (unsigned long)f;
-    f = (unsigned long long)h2 + st->pad[2] + (f >> 32); h2 = (unsigned long)f;
-    f = (unsigned long long)h3 + st->pad[3] + (f >> 32); h3 = (unsigned long)f;
+    /* mac = (h + pad) % (2^128)
+     *
+     * tinylink change: the upstream donna code uses a 64-bit `f` to fold
+     * the carry between adds (`f >> 32` extracts the carry-out of step n
+     * for step n+1). On Xtensa LX6 — which has no add-with-carry
+     * instruction — GCC compiles each `(uint64_t)h + pad + (f >> 32)`
+     * down to a 32-bit `add.n` followed by `bgeu Aresult, Aoperand` to
+     * detect overflow. That conditional branch is taken on values
+     * derived from the secret state (message ⊕ key), and disassembly of
+     * post-#51 builds confirmed five `bgeu` sites in the carry region
+     * (see docs/SECURITY-MODEL.md). Net leak: ~4 bits per MAC of
+     * timing-side-channel information.
+     *
+     * Rewrite as a branch-free 32-bit chain. Standard carry-out for an
+     * unsigned add `sum = a + b + cin` (cin ∈ {0,1}, Hacker's Delight
+     * §2-13):
+     *
+     *   cout = ((a & b) | ((a | b) & ~sum)) >> 31
+     *
+     * which compiles to a straight run of `and`/`or`/`xor`/`srli` on
+     * LX6 — zero conditional branches. The output mac bytes are bit-
+     * identical to the upstream donna version (verified against RFC
+     * 8439 §2.5.2 + the streamed-chunk KAT in tools/test/test_poly1305). */
+    {
+        uint32_t a, b, sum, carry;
+
+        a     = (uint32_t)h0;
+        b     = (uint32_t)st->pad[0];
+        sum   = a + b;
+        carry = ((a & b) | ((a | b) & ~sum)) >> 31;
+        h0    = sum;
+
+        a     = (uint32_t)h1;
+        b     = (uint32_t)st->pad[1];
+        sum   = a + b + carry;
+        carry = ((a & b) | ((a | b) & ~sum)) >> 31;
+        h1    = sum;
+
+        a     = (uint32_t)h2;
+        b     = (uint32_t)st->pad[2];
+        sum   = a + b + carry;
+        carry = ((a & b) | ((a | b) & ~sum)) >> 31;
+        h2    = sum;
+
+        a     = (uint32_t)h3;
+        b     = (uint32_t)st->pad[3];
+        sum   = a + b + carry;
+        /* Final carry-out is discarded — MAC is computed mod 2^128. */
+        h3    = sum;
+    }
 
     U32TO8(mac +  0, h0);
     U32TO8(mac +  4, h1);
