@@ -187,25 +187,44 @@ the optimizer, particularly after the AEAD perf sprint that added
   that bit is the result the protocol caller receives — no
   side-channel beyond what the protocol itself reveals.
 
-**One residual finding, low severity:**
+**Closed in this review pass (was the residual finding):**
 
-- **`poly1305_finish` 64-bit-add carry detection** (offsets 0xef,
-  0xfc, 0x105, 0x110, 0x119): the four `f = (uint64_t)h[i] +
-  st->pad[i] + (f >> 32)` lines compile, on Xtensa LX6, to a 32-bit
-  `add.n` followed by `bgeu Aresult, Aoperand, +5` to detect the
-  carry — the LX6 ISA has no add-with-carry, so GCC falls back to the
-  branched form. The branch decides the carry between two
-  secret-derived 32-bit values (`h` from message+key, `pad` from key).
-  Leak: 1 bit per add × 4 adds = 4 bits per MAC. Threat-model impact:
-  - WG keys rotate every 110 s (initiator-side proactive rekey, see
-    `ARCHITECTURE.md` § "WireGuard handshake lifecycle"), so an
-    attacker has at most ~22 MACs per session worth of timing samples
-    on the same key.
-  - The branch is the difference between one taken and one
-    not-taken path in straight-line code — a sub-cycle timing delta
-    on the LX6 (no branch predictor, no caches that could amplify).
-  - Mitigation would require either inline asm or a
-    branch-free carry idiom (`carry = ((a | b) >> 31) & ~(c >> 31) |
-    ((a >> 31) & (b >> 31))`) plus re-validation against the host
-    KAT. Not landed in this review pass; tracked as a residual risk
-    rather than a blocker.
+- **`poly1305_finish` 64-bit-add carry detection** — fixed by PR replacing
+  the four `f = (uint64_t)h[i] + st->pad[i] + (f >> 32)` lines in
+  `crypto/poly1305_donna_32.h` with an explicit 32-bit branch-free
+  carry chain.
+
+  Pre-fix shape: the chain compiled, on Xtensa LX6, to a 32-bit `add.n`
+  followed by `bgeu Aresult, Aoperand, +5` to detect the carry — the LX6
+  ISA has no add-with-carry, so GCC fell back to the branched form. The
+  branch was data-dependent on secret-derived 32-bit values (`h` from
+  message+key, `pad` from key). Net leak: ~4 bits per MAC of
+  timing-side-channel information, bounded by WG key rotation (≤ ~22
+  MACs per same key per the 110 s proactive rekey window).
+
+  Post-fix: rewrite uses the standard branch-free unsigned-add carry
+  identity (Hacker's Delight §2-13):
+
+  ```c
+  sum   = a + b + carry_in;
+  carry = ((a & b) | ((a | b) & ~sum)) >> 31;
+  ```
+
+  which compiles to a straight run of `and`/`or`/`xor`/`srli`/`extui`
+  ops — no conditional branches. Verified by disassembling the post-fix
+  `poly1305_finish`: zero `bgeu`/`bltu`/`beq` etc. in the final-add
+  region (the two remaining branches in the prologue are
+  `if (st->leftover)` and the zero-padding loop bound — both gated on
+  *public* message-length pattern, not key/message bits). The four
+  `extui` ops counted across the function map to: 1× existing
+  `(g4 >> 31) - 1` mask select (line ~191, already documented clean
+  above) + 3× new carry-out extractions for steps 0..2 (step 3 discards
+  carry-out, since the MAC is mod 2^128).
+
+  Correctness re-validated against `tools/test/test_poly1305`
+  (RFC 8439 §2.5.2 one-shot + streamed-chunk vectors) — bit-identical
+  MAC output. Full downstream KAT (`make test`: chacha20poly1305, WG
+  transport encrypt/decrypt, DISCO seal/open, DERP frame codec) passes
+  unchanged: 493 OK, 0 FAIL.
+
+  Cost: +48 B flash on the ESP32 build; zero DRAM/IRAM change.
