@@ -1281,16 +1281,47 @@ esp_err_t tinylink_wg_socket_init(void)
  * difference vs the legacy code is reliability: we're running in a
  * persistent task, so the stack is already there. */
 
-/* Stack: 12 KiB. ts2021_connect peak (~10 KiB mbedtls cert verify +
- * ~1 KiB Noise IK + locals) fits with ~1 KiB margin. Tighter than the
- * legacy 24 KiB but adequate because this task ONLY does
- * connect+push+close — no nghttp2 streaming state, no concurrent work.
- * 12 KiB also keeps the BSS impact bounded (every KiB we lock in BSS
- * comes directly out of the DRAM heap arena WiFi init draws from —
- * verified 2026-05-11_validate_optB_v2 where 16 KiB tipped DRAM under
- * the WiFi driver's contiguous-block requirement and the boot CPU
- * asserted in esp_startup_start_app). */
-#define TINYLINK_EP_PUSH_TASK_STACK    12288
+/* Stack: 11 KiB. Trimmed from 12 KiB on the basis of soak-instrumentation
+ * (PR #97 onwards) which measured the lifetime peak across the boot-time
+ * endpoint push at 9 264 B used (out of the prior 12 KiB allocation).
+ * That push exercises the deepest code path this task ever runs:
+ * ts2021_connect (mbedtls cert verify against LE E8 → ISRG Root X2 P-384
+ * chain + ECDHE-RSA-AES128-GCM key agreement) + Noise IK init + POST
+ * the discovered endpoint. The original 12 KiB was sized for an
+ * estimated ~10 KiB mbedtls peak + ~1 KiB Noise IK + locals = ~11 KiB
+ * with ~1 KiB margin; the measurement showed the actual peak is
+ * ~1.7 KiB BELOW that estimate, so trimming 1 KiB still preserves
+ * ~2 KiB (≈ 22 %) margin over measured — 2× the author's original
+ * tolerance.
+ *
+ * Margin trade-off note: 22 % is tighter than the other stack trims in
+ * this audit round (DERP #98 at 108 %, LP #99 at 86 %, stun_r #100 at
+ * 70 %). The justification is twofold:
+ *
+ *   1. The endpoint-push code path is structurally simple: a single
+ *      synchronous connect+push+close. No streaming, no nghttp2 frame
+ *      machine, no concurrent work. The mbedtls handshake is the
+ *      dominant frame and is deterministic across reconnects (same
+ *      cert chain, same suite, same allocation pattern).
+ *
+ *   2. The soak only captured ONE push (the boot-time initial
+ *      endpoint announcement) — STUN re-probes at t=300 s + t=600 s
+ *      reported the same endpoint, so no follow-up push fired. A
+ *      multi-hour soak with WAN-flap (per the CHANGELOG.md:107-117
+ *      recipe) would exercise NAT-rebind-triggered pushes during
+ *      heap fragmentation and is the proper validation budget for
+ *      further trimming (11 → 10 KiB). Until then 11 KiB is the
+ *      conservative landing zone.
+ *
+ * Indirect heap benefit: this stack lives in BSS (s_endpoint_push_stack
+ * is StaticTask_t-backed via xTaskCreateStatic, see below). Per the
+ * author's prior comment, "every KiB we lock in BSS comes directly out
+ * of the DRAM heap arena WiFi init draws from — verified
+ * 2026-05-11_validate_optB_v2 where 16 KiB tipped DRAM under the WiFi
+ * driver's contiguous-block requirement and the boot CPU asserted in
+ * esp_startup_start_app". Trimming 1 KiB from this BSS allocation
+ * gives ~1 KiB back to WiFi's contiguous-block budget at boot. */
+#define TINYLINK_EP_PUSH_TASK_STACK    11264
 #define TINYLINK_EP_PUSH_WAIT_MS        2000
 
 /* Exponential capped backoff for endpoint-push retries. Pre-PR the
