@@ -466,6 +466,16 @@ CONFIG_ESP_MAIN_TASK_STACK_SIZE=24576
 CONFIG_ESP_TIMER_TASK_STACK_SIZE=6144
 
 # ---- Production: silent error paths ------------------------------------------
+# newlib-nano printf/scanf — drops %lld/%llu/%lf support, recovers the
+# big chunk of flash that _vfprintf_r / _svfprintf_r / __ssvfscanf_r
+# carry (measured ~11 KiB / 11 KiB / 8.6 KiB pre-trim in the post-curves
+# ELF, plus _strtod_l + _dtoa_r at ~3 KiB each). Enabled together with
+# the conversion of all 11 %lld/%llu call-sites in this branch to
+# either (unsigned long)+%lu (for bounded counters) or 32-bit hex high/
+# low split (for genuine 64-bit values: TAI64N timestamps, Tailscale
+# node ID). %f / %g also unsupported under nano — tinylink never logs
+# floats (telemetry prints temp as %ld.%03ld manually), so safe.
+CONFIG_LIBC_NEWLIB_NANO_FORMAT=y
 # Asserts still abort (level=1) but don't print the message string + __FILE__
 # + __LINE__. Same crash safety, ~10 KiB flash saved across the error-handling
 # surface. Re-enable (=2) in a "diag" overlay if field-debugging a panic.
