@@ -92,7 +92,7 @@ static esp_err_t build_request_body(const tinylink_keys_t *keys,
 
     cJSON_AddStringToObject(hostinfo, "OS", "esp32");
     cJSON_AddStringToObject(hostinfo, "Hostname", CONFIG_TINYLINK_DEVICE_HOSTNAME);
-    cJSON_AddStringToObject(hostinfo, "IPNVersion", "0.1.0-tinylink");
+    cJSON_AddStringToObject(hostinfo, "IPNVersion", TINYLINK_IPN_VERSION);
     cJSON_AddItemToObject(root, "Hostinfo", hostinfo);
 
     cJSON_AddStringToObject(auth, "AuthKey", auth_key);

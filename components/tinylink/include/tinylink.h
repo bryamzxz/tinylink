@@ -13,9 +13,27 @@
 extern "C" {
 #endif
 
-#define TINYLINK_VERSION_MAJOR 0
-#define TINYLINK_VERSION_MINOR 1
+#define TINYLINK_VERSION_MAJOR 1
+#define TINYLINK_VERSION_MINOR 0
 #define TINYLINK_VERSION_PATCH 0
+
+/* String forms derived from the integer components above so a future
+ * bump only touches the three #defines. Adjacent-string-literal
+ * concatenation lets these be used inside printf-style format strings
+ * too (see mapreq.c HostInfo template).
+ *
+ * Control-plane side effect: tailscale derives `tsReleaseTrack` from
+ * the MINOR component via `version.IsUnstableBuild` in
+ * tailscale/version/prop.go — minor%2==1 → unstable, even → stable. So
+ * a MINOR bump 1→0 (or any even value) flips the admin panel from
+ * "unstable" to "stable" automatically. */
+#define TINYLINK_STR_HELPER(x) #x
+#define TINYLINK_STR(x) TINYLINK_STR_HELPER(x)
+#define TINYLINK_VERSION_STRING                                         \
+    TINYLINK_STR(TINYLINK_VERSION_MAJOR) "."                            \
+    TINYLINK_STR(TINYLINK_VERSION_MINOR) "."                            \
+    TINYLINK_STR(TINYLINK_VERSION_PATCH)
+#define TINYLINK_IPN_VERSION TINYLINK_VERSION_STRING "-tinylink"
 
 #define TINYLINK_KEY_LEN 32
 
