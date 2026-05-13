@@ -584,7 +584,8 @@ static int build_request_body(const tinylink_keys_t *keys,
         "\"Stream\":%s,"
         "\"KeepAlive\":true,"
         "%s"
-        "\"Hostinfo\":{\"OS\":\"esp32\",\"Hostname\":\"%s\",\"IPNVersion\":\"0.1.0-tinylink\"%s}"
+        "\"Hostinfo\":{\"OS\":\"esp32\",\"Hostname\":\"%s\","
+        "\"IPNVersion\":\"" TINYLINK_IPN_VERSION "\"%s}"
         "%s"
         "}",
         node_key_hex, disco_key_hex,

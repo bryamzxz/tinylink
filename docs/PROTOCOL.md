@@ -112,7 +112,7 @@ JSON body, fields used today:
 | `NLKey`             | `"nlpub:" + 64 zeros` for M1 (TKA disabled). Real Ed25519 NLPrivate generation lands in M7 hardening. The field has no `omitempty` upstream, so it must be present. |
 | `Hostinfo.OS`       | `"esp32"`.                                         |
 | `Hostinfo.Hostname` | from `CONFIG_TINYLINK_DEVICE_HOSTNAME`.            |
-| `Hostinfo.IPNVersion` | `"0.1.0-tinylink"`.                              |
+| `Hostinfo.IPNVersion` | `TINYLINK_IPN_VERSION` (currently `"1.0.0-tinylink"`; derived from `TINYLINK_VERSION_{MAJOR,MINOR,PATCH}` in `components/tinylink/include/tinylink.h`). Tailscale parses the `MAJOR.MINOR.PATCH` prefix and labels the node `tsReleaseTrack=stable` when MINOR is even, `unstable` when odd (see `tailscale/version/prop.go::IsUnstableBuild`). |
 | `Auth.AuthKey`      | `tskey-auth-...` from NVS `tl_creds/auth_key`.     |
 | `Timestamp`         | RFC3339 from the device clock.                     |
 | `Expiry`            | `"0001-01-01T00:00:00Z"` (no expiry).              |

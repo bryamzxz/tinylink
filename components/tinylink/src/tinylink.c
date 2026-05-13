@@ -41,15 +41,9 @@
 #include "wg_netif.h"
 #include "wg_proto.h"
 
-#define STR_HELPER(x) #x
-#define STR(x) STR_HELPER(x)
-
 static const char *TAG = "tinylink";
 
-static const char k_version[] =
-    STR(TINYLINK_VERSION_MAJOR) "."
-    STR(TINYLINK_VERSION_MINOR) "."
-    STR(TINYLINK_VERSION_PATCH);
+static const char k_version[] = TINYLINK_VERSION_STRING;
 
 static tinylink_keys_t s_keys;
 static uint8_t         s_control_pub[32];
