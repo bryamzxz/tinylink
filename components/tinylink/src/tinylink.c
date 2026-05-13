@@ -185,10 +185,15 @@ esp_err_t tinylink_tai64n_floor_init(void)
     }
 
     wg_tai64n_init(persisted, reservation, tai64n_persist_cb);
-    ESP_LOGI(TAG, "tai64n_floor: persisted=%llu reservation=%llu (chunk=%llu)",
-             (unsigned long long)persisted,
-             (unsigned long long)reservation,
-             (unsigned long long)WG_TAI64N_RESERVE_CHUNK_SECS);
+    /* TAI64N timestamps span 64 bits genuinely (nanoseconds since the
+     * TAI epoch); high/low hex split is the canonical NEWLIB_NANO_FORMAT-
+     * compatible way to log them without dragging in full %llu. */
+    ESP_LOGI(TAG, "tai64n_floor: persisted=0x%08lx%08lx reservation=0x%08lx%08lx (chunk=%lu)",
+             (unsigned long)(persisted    >> 32),
+             (unsigned long)(persisted    & 0xFFFFFFFFul),
+             (unsigned long)(reservation  >> 32),
+             (unsigned long)(reservation  & 0xFFFFFFFFul),
+             (unsigned long)WG_TAI64N_RESERVE_CHUNK_SECS);
     return ESP_OK;
 }
 
@@ -706,17 +711,17 @@ static int derp_sup_event_cb(const derp_event_t *e, void *ctx)
     switch (e->kind) {
     case DERP_EVT_RECV_PACKET:
         st->recv_packets++;
-        ESP_LOGI(TAG, "derp recv: src=%02x%02x..%02x%02x len=%u (total=%llu)",
+        ESP_LOGI(TAG, "derp recv: src=%02x%02x..%02x%02x len=%u (total=%lu)",
                  e->src_pub[0], e->src_pub[1],
                  e->src_pub[DERP_KEY_LEN - 2], e->src_pub[DERP_KEY_LEN - 1],
                  (unsigned)e->data_len,
-                 (unsigned long long)st->recv_packets);
+                 (unsigned long)st->recv_packets);
         handle_disco_relayed(e, st);
         break;
     case DERP_EVT_KEEPALIVE:
         st->keepalives++;
-        ESP_LOGD(TAG, "derp keepalive (total=%llu)",
-                 (unsigned long long)st->keepalives);
+        ESP_LOGD(TAG, "derp keepalive (total=%lu)",
+                 (unsigned long)st->keepalives);
         break;
     case DERP_EVT_PEER_PRESENT:
         st->peer_present++;
@@ -844,17 +849,17 @@ static void derp_supervised_task(void *arg)
             ESP_LOGW(TAG, "derp supervisor: server restarting — backoff");
         } else {
             ESP_LOGW(TAG, "derp supervisor: stream ended 0x%x — "
-                          "stats recv=%llu disco_pongs=%llu "
-                          "disco_pings_seen=%llu disco_cmms=%llu "
-                          "send_err=%llu keepalives=%llu wg_tx_drops=%llu",
+                          "stats recv=%lu disco_pongs=%lu "
+                          "disco_pings_seen=%lu disco_cmms=%lu "
+                          "send_err=%lu keepalives=%lu wg_tx_drops=%lu",
                      err,
-                     (unsigned long long)stats.recv_packets,
-                     (unsigned long long)stats.disco_pings_answered,
-                     (unsigned long long)stats.disco_pongs_seen,
-                     (unsigned long long)stats.disco_cmms_seen,
-                     (unsigned long long)stats.disco_send_errors,
-                     (unsigned long long)stats.keepalives,
-                     (unsigned long long)wg_netif_get_tx_drops());
+                     (unsigned long)stats.recv_packets,
+                     (unsigned long)stats.disco_pings_answered,
+                     (unsigned long)stats.disco_pongs_seen,
+                     (unsigned long)stats.disco_cmms_seen,
+                     (unsigned long)stats.disco_send_errors,
+                     (unsigned long)stats.keepalives,
+                     (unsigned long)wg_netif_get_tx_drops());
         }
         derp_client_close(&s_derp_sup);
         vTaskDelay(backoff);
@@ -1009,8 +1014,12 @@ static esp_err_t long_poll_handler(const tl_netmap_t *nm, void *ctx)
     update_derp_host_from_netmap(nm);
 #endif
     if (!s_dataplane_started) {
-        ESP_LOGI(TAG, "netmap (initial): self.id=%llu peers=%u derp_regions=%u",
-                 (unsigned long long)nm->self_id,
+        /* Tailscale node ID is genuinely 64-bit (random server-assigned);
+         * high/low hex split keeps it printable under NEWLIB_NANO_FORMAT
+         * without dragging in full %llu. */
+        ESP_LOGI(TAG, "netmap (initial): self.id=0x%08lx%08lx peers=%u derp_regions=%u",
+                 (unsigned long)(nm->self_id >> 32),
+                 (unsigned long)(nm->self_id & 0xFFFFFFFFul),
                  (unsigned)nm->n_peers,
                  (unsigned)nm->n_derp_regions);
         esp_err_t err = wg_dataplane_start(&s_keys, nm);

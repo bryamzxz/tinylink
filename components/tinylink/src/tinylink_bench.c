@@ -67,11 +67,14 @@ static void bench_one(const char *label, size_t mlen, uint32_t iters)
     uint32_t enc_mbps = (uint32_t)((uint64_t)mlen * iters / (uint64_t)enc_us);
     uint32_t dec_mbps = (uint32_t)((uint64_t)mlen * iters / (uint64_t)dec_us);
 
+    /* enc_us / dec_us are int64_t per esp_timer_get_time(); for benches
+     * with iters ≤ 10_000 and per-call cost ≲ 1 ms the totals stay well
+     * under 2^31 µs (~36 min), so a long cast is safe and avoids %lld. */
     ESP_LOGI(TAG,
-             "%-7s mlen=%4u iters=%4u | enc %lld us total, %u ns/call, %u ns/B, %u MB/s | dec %lld us total, %u ns/call, %u ns/B, %u MB/s | dec_rc=%d",
+             "%-7s mlen=%4u iters=%4u | enc %ld us total, %u ns/call, %u ns/B, %u MB/s | dec %ld us total, %u ns/call, %u ns/B, %u MB/s | dec_rc=%d",
              label, (unsigned)mlen, (unsigned)iters,
-             (long long)enc_us, (unsigned)enc_ns_per_call, (unsigned)enc_ns_per_byte, (unsigned)enc_mbps,
-             (long long)dec_us, (unsigned)dec_ns_per_call, (unsigned)dec_ns_per_byte, (unsigned)dec_mbps,
+             (long)enc_us, (unsigned)enc_ns_per_call, (unsigned)enc_ns_per_byte, (unsigned)enc_mbps,
+             (long)dec_us, (unsigned)dec_ns_per_call, (unsigned)dec_ns_per_byte, (unsigned)dec_mbps,
              rc);
 }
 

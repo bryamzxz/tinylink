@@ -424,9 +424,9 @@ static int start_rekey(void)
 {
     if (build_and_send_init() != 0) return -1;
     g.rekey_attempt++;
-    ESP_LOGI(TAG, "rekey init sent (attempt %d, idx=0x%08x, age=%llds)",
+    ESP_LOGI(TAG, "rekey init sent (attempt %d, idx=0x%08x, age=%lds)",
              g.rekey_attempt, (unsigned)g.local_index,
-             (long long)((now_us() - g.last_handshake_completed_us) / 1000000LL));
+             (long)((now_us() - g.last_handshake_completed_us) / 1000000LL));
     return 0;
 }
 
@@ -1234,8 +1234,8 @@ esp_err_t wg_netif_send_plaintext(const uint8_t *pkt, size_t len)
          * UART doesn't spam if backlog runs hot for a sustained burst. */
         uint64_t prev = g.tx_drops++;
         if ((prev % WG_TX_DROP_LOG_EVERY) == 0) {
-            ESP_LOGW(TAG, "tx queue full — dropped frame (total=%llu)",
-                     (unsigned long long)g.tx_drops);
+            ESP_LOGW(TAG, "tx queue full — dropped frame (total=%lu)",
+                     (unsigned long)g.tx_drops);
         }
         return ESP_FAIL;
     }

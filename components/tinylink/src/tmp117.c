@@ -137,7 +137,7 @@ esp_err_t tmp117_read_milli_c(int32_t *out_milli_c)
     int64_t milli = ((int64_t)signed_raw * TMP117_LSB_NUMER) /
                     TMP117_LSB_DENOM;
     if (milli < TMP117_MIN_MILLI_C || milli > TMP117_MAX_MILLI_C) {
-        ESP_LOGW(TAG, "reading out of range: %lld m°C", (long long)milli);
+        ESP_LOGW(TAG, "reading out of range: %ld m°C", (long)milli);
         return ESP_ERR_INVALID_RESPONSE;
     }
     *out_milli_c = (int32_t)milli;
