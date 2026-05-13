@@ -408,6 +408,37 @@ CONFIG_FREERTOS_HZ=100
 # lwIP tcpip pin above. Cheap, no measurable downside on a low-load
 # device.
 CONFIG_FREERTOS_TIMER_TASK_AFFINITY_CPU0=y
+
+# ---- lwIP tcpip_thread stack — bump from IDF default 3 KiB ------------------
+# 30-min soak 2026-05-13 caught a stack overflow in the `tiT` task
+# (the lwIP tcpip_thread) under heap-pressure conditions: Servidor1's
+# WG responder was unreachable for several minutes, ESP32-side
+# handshake retries piled up, telemetry sendto started returning ENOMEM
+# (errno=12) on the UDP socket — lwIP's error-recovery path in tcpip_
+# input/tcpip_callback used more stack than the happy path, and at the
+# default 3 KiB allocation `tiT` was already at 95.5 % steady-state
+# (`hwm = 140 B free` consistent across the soak's diag dumps).
+# Result: explicit FreeRTOS stack-overflow canary fire + reset.
+#
+#   Panic signature:  ***ERROR*** A stack overflow in task tiT has
+#                     been detected.
+#   Steady-state peak: 2 932 B used out of 3 072 alloc
+#   Crash scenario:   deeper code path under ENOMEM / heap-fragment-
+#                     ation conditions, exact peak unknown but > 3 072 B
+#
+# 4 608 B (4.5 KiB) gives 1 676 B margin (57 %) over the observed
+# steady-state peak. That's the cushion size adopted as a baseline for
+# the stack trims in this round; same target works in reverse for
+# bumping a too-tight stack. Cost: ~1.5 KiB more heap at lwIP init —
+# acceptable trade vs the device-resets-itself-in-the-field failure
+# mode.
+#
+# Not bumping to 5 KiB or 6 KiB because the underlying cause (heap
+# pressure from extended WG-responder-unreachable cascade) is fixable
+# upstream — once Servidor1 stays reachable, the deep path doesn't fire.
+# 4.5 KiB is sized for the rare residual scenario where Servidor1 burps
+# briefly.
+CONFIG_LWIP_TCPIP_TASK_STACK_SIZE=4608
 CONFIG_FREERTOS_USE_TRACE_FACILITY=y
 CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS=y
 
