@@ -84,6 +84,16 @@ static void drop_control_conn(void)
     s_conn_open = false;
 }
 
+/* Snapshotted from s_conn.h2_retry_after_s inside tinylink_register, before
+ * drop_control_conn tears the conn down. Lets the boot register loop
+ * (main.c) read the hint without holding a reference to the live conn. */
+static int s_last_register_retry_after_s;
+
+int tinylink_last_retry_after_s(void)
+{
+    return s_last_register_retry_after_s;
+}
+
 const char *tinylink_version_string(void)
 {
     return k_version;
@@ -209,6 +219,10 @@ esp_err_t tinylink_register(void)
 {
     if (!s_initialized) return ESP_ERR_INVALID_STATE;
 
+    /* Reset the per-attempt retry-after hint so a TLS / NVS / network
+     * failure path doesn't surface a stale value from a previous 429. */
+    s_last_register_retry_after_s = 0;
+
     char auth_key[128];
     esp_err_t err = read_auth_key(auth_key, sizeof(auth_key));
     if (err != ESP_OK) return err;
@@ -221,6 +235,11 @@ esp_err_t tinylink_register(void)
     }
 
     err = register_emit(&s_conn, &s_keys, auth_key);
+
+    /* Snapshot before drop_control_conn — register.c parses Retry-After
+     * on 429/503 into s_conn; drop_control_conn calls ts2021_close
+     * which may zero per-conn state on a future change. */
+    s_last_register_retry_after_s = s_conn.h2_retry_after_s;
 
     /* Scrub the auth key in stack memory. mbedtls_platform_zeroize is a
      * compiler-barrier'd zero (won't be optimized out as a dead store the
@@ -1041,18 +1060,29 @@ static void long_poll_task(void *arg)
     (void)arg;
     ESP_LOGI(TAG, "long-poll task: starting");
     for (;;) {
+        int retry_after_s = 0;
         esp_err_t err = ensure_control_conn();
         if (err == ESP_OK) {
             err = mapreq_run_stream(&s_conn, &s_keys, long_poll_handler, NULL);
             /* Stream ended: either the server closed it (idle / ping
-             * failure / restart) or our side errored. Drop the conn so
-             * the next iteration brings up a fresh one. */
+             * failure / restart) or our side errored. Capture any
+             * Retry-After hint from the response (mapreq.c parses it on
+             * 429/503) before drop_control_conn clears the conn. */
+            retry_after_s = s_conn.h2_retry_after_s;
             ESP_LOGW(TAG, "long-poll stream ended: 0x%x — reconnecting", err);
             drop_control_conn();
         } else {
             ESP_LOGW(TAG, "long-poll connect failed: 0x%x — backing off", err);
         }
-        vTaskDelay(pdMS_TO_TICKS(CONFIG_TINYLINK_REGISTER_RETRY_MS));
+
+        uint32_t delay_ms = (retry_after_s > 0)
+                              ? (uint32_t)retry_after_s * 1000U
+                              : (uint32_t)CONFIG_TINYLINK_REGISTER_RETRY_MS;
+        if (retry_after_s > 0) {
+            ESP_LOGI(TAG, "long-poll: honoring server Retry-After=%d s",
+                     retry_after_s);
+        }
+        vTaskDelay(pdMS_TO_TICKS(delay_ms));
     }
 }
 
@@ -1268,14 +1298,31 @@ static void endpoint_updater_task(void *arg)
         }
 
         err = mapreq_push_endpoints(&conn, &s_keys);
+        /* Capture Retry-After (set by mapreq.c on 429/503) before
+         * ts2021_close, since the conn's per-stream state is gone after
+         * close. Only meaningful when err != ESP_OK with status 429/503;
+         * for all other paths mapreq_push_endpoints either leaves the
+         * field at the h2_request_reset baseline of 0, or sets it from
+         * a header that we'll only act on when err signals failure. */
+        int retry_after_s = conn.h2_retry_after_s;
         ts2021_close(&conn);
 
         if (err != ESP_OK) {
+            uint32_t delay_ms = (retry_after_s > 0)
+                                  ? (uint32_t)retry_after_s * 1000U
+                                  : (uint32_t)s_endpoint_push_backoff_ms;
             ESP_LOGW(TAG, "endpoint_push: mapreq_push_endpoints failed: "
-                          "0x%x — retrying gen=%u in %d ms",
-                     err, (unsigned)gen, s_endpoint_push_backoff_ms);
-            vTaskDelay(pdMS_TO_TICKS(s_endpoint_push_backoff_ms));
-            endpoint_push_bump_backoff();
+                          "0x%x — retrying gen=%u in %u ms%s",
+                     err, (unsigned)gen, (unsigned)delay_ms,
+                     retry_after_s > 0 ? " (server Retry-After)" : "");
+            vTaskDelay(pdMS_TO_TICKS(delay_ms));
+            /* When the server gave us a specific Retry-After, don't ramp
+             * the exponential backoff on top of it — the server told us
+             * exactly how long to wait, and our internal escalation
+             * would double-count and likely overshoot on the next round. */
+            if (retry_after_s == 0) {
+                endpoint_push_bump_backoff();
+            }
             xSemaphoreGive(s_endpoint_push_sem);
             continue;
         }

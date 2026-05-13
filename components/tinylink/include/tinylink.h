@@ -63,6 +63,15 @@ esp_err_t tinylink_tai64n_floor_init(void);
  */
 esp_err_t tinylink_register(void);
 
+/* Returns the most recent Retry-After hint (RFC 7231 §7.1.3
+ * delta-seconds, clamped into [1, 300]) parsed from the last response
+ * on the shared control-plane ts2021 conn — typically the most recent
+ * tinylink_register() attempt. Returns 0 if the last response had no
+ * Retry-After header, the value was malformed, or no request has
+ * completed yet. Callers use this to pace boot-loop retries when the
+ * control plane signals a 429/503. */
+int tinylink_last_retry_after_s(void);
+
 /* Read-only view of the current node identities, useful for debugging and
  * for M2+ which needs the NodeKey for the WireGuard data plane. The output
  * struct is filled even if tinylink_register() has not been called yet —

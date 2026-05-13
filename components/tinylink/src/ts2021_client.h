@@ -123,6 +123,14 @@ typedef struct {
     bool     h2_stream_closed;
     int      h2_stream_error;
 
+    /* Parsed Retry-After header value in seconds (RFC 7231 §7.1.3
+     * delta-seconds form, clamped into [1, 300] by
+     * h2_parse_retry_after_seconds). 0 means the response had no
+     * Retry-After or the value was malformed; caller falls back to its
+     * own backoff. Only meaningful when h2_status is 429 or 503 — other
+     * statuses ignore the field. */
+    int      h2_retry_after_s;
+
     /* Response collection (one-shot mode). Pointer is borrowed from
      * the h2_post_json caller — this struct is NOT the owner. */
     uint8_t *h2_resp_buf;

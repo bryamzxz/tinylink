@@ -630,8 +630,14 @@ esp_err_t mapreq_push_endpoints(ts2021_conn_t *conn,
     ESP_LOGI(TAG, "endpoint push: HTTP %d (resp %u B)",
              status, (unsigned)resp_len);
     if (status != 200) {
-        ESP_LOGE(TAG, "endpoint push HTTP %d (server rejected lite update)",
-                 status);
+        if (status == 429 || status == 503) {
+            ESP_LOGW(TAG, "endpoint push throttled: HTTP %d "
+                          "(Retry-After=%d s)",
+                     status, conn->h2_retry_after_s);
+        } else {
+            ESP_LOGE(TAG, "endpoint push HTTP %d (server rejected lite update)",
+                     status);
+        }
         return ESP_FAIL;
     }
     return ESP_OK;
@@ -678,9 +684,15 @@ esp_err_t mapreq_fetch_once(ts2021_conn_t *conn,
     ESP_LOGI(TAG, "/machine/map status=%d body=%u bytes",
              status, (unsigned)resp_len);
     if (status != 200) {
-        ESP_LOGE(TAG, "control plane returned HTTP %d: %.*s",
-                 status, (int)(resp_len > 200 ? 200 : resp_len),
-                 (const char *)resp);
+        if (status == 429 || status == 503) {
+            ESP_LOGW(TAG, "/machine/map throttled: HTTP %d "
+                          "(Retry-After=%d s)",
+                     status, conn->h2_retry_after_s);
+        } else {
+            ESP_LOGE(TAG, "control plane returned HTTP %d: %.*s",
+                     status, (int)(resp_len > 200 ? 200 : resp_len),
+                     (const char *)resp);
+        }
         free(resp);
         return ESP_FAIL;
     }
@@ -891,7 +903,13 @@ esp_err_t mapreq_run_stream(ts2021_conn_t *conn,
         return err;
     }
     if (status != 200) {
-        ESP_LOGE(TAG, "/machine/map (stream) returned HTTP %d", status);
+        if (status == 429 || status == 503) {
+            ESP_LOGW(TAG, "/machine/map (stream) throttled: HTTP %d "
+                          "(Retry-After=%d s)",
+                     status, conn->h2_retry_after_s);
+        } else {
+            ESP_LOGE(TAG, "/machine/map (stream) returned HTTP %d", status);
+        }
         return ESP_FAIL;
     }
     ESP_LOGI(TAG, "/machine/map stream closed cleanly");

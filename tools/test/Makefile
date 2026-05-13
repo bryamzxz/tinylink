@@ -20,7 +20,7 @@ TARGETS := test_blake2s test_curve25519 test_mapresp \
            test_chacha20 test_poly1305 test_chacha20poly1305 \
            test_hkdf_noise test_wg_handshake test_wg_transport \
            test_wg_demux test_disco test_stun test_tls_io test_derp \
-           test_disco_handler test_disco_prober
+           test_disco_handler test_disco_prober test_retry_after
 
 all: $(TARGETS)
 
@@ -154,6 +154,12 @@ test_derp: test_derp.c \
 	    $(CRYPTO)/nacl_box.c $(CRYPTO)/curve25519.c $(CRYPTO)/curve25519_donna.c $(CRYPTO)/salsa20.c \
 	    $(CRYPTO)/poly1305_donna.c host_mbedtls_shim.c
 
+# HTTP/2 Retry-After header parser (RFC 7231 §7.1.3 delta-seconds).
+# Header-only; the test just compiles the .c against the .h. No platform
+# deps, no crypto.
+test_retry_after: test_retry_after.c $(TL_SRC)/h2_retry_after.h
+	$(CC) $(CFLAGS) -I$(TL_SRC) -o $@ test_retry_after.c
+
 # WG transport (data plane) — encrypt/decrypt + RFC 6479 anti-replay.
 test_wg_transport: test_wg_transport.c \
                   $(TL_SRC)/wg_transport.c $(TL_SRC)/wg_transport.h \
@@ -171,13 +177,15 @@ test_wg_transport: test_wg_transport.c \
         test_chacha20.run test_poly1305.run test_chacha20poly1305.run \
         test_hkdf_noise.run test_wg_handshake.run test_wg_transport.run \
         test_wg_demux.run test_disco.run test_stun.run test_tls_io.run \
-        test_derp.run test_disco_handler.run test_disco_prober.run clean
+        test_derp.run test_disco_handler.run test_disco_prober.run \
+        test_retry_after.run clean
 
 test: test_blake2s.run test_curve25519.run test_mapresp.run \
       test_chacha20.run test_poly1305.run test_chacha20poly1305.run \
       test_hkdf_noise.run test_wg_handshake.run test_wg_transport.run \
       test_wg_demux.run test_disco.run test_stun.run test_tls_io.run \
-      test_derp.run test_disco_handler.run test_disco_prober.run
+      test_derp.run test_disco_handler.run test_disco_prober.run \
+      test_retry_after.run
 
 test_blake2s.run: test_blake2s
 	./test_blake2s
@@ -226,6 +234,9 @@ test_disco_handler.run: test_disco_handler
 
 test_disco_prober.run: test_disco_prober
 	./test_disco_prober
+
+test_retry_after.run: test_retry_after
+	./test_retry_after
 
 clean:
 	rm -f $(TARGETS)
