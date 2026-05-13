@@ -4,6 +4,7 @@
 #ifdef ESP_PLATFORM
 
 #include "telemetry.h"
+#include "tinylink.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -97,6 +98,14 @@ static void telemetry_task(void *arg)
     uint32_t seq = 0;
     char buf[TX_BUF_SZ];
 
+    /* Periodic diag dump for soak observability: every 12th telemetry
+     * tx ≈ every 60 s at the default 5 s period. Drives the
+     * tinylink_diag_dump_stacks() walk of all FreeRTOS task stack
+     * high-water marks (data source for the deferred task-stack-trim
+     * audit item). Skip seq==0 so the first dump happens at seq=12
+     * (~65 s post-boot) when all bringup tasks have stabilized. */
+    enum { TL_DIAG_TX_PERIOD = 12 };
+
     for (;;) {
         int32_t milli_c = 0;
         err = tmp117_read_milli_c(&milli_c);
@@ -128,6 +137,9 @@ static void telemetry_task(void *arg)
                      sign < 0 ? "-" : "",
                      (long)(abs_milli / 1000), (long)(abs_milli % 1000),
                      (int)sent);
+        }
+        if (seq > 0 && (seq % TL_DIAG_TX_PERIOD) == 0) {
+            tinylink_diag_dump_stacks();
         }
         vTaskDelay(pdMS_TO_TICKS(CONFIG_TINYLINK_TELEMETRY_PERIOD_MS));
     }

@@ -272,6 +272,27 @@ bool tinylink_get_public_endpoint(uint8_t addr_v4[4], uint16_t *port);
 
 const char *tinylink_version_string(void);
 
+/* --- Diag / soak-instrumentation API -------------------------------------
+ *
+ * Periodic stack high-water-mark dump driven from telemetry_task. Walks
+ * all live FreeRTOS tasks via uxTaskGetSystemState() (requires
+ * CONFIG_FREERTOS_USE_TRACE_FACILITY=y, already on for this build) and
+ * logs one line per task with `pcTaskName` + `usStackHighWaterMark`
+ * (StackType_t units = 4 B on Xtensa LX6) + a converted bytes-free
+ * field. Plus one summary line with heap_free + largest_free_block
+ * (MALLOC_CAP_DEFAULT) so soak analysis can correlate stack pressure
+ * with heap fragmentation.
+ *
+ * Cost: ~1.2 KiB static BSS for the TaskStatus_t snapshot buffer +
+ * one ESP_LOGI line per task per call. Called every 60 s from
+ * telemetry_task (every 12th tx at the default 5 s telemetry period).
+ *
+ * Intended audience: this is the data source for the deferred audit
+ * items "task stack trim" and (via correlation with the mapresp parse
+ * logs added in the same PR) "jsmn / body_buf trim". Once those land
+ * the diag dump can be Kconfig-gated off for production. */
+void tinylink_diag_dump_stacks(void);
+
 #ifdef __cplusplus
 }
 #endif
