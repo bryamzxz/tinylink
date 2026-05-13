@@ -26,28 +26,29 @@
 
 /* --- helpers -------------------------------------------------------- */
 
+/* LE pack/unpack via __builtin_memcpy. Xtensa LX6 + host builds are
+ * little-endian, so this folds to 1× l32i/s32i (aligned) or 4× l8ui/s8i
+ * (unaligned) — identical to wg_transport.c's load_u32_le / store_u32_le
+ * and chacha20.c's U8TO32_LITTLE / U32TO8_LITTLE. Avoids the byte-loop
+ * pattern the rest of the crypto module phased out. */
+
 static uint32_t le_u32_load(const uint8_t in[4])
 {
-    return ((uint32_t)in[0])       |
-           ((uint32_t)in[1] <<  8) |
-           ((uint32_t)in[2] << 16) |
-           ((uint32_t)in[3] << 24);
+    uint32_t v;
+    __builtin_memcpy(&v, in, sizeof(v));
+    return v;
 }
 
 static uint64_t le_u64_load(const uint8_t in[8])
 {
-    uint64_t v = 0;
-    for (int i = 0; i < 8; i++) {
-        v |= ((uint64_t)in[i]) << (8 * i);
-    }
+    uint64_t v;
+    __builtin_memcpy(&v, in, sizeof(v));
     return v;
 }
 
 static void le_u64_store(uint8_t out[8], uint64_t v)
 {
-    for (int i = 0; i < 8; i++) {
-        out[i] = (uint8_t)(v >> (8 * i));
-    }
+    __builtin_memcpy(out, &v, sizeof(v));
 }
 
 /* Constant-time byte compare. Returns 0 iff equal. Same idiom used
