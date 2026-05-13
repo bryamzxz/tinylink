@@ -1738,13 +1738,27 @@ static esp_timer_handle_t s_reprobe_retry_timer = NULL;
 
 static BaseType_t stun_reprobe_try_spawn(void)
 {
-    /* 4 KiB stack: stun_probe_run does one DNS lookup + one
-     * sendto + one recvfrom; no TLS or crypto. Same budget as the
-     * WG RX task. Priority IDLE+1 — explicitly below the long-poll
-     * (IDLE+4) and the WG dataplane so neither gets preempted by a
-     * background probe. */
+    /* 3 KiB stack — sized from the 420 s soak instrumentation
+     * (PR #97 + #98 + #99) which captured the first actual
+     * stun_probe execution at t≈611 s post-boot and measured
+     * the lifetime peak at 1 808 B used. The probe path is
+     * DNS lookup (getaddrinfo) + sendto + recvfrom; no TLS or
+     * crypto. 3 KiB leaves 1 264 B margin (≈ 70 %) over peak,
+     * matching the safety ratio adopted for tinylink_derp (#98)
+     * and tinylink_lp (#99).
+     *
+     * The earlier 4 KiB budget was sized symmetrically with
+     * wg_rx (8 KiB) "same as the WG RX task" — but wg_rx does
+     * NaCl box open + sealed pong build on the RX path (DISCO
+     * direct handler), much heavier than this task's plain UDP
+     * probe. The 4 KiB never had a measurement behind it; the
+     * audit just inherited it from the WG sizing.
+     *
+     * Priority IDLE+1 unchanged — explicitly below the long-poll
+     * (IDLE+4) and the WG dataplane so neither gets preempted
+     * by a background probe. */
     return xTaskCreate(stun_reprobe_task, "tinylink_stun_re",
-                       4096, NULL, tskIDLE_PRIORITY + 1, NULL);
+                       3072, NULL, tskIDLE_PRIORITY + 1, NULL);
 }
 
 static void stun_reprobe_retry_cb(void *arg)
