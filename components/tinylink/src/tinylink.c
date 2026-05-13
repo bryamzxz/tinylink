@@ -947,16 +947,25 @@ esp_err_t tinylink_derp_supervised_start(void)
         return ESP_OK;
     }
 
-    /* Spawn the task. 12 KiB stack: mbedtls handshake peak is the
-     * dominant frame (~6 KiB stack) plus the derp recv loop's small
-     * frames. The long-poll task ships at 24 KiB but holds a static
-     * tl_netmap_t in its frame; the supervisor doesn't, so half the
-     * budget is enough.
+    /* Spawn the task. 10 KiB stack: sized from the soak-instrumentation
+     * dump (PR #97) which measured the lifetime peak at 4920 B used
+     * (out of the prior 12 KiB allocation) across the full handshake
+     * + recv-loop cycle to derp16b.tailscale.com on 2026-05-12. The
+     * dominant frame is the mbedtls handshake against the
+     * LE E8 → ISRG Root X2 P-384 cert chain plus ECDHE-RSA-AES128-
+     * GCM key agreement; the cert chain and suite are deterministic
+     * across reconnects, so the peak is structural rather than
+     * load-dependent. 10 KiB leaves 5 KiB margin (≈ 100 % over the
+     * measured peak), enough to absorb any small drift between
+     * IDF mbedtls versions without re-tightening here. Anything
+     * tighter than 10 KiB should be backed by a multi-hour soak
+     * that includes server-restart-driven reconnects, which the
+     * 100 s smoke did not exercise.
      *
      * This start function MUST be called pre-TLS-bringup (i.e.
      * BEFORE tinylink_register / dataplane_start / long_poll_start in
      * main.c::bringup) so the heap arena is still pristine when
-     * xTaskCreate looks for 12 KiB contiguous. The task body itself
+     * xTaskCreate looks for 10 KiB contiguous. The task body itself
      * waits internally for the first netmap before doing any TLS
      * work, so this re-ordering does not regress the previous
      * "DERP handshake after long-poll netmap" invariant — it only
@@ -966,10 +975,10 @@ esp_err_t tinylink_derp_supervised_start(void)
      * arena and ALL DERP-dependent features stay dead (observed
      * across 3 soaks pre-PR). */
     BaseType_t ok = xTaskCreate(derp_supervised_task, "tinylink_derp",
-                                12288, NULL, tskIDLE_PRIORITY + 3, NULL);
+                                10240, NULL, tskIDLE_PRIORITY + 3, NULL);
     if (ok != pdPASS) {
         ESP_LOGE(TAG, "xTaskCreate(derp supervisor) failed — "
-                      "heap_free=%u largest=%u (need 12 KiB contiguous)",
+                      "heap_free=%u largest=%u (need 10 KiB contiguous)",
                  (unsigned)esp_get_free_heap_size(),
                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
         return ESP_ERR_NO_MEM;
