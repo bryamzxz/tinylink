@@ -179,6 +179,36 @@ CONFIG_MBEDTLS_CLIENT_SSL_SESSION_TICKETS=n
 # CONFIG_MBEDTLS_ECP_DP_BP384R1_ENABLED is not set
 # CONFIG_MBEDTLS_ECP_DP_BP512R1_ENABLED is not set
 
+# ---- mbedTLS — drop X.509 CRL + CSR parsers (unused by tinylink) ------------
+# CRL_PARSE_C: Certificate Revocation List parser. mbedTLS's
+# x509_crt_verifycrl is the only consumer in the verify path, and
+# esp_tls invokes mbedtls_x509_crt_verify_with_profile passing NULL for
+# `ca_crl` (esp-tls/esp_tls_mbedtls.c: no CRL argument is constructed
+# anywhere). controlplane.tailscale.com publishes OCSP responses, not
+# CRLs — Let's Encrypt deprecated CRL distribution points for end-entity
+# certs years ago and runs OCSP via ocsp.int-x3.letsencrypt.org. We
+# don't do OCSP stapling either; revocation checking on this device is
+# best-effort via fresh handshakes and the rotation cadence the cert
+# bundle ships with. The verify path stays correct: untrusted leaf
+# certs are still rejected via signature + chain + expiry checks,
+# only the "is this cert on a revocation list" probe goes away —
+# which was a no-op already.
+#
+# CSR_PARSE_C: Certificate Signing Request parser. Tinylink never
+# generates or parses CSRs — `keys.c`, `control_key.c`, and
+# `noise_ik.c` produce raw key material (Curve25519 + ECDSA-P256)
+# without an enrolment / X509 path. esp_tls doesn't parse CSRs either
+# (it's a client TLS lib, not a CA). Pure dead code.
+#
+# Symbol impact (pre-trim ELF via xtensa-esp32-elf-nm): x509_crt_verifycrl
+# (233 B static helper) + x509_get_crl_extensions / x509_get_crl_entry_ext
+# / mbedtls_x509_crl_* full parser. mbedtls_x509_csr_parse* parser
+# already gc-section-stripped by the linker (no caller). Verify-path
+# integration #ifdef'd via MBEDTLS_X509_CRL_PARSE_C in
+# mbedtls/library/x509_crt.c.
+# CONFIG_MBEDTLS_X509_CRL_PARSE_C is not set
+# CONFIG_MBEDTLS_X509_CSR_PARSE_C is not set
+
 # ---- mbedTLS — drop static-ECDH key exchanges (TLS_ECDH_* suites) -----------
 # ECDH_ECDSA / ECDH_RSA are static-ECDH cipher suites where the server's
 # long-term ECDH public key sits in its cert (RFC 4492 §2.1, §2.3). They
