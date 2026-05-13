@@ -1136,32 +1136,42 @@ static void long_poll_task(void *arg)
 esp_err_t tinylink_long_poll_start(void)
 {
     if (!s_initialized) return ESP_ERR_INVALID_STATE;
-    /* 20 KiB stack — sized from the soak-instrumentation dump (PR #97)
-     * which measured the lifetime peak at 11 040 B used across the
-     * full bringup window: ts2021_connect TLS handshake against the
-     * LE E8 → ISRG Root X2 P-384 chain (mbedtls cert-chain verify
-     * + ECDSA + X.509 parsing) + Noise IK init + the streaming
-     * mapresp_parse of the initial 24 123-byte netmap with 2150
-     * jsmn tokens. The static body_buf (32 KiB) and the static
-     * jsmntok_t toks[2500] (40 KiB) both live in BSS, so the heavy
-     * data structures stay off this task's stack.
+    /* 24 KiB stack — reverted from a 20 KiB trim attempt (#99) that was
+     * sized off a 100 s smoke measurement (peak 11 040 B = 45 % used).
      *
-     * Historical note: an earlier sizing at 8 KiB blew the stack —
-     * see the audit commit message + soak data from 2026-05-12. The
-     * author's recovery estimate of "~12 KiB handshake peak + ~2 KiB
-     * Noise IK = 14 KiB" overshot by ~3 KiB vs measured. 20 KiB
-     * leaves ~9.4 KiB margin (≈ 86 %) over measured peak, enough
-     * to absorb mbedtls allocation pattern drift between IDF
-     * versions or a slightly larger netmap (jsmn token count
-     * doesn't affect stack — only the static toks[] table).
+     * Extended 420 s soak with ~18 min device uptime captured the
+     * tinylink_lp lifetime peak at 20 004 B used — i.e. the 100 s
+     * smoke missed a path that fires only after extended operation.
+     * The 20 KiB trim left just 476 B (2.3 %) margin against that
+     * peak, dangerously close to overflow. Reverting to 24 KiB
+     * restores the original ~4.5 KiB (23 %) margin, which is what
+     * the historical author chose with "~14 KiB handshake estimate
+     * + safety" reasoning.
      *
-     * Anything tighter than 20 KiB should be backed by a multi-
-     * hour soak that exercises Retry-After backoff + reconnect
-     * loop + post-bringup mid-stream errors + larger netmap
-     * conditions (more peers, more DERP regions) than the 100 s
-     * smoke captured. */
+     * The path that bursts to 20 KiB has not been pinpointed in
+     * source — it fires in the first 13 min between boot and the
+     * follow-up soak's first stack-diag dump. Likely candidates:
+     *   - Long-poll stream-error + ts2021_connect RE-handshake after
+     *     heap has fragmented (mbedtls allocation patterns shift)
+     *   - mapresp_parse path on a NON-KeepAlive incremental update
+     *     not exercised by the original boot-time netmap
+     *   - Retry-After backoff + reconnect under unusual heap state
+     *
+     * Static body_buf (32 KiB) and static jsmntok_t toks[2500]
+     * (40 KiB) both live in BSS, so the heavy data structures stay
+     * off this task's stack. The 20 KiB jump must therefore come
+     * from a stack-local allocation pattern in mbedtls / esp_tls /
+     * the streaming parser itself.
+     *
+     * Trim retry policy: anything tighter than 24 KiB requires a
+     * multi-hour soak with stack-diag dumps every 60 s to validate
+     * the worst-case lifetime hwm across heap fragmentation states.
+     * The 100 s post-boot smoke pattern that worked for the other
+     * stack trims (DERP #98, stun_r #100, wg_tx #101, ep_up #102)
+     * is INSUFFICIENT for tasks that do TLS reconnects long after
+     * the initial boot path settles. */
     BaseType_t ok = xTaskCreate(long_poll_task, "tinylink_lp",
-                                20480, NULL, tskIDLE_PRIORITY + 4, NULL);
+                                24576, NULL, tskIDLE_PRIORITY + 4, NULL);
     if (ok != pdPASS) {
         ESP_LOGE(TAG, "xTaskCreate(long_poll) failed");
         return ESP_ERR_NO_MEM;
