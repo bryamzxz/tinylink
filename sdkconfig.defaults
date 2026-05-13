@@ -31,6 +31,16 @@ CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=16
 CONFIG_ESP_WIFI_AMPDU_TX_ENABLED=y
 CONFIG_ESP_WIFI_AMPDU_RX_ENABLED=y
 CONFIG_ESP_WIFI_NVS_ENABLED=y
+# WiFi mgmt buffer pool — IDF default is 32, sized for clients that
+# scan + roam across multiple APs (each scan response/beacon/probe
+# response burst needs a free buffer). Tinylink associates to ONE
+# fixed AP (INTELCOM-CARDONA), never roams, doesn't scan post-assoc.
+# 8 buffers cover the worst-case probe-response burst during the
+# initial scan + leave headroom for unsolicited beacons / deauth
+# frames the supplicant still has to process. ~700 B per buffer,
+# 32 -> 8 saves ~16-17 KiB DRAM static. Failure mode if too small:
+# WiFi disconnect-retry loop visible immediately in serial logs.
+CONFIG_ESP_WIFI_MGMT_SBUF_NUM=8
 # Station-only build: tinylink never runs as an AP (no WIFI_MODE_AP,
 # no esp_wifi_set_mode(WIFI_MODE_AP), no softap_start call site).
 # Drops the entire AP-side code path: beacon scheduler, AID table,
@@ -300,6 +310,43 @@ CONFIG_LWIP_TCPIP_CORE_LOCKING=y
 CONFIG_LWIP_DHCP_DOES_ARP_CHECK=n
 CONFIG_LWIP_TCP_SACK_OUT=n
 CONFIG_LWIP_TCP_MSS=1440
+# Pin lwIP tcpip_thread to CPU0 (same core as WiFi MAC) for cache
+# locality with the WiFi driver's RX path. IDF default is NO_AFFINITY,
+# which lets the scheduler bounce the task between cores under load
+# and incurs cache misses on every move. tinylink's throughput isn't
+# WiFi-bound, but the change is free (one Kconfig) and removes a
+# small jitter source. WiFi task itself is pinned to CPU0 via
+# CONFIG_ESP_WIFI_TASK_PINNED_TO_CORE_0=y (already set).
+CONFIG_LWIP_TCPIP_TASK_AFFINITY_CPU0=y
+# Trim socket descriptor pool. tinylink concurrent socket budget:
+#   1× UDP for STUN probe (stun_probe.c:136)
+#   1× UDP for telemetry (telemetry.c:47)
+#   1× UDP for WG transport (wg_netif.c:1042)
+#   1-2× TCP for esp_tls to controlplane (long-poll + register cycle)
+#   1× TCP for esp_tls to derp*.tailscale.com (supervisor)
+# = 5-6 concurrent max. 6 gives one spare; failure mode is EAGAIN
+# on socket() which would be visible immediately in serial. IDF
+# default of 10 wastes ~250 B per unused slot in lwip_socket_t.
+CONFIG_LWIP_MAX_SOCKETS=6
+# lwIP loopback (127.0.0.1) — unused. Tinylink talks to localhost
+# nowhere; the 100.64.0.0/10 CGNAT range is routed via the WG netif,
+# the 192.168.x.x AP subnet via WiFi, and the WAN via the default
+# WiFi route. No code path constructs a sockaddr_in with INADDR_LOOPBACK.
+# Disabling drops the loopback pbuf pool (8 × ~80 B ≈ 640 B BSS) plus
+# the netif_loop integration code. esp_netif still works without it.
+# CONFIG_LWIP_NETIF_LOOPBACK is not set
+# DNS resolution path stays via the regular WiFi netif's DNS list
+# (set via DHCP from INTELCOM-CARDONA). mDNS query support is unused
+# — tinylink resolves controlplane.tailscale.com / derp*.tailscale.com
+# via standard DNS, never via mdns. The IDF mdns component is also
+# excluded by EXCLUDE_COMPONENTS in CMakeLists.txt, but the lwIP-side
+# mDNS query parser is a separate Kconfig that stays on by default.
+# CONFIG_LWIP_DNS_SUPPORT_MDNS_QUERIES is not set
+# DHCP server. CONFIG_ESP_WIFI_SOFTAP_SUPPORT is already off (we never
+# start an AP interface) so there are no DHCP clients to serve. The
+# dhcps_* code path is unreachable; disabling drops the module + the
+# default lease table.
+# CONFIG_LWIP_DHCPS is not set
 # IPv4-only build: every socket in the firmware (WG UDP, esp_tls to
 # controlplane.tailscale.com, DERP, STUN, telemetry) uses AF_INET. Disabling
 # IPv6 recovers ~7 KiB RAM + ~39 KiB flash and shrinks the dual-stack
@@ -356,6 +403,11 @@ CONFIG_BOOTLOADER_LOG_LEVEL_NONE=y
 # uses N >= 100 ms, so no delay round-trips to 0 ticks. No bare integer
 # tick arguments to vTaskDelay / xQueue* / xSemaphoreTake in our code.
 CONFIG_FREERTOS_HZ=100
+# Pin timer service task to CPU0 along with tcpip + WiFi MAC. IDF
+# default is NO_AFFINITY; cache-locality argument identical to the
+# lwIP tcpip pin above. Cheap, no measurable downside on a low-load
+# device.
+CONFIG_FREERTOS_TIMER_TASK_AFFINITY_CPU0=y
 CONFIG_FREERTOS_USE_TRACE_FACILITY=y
 CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS=y
 
