@@ -134,6 +134,51 @@ CONFIG_MBEDTLS_CLIENT_SSL_SESSION_TICKETS=n
 # the printed hex value.
 # CONFIG_MBEDTLS_ERROR_STRINGS is not set
 
+# ---- mbedTLS ECP curves — trim to {P-256, P-384, Curve25519} ----------------
+# Tailscale's controlplane.tailscale.com is currently fronted by Let's
+# Encrypt's E8 intermediate. Verified 2026-05-12 via
+#   openssl s_client -connect controlplane.tailscale.com:443 \
+#     -servername controlplane.tailscale.com -showcerts
+#
+# Leaf cert:  public key = P-256 (prime256v1),
+#             signed with ecdsa-with-SHA384 by issuer "Let's Encrypt E8"
+# Issuer E8:  public key = P-384 (secp384r1),
+#             signed with ecdsa-with-SHA384 by ISRG Root X2 (also P-384)
+#
+# So we MUST keep P-256 (leaf key) AND P-384 (intermediate + root key) to
+# validate the chain. Hash side is covered by CONFIG_MBEDTLS_SHA512_C=y
+# (provides SHA-384). DERP TLS endpoints (derp1.tailscale.com etc.) sit
+# behind the same LE E8 issuer chain, so this set serves both.
+#
+# Initial attempt on this branch trimmed P-384 too, which broke the
+# handshake with mbedtls_ssl_handshake = -0x3A00 (X509_CERT_VERIFY_FAILED)
+# against BOTH controlplane and derp1 — fail-loud at boot, no silent
+# regression. P-384 stays on. Re-audit if Tailscale ever rotates to a
+# different LE chain (E5/E6 are P-256, but the upstream root behind those
+# is still P-384 ISRG X2 today).
+#
+# Curve25519 stays on too — costs ~78 B (ecp_mod_p255) and a few tables,
+# keeps mbedTLS's X25519 KEM path warm for any future TLS 1.3 enablement
+# (currently MBEDTLS_SSL_PROTO_TLS1_3 is off, so this is a hedge). Noise
+# IK + WireGuard use the vendored donna X25519 in crypto/curve25519*.c
+# independently of this Kconfig.
+#
+# Dropped curves (8): SECP192R1, SECP224R1, SECP521R1, the three Koblitz
+# (SECP192K1, SECP224K1, SECP256K1), and the three Brainpool (BP256R1,
+# BP384R1, BP512R1). Confirmed pre-trim via xtensa-esp32-elf-nm that
+# these consumed `ecp_mod_p<bits>` helpers (~78-610 B each) plus per-
+# curve `<curve>_p/_n/_gx/_gy/_b/_a` rodata tables (48-68 B × 6 per
+# curve) ≈ 5-7 KiB across all eight.
+# CONFIG_MBEDTLS_ECP_DP_SECP192R1_ENABLED is not set
+# CONFIG_MBEDTLS_ECP_DP_SECP224R1_ENABLED is not set
+# CONFIG_MBEDTLS_ECP_DP_SECP521R1_ENABLED is not set
+# CONFIG_MBEDTLS_ECP_DP_SECP192K1_ENABLED is not set
+# CONFIG_MBEDTLS_ECP_DP_SECP224K1_ENABLED is not set
+# CONFIG_MBEDTLS_ECP_DP_SECP256K1_ENABLED is not set
+# CONFIG_MBEDTLS_ECP_DP_BP256R1_ENABLED is not set
+# CONFIG_MBEDTLS_ECP_DP_BP384R1_ENABLED is not set
+# CONFIG_MBEDTLS_ECP_DP_BP512R1_ENABLED is not set
+
 # ---- lwIP tunings ------------------------------------------------------------
 CONFIG_LWIP_TCPIP_CORE_LOCKING=y
 CONFIG_LWIP_DHCP_DOES_ARP_CHECK=n
