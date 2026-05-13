@@ -179,6 +179,67 @@ CONFIG_MBEDTLS_CLIENT_SSL_SESSION_TICKETS=n
 # CONFIG_MBEDTLS_ECP_DP_BP384R1_ENABLED is not set
 # CONFIG_MBEDTLS_ECP_DP_BP512R1_ENABLED is not set
 
+# ---- mbedTLS — final prune: CCM, PKCS7, non-AES GCM, deterministic ECDSA ----
+# Final stage of the perf-audit mbedTLS section (stages 1-3 trimmed
+# curves, static-ECDH, and X.509 CRL/CSR). This batch turns off four
+# more sub-systems that grep confirms tinylink and its dependencies
+# never call.
+#
+# 1. CCM_C — AES-CCM mode (counter with CBC-MAC, RFC 3610). Used by
+#    some IoT-class TLS suites (TLS_*_WITH_AES_*_CCM_8 etc.) and by
+#    DTLS deployments that want a lighter alternative to GCM. Modern
+#    Go crypto/tls (controlplane + DERP) advertises ONLY GCM and
+#    ChaCha20-Poly1305 — no CCM in the suite list. Verified empirically
+#    on this branch's parent: the negotiated suite is consistently
+#    ECDHE-RSA-AES128-GCM-SHA256. ChaCha20-Poly1305 stays available
+#    via MBEDTLS_CHACHAPOLY_C (separate Kconfig, kept on as a fallback
+#    if the server ever rotates suite preferences).
+#
+# 2. PKCS7_C — Cryptographic Message Syntax (PKCS#7 / RFC 2315) parser.
+#    Used for S/MIME, code-signing envelopes, etc. The IDF bootloader's
+#    secure-boot signature path uses ECDSA over the partition table +
+#    app image, NOT PKCS#7. The tinylink TLS path uses raw X.509 certs,
+#    not PKCS#7-wrapped chains. Grep: no `mbedtls_pkcs7_` calls
+#    anywhere in components/tinylink/src or main/.
+#
+# 3. GCM_SUPPORT_NON_AES_CIPHER — gates ARIA-GCM + Camellia-GCM. Both
+#    are Korean/Japanese alternatives to AES that nobody on the public
+#    internet uses for TLS. xtensa-esp32-elf-nm on the pre-trim ELF
+#    shows the ARIA implementation present:
+#      mbedtls_aria_setkey_enc  (883 B .text)
+#      mbedtls_aria_crypt_ecb   (814 B .text)
+#      aria_sb1/sb2/is1/is2     (256 B each rodata, 1024 B total)
+#      mbedtls_aria_crypt_cbc / _cfb128 / setkey_dec
+#    plus the ARIA-specific GCM wrapper. Disabling this Kconfig
+#    de-selects MBEDTLS_ARIA_C and MBEDTLS_CAMELLIA_C transitively
+#    in the IDF Kconfig graph, stripping the full block.
+#
+# 4. ECDSA_DETERMINISTIC — RFC 6979 deterministic-nonce ECDSA SIGNING.
+#    Tinylink only VERIFIES ECDSA signatures (the Tailscale cert chain
+#    + the optional control-key TOFU pin). Verification uses
+#    mbedtls_ecdsa_verify, which doesn't depend on nonce generation at
+#    all — the signature already carries the (r, s) pair. The
+#    deterministic-sign API + its HMAC_DRBG backing (~600 B
+#    mbedtls_hmac_drbg_*) are pure dead weight here.
+#
+# What stays enabled:
+#   MBEDTLS_GCM_C=y            (AES-GCM, the suite Tailscale uses)
+#   MBEDTLS_CHACHAPOLY_C=y     (ChaCha20-Poly1305 TLS fallback +
+#                               independently used by ts2021/WG via
+#                               the vendored donna implementations)
+#   MBEDTLS_ECDSA_C=y          (verify-only path)
+#   MBEDTLS_X509_CRT_PARSE_C=y (still load-bearing for cert chain)
+#
+# Expected symbol drop: full ARIA (~3-4 KiB), CCM mode functions
+# (~1-1.5 KiB), HMAC_DRBG (~600-800 B), deterministic-ECDSA signing
+# helpers (~200 B). All four batched into one PR because they have
+# zero coupling to each other; each one's verify-path effect is
+# independently grep-verified above.
+# CONFIG_MBEDTLS_CCM_C is not set
+# CONFIG_MBEDTLS_PKCS7_C is not set
+# CONFIG_MBEDTLS_GCM_SUPPORT_NON_AES_CIPHER is not set
+# CONFIG_MBEDTLS_ECDSA_DETERMINISTIC is not set
+
 # ---- mbedTLS — drop X.509 CRL + CSR parsers (unused by tinylink) ------------
 # CRL_PARSE_C: Certificate Revocation List parser. mbedTLS's
 # x509_crt_verifycrl is the only consumer in the verify path, and
