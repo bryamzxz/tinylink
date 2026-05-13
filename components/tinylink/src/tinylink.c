@@ -1136,15 +1136,32 @@ static void long_poll_task(void *arg)
 esp_err_t tinylink_long_poll_start(void)
 {
     if (!s_initialized) return ESP_ERR_INVALID_STATE;
-    /* 24 KiB stack — same budget as CONFIG_ESP_MAIN_TASK_STACK_SIZE.
-     * The earlier 8 KiB note was wrong: ts2021_connect builds an
-     * mbedtls TLS handshake (cert chain verification, ECDSA, X.509
-     * parsing, ~12 KiB peak) PLUS our Noise IK init (~2 KiB) on the
-     * task stack. Running this in 8 KiB blew the stack and looked
-     * like random heap corruption / alignment / load-prohibited
-     * panics depending on what the overflow happened to overwrite. */
+    /* 20 KiB stack — sized from the soak-instrumentation dump (PR #97)
+     * which measured the lifetime peak at 11 040 B used across the
+     * full bringup window: ts2021_connect TLS handshake against the
+     * LE E8 → ISRG Root X2 P-384 chain (mbedtls cert-chain verify
+     * + ECDSA + X.509 parsing) + Noise IK init + the streaming
+     * mapresp_parse of the initial 24 123-byte netmap with 2150
+     * jsmn tokens. The static body_buf (32 KiB) and the static
+     * jsmntok_t toks[2500] (40 KiB) both live in BSS, so the heavy
+     * data structures stay off this task's stack.
+     *
+     * Historical note: an earlier sizing at 8 KiB blew the stack —
+     * see the audit commit message + soak data from 2026-05-12. The
+     * author's recovery estimate of "~12 KiB handshake peak + ~2 KiB
+     * Noise IK = 14 KiB" overshot by ~3 KiB vs measured. 20 KiB
+     * leaves ~9.4 KiB margin (≈ 86 %) over measured peak, enough
+     * to absorb mbedtls allocation pattern drift between IDF
+     * versions or a slightly larger netmap (jsmn token count
+     * doesn't affect stack — only the static toks[] table).
+     *
+     * Anything tighter than 20 KiB should be backed by a multi-
+     * hour soak that exercises Retry-After backoff + reconnect
+     * loop + post-bringup mid-stream errors + larger netmap
+     * conditions (more peers, more DERP regions) than the 100 s
+     * smoke captured. */
     BaseType_t ok = xTaskCreate(long_poll_task, "tinylink_lp",
-                                24576, NULL, tskIDLE_PRIORITY + 4, NULL);
+                                20480, NULL, tskIDLE_PRIORITY + 4, NULL);
     if (ok != pdPASS) {
         ESP_LOGE(TAG, "xTaskCreate(long_poll) failed");
         return ESP_ERR_NO_MEM;
