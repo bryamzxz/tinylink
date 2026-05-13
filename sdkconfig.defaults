@@ -153,13 +153,16 @@ CONFIG_LWIP_IPV6=n
 CONFIG_LWIP_IP4_FRAG=n
 CONFIG_LWIP_IP4_REASSEMBLY=n
 
-# PPP netstack used by tinylink_wg's lwIP integration (wg_lwip.c) for
-# the point-to-point WG tunnel netif. We don't actually run PPP — we
-# need ESP_NETIF_NETSTACK_DEFAULT_PPP as the base netstack template
-# (raw IP, no link layer, no DHCP triggers). Enabling PPP costs ~10
-# KiB flash; turning it on lets esp_netif register our custom netif
-# without the DHCP-callback collision that killed trombik on IDF v5.5.
-CONFIG_LWIP_PPP_SUPPORT=y
+# PPP support disabled — the WG tunnel netif now uses a custom no-op
+# netstack defined in wg_lwip.c::s_wg_netstack_config (lines 178-184),
+# landed in commit 4a915df ("feat/wg-netif-without-is-ppp"). Pre-Build-C
+# we needed ESP_NETIF_NETSTACK_DEFAULT_PPP as the base template (forcing
+# CONFIG_LWIP_PPP_SUPPORT=y), but the custom netstack now provides the
+# raw-IP init_fn + stub input_fn directly without depending on the PPP
+# module. Turning PPP off recovers ~10-20 KiB flash (ipcp_nakci,
+# vj_compress_tcp, ppp_pcb, LCP/PAP/CHAP FSM, HDLC framing — all
+# verified inalcanzables in the post-4a915df build via xtensa-esp32-elf-nm).
+# CONFIG_LWIP_PPP_SUPPORT is not set
 
 # ---- VFS trim ----------------------------------------------------------------
 # Tinylink doesn't open files (no SD/SPIFFS/FAT), doesn't iterate
