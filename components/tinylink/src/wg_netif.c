@@ -140,11 +140,18 @@ static const char *TAG = "wg_netif";
  * itself would have to drain — guaranteed deadlock). One step below
  * the RX task so packet decode wins under load.
  *
- * Stack: 8 KiB. Earlier budget was 4 KiB (sendto recursing into the
- * WiFi driver TX callback chain measured >2 KiB; canary tripped at
- * 3 KiB on first sizing). That margin was marginal pre-PR-#65 and
+ * Stack: 7 KiB (conservative trim from 8 KiB; soak-instrumentation
+ * #97 + #98 + #99 + #100 measured the lifetime peak at 2 176 B used
+ * in steady-state across a 420 s passive soak — i.e. WG session
+ * stays up the whole window, sendto cascades happen only for
+ * keepalives + telemetry tx + DISCO pong, NOT for the post-outage
+ * recovery scenario that historically blew the stack).
+ *
+ * Earlier budget was 4 KiB (sendto recursing into the WiFi driver
+ * TX callback chain measured >2 KiB; canary tripped at 3 KiB on
+ * first sizing). That margin was marginal pre-PR-#65 and
  * insufficient post-#65 where the tinylink + main + mbedcrypto
- * components compile at -O2: aggressive inlining grows the effective
+ * components compile at -O2: aggressive inlining grew the effective
  * stack frame of the sendto path (lwIP linkoutput → wg_transport
  * encrypt → sendto → WiFi driver TX queue) past the 4 KiB ceiling.
  * Caught 2026-05-11 in /tmp/tinylink_capture_2026-05-11_validate_v2.log
@@ -152,13 +159,27 @@ static const char *TAG = "wg_netif";
  * telemetry packet hitting the path after a 9-minute outage)
  * immediately followed by
  * `***ERROR*** A stack overflow in task wg_tx has been detected.`
- * + SW_CPU_RESET. The queue length (WG_TX_QUEUE_LEN=3) makes a real
- * flood impossible — drops happen at xQueueSend(..., 0) when full.
- * 8 KiB matches WG_RX_TASK_STACK_BYTES, gives ~5 KiB headroom over
- * the empirical 3 KiB peak, and absorbs the -O2 frame growth without
- * needing per-component tuning. The 1.5 KiB queue item still stays
- * OFF this stack (in g.tx_worker_scratch). */
-#define WG_TX_TASK_STACK_BYTES 8192
+ * + SW_CPU_RESET.
+ *
+ * The post-outage cascade IS the deepest path, and the passive
+ * 420 s soak did NOT exercise it. So the actual post-outage peak
+ * under -O2 is still UNKNOWN, only bounded:
+ *   lower: > 4 096 B (the historical overflow at 4 KiB stack)
+ *   upper: < 8 192 B (8 months stable operation at this size)
+ *
+ * 7 KiB sits 75 % above the lower bound while still leaving 2 KiB
+ * heap headroom vs the 8 KiB baseline. Further tightening (6 KiB,
+ * 5 KiB) requires a forced-flap soak — iptables-DROP on Servidor1
+ * per the CHANGELOG.md:107-117 recipe — that exercises the post-
+ * outage recovery + first-telemetry-after-handshake cascade
+ * directly and produces a measured peak from `stack diag:` dumps
+ * during the recovery window.
+ *
+ * The queue length (WG_TX_QUEUE_LEN=3) makes a real flood
+ * impossible — drops happen at xQueueSend(..., 0) when full. The
+ * 1.5 KiB queue item still stays OFF this stack (in
+ * g.tx_worker_scratch). */
+#define WG_TX_TASK_STACK_BYTES 7168
 #define WG_TX_TASK_PRIO        (tskIDLE_PRIORITY + 2)
 
 /* Outbound TX queue depth. At 1.5 KiB per item, 3 items = 4.7 KiB
