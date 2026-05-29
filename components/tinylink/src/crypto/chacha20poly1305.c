@@ -21,6 +21,7 @@
 
 #include "chacha20.h"
 #include "poly1305_donna.h"
+#include "secure_zero.h"
 
 #define TAG_LEN CHACHA20POLY1305_TAG_LEN
 
@@ -144,8 +145,8 @@ void chacha20poly1305_encrypt(uint8_t *out,
     /* Tag goes after the ciphertext: out[mlen..mlen+16]. */
     aead_tag(out + mlen, otk, aad, aad_len, out, mlen);
 
-    memset(otk, 0, sizeof(otk));
-    memset(&ctx, 0, sizeof(ctx));
+    tl_secure_zero(otk, sizeof(otk));
+    tl_secure_zero(&ctx, sizeof(ctx));
 }
 
 int chacha20poly1305_decrypt(uint8_t *out,
@@ -169,9 +170,9 @@ int chacha20poly1305_decrypt(uint8_t *out,
     aead_tag(expected_tag, otk, aad, aad_len, c, mlen);
 
     if (ct_memeq(expected_tag, c + mlen, TAG_LEN) != 0) {
-        memset(otk, 0, sizeof(otk));
-        memset(&ctx, 0, sizeof(ctx));
-        memset(expected_tag, 0, sizeof(expected_tag));
+        tl_secure_zero(otk, sizeof(otk));
+        tl_secure_zero(&ctx, sizeof(ctx));
+        tl_secure_zero(expected_tag, sizeof(expected_tag));
         return -1;
     }
 
@@ -179,8 +180,8 @@ int chacha20poly1305_decrypt(uint8_t *out,
         chacha20(&ctx, out, c, (uint32_t)mlen);
     }
 
-    memset(otk, 0, sizeof(otk));
-    memset(&ctx, 0, sizeof(ctx));
-    memset(expected_tag, 0, sizeof(expected_tag));
+    tl_secure_zero(otk, sizeof(otk));
+    tl_secure_zero(&ctx, sizeof(ctx));
+    tl_secure_zero(expected_tag, sizeof(expected_tag));
     return 0;
 }

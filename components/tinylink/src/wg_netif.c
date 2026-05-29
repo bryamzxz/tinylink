@@ -459,11 +459,16 @@ static int start_rekey(void)
  *    is still serving traffic; we atomically install the new keys and
  *    drop the rekey-in-flight flag.
  *
- * In either case wg_transport_session_init overwrites g.transport with
- * the new keys, so any in-flight encrypt that just sampled the OLD
- * session pointer races into the swap; that's fine because both keys
- * are valid on the wire (responder accepts the previous session for
- * REJECT_AFTER_TIME after rotating). */
+ * wg_transport_session_init overwrites g.transport IN PLACE — it installs
+ * the new send_key AND resets send_counter to 0. That swap MUST be mutually
+ * exclusive with wg_transport_encrypt (which read-modify-writes the same
+ * g.transport.send_counter and reads g.transport.send_key, under g.lock, on
+ * the lwIP-TCPIP task). wg_rx is unpinned and TCPIP is pinned to CPU0, so on
+ * the dual-core LX6 they run truly in parallel: without the lock a concurrent
+ * encrypt could latch the OLD high counter, then read the NEWLY installed
+ * send_key, emitting (new_key, old_counter) — a counter the fresh session
+ * re-uses as it climbs from 0, i.e. catastrophic ChaCha20-Poly1305 nonce
+ * reuse. So we take the SAME g.lock send_plaintext uses around the swap. */
 static void handle_handshake_response(const uint8_t *buf, size_t len)
 {
     if (len != sizeof(struct wg_msg_response)) return;
@@ -487,8 +492,10 @@ static void handle_handshake_response(const uint8_t *buf, size_t len)
         return;
     }
 
+    xSemaphoreTake(g.lock, portMAX_DELAY);
     wg_transport_session_init(&g.transport, g.local_index, remote_index,
                               send_key, recv_key);
+    xSemaphoreGive(g.lock);
     /* Scrub once the keys are copied into the session. */
     memset(send_key, 0, sizeof(send_key));
     memset(recv_key, 0, sizeof(recv_key));
@@ -657,10 +664,17 @@ static void handle_disco_direct(const uint8_t *buf, size_t len,
         ESP_LOGI(TAG, "disco pong (direct): src=%s:%u txid=%02x%02x%02x%02x..",
                  src_ip, (unsigned)ntohs(src->sin_port),
                  txid[0], txid[1], txid[2], txid[3]);
-        if (!disco_prober_match_and_remove(txid, now_us())) {
+        /* Bind the match to the AddrPort we actually probed: a captured
+         * Pong replayed from a spoofed source fails the source check and
+         * cannot roam the WG endpoint to the attacker's address (ROAM-3).
+         * On success src == the probed dst, so the roam below is the
+         * magicsock `sentPing.to` model, not roam-to-arbitrary-source. */
+        if (!disco_prober_match_and_remove(
+                txid, (uint32_t)src->sin_addr.s_addr, ntohs(src->sin_port),
+                now_us())) {
             ESP_LOGD(TAG,
-                "disco pong: txid not in prober table — ignoring "
-                "(replay or stale)");
+                "disco pong: txid/source not in prober table — ignoring "
+                "(replay, spoofed source, or stale)");
             return;
         }
         if (roam_allowed) {

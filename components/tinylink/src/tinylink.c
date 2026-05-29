@@ -10,14 +10,17 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 
+#include "esp_event.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_netif.h"
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "mbedtls/platform_util.h"
 #include "nvs.h"
 #include "sdkconfig.h"
 
+#include "backoff.h"
 #include "control_key.h"
 #include "derp_client.h"
 #include "disco.h"
@@ -1102,32 +1105,52 @@ static esp_err_t long_poll_handler(const tl_netmap_t *nm, void *ctx)
     return err;
 }
 
+/* RC-2 reconnect backoff. Base is deliberately small so a clean
+ * stream-end (server idle/ping-rotation/restart) reconnects promptly
+ * instead of leaving the device 30 s without netmap updates; the cap
+ * preserves the previous worst-case interval. A stream that stayed up
+ * at least HEALTHY_MS counts as a working connection and resets the
+ * attempt counter, so only genuine connect failures / instant-drop
+ * flapping climb the backoff. */
+#define LP_BACKOFF_BASE_MS 1000u
+#define LP_BACKOFF_CAP_MS  ((uint32_t)CONFIG_TINYLINK_REGISTER_RETRY_MS)
+#define LP_HEALTHY_MS      10000LL
+
 static void long_poll_task(void *arg)
 {
     (void)arg;
     ESP_LOGI(TAG, "long-poll task: starting");
+    uint32_t fail_attempt = 0;
     for (;;) {
         int retry_after_s = 0;
         esp_err_t err = ensure_control_conn();
         if (err == ESP_OK) {
+            const int64_t t0 = esp_timer_get_time();
             err = mapreq_run_stream(&s_conn, &s_keys, long_poll_handler, NULL);
             /* Stream ended: either the server closed it (idle / ping
              * failure / restart) or our side errored. Capture any
              * Retry-After hint from the response (mapreq.c parses it on
              * 429/503) before drop_control_conn clears the conn. */
             retry_after_s = s_conn.h2_retry_after_s;
+            const int64_t up_us = esp_timer_get_time() - t0;
             ESP_LOGW(TAG, "long-poll stream ended: 0x%x — reconnecting", err);
             drop_control_conn();
+            /* The stream was a healthy working connection — recover fast. */
+            if (up_us >= LP_HEALTHY_MS * 1000LL) fail_attempt = 0;
         } else {
             ESP_LOGW(TAG, "long-poll connect failed: 0x%x — backing off", err);
         }
 
-        uint32_t delay_ms = (retry_after_s > 0)
-                              ? (uint32_t)retry_after_s * 1000U
-                              : (uint32_t)CONFIG_TINYLINK_REGISTER_RETRY_MS;
+        uint32_t delay_ms;
         if (retry_after_s > 0) {
+            /* Server-directed delay overrides our backoff. */
+            delay_ms = (uint32_t)retry_after_s * 1000U;
             ESP_LOGI(TAG, "long-poll: honoring server Retry-After=%d s",
                      retry_after_s);
+        } else {
+            delay_ms = tl_backoff_ms(fail_attempt, LP_BACKOFF_BASE_MS,
+                                     LP_BACKOFF_CAP_MS, esp_random());
+            if (fail_attempt < 1000u) fail_attempt++;  /* saturate the counter */
         }
         vTaskDelay(pdMS_TO_TICKS(delay_ms));
     }
@@ -1737,14 +1760,42 @@ bool tinylink_get_public_endpoint(uint8_t addr_v4[4], uint16_t *port)
     return true;
 }
 
+/* ROAM-2: wake source for the reprobe task. Given by the periodic timeout
+ * (the take below) OR immediately by the IP_EVENT_STA_GOT_IP handler when
+ * the device's own L3 identity changes (WiFi (re)connect / DHCP renew).
+ * Without this, a local network change left the STUN-learned public
+ * AddrPort — and the endpoint advertised to peers — stale for up to
+ * CONFIG_TINYLINK_STUN_REPROBE_MS (5 min). Mirrors magicsock's netmon
+ * linkChange → Rebind+ReSTUN. */
+static SemaphoreHandle_t s_stun_reprobe_wake;
+
+static void stun_reprobe_on_got_ip(void *arg, esp_event_base_t base,
+                                   int32_t id, void *data)
+{
+    (void)arg; (void)base; (void)id; (void)data;
+    /* Binary give coalesces: several GOT_IP events before the task runs
+     * collapse to a single immediate reprobe. */
+    if (s_stun_reprobe_wake != NULL) {
+        xSemaphoreGive(s_stun_reprobe_wake);
+    }
+}
+
 static void stun_reprobe_task(void *arg)
 {
     (void)arg;
     /* Sleep before the first iteration: the boot-time probe ran in
      * tinylink_stun_probe() before this task was even spawned, so
-     * doing a second probe immediately would just burn bandwidth. */
+     * doing a second probe immediately would just burn bandwidth. The
+     * wait returns early (before the period elapses) when a local network
+     * change signals s_stun_reprobe_wake — re-discovering the public
+     * endpoint within one STUN RTT instead of up to one reprobe period. */
     for (;;) {
-        vTaskDelay(pdMS_TO_TICKS(CONFIG_TINYLINK_STUN_REPROBE_MS));
+        if (s_stun_reprobe_wake != NULL) {
+            xSemaphoreTake(s_stun_reprobe_wake,
+                           pdMS_TO_TICKS(CONFIG_TINYLINK_STUN_REPROBE_MS));
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(CONFIG_TINYLINK_STUN_REPROBE_MS));
+        }
         esp_err_t err = tinylink_stun_probe();
         if (err != ESP_OK) {
             /* Don't escalate: the cached value (if any) is still in
@@ -1818,6 +1869,24 @@ static void stun_reprobe_retry_cb(void *arg)
 
 esp_err_t tinylink_stun_reprobe_start(void)
 {
+    /* ROAM-2: create the wake semaphore and subscribe to local IP changes
+     * before spawning, so the task can be signalled the moment it exists.
+     * The esp_event default loop is already created by app_wifi_start().
+     * Idempotent — guarded so a retry-timer respawn doesn't re-register. */
+    if (s_stun_reprobe_wake == NULL) {
+        s_stun_reprobe_wake = xSemaphoreCreateBinary();
+        if (s_stun_reprobe_wake == NULL) {
+            ESP_LOGE(TAG, "stun_reprobe: wake-sem alloc failed");
+            return ESP_ERR_NO_MEM;
+        }
+        esp_err_t eerr = esp_event_handler_instance_register(
+            IP_EVENT, IP_EVENT_STA_GOT_IP, &stun_reprobe_on_got_ip, NULL, NULL);
+        if (eerr != ESP_OK) {
+            ESP_LOGW(TAG, "stun_reprobe: GOT_IP subscribe failed: 0x%x "
+                          "— falling back to periodic-only reprobe", eerr);
+        }
+    }
+
     if (stun_reprobe_try_spawn() == pdPASS) return ESP_OK;
 
     /* Boot-time spawn failed. Schedule a retry via esp_timer (which
