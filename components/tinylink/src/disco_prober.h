@@ -75,14 +75,28 @@ void disco_prober_record(const uint8_t txid[DISCO_TXID_LEN],
                          uint32_t dst_v4_be, uint16_t dst_port,
                          int64_t now_us);
 
-/* Look up a Pong's txid in the table. If a matching outstanding probe
- * is found AND it has not yet expired, remove it and return true.
- * Otherwise return false (caller must drop the roam decision).
+/* Look up a Pong's txid in the table. Returns true ONLY if a matching
+ * outstanding probe is found, it has not expired, AND the Pong arrived
+ * from the exact AddrPort the probe was sent to (src_v4_be/src_port ==
+ * the recorded dst). On a true result the slot is consumed (removed).
  *
- * now_us is used to enforce the timeout — a stale matching entry
- * returns false AND is cleared so a subsequent legitimate probe can
- * reuse the slot. */
+ * Binding the match to the probed destination — not just the txid — is
+ * what actually defeats the "replay-of-captured-Pong-from-spoofed-
+ * AddrPort" attack named in this file's header: a captured sealed Pong
+ * reinjected from a spoofed source no longer roams the WG endpoint to
+ * the attacker's address. Mirrors upstream tailscale, which keys the
+ * roam decision on `sentPing.to` (the probed address), not the Pong's
+ * arrival source (endpoint.go handlePongConnLocked).
+ *
+ * src_v4_be is the Pong's source IPv4 in network byte order; src_port is
+ * host order. A txid match from the WRONG source returns false WITHOUT
+ * consuming the slot, so a spoofed Pong cannot burn the slot and lock
+ * out the genuine one. A stale (expired) matching entry returns false
+ * and IS cleared so a subsequent legitimate probe can reuse the slot.
+ *
+ * now_us is used to enforce the timeout. */
 bool disco_prober_match_and_remove(const uint8_t txid[DISCO_TXID_LEN],
+                                   uint32_t src_v4_be, uint16_t src_port,
                                    int64_t now_us);
 
 /* Test helper: wipe the table. Production code never needs this

@@ -85,6 +85,7 @@ void disco_prober_record(const uint8_t txid[DISCO_TXID_LEN],
 }
 
 bool disco_prober_match_and_remove(const uint8_t txid[DISCO_TXID_LEN],
+                                   uint32_t src_v4_be, uint16_t src_port,
                                    int64_t now_us)
 {
     if (txid == NULL) return false;
@@ -97,7 +98,15 @@ bool disco_prober_match_and_remove(const uint8_t txid[DISCO_TXID_LEN],
     for (int i = 0; i < DISCO_PROBER_TABLE_SIZE; i++) {
         if (!s_table[i].valid) continue;
         if (memcmp(s_table[i].txid, txid, DISCO_TXID_LEN) != 0) continue;
-        /* Match found. Check freshness. */
+        /* txid match. Bind the result to the probed destination: a Pong
+         * from any source other than the AddrPort we pinged is a spoofed
+         * replay and is rejected WITHOUT consuming the slot, so it cannot
+         * lock out the genuine Pong that is still in flight. */
+        if (s_table[i].dst_v4_be != src_v4_be ||
+            s_table[i].dst_port  != src_port) {
+            break;
+        }
+        /* Source matches. Check freshness. */
         if (s_table[i].sent_us >= expiry_threshold_us) {
             matched = true;
         }

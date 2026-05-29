@@ -20,9 +20,14 @@ TARGETS := test_blake2s test_curve25519 test_mapresp \
            test_chacha20 test_poly1305 test_chacha20poly1305 \
            test_hkdf_noise test_wg_handshake test_wg_transport \
            test_wg_demux test_disco test_stun test_tls_io test_derp \
-           test_disco_handler test_disco_prober test_retry_after
+           test_disco_handler test_disco_prober test_retry_after \
+           test_backoff
 
 all: $(TARGETS)
+
+# Pure exponential-backoff-with-jitter helper (RC-2). Header-only.
+test_backoff: test_backoff.c $(TL_SRC)/backoff.h
+	$(CC) $(CFLAGS) -I$(TL_SRC) -o $@ test_backoff.c
 
 test_blake2s: test_blake2s.c $(CRYPTO)/blake2s.c $(CRYPTO)/blake2s.h
 	$(CC) $(CFLAGS) -I$(CRYPTO) -o $@ test_blake2s.c $(CRYPTO)/blake2s.c
@@ -178,14 +183,14 @@ test_wg_transport: test_wg_transport.c \
         test_hkdf_noise.run test_wg_handshake.run test_wg_transport.run \
         test_wg_demux.run test_disco.run test_stun.run test_tls_io.run \
         test_derp.run test_disco_handler.run test_disco_prober.run \
-        test_retry_after.run clean
+        test_retry_after.run test_backoff.run clean
 
 test: test_blake2s.run test_curve25519.run test_mapresp.run \
       test_chacha20.run test_poly1305.run test_chacha20poly1305.run \
       test_hkdf_noise.run test_wg_handshake.run test_wg_transport.run \
       test_wg_demux.run test_disco.run test_stun.run test_tls_io.run \
       test_derp.run test_disco_handler.run test_disco_prober.run \
-      test_retry_after.run
+      test_retry_after.run test_backoff.run
 
 test_blake2s.run: test_blake2s
 	./test_blake2s
@@ -198,6 +203,9 @@ test_mapresp.run: test_mapresp
 
 test_chacha20.run: test_chacha20
 	./test_chacha20
+
+test_backoff.run: test_backoff
+	./test_backoff
 
 test_poly1305.run: test_poly1305
 	./test_poly1305
