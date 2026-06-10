@@ -21,6 +21,7 @@
 #include "lwip/sockets.h"
 
 #include "crypto/nacl_box.h"
+#include "crypto/secure_zero.h"
 #include "disco_handler.h"
 #include "disco_prober.h"
 #include "wg_demux.h"
@@ -487,8 +488,8 @@ static void handle_handshake_response(const uint8_t *buf, size_t len)
                                       send_key, recv_key, &remote_index) != 0) {
         ESP_LOGW(TAG, "handshake response rejected (path=%s)",
                  cold_path ? "cold" : "rekey");
-        memset(send_key, 0, sizeof(send_key));
-        memset(recv_key, 0, sizeof(recv_key));
+        tl_secure_zero(send_key, sizeof(send_key));
+        tl_secure_zero(recv_key, sizeof(recv_key));
         return;
     }
 
@@ -497,8 +498,8 @@ static void handle_handshake_response(const uint8_t *buf, size_t len)
                               send_key, recv_key);
     xSemaphoreGive(g.lock);
     /* Scrub once the keys are copied into the session. */
-    memset(send_key, 0, sizeof(send_key));
-    memset(recv_key, 0, sizeof(recv_key));
+    tl_secure_zero(send_key, sizeof(send_key));
+    tl_secure_zero(recv_key, sizeof(recv_key));
     wg_handshake_scrub(&g.handshake);
 
     g.last_handshake_completed_us = now_us();
