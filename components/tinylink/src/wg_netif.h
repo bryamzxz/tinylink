@@ -223,6 +223,16 @@ int wg_netif_get_socket(void);
  * of the two would receive a given datagram). */
 bool wg_netif_rx_running(void);
 
+/* Copy the active WG peer's DiscoKey into out (WG_KEY_LEN bytes) and
+ * return true if one is known (has_peer_disco_pub). Returns false (and
+ * leaves out untouched) when no peer DiscoKey is configured yet — the
+ * caller should then treat all DISCO senders as permissive, matching
+ * the direct-path roaming gate. Exposed so the DERP-relayed DISCO
+ * handler in tinylink.c can apply the same knownPeerDiscoKey gate the
+ * direct UDP path applies in handle_disco_direct, instead of acting on
+ * a PING/CallMeMaybe sealed by any tailnet node's DiscoKey. */
+bool wg_netif_get_peer_disco_pub(uint8_t out[WG_KEY_LEN]);
+
 #ifdef __cplusplus
 }
 #endif

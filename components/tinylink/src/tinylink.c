@@ -697,6 +697,27 @@ static void handle_disco_relayed(const derp_event_t *e,
                                          e->data, e->data_len,
                                          s_keys.disco_priv, s_keys.disco_pub,
                                          &type, peer_disco_pub, txid);
+
+    /* knownPeerDiscoKey gate (mirrors the direct-UDP path's gate in
+     * wg_netif.c handle_disco_direct). disco_handle_recv only proves the
+     * frame was sealed TO us — any tailnet node can do that. Before we
+     * answer a PING or, worse, punch the endpoints in a CallMeMaybe (a
+     * UDP ping flood to attacker-chosen addresses), require the sender's
+     * DiscoKey to match the active WG peer's. Only DISCO message types
+     * are gated; the default case below is relayed WireGuard traffic,
+     * which wg_netif_inject_packet gates separately by src NodeKey. When
+     * no peer DiscoKey is known yet (early bringup) the gate is
+     * permissive, same as the direct path. */
+    if (type == DISCO_TYPE_PING || type == DISCO_TYPE_PONG ||
+        type == DISCO_TYPE_CALLMEMAYBE) {
+        uint8_t known_disco[WG_KEY_LEN];
+        if (wg_netif_get_peer_disco_pub(known_disco) &&
+            memcmp(peer_disco_pub, known_disco, DISCO_KEY_LEN) != 0) {
+            ESP_LOGD(TAG, "drop relayed DISCO from unknown DiscoKey");
+            return;
+        }
+    }
+
     switch (type) {
     case DISCO_TYPE_PING:
         if (reply_len > 0) {

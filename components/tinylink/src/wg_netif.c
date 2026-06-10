@@ -521,7 +521,24 @@ static void handle_handshake_response(const uint8_t *buf, size_t len)
     }
 }
 
-/* Process a MessageTransport from the peer. */
+/* Process a MessageTransport from the peer.
+ *
+ * WGN-1 (rx side): wg_transport_decrypt does a non-atomic read-modify-write
+ * of the replay window (g.transport.replay.highest + .bitmap) and reads
+ * g.transport.recv_key. handle_transport is reachable from TWO unpinned
+ * FreeRTOS tasks that run in parallel on the dual-core LX6: the wg_rx UDP
+ * task (rx_task) and the tinylink_derp relay task (via
+ * wg_netif_inject_packet). Whenever a direct-UDP session and a DERP relay
+ * are simultaneously active (the normal NAT-traversal transition + every
+ * path-stale -> DERP fallback) two transport packets can be decrypted
+ * concurrently -> racing RMWs on the replay bitmap (lost update could
+ * ACCEPT a replayed packet or corrupt the window across a rekey) and a
+ * recv_key read racing the session_init writer in
+ * handle_handshake_response. The #105 fix locked only that writer; this
+ * locks the reader so the mutual exclusion actually holds. Lock scope is
+ * the decrypt + watchdog-clock update ONLY: g.rx_cb re-enters lwIP, which
+ * calls back into wg_netif_send_plaintext (takes g.lock), so holding the
+ * lock across it would deadlock. */
 static void handle_transport(const uint8_t *buf, size_t len)
 {
     if (g.state != WG_NETIF_UP) return;
@@ -530,16 +547,23 @@ static void handle_transport(const uint8_t *buf, size_t len)
      * WG_RX_BUF_LEN - WG_TRANSPORT_OVERHEAD. */
     uint8_t  plaintext[WG_RX_BUF_LEN];
     size_t   plen = 0;
-    if (wg_transport_decrypt(&g.transport, buf, len,
-                             plaintext, sizeof(plaintext), &plen) != 0) {
+
+    xSemaphoreTake(g.lock, portMAX_DELAY);
+    int drc = wg_transport_decrypt(&g.transport, buf, len,
+                                   plaintext, sizeof(plaintext), &plen);
+    if (drc == 0) {
+        /* Successful decrypt = peer's session keys still match ours.
+         * Update the RX-stale watchdog clock under the same lock for both
+         * data packets AND zero-length keepalives, since both prove the
+         * WG transport keys are mutually valid. The watchdog cares about
+         * session liveness, not payload direction. */
+        g.last_transport_recv_us = now_us();
+    }
+    xSemaphoreGive(g.lock);
+
+    if (drc != 0) {
         return;  /* Replay / tamper / wrong index — silent drop. */
     }
-    /* Successful decrypt = peer's session keys still match ours. Update
-     * the RX-stale watchdog clock for both data packets AND zero-length
-     * keepalives, since both prove the WG transport keys are mutually
-     * valid. The watchdog cares about session liveness, not payload
-     * direction. */
-    g.last_transport_recv_us = now_us();
     if (plen == 0) {
         /* WG keepalive (zero plaintext) — peer is alive, nothing to
          * deliver upstream. */
@@ -1372,6 +1396,13 @@ int wg_netif_get_socket(void)
 bool wg_netif_rx_running(void)
 {
     return g.rx_task != NULL;
+}
+
+bool wg_netif_get_peer_disco_pub(uint8_t out[WG_KEY_LEN])
+{
+    if (!g.peer.has_peer_disco_pub) return false;
+    memcpy(out, g.peer.peer_disco_pub, WG_KEY_LEN);
+    return true;
 }
 
 #endif /* ESP_PLATFORM */
