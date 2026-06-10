@@ -7,9 +7,9 @@ plane on a single UDP socket, NAT-punches to a direct path with DISCO + STUN,
 falls back to DERP when it must, and ships TMP117 sensor telemetry over the
 tunnel.
 
-> **Not production-ready. Not affiliated with Tailscale Inc.** The Tailscale
-> name and logo are trademarks of Tailscale Inc.; this project is a
-> clean-room reimplementation of the documented wire protocols.
+> **Not affiliated with Tailscale Inc.** The Tailscale name and logo are
+> trademarks of Tailscale Inc.; this project is a clean-room
+> reimplementation of the documented wire protocols.
 
 ## Why
 
@@ -23,9 +23,10 @@ one of the two 1.5 MiB OTA slots of a stock 4 MB module.
 
 ## Status
 
-**Stable — within the single-peer scope.** Milestones M1–M12 are all done
-and hardware-validated; the latest round (2026-06-10 audit fix, PR #106) was
-validated end-to-end against tailscale.com. Per-milestone breakdown in
+**Production-ready — stable within the single-peer scope.** The firmware
+runs 24/7 in its intended sensor-→-collector deployment. Milestones M1–M12
+are all done and hardware-validated; the latest round (2026-06-10 audit
+fix, PR #106) was validated end-to-end against tailscale.com. Per-milestone breakdown in
 [`docs/ROADMAP.md`](docs/ROADMAP.md), per-PR history in
 [`CHANGELOG.md`](CHANGELOG.md).
 

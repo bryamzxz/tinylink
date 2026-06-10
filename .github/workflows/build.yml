@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 Bryam (bryamzxz)
 #
-# Build matrix for tinylink. Treats warnings as errors so the pre-alpha
-# tree stays clean while the code surface is small.
+# Build matrix for tinylink. Treats warnings as errors so the tree
+# stays clean while the code surface is small.
 
 name: build
 
