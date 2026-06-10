@@ -20,10 +20,14 @@ We **do not** defend against:
 
 - Physical attackers with persistent access to the board (e.g. an attacker
   who can clip onto the I²C lines, read flash with a programmer, or burn
-  fresh eFuses). Anyone with that level of access can also dump the
-  encrypted NVS partition and recover the eFuse-derived key from the
-  bootrom; that is an ESP32 platform decision, not something tinylink can
-  paper over.
+  fresh eFuses). On the current build the bar is even lower than the
+  encrypted-NVS scenario implies: flash encryption is **not** enabled
+  (`CONFIG_SECURE_FLASH_ENC_ENABLED` / `CONFIG_FLASH_ENCRYPTION_ENABLED`
+  unset in `sdkconfig`), so the NVS partition holding the Curve25519
+  private keys is plaintext on flash — a single `esptool.py read_flash`
+  recovers every identity without touching eFuses. See the **at-rest key
+  storage** note under "Long-term keys": closing this gap is on the
+  hardening roadmap, not done.
 - Compromise of `controlplane.tailscale.com` itself.
 
 ## Long-term keys
@@ -38,11 +42,27 @@ We **do not** defend against:
 | WiFi PSK        | local network association     | NVS `tl_creds/wifi_pass` (str) |
 | Pinned control plane pub | TOFU pin               | NVS `tl_pin/control_pub` (32 B)|
 
-All NVS data sits in an `nvs_creds` partition with
-`CONFIG_NVS_ENCRYPTION=y` set on top of the eFuse-derived flash-encryption
-key. The Curve25519 identities are generated on first boot using
-`esp_fill_random()` (RF-derived entropy) and never leave the chip in
-plaintext.
+**At-rest key storage — NOT currently encrypted.** The keys are read and
+written through the plain default NVS partition (`keys.c` calls
+`nvs_open("tl_keys", …)` against the default `nvs` namespace; there is no
+`nvs_creds`/`nvs_keys` encrypted partition in `partitions.csv`). Although
+`CONFIG_NVS_ENCRYPTION=y` is present in `sdkconfig`, NVS encryption only
+takes effect once flash encryption derives the XTS key — and flash
+encryption is **off** on this build (`CONFIG_SECURE_FLASH_ENC_ENABLED`
+and `CONFIG_FLASH_ENCRYPTION_ENABLED` are both unset). Net effect: the
+Curve25519 MachineKey / NodeKey / DiscoKey private blobs sit in flash in
+the clear. Enabling eFuse-backed flash encryption + a real encrypted-NVS
+partition is roadmap hardening, **not** a property the current firmware
+provides — do not assume at-rest confidentiality.
+
+The Curve25519 identities are generated on first boot using
+`esp_fill_random()` (RF-derived entropy) and never leave the chip over
+the wire. As of the identity-regen hardening (`keys.c`
+`keys_load_or_generate`), the MachineKey and NodeKey are regenerated
+**atomically as a unit** if either is absent or corrupt — matching
+headscale's 1:1 NodeKey↔MachineKey binding — while the DiscoKey
+regenerates independently. A hard NVS fault is propagated, never papered
+over by silently minting a fresh identity over a recoverable one.
 
 The Tailscale auth key is **single-use by convention** — once
 `MachineAuthorized=true` returns, the auth key has done its job and
@@ -103,6 +123,88 @@ cheaper than dragging in another dependency.
 - **MagicDNS resolution.** We use raw `100.x.y.z` peer IPs.
 - **Tailnet Lock.** tinylink does not verify the tailnet-lock signature
   on `NodeKey` updates. If you need this, do not use tinylink.
+- **TLS certificate validity windows.** `MBEDTLS_HAVE_TIME_DATE` is unset
+  and there is no SNTP wall-clock sync feeding mbedTLS, so the three TLS
+  clients (control-plane `/key` bootstrap, ts2021, DERP) verify the cert
+  chain and pin but **never** check `notBefore` / `notAfter`. An expired
+  or not-yet-valid leaf is accepted. Chain validity still rests on the
+  TOFU/compile-in control-pub pin, not on time.
+
+## Accepted risks / hardening roadmap (not yet addressed)
+
+These are known gaps, surfaced honestly so nobody mistakes them for
+solved. None is fixed in the current firmware.
+
+- **NVS private keys are plaintext at rest.** See "Long-term keys":
+  flash encryption is off, so the Curve25519 identities are recoverable
+  from a raw flash dump. Highest-value hardening item.
+- **No self-recovery watchdog for application tasks.** The task WDT is
+  compiled in (`CONFIG_ESP_TASK_WDT_EN=y`) but `CONFIG_..._WDT_PANIC` is
+  unset and it only subscribes the two idle tasks — no application task
+  (`wg_rx`, long-poll, DERP supervisor, telemetry) calls
+  `esp_task_wdt_add`. So a wedged application task does **not** trigger a
+  reset: the device stays bricked until a physical power-cycle. There is
+  no `esp_restart` self-recovery path.
+
+## Audit-fix round (2026-06) — control + transport posture
+
+Six fixes from the 2026-06 cluster, all hardware-validated against the
+live `tailscale.com` control plane. Each is summarized here for the
+threat-model record; the commit-level detail lives in `CHANGELOG.md`.
+
+- **Control-channel capability floor.** The ts2021 Noise handshake now
+  advertises `TINYLINK_CAPVER = 138` (= Tailscale v1.98) as the single
+  source of truth (`components/tinylink/include/tinylink.h`). It is mixed
+  into the Noise prologue (`ts2021_client.c`: `"Tailscale Control
+  Protocol v138"`, was hardcoded `1`) and into `RegisterRequest.Version`
+  / `MapRequest.Version`. 138 clears headscale's
+  `MinSupportedCapabilityVersion = 113` (= v1.80) earlyNoise floor with
+  headroom, so the device is no longer silently rejected by a current
+  headscale. The separate `/key?v=100` TLS-bootstrap floor in
+  `control_key.c` is deliberately lower and is **not** tied to this
+  macro. Changing the macro re-hashes the prologue, so a bump requires
+  a hardware A/B smoke against the live control plane.
+- **EarlyNoise payload drained, not trusted.** `consume_early_payload`
+  (`ts2021_client.c`) now reads the 9-byte EarlyNoise header
+  (`magic[5] || BE32 len || JSON`) as a byte **stream** spanning Noise
+  records — the control plane flushes the 5-byte magic as its own
+  record, so the prior record-aligned reader desynced the HTTP/2 stream.
+  The EarlyNoise JSON (which carries the `NodeKeyChallenge`) is length-
+  checked and then **drained and discarded**: tinylink does not act on
+  the challenge, it only consumes the bytes so the HTTP/2 residual lines
+  up. The challenge is a server-anti-replay hint, not a client secret,
+  so discarding it costs nothing.
+- **WGN-1 transport-key race — FULLY closed.** PR #105 had wrapped only
+  the session-init *writer* (the recv-key swap) under `g.lock`. The rx
+  *reader* path is now also locked: `handle_transport` (`wg_netif.c`)
+  takes `g.lock` around `wg_transport_decrypt`, which does a non-atomic
+  read-modify-write of the replay-window bitmap and reads
+  `g.transport.recv_key`. `handle_transport` is reachable from two
+  unpinned tasks (`wg_rx` and `tinylink_derp`), so without the lock a
+  concurrent session swap could let two decrypts race the same
+  `(recv_key, replay-window)` state — the classic `(key, nonce)`-reuse /
+  replay-window corruption. With both the writer lock (#105) and this
+  reader lock, the WGN-1 window is closed; the rx path is **no longer
+  unlocked**.
+- **Relayed-DISCO sender gate (`knownPeerDiscoKey`).**
+  `handle_disco_relayed` (`tinylink.c`) now drops a DERP-relayed
+  `PING` / `PONG` / `CallMeMaybe` whose decrypted sender `DiscoKey` does
+  not match the active WG peer's, via the new
+  `wg_netif_get_peer_disco_pub` accessor. This mirrors the direct-UDP
+  path's existing gate. `disco_open` only proves the frame was sealed
+  *to* us — any tailnet node can do that — so before this gate an
+  attacker-sealed `CallMeMaybe` could make the device fire a UDP ping
+  flood at attacker-chosen endpoints. The gate is permissive only during
+  early bringup, before any peer DiscoKey is known (same as the direct
+  path). Relayed *WireGuard* traffic falls through to
+  `wg_netif_inject_packet`, which gates separately by source NodeKey.
+- **Adversarial-MapResponse depth bound.** `jsmn_skip` (`jsmn_skip.h`)
+  is now depth-bounded at `JSMN_SKIP_MAX_DEPTH = 64`: a malicious
+  control plane (or MITM past the Noise layer) can no longer hand the
+  long-poll task a pathologically nested JSON object that recurses the
+  skip walk deep enough to overflow that task's stack. Legitimate
+  netmaps are nowhere near 64 levels deep, so well-formed responses are
+  unaffected.
 
 ## Verification still TODO before any production use
 
@@ -125,6 +227,17 @@ Distilled from the protocol research artifact §L.
   and DISCO (24-byte random) have different nonce schemes. Force a
   rekey on every boot by zeroing all transport keys at startup; never
   reuse a counter across reboots.
+- **Secret-key scrubbing — sweep COMPLETE.** Every site that holds
+  secret key material now zeroes it with `tl_secure_zero` (a
+  `volatile`-pointer scrub the optimizer cannot elide), not plain
+  `memset`. This covers the WG session keys (`wg_netif.c`), the WG
+  handshake DH / chaining / tau / derived keys and `wg_handshake_scrub`
+  (`wg_handshake.c`), and the AEAD/KDF scratch in `salsa20.c`,
+  `hkdf_blake2s.c`, and `chacha20poly1305.c`. Public, non-secret values
+  (nonces, timestamps, on-wire message buffers) deliberately keep plain
+  `memset` — scrubbing them buys nothing. The earlier state where WG
+  session/handshake keys were torn down with a dead-code-eliminable
+  `memset` is resolved.
 - **Hardware RNG.** `esp_random()` is only a true TRNG *after*
   `esp_wifi_start()`. Generate Curve25519 long-term identities only
   after WiFi is up — `tinylink_init()` is called from `app_main()`
@@ -138,11 +251,13 @@ Distilled from the protocol research artifact §L.
   ts2021 (man-in-the-middle via a corporate TLS root). Set
   `CONFIG_TINYLINK_CONTROL_PUB_FALLBACK_HEX` to the operator's known
   control plane pubkey (64 hex chars): on first boot the device
-  installs that value as the NVS pin without any network round-trip,
-  and `control_key_refresh()` later refuses any fetched key that
-  disagrees. Empty (the default) preserves the legacy TOFU behavior
-  for development. Production firmware MUST set this; logged as a
-  WARN at boot when empty.
+  installs that value as the NVS pin without any network round-trip, so
+  no fetched key can ever override it. Empty (the default) preserves the
+  legacy TOFU behavior for development. Production firmware MUST set this;
+  logged as a WARN at boot when empty. (The old `control_key_refresh()`
+  re-fetch primitive was removed in the 2026-06 audit round — it was
+  dead code that also unconditionally clobbered the TOFU pin on every
+  call, so deleting it strengthens the pin rather than weakening it.)
 - **Replay window.** A 64-bit single-word bitmap is fine for single-peer
   single-flow. If tinylink ever extends to multi-peer, switch to the
   RFC 6479 2000-entry scheme or accept replay risk.

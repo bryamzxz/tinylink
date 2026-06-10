@@ -49,15 +49,23 @@ primitives we did, see [`SECURITY-MODEL.md`](SECURITY-MODEL.md).
 |                                                               |
 |  control plane (one Noise+H/2 channel reused for everything): |
 |     ts2021_client.c   Noise IK over TLS Upgrade               |
+|        │   prologue "Tailscale Control Protocol v138"         |
+|        │   (TINYLINK_CAPVER=138, clears headscale floor 113); |
+|        │   consume_early_payload reads EarlyNoise as a byte   |
+|        │   STREAM across Noise records (5B magic|BE32|JSON)   |
 |        ↑                                                      |
 |        │                                                      |
-|     register.c        POST /machine/register                  |
-|     mapreq.c          POST /machine/map                       |
+|     register.c        POST /machine/register (Version=138)    |
+|     mapreq.c          POST /machine/map      (Version=138)    |
 |       ├── mapreq_push_endpoints  Stream=false+OmitPeers=true  |
 |       │                          (lite update — only writable |
 |       │                          shape at CapVer ≥ 68)        |
 |       └── mapreq_run_stream      Stream=true (read-only       |
-|                                   netmap stream)              |
+|                                   netmap stream); skip_value  |
+|                                   depth-bounded (jsmn_skip.h, |
+|                                   MAX_DEPTH=64) so an          |
+|                                   adversarial nested netmap    |
+|                                   can't overflow the LP stack |
 |                                                               |
 |  data plane (single UDP socket, demuxed):                     |
 |     wg_netif.c                                                |
@@ -67,6 +75,9 @@ primitives we did, see [`SECURITY-MODEL.md`](SECURITY-MODEL.md).
 |       │       ├── HANDSHAKE_RESP  → handle_handshake_response |
 |       │       ├── TRANSPORT       → handle_transport →        |
 |       │       │                     decrypt → rx_cb           |
+|       │       │                     (decrypt + replay-window  |
+|       │       │                      under g.lock — WGN-1 rx, |
+|       │       │                      racing wg_rx + derp task)|
 |       │       │                       │                       |
 |       │       │                       ▼                       |
 |       │       │                 wg_lwip::wg_rx_inject →       |
@@ -96,6 +107,9 @@ primitives we did, see [`SECURITY-MODEL.md`](SECURITY-MODEL.md).
 |     derp_client.c    Long-lived TLS upgrade                   |
 |     tinylink.c::derp_supervised_task                          |
 |       ├── handle_disco_relayed                                |
+|       │     (gated: relayed DISCO whose sender DiscoKey !=    |
+|       │      active WG peer's is dropped — knownPeerDiscoKey, |
+|       │      via wg_netif_get_peer_disco_pub)                 |
 |       │     CMM → send_disco_pings_to_cmm_endpoints           |
 |       │           (sends DISCO ping via wg_netif socket to    |
 |       │            each peer endpoint — NAT punch)            |
@@ -263,19 +277,28 @@ anyone bisecting an unrelated regression to before the netstack switch.
    coalesces concurrent triggers. Replaces the legacy one-shot
    `xTaskCreate` per re-probe that started failing on a fragmented
    heap after hours of operation.
-10. **DISCO replay window** (`disco_replay.{c,h}`) — NaCl box
-   (XSalsa20-Poly1305) is a stateless AEAD: `nacl_box_open` is
-   deterministic, so an attacker who passively captures one DISCO
-   PING/PONG can replay it from a spoofed/owned source AddrPort and
+10. **Outbound DISCO prober + tx-id binding** (`disco_prober.{c,h}`,
+   replaces the deleted `disco_replay.{c,h}` — commit `31de72d`) — NaCl
+   box (XSalsa20-Poly1305) is a stateless AEAD: `nacl_box_open` is
+   deterministic, so an attacker who passively captures one DISCO PONG
+   could replay it from a spoofed/owned source AddrPort and try to
    trigger the roam in (7) toward an attacker-chosen target,
-   black-holing the WG transport. The replay window dedups on the
-   24-byte NaCl-box nonce of inbound DISCO frames (post-decrypt-
-   success) — last 128 entries, ~3 KiB BSS, single-peer scope. A
-   replay matches the recorded nonce → frame dropped before any
-   side-effect (no roam, no Pong emit). The DiscoKey gate from (7)
-   already filters out frames from non-WG-peers; this layer adds
-   resilience against replay of frames from the legitimate peer's
-   DiscoKey.
+   black-holing the WG transport. Rather than dedup inbound nonces
+   reactively, the prober makes the roam *outbound-bound*: every DISCO
+   ping we originate (`disco_prober_record` from `tinylink.c`) stamps
+   the 12-byte transaction id together with the destination AddrPort
+   into a 16-slot table (`s_table`, 5 s timeout, ~512 B BSS,
+   `taskENTER_CRITICAL`-guarded for the two-task RX/relay paths). The
+   roam in (7) is then gated by `disco_prober_match_and_remove`
+   (ROAM-3, `wg_netif.c:697`): a PONG can only flap the WG endpoint if
+   its tx-id matches a ping *we* actually sent to *that* source — a
+   replayed or attacker-forged PONG carries no live tx-id and is
+   dropped before any side-effect. The DiscoKey gate from (7) still
+   filters frames from non-WG-peers; this layer binds the response to a
+   genuine in-flight probe even for the legitimate peer's DiscoKey. The
+   relayed-DISCO path gets the same DiscoKey gate (see
+   `handle_disco_relayed` below). BSS delta vs. the old replay window:
+   −3072 (replay) +512 (prober) = −2560 B.
 
 Conditions 1-5 landed in PR #42; condition (1) was also touched by
 PR #53 (STUN re-probe via WG socket); the netif ICMP carrier (raw IP
@@ -421,7 +444,10 @@ The original M1-only layout, kept for historical reference:
 |     tinylink_init / tinylink_register / tinylink_get_keys      |
 |                                                                |
 |  Internal modules (src/)                                       |
-|     keys.c           — NVS-backed Curve25519 identities        |
+|     keys.c           — NVS-backed Curve25519 identities;       |
+|                        machine+node regenerate ATOMICALLY      |
+|                        (1:1 binding, policy in keys_regen.h),  |
+|                        disco independent                       |
 |     control_key.c    — HTTPS GET /key + NVS pinning            |
 |     ts2021_client.c  — TLS, HTTP Upgrade, Noise framing        |
 |     register.c       — RegisterRequest JSON + response parse   |
@@ -435,6 +461,10 @@ The original M1-only layout, kept for historical reference:
 |     curve25519_donna.c — agl curve25519-donna 1:1 (BSD-3)      |
 |     salsa20.c        — Salsa20 / HSalsa20 / XSalsa20           |
 |     nacl_box.c       — crypto_box / crypto_box_open            |
+|     secure_zero.h    — tl_secure_zero scrubs ALL secret key    |
+|                        material (39 sites: wg session/handshake|
+|                        keys, salsa20, hkdf, chachapoly); public|
+|                        nonces/timestamps keep plain memset     |
 +----------------------------------------------------------------+
         │
         ▼

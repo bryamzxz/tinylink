@@ -7,6 +7,225 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Audit fix round (2026-06-10, branch `fix/audit-cluster-1-protocol-wg`)
+
+Six fixes from the 2026-06-10 upstream + security audit, each built, host-
+tested (`make test` 531/0, up from 513 — +9 `keys_regen`, +9 `jsmn_skip`)
+and hardware-validated A/B against `controlplane.tailscale.com`. Net flash
+≈ +0.5 KiB. The remaining audit items are deferred on external conditions:
+netmap `PeersChanged`/`PeersRemoved` delta-merge (needs a multi-peer
+tailnet to validate), backoff consolidation (needs an extended soak), and
+the forced-flap relay soak (needs Servidor1 root).
+
+#### 1 — capver 138 at the Noise layer + stream-based early-payload (`971419c`)
+
+Closes the standing headscale-compatibility item and fixes a dormant
+control-channel framing bug that the bump exposed.
+
+**The capver bump.** tinylink advertised Tailscale `CapabilityVersion`
+`138` in its `RegisterRequest`/`MapRequest` JSON since 2026-05-02, but
+the **Noise-layer** version field stayed hardcoded at `1`
+(`ts2021_client.h` `TS2021_PROTOCOL_VERSION`). headscale `main` rejects
+that in `earlyNoise` (`hscontrol/noise.go`) the moment the
+`/ts2021` upgrade completes — `MinSupportedCapabilityVersion=113`
+(`capver_generated.go`) is checked **before any JSON is read** — so
+tinylink was never headscale-compatible at the Noise layer; it only
+worked because tailscale.com SaaS tolerates a v1 client. Introduces a
+single source of truth, `TINYLINK_CAPVER 138`
+(`components/tinylink/include/tinylink.h`), from which the Noise
+initiation header + prologue (`"Tailscale Control Protocol v138"`),
+`RegisterRequest.Version` (`register.c`) and `MapRequest.Version`
+(`mapreq.c`) all derive, so the three wire sites can never silently
+diverge again. The bump is wire-safe: the server reconstructs the Noise
+prologue from the client-claimed version
+(`controlbase/handshake.go`), so both ends agree by construction.
+(`control_key.c`'s `/key?v=100` is a deliberately separate, lower floor
+— only needs `>= NoiseCapabilityVersion` — and is intentionally **not**
+tied to the macro.) Upstream `tailcfg.CurrentCapabilityVersion` is `141`
+as of 2026-06; `138` (= Tailscale v1.98) clears the headscale floor with
+~9–10 minors of headroom.
+
+**The bug the bump exposed.** Claiming v138 makes tailscale.com SaaS
+send the optional `tailcfg.EarlyNoise` payload
+(`magic[5] || BE32 length || JSON`) that it never sent to a v1 client.
+The 9-byte header is **not** packed into one Noise record — observed in
+vivo, the 5-byte magic `\xff\xff\xffTS` arrives as its **own** record,
+with the length + 95-byte JSON in later records. The old
+`consume_early_payload` (`ts2021_client.c`) was record-aligned: it
+assumed the whole 9-byte header fit in the first record and, seeing a
+5-byte record (`< 9`), mis-stashed the magic as HTTP/2 data — desyncing
+the stream so the server closed the connection
+(`h2_session_init` → EOF, nghttp2 `-902`). Rewritten to read the
+early-payload header as a byte **stream** that spans Noise records,
+mirroring upstream `control/ts2021/conn.go` `readHeader`
+(`io.ReadFull` over the decrypted stream). The `EarlyNoise`
+`NodeKeyChallenge` is drained and discarded — auth-key registration does
+not require responding to it, same posture the upstream client takes in
+production.
+
+**Validation.** ESP32 boot against tailscale.com:
+`EarlyPayload sentinel found, 95 bytes JSON (skipping)` →
+`/machine/register status=200 MachineAuthorized=true` → dataplane up →
+telemetry `seq 1..50` continuous → WG rekey at session age 110 s OK →
+0 errors over a multi-minute soak. Flash delta ≈ 0 (the value change is
+a constant; the early-payload rewrite adds ~320 B). Follow-up: a
+host-side regression test feeding a split-record early-payload header
+(magic and length in separate records) would lock in the fix.
+
+#### 2 — lock rx transport decrypt + gate relayed DISCO (`e8997d7`)
+
+**WGN-1 (rx side).** PR #105 closed the WGN-1 writer race but left the
+reader unlocked: `wg_transport_decrypt` does a non-atomic read-modify-write
+of the replay window and reads `recv_key` with no `g.lock`, while
+`handle_transport` runs from **two** unpinned tasks — the `wg_rx` UDP task
+and the `tinylink_derp` relay task (via `wg_netif_inject_packet`) — which
+run in parallel on the dual-core LX6 whenever direct UDP and DERP traffic
+overlap (NAT-traversal transitions, path-stale fallback). Concurrent RMWs
+could accept a replayed packet or corrupt the window across a rekey. Take
+`g.lock` around the decrypt, released **before** `g.rx_cb` (which re-enters
+lwIP → `wg_netif_send_plaintext` → `g.lock`, a deadlock if held). Severity
+is High/P1, not P0 — the rx race can't reuse a nonce or leak a key.
+
+**Relayed DISCO knownPeerDiscoKey gate.** `handle_disco_relayed` acted on a
+PING/CallMeMaybe sealed by **any** tailnet node's DiscoKey — and a
+CallMeMaybe makes the node fire a UDP ping flood to the endpoints named in
+it (attacker-chosen). Add the same pre-action gate the direct UDP path uses
+(new `wg_netif_get_peer_disco_pub` accessor): drop relayed DISCO whose
+decrypted sender DiscoKey ≠ the active WG peer's. (The pre-AEAD CPU-DoS
+variant and the shared-K fast path are a noted follow-on.)
+
+#### 3 — atomic machine+node identity regeneration (`573312f`)
+
+headscale `main` now enforces a 1:1 `NodeKey`↔`MachineKey` binding on
+registration **and** re-auth (upstream `eb57a3a6` + `4914f9f2`). `keys.c`
+regenerated each key independently, so a partial NVS loss (e.g. machine
+present, node missing) regenerated only the missing one → a
+fresh-node/stale-machine pair the server rejects permanently. Treat machine
++ node as one unit: if either is absent **or corrupt**, regenerate and
+persist **both**; the disco key stays independent. A hard NVS fault now
+fails loudly instead of silently regenerating over a transient error. The
+policy lives in the pure header `keys_regen.h`, host-tested across all 8
+`(machine, node, disco)` presence combinations (`test_keys_regen`).
+
+#### 4 — bound `skip_value` recursion depth (`0d5ec30`)
+
+`skip_value` recursed once per JSON nesting level, so a control plane (or a
+MITM past TLS) could send deeply-nested JSON to recurse it deep enough to
+overflow the 24 KiB long-poll task stack. Factored into the pure header
+`jsmn_skip.h` with a `JSMN_SKIP_MAX_DEPTH` (64) cap that returns a shallow,
+always-in-bounds advance past the limit. Legitimate netmaps nest only a
+handful of levels, so their skipping is byte-for-byte unchanged. Host-tested
+(`test_skip_value`: exact at/below the cap, provably bounded past it).
+Note: `jsmn_skip_d` is plain `static` (not `inline`) on purpose — the inline
+hint makes -O2 recursively inline the self-call ~8 levels deep, +8–11 KiB
+for no gain on this cold path.
+
+#### 5 — secure_zero sweep (`df7b6bd`)
+
+PR #105 added `crypto/secure_zero.h` but only adopted `tl_secure_zero` in
+`chacha20poly1305.c`. Extend it to the remaining secret scrubs (39 sites):
+WG session keys (`wg_netif.c`), handshake DH/chaining/tau/derived keys and
+`wg_handshake_scrub` (`wg_handshake.c`), the XSalsa20 subkey (`salsa20.c`),
+and the HKDF temp keys / HMAC pads / keystream (`hkdf_blake2s.c`). Public
+values (nonces, timestamps, wire messages) keep plain `memset`. Behaviorally
+identical — the crypto KATs are unchanged — but the scrub now holds by
+construction across LTO / inlining / toolchain changes (CWE-14).
+
+#### 6 — wifi-connect logging + dead-code + hygiene (`22969c4`)
+
+- `app_wifi.c`: capture `esp_wifi_connect()`'s return and `ESP_LOGW` on
+  failure — a synchronous error queues no `DISCONNECTED` event, so the
+  silent call could leave an unattended node permanently offline.
+- Remove `control_key_refresh()` — a dead primitive (zero callers) that
+  also overwrote the TOFU pin unconditionally.
+- Remove `CONFIG_TINYLINK_LOG_LEVEL` — defined + documented but never
+  consumed.
+- Fix a `derp_client.c` comment that wrongly claimed `DERPPort` is absent
+  from the wire (`mapreq.c` parses it; the field is json `omitempty`).
+- `.gitignore`: self-maintaining `test_*` pattern, ignore `.claude/`, and
+  remove the orphan `test_disco_replay` binary that ran deleted code.
+
+### Security audit round (2026-05-29, PR #105 — `d11dfd2`)
+
+WGN-1 (HIGH) + four protocol hardenings, driven by a crypto/protocol
+audit verified against ASM + upstream + a multi-agent workflow.
+
+- **WGN-1 (HIGH, fixed):** `handle_handshake_response` called
+  `wg_transport_session_init` (installs new `send_key`, resets
+  `send_counter=0`) **without** `g.lock`, while
+  `wg_netif_send_plaintext` does the counter RMW + key read **under**
+  `g.lock`. `wg_rx` is unpinned and lwIP TCPIP is pinned to CPU0 → true
+  dual-core parallelism → a concurrent encrypt could latch the OLD
+  counter then read the NEW key, emitting `(new_key, old_counter)` and
+  re-using it as the fresh session climbs from 0 — catastrophic
+  ChaCha20-Poly1305 nonce reuse. Fix: wrap the swap in the same
+  `g.lock`. HW-verified: 110 s rekey completed in ~60 ms, telemetry
+  uninterrupted, no deadlock.
+- **ROAM-3:** `disco_prober_match_and_remove` now binds a Pong match to
+  the *probed destination* `(src_v4, src_port)`, rejecting spoofed-source
+  Pong replays without burning the outstanding-probe slot
+  (magicsock `sentPing.to` model). TDD'd (`test_disco_prober.c`).
+- **CWE-14 scrub:** new `crypto/secure_zero.h` (`tl_secure_zero` =
+  `mbedtls_platform_zeroize` on ESP, volatile-indirect memset on host);
+  `chacha20poly1305.c` scrubs converted. (ASM showed plain `memset` was
+  *not* actually elided at -O2 here, so this is by-construction
+  hardening, not an active-leak fix.)
+- **RC-2:** new pure `backoff.h` (`tl_backoff_ms`, exp + jitter, TDD'd in
+  `test_backoff.c`); `long_poll_task` now exp-backoff (base 1 s, cap 30 s,
+  reset after a ≥10 s healthy stream) instead of fixed 30 s. Retry-After
+  still overrides.
+- **ROAM-2:** STUN re-probe now waits on a binary sem; an
+  `IP_EVENT_STA_GOT_IP` handler signals it → re-STUN within ~1 RTT on a
+  local WiFi/DHCP change instead of waiting 5 min.
+- Skipped **WGN-2** (message-count rekey): never fires at telemetry
+  cadence → would be a dead primitive.
+
+Host `make test` 513/0; ESP build clean; 150 s HW capture clean.
+
+### Performance + resource round (2026-05-13, PRs #88–#104)
+
+17 PRs, net **−68.1 KiB flash** and largest-contiguous-heap-block
+**6 656 → 9 216 B**. Two stack trims were caught regressing and
+reverted, which is why the round nets fewer than 17 wins.
+
+- **#88** turn off `CONFIG_LWIP_PPP_SUPPORT` — dead code since the
+  raw-IP WG netif (`4a915df`). **−21.4 KiB**.
+- **#89** `EXCLUDE_COMPONENTS` for IDF subsystems with 0 callers.
+- **#90–#93** mbedTLS 4-stage prune (**−13.6 KiB**): ECP curves trimmed
+  to `{P-256, P-384, Curve25519}` (drop 8 unused), static-ECDH key
+  exchanges off, X509 CRL + CSR parsers off, and CCM/PKCS7/non-AES-GCM/
+  deterministic-ECDSA off. Curves verified against the live TLS cert
+  chain first (LE E8 P-384 → ISRG Root X2 P-384).
+- **#94** WiFi + lwIP trimmed for the single-AP/single-STA workload.
+- **#95** `NEWLIB_NANO_FORMAT` + convert 11 `%lld/%llu` log call-sites.
+  **−30.3 KiB**.
+- **#96** `chacha20poly1305.c` LE helpers via `__builtin_memcpy`, drop
+  byte loops.
+- **#97** soak observability: per-task stack-hwm dump + jsmn/body-buf
+  peak logs (the data source for the deferred stack/jsmn trims).
+- **#98–#102** five stack trims, of which **two were reverted**:
+  long-poll **#99 reverted by #103** (the 100 s smoke missed a 20 KiB
+  peak at 18 min uptime); endpoint-push **#102 reverted by #104**
+  (a 30-min stress soak hit a NAT-rebind + heap-frag panic). **#104**
+  also bumped `CONFIG_LWIP_TCPIP_TASK_STACK_SIZE` 3 K → 4.5 K (`tiT` was
+  at 95.5 % steady-state and overflowed under ENOMEM `sendto` pressure).
+  Lesson recorded: stack trims of tasks with TLS reconnect/retry loops
+  need a multi-hour soak, not a boot smoke (`uxTaskGetStackHighWaterMark`
+  is a lifetime max). Final 30-min soak: 0 panics, heap stable.
+
+### Misc round (2026-05-12, PRs #85–#87)
+
+- **#85** (`a827843`) `h2_client` honors a server `Retry-After` header on
+  429/503 throttles (`h2_retry_after.h`, parsed delta-seconds clamped
+  into `[1, 300]`). +15 host tests.
+- **#86** (`e2b4594`) branch-free carry in `poly1305_finish` — closes a
+  documented LX6 timing side-channel. Bit-identical KAT vs the baseline
+  tags.
+- **#87** (`1be9708`) bump `IPNVersion` to `1.0.0-tinylink`, flipping the
+  admin-panel `tsReleaseTrack` from unstable → stable (MINOR even via
+  `version.IsUnstableBuild`). Derived from `TINYLINK_VERSION_*`, single
+  source of truth in `tinylink.h`.
+
 ### DERP outbound round (2026-05-12 evening, PR-D0 + PR-D1)
 
 Two PRs that together unlock the full DERP-mediated fallback path the

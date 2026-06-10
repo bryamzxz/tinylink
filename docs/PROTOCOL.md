@@ -77,11 +77,17 @@ authenticated under the Noise transport keys. `maxMessageSize=4096`,
 giving a plaintext cap of `4096 − 3 − 16 = 4077`.
 
 The Noise IK prologue is the **string**
-`"Tailscale Control Protocol v1"` (prefix `"Tailscale Control Protocol v"`
+`"Tailscale Control Protocol v138"` (prefix `"Tailscale Control Protocol v"`
 + decimal protocol version, per `controlbase/handshake.go:protocolVersionPrologue`).
-The earlier note in this doc that called the prologue "the single byte
-`0x01`" was wrong; that byte appears in the cleartext init header, not
-in the Noise prologue.
+The decimal suffix is `TINYLINK_CAPVER` (the single source of truth in
+`components/tinylink/include/tinylink.h`, currently `138`); `ts2021_client.c`
+builds the prologue with `snprintf(prologue, …, TS2021_PROLOGUE_PREFIX,
+TS2021_PROTOCOL_VERSION)` where `TS2021_PROTOCOL_VERSION = TINYLINK_CAPVER`,
+and writes the same value into the cleartext BE16 header of the initiation
+frame so the server can reconstruct the prologue. (It was hardcoded `1` in M1;
+that broke headscale's `earlyNoise` floor of 113 — see below.) The earlier
+note in this doc that called the prologue "the single byte `0x01`" was wrong;
+that byte appears in the cleartext init header, not in the Noise prologue.
 
 After the upgrade and the optional EarlyPayload, the inner protocol is
 **HTTP/2** (per `tailscale/control/ts2021/`). tinylink wraps
@@ -92,13 +98,30 @@ the client disable HPACK dynamic-table indexing
 (`SETTINGS_ENABLE_PUSH = 0`) for one-shot request semantics.
 
 After `read_msg2` the connection optionally carries an EarlyPayload
-sentinel — `"\xff\xff\xffTS"` (5 B) + `BE32 length` + JSON-encoded
-`tailcfg.EarlyNoise` (per `tailscale/control/ts2021/conn.go`,
-`hdrLen=9`). Its only field is `NodeKeyChallenge`. The current upstream
-client reads it but no caller of `GetEarlyPayload` exists in production
-(`SealToChallenge` / `OpenFrom` from `types/key/chal.go` are referenced
-only in tests). tinylink therefore **drains and discards** the
-EarlyPayload bytes and starts the HTTP/2 stream from whatever follows.
+sentinel — `"\xff\xff\xffTS"` (5 B magic) + `BE32 length` + JSON-encoded
+`tailcfg.EarlyNoise` (per `tailscale/control/ts2021/conn.go`, `hdrLen=9`).
+Its only field is `NodeKeyChallenge`.
+
+The header crosses Noise record boundaries and must be read as a byte
+**stream**, not record-by-record. The control plane does *not* pack the
+9-byte header into one Noise record: observed in vivo against
+`controlplane.tailscale.com` for a capver ≥ 113 client, the **5-byte magic
+arrives as its own record**, with the `BE32` length and the JSON in later
+records. So `consume_early_payload` (`ts2021_client.c`) decrypts records
+into a buffer and consumes them byte-wise until it has all 9 header bytes —
+mirroring upstream `readHeader`, which does `io.ReadFull(c.Conn, hdr[:9])`
+over the decrypted stream (`control/ts2021/conn.go`). An earlier
+record-aligned version assumed the whole header fit in the first record and
+mis-stashed the short 5-byte magic record as HTTP/2 data, desyncing the
+stream so the server closed the connection (`h2_session_init` → EOF).
+
+The current upstream client reads the payload but no caller of
+`GetEarlyPayload` exists in production (`SealToChallenge` / `OpenFrom` from
+`types/key/chal.go` are referenced only in tests). tinylink therefore
+**drains and discards** the EarlyPayload — it skips the magic, the `BE32`
+length, and that many JSON bytes (which themselves may span further
+records), leaving whatever follows as the HTTP/2 residual replayed to
+nghttp2. The `NodeKeyChallenge` is dropped on the floor.
 
 ## /machine/register (M1)
 
@@ -106,7 +129,7 @@ JSON body, fields used today:
 
 | Field               | Notes                                              |
 |---------------------|----------------------------------------------------|
-| `Version`           | `1` — Noise transport `CapabilityVersion` (upstream pins this on the wire; feature gating is keyed on `Hostinfo`, not `Version`). |
+| `Version`           | `TINYLINK_CAPVER` (currently `138` = Tailscale v1.98) — the Tailscale `CapabilityVersion`, same value as the ts2021 Noise prologue/header (`register.c` adds `cJSON_AddNumberToObject(root, "Version", TINYLINK_CAPVER)`). M1 hardcoded `1`, which sits below headscale's `earlyNoise` floor `MinSupportedCapabilityVersion = 113` (`hscontrol/capver/capver_generated.go`) and aborts the `/ts2021` upgrade before any JSON is read. Feature gating is keyed on `Hostinfo`, not `Version`. |
 | `NodeKey`           | `"nodekey:" + 64-hex` of NodeKey public.           |
 | `OldNodeKey`        | `"nodekey:" + 64 zeros` on first registration.     |
 | `NLKey`             | `"nlpub:" + 64 zeros` for M1 (TKA disabled). Real Ed25519 NLPrivate generation lands in M7 hardening. The field has no `omitempty` upstream, so it must be present. |

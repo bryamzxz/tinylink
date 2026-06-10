@@ -9,7 +9,13 @@ written in pure C on **ESP-IDF v5.5.x**.
 M1–M7 all landed, perf round 2026-05-10 closed, sdkconfig perf-trim
 round 2026-05-12 PM merged (5 PRs), DERP outbound round 2026-05-12
 evening merged (PR-D0 + PR-D1: lossless transport during peer NAT
-flap).**
+flap), perf-audit round (#88–#104) net −68.1 KiB flash + largest
+contig heap 6656→9216, security round #105 (WGN-1 writer + ROAM-3 +
+secure_zero intro + RC-2 + ROAM-2), and the 2026-06-10 audit-fix
+round — 6 fixes hardware-validated against tailscale.com (capver 138
+at the Noise layer, WGN-1 rx-path lock + relayed-DISCO peer gate,
+atomic machine+node key regen, depth-bounded MapResponse skip,
+complete secure_zero key-scrub sweep, dead-primitive removals).**
 
 | Layer                          | State                                  |
 |--------------------------------|----------------------------------------|
@@ -25,6 +31,9 @@ flap).**
 | Perf + power round (2026-05-10)| done — constant-time crypto, light-sleep PM, QIO@80, -O2 |
 | sdkconfig perf-trim (2026-05-12 PM) | 5 PRs merged: −158.7 KiB flash · DRAM −2.9 KiB · IRAM −30.5 KiB (80%→56%) |
 | DERP outbound round (2026-05-12 evening) | 2 PRs merged: derp supervisor finally spawns + WG transport relay fallback (lossless on path-stale or sendto errno) |
+| Perf-audit round (#88–#104)    | done — net −68.1 KiB flash · largest-contig heap 6656→9216 (PPP off, NEWLIB_NANO, mbedTLS 4-stage prune, stack trims) |
+| Security round (#105)          | done — WGN-1 session-init writer lock + ROAM-3 pong src-binding + secure_zero intro + RC-2 backoff + ROAM-2 reprobe |
+| Audit-fix round (2026-06-10)   | done — 6 fixes, hardware-validated against tailscale.com: capver 138 Noise layer, WGN-1 rx lock + relayed-DISCO gate, atomic key regen, depth-bounded skip, full secure_zero sweep |
 
 What works today, verified on real hardware:
 
@@ -37,12 +46,27 @@ What works today, verified on real hardware:
 - The Tailscale admin panel shows `Endpoints: 190.x.x.x:<port>` and
   `Client connectivity → UDP: Yes`.
 
-What's still pending:
+What's still pending (deferred / next-round — none are blocking the
+current sensor-→-collector path):
 
-- DERP outbound queue (only relevant for peers behind shared CGNAT
-  where direct UDP can never work — for peers with public IPs the
-  direct path covers everything).
-- Multi-peer (single-peer today).
+- Multi-peer (single-peer today); the netmap `PeersChanged`/
+  `PeersRemoved` delta-merge is stubbed pending a multi-peer tailnet
+  to validate against.
+- Backoff consolidation — three divergent backoffs (DERP supervisor +
+  `endpoint_push`, the latter two without jitter) want folding into a
+  single `tl_backoff_ms`; deferred pending an extended soak
+  (`endpoint_push` is regression-sensitive).
+- Forced-flap relay soak — exercise PR-D1's RX-stale relay branch
+  under a real Servidor1 outage (needs Servidor1 root). Healthy path
+  is validated; the relay path is in place but dormant.
+- **No task watchdog / `esp_restart` self-recovery** — a wedged task
+  is a brick until physical reset.
+- **NVS private keys are stored in PLAINTEXT** — there is no
+  `CONFIG_SECURE_FLASH_ENC_ENABLED` and `keys.c` uses the default
+  plain partition. At-rest/eFuse key encryption is aspirational, not
+  currently enabled (see *Provisioning* below).
+- **No SNTP / wall-clock** — `MBEDTLS_HAVE_TIME_DATE` is off, so the
+  three TLS clients never validate cert `notBefore`/`notAfter`.
 
 ## Performance + power round (2026-05-10)
 
@@ -327,6 +351,14 @@ Three properties that are non-obvious from a casual read of the code:
    OmitPeers=true), the only shape modern Tailscale.com persists at
    CapVer ≥ 68. The long-poll Stream=true is read-only — it streams
    netmap updates but ignores any Hostinfo/Endpoints in the request.
+   The advertised CapabilityVersion is `TINYLINK_CAPVER = 138`
+   (= Tailscale v1.98), set once in `components/tinylink/include/
+   tinylink.h` and derived into the Noise prologue, RegisterRequest,
+   and MapRequest. It clears headscale's earlyNoise
+   `MinSupportedCapabilityVersion` floor of 113 (= Tailscale v1.80),
+   which the server enforces before any JSON is read. The separate
+   `/key?v=100` floor in `control_key.c` is a deliberately lower,
+   independent value for the legacy TOFU control-key fetch.
 
 ## Roadmap
 
@@ -342,6 +374,9 @@ Three properties that are non-obvious from a casual read of the code:
 | 8 | Perf + power round (2026-05-10)                 | done                  |
 | 9 | sdkconfig perf-trim round (2026-05-12 PM)       | done — 5 PRs merged (#76-#80) |
 | 10 | DERP outbound round (2026-05-12 evening)       | done — PR-D0 + PR-D1 merged (#82, #83), 30-min smoke OK, relay dormant pending forced flap test |
+| 11 | Perf-audit round (#88–#104)                    | done — net −68.1 KiB flash, largest-contig heap 6656→9216; two stack trims reverted (#103, #104) after extended soak caught them |
+| 12 | Security round (#105)                          | done — WGN-1 session-init writer + ROAM-3 + secure_zero intro + RC-2 + ROAM-2 |
+| 13 | Audit-fix round (2026-06-10)                   | done — 6 fixes hardware-validated vs tailscale.com: capver 138 at the Noise layer (clears headscale's earlyNoise floor 113), WGN-1 rx-path lock + relayed-DISCO peer-DiscoKey gate, atomic machine+node key regen, depth-bounded MapResponse skip, complete secure_zero key-scrub sweep, dead-primitive removals. `disco_replay` deleted, replaced by `disco_prober`. Host suite 531 assertions / 20 binaries |
 
 See [`docs/ROADMAP.md`](docs/ROADMAP.md) for the per-milestone breakdown.
 
@@ -360,8 +395,7 @@ Host-side codec tests:
 
 ```bash
 cd tools/test
-make
-for t in test_*; do ./$t; done   # 15 KAT binaries, all should report ALL OK
+make test                          # 20 binaries · 531 assertions, all should report PASS
 ```
 
 On-device AEAD micro-bench (opt-in via `CONFIG_TINYLINK_BENCH_AEAD`,
@@ -376,9 +410,12 @@ round detail.
 
 ## Provisioning
 
-Credentials (WiFi + Tailscale auth key) are stored in an encrypted NVS
-partition. The Curve25519 node identities are generated on first boot
-and persisted automatically. See [`docs/PROVISIONING.md`](docs/PROVISIONING.md).
+Credentials (WiFi + Tailscale auth key) are stored in NVS. The
+Curve25519 node identities are generated on first boot and persisted
+automatically. **NVS is currently a plaintext partition** —
+`CONFIG_SECURE_FLASH_ENC_ENABLED` is not set, so at-rest/eFuse key
+encryption is aspirational, not enabled (tracked under *What's still
+pending*). See [`docs/PROVISIONING.md`](docs/PROVISIONING.md).
 
 ## Examples
 
