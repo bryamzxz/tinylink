@@ -2,13 +2,14 @@
 
 ## Supported versions
 
-tinylink is pre-alpha. Until v0.1.0 ships there is no notion of a "supported
-release line"; only `main` receives fixes.
+tinylink versions as `1.0.x` (`TINYLINK_IPN_VERSION` in
+`components/tinylink/include/tinylink.h`), but there are no release tags or
+branches yet: development happens on `main` and only `main` receives fixes.
 
-| Version  | Supported          |
-|----------|--------------------|
-| `main`   | yes                |
-| `< 0.1`  | no (pre-release)   |
+| Version       | Supported |
+|---------------|-----------|
+| `main`        | yes       |
+| anything else | no        |
 
 ## Reporting a vulnerability
 
