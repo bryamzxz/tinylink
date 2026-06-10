@@ -32,13 +32,6 @@ extern "C" {
  */
 esp_err_t control_key_get(uint8_t out_pub[CONTROL_KEY_LEN]);
 
-/* Force-refresh the pin from /key?v=100. If
- * CONFIG_TINYLINK_CONTROL_PUB_FALLBACK_HEX is set, the fetched key
- * MUST match it; otherwise the refresh is refused and the existing
- * NVS pin is left intact (returns ESP_ERR_INVALID_RESPONSE). Use only
- * after a controlled key rotation event. */
-esp_err_t control_key_refresh(uint8_t out_pub[CONTROL_KEY_LEN]);
-
 #ifdef __cplusplus
 }
 #endif
