@@ -24,9 +24,16 @@
 #include "nghttp2/nghttp2.h"
 
 #include "noise_ik.h"
+#include "tinylink.h"  /* TINYLINK_CAPVER — single source of truth */
 
 #define TS2021_PROTOCOL_NAME    "Noise_IK_25519_ChaChaPoly_BLAKE2s"
-#define TS2021_PROTOCOL_VERSION 1
+/* The version carried in the controlbase initiation: BE16 header field
+ * + decimal suffix of the Noise prologue. The server derives its own
+ * prologue from this client-claimed value (controlbase handshake.go),
+ * so both ends stay in agreement by construction. Must equal
+ * tailcfg.CurrentCapabilityVersion to clear headscale's earlyNoise
+ * MinSupportedCapabilityVersion gate — see TINYLINK_CAPVER. */
+#define TS2021_PROTOCOL_VERSION TINYLINK_CAPVER
 #define TS2021_PROLOGUE_PREFIX  "Tailscale Control Protocol v"
 
 /* controlbase wire format: */

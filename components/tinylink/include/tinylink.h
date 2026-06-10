@@ -35,6 +35,31 @@ extern "C" {
     TINYLINK_STR(TINYLINK_VERSION_PATCH)
 #define TINYLINK_IPN_VERSION TINYLINK_VERSION_STRING "-tinylink"
 
+/* tailcfg.CurrentCapabilityVersion advertised to the control plane.
+ * SINGLE SOURCE OF TRUTH — every place that announces our capability
+ * version derives it from this macro so the four wire sites can never
+ * silently diverge:
+ *   1. ts2021 Noise initiation: BE16 header field + prologue string
+ *      (ts2021_client.h TS2021_PROTOCOL_VERSION). This is the gate
+ *      headscale enforces FIRST, in earlyNoise, before any JSON is
+ *      read — a value below its MinSupportedCapabilityVersion aborts
+ *      the /ts2021 upgrade outright.
+ *   2. RegisterRequest.Version  (register.c)
+ *   3. MapRequest.Version       (mapreq.c)
+ * NOTE: control_key.c's "/key?v=" floor is a deliberately separate,
+ * lower value (only needs >= NoiseCapabilityVersion) and is NOT tied
+ * to this macro.
+ *
+ * Floor check (verify on every upstream-audit round): headscale main
+ * enforces MinSupportedCapabilityVersion = 113 (= Tailscale v1.80) and
+ * climbs ~1 minor/month (oldest of the latest 10 minors). Upstream
+ * tailcfg.CurrentCapabilityVersion is 141 as of 2026-06. 138 (= v1.98)
+ * is >= the headscale floor with ~9-10 minors of headroom. Bumping the
+ * value changes the Noise prologue hash, so it requires a hardware A/B
+ * smoke against the live control plane per the repo's verify-regression
+ * rule. */
+#define TINYLINK_CAPVER 138
+
 #define TINYLINK_KEY_LEN 32
 
 /* The three Curve25519 identities a Tailscale node carries. They are
