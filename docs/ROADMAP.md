@@ -21,6 +21,11 @@ Go implementation, which is the authoritative reference for wire format.
 | M5 | DERP relay + direct-UDP NAT traversal         | done — DISCO punch via CallMeMaybe  | v0.5             | 1-2 wk   |
 | M6 | ICMP-over-WG end-to-end                       | done — verified on hardware         | v0.6             | <1 wk    |
 | M7 | Production hardening                          | done — within scope (eFuse + secure-boot intentionally out of scope) | v0.7 | landed |
+| M8 | Perf + power round (2026-05-10)               | done — PRs #61–#65                   | v0.7             | landed   |
+| M9 | Protocol + crypto follow-ups                  | done — PRs #85–#87                   | v0.7             | landed   |
+| M10| Perf-trim + footprint round                   | done — PRs #88–#104 (net −68.1 KiB)  | v0.7             | landed   |
+| M11| Security round                                | done — PR #105 (WGN-1 writer + 4 hardenings) | v0.7    | landed   |
+| M12| Audit-fix round (2026-06-10)                  | done — 6 fixes, HW-validated vs tailscale.com | v0.7   | landed   |
 
 End-to-end verification on hardware (sensor-cali next to router,
 Servidor1 WG peer with public IP):
@@ -85,9 +90,15 @@ established direct-UDP + ICMP path):
   DISCO pong is the canonical path-liveness signal. Cooldown
   `WG_PATH_PROBE_COOLDOWN_MS = 10 s` bounds the rate during a long
   outage.
-- **DERP outbound queue**: needed only for peers behind shared CGNAT
-  (where direct UDP can never punch). For peers with public IPs the
-  direct path covers all traffic.
+- ~~**DERP outbound queue**~~ — *landed (PR #83, 2026-05-12)*. Needed
+  only for peers behind shared CGNAT (where direct UDP can never
+  punch) or while a direct path is stale. `wg_netif.c` now relays WG
+  transport frames out through the supervised DERP session as a
+  lossless fallback, mirroring the inbound `wg_netif_inject_packet`
+  path. For peers with public IPs the direct UDP path still carries
+  all steady-state traffic; the relay only engages on path-stale.
+  Forced-flap exercise of this RX-stale branch (iptables-DROP on
+  Servidor1) is still pending — see GAP below.
 - **Responder-mode handshake**: steady-state session expiry is already
   fixed by initiator-side proactive rekey at session_age=110 s (see
   `ARCHITECTURE.md` § "WireGuard handshake lifecycle"). Responder
@@ -524,9 +535,13 @@ make `tailscale ping` show `via 190.x.x.x:port` instead of
 `via DERP(mia)` after one CMM round-trip.
 
 Outbound DERP queue (relayed WG transport for end-to-end ICMP via
-DERP for CGNAT-trapped peers) is the only piece left for M5 and is
-deferred — for peers with public IPs the direct path covers
-everything.
+DERP for CGNAT-trapped peers) landed in PR #83 (2026-05-12):
+`wg_netif.c` relays transport frames out through the supervised DERP
+session when the direct path is stale, mirroring the inbound inject
+path. For peers with public IPs the direct path still covers
+everything; the relay only engages on path-stale. The one remaining
+open task here is a forced-flap soak that actually exercises the
+RX-stale branch (iptables-DROP on Servidor1) — see GAPS below.
 
 ES: idem.
 
@@ -595,10 +610,13 @@ change has its own verification trail. Status as of HEAD:
 - [x] **Compile-in fallback control plane pubkey.** Optional
   `CONFIG_TINYLINK_CONTROL_PUB_FALLBACK_HEX` (64 hex chars). When
   set, `control_key_get()` installs the fallback as the NVS pin on
-  first boot without any network round-trip, and
-  `control_key_refresh()` refuses a fetched key that disagrees.
-  Empty preserves legacy TOFU (with a loud WARN). See
-  `components/tinylink/src/control_key.{c,h}`.
+  first boot without any network round-trip. Empty preserves legacy
+  TOFU (with a loud WARN). See
+  `components/tinylink/src/control_key.{c,h}`. (The companion
+  `control_key_refresh()` re-fetch-and-compare primitive was removed
+  in `22969c4` — it had no caller and unconditionally overwrote the
+  TOFU pin, a dead primitive that was net-negative for the pin's
+  integrity.)
 - [x] **TAI64N monotonicity across reboots.** `wg_tai64n_init()`
   installs a persisted seconds floor at boot;
   `tinylink_tai64n_floor_init()` reads it from NVS namespace
@@ -702,3 +720,202 @@ intermediate state; on-device boot captures show 0 `bcn_timeout`,
 0 wifi disconnects, 0 panics, exact 5 s telemetry cadence.
 
 ES: idem.
+
+## M9 — Protocol + crypto follow-ups (PRs #85–#87)
+
+Three small landed items that the milestone view had not yet
+absorbed; the `CHANGELOG.md` entries are authoritative.
+
+- [x] **PR #85 — `429` / `Retry-After` handling.** The control-plane
+  HTTP clients now parse a `429 Too Many Requests` with its
+  `Retry-After` header (delta-seconds or HTTP-date) and back off for
+  the advertised interval instead of hammering. +15 host assertions
+  in the 429/Retry-After parser test.
+- [x] **PR #86 — branch-free Poly1305 carry.** Replaced the
+  `poly1305_finish` add-with-carry's data-dependent `bgeu` branches
+  (the residual finding from M7-6) with a branch-free carry, closing
+  the documented ~4-bit-per-MAC timing leak (LX6 has no ISA
+  add-with-carry). Tags are bit-identical to the prior baseline —
+  20-min ICMP-over-WG soak (5.29 % loss / 109 ms avg) confirmed no
+  functional regression. See `SECURITY-MODEL.md`.
+- [x] **PR #87 — IPN `1.0.0-tinylink`.** Bumped the IPN bus version
+  and flipped the `tsReleaseTrack` panel `unstable → stable`. The
+  macro is derivable from a single source of truth in `tinylink.h`.
+
+ES: idem.
+
+## M10 — Perf-trim + footprint round (PRs #88–#104)
+
+A 17-PR aggressive footprint round (the `perf-audit` skill's
+verified-against-real-code output). Main HEAD after the round was
+`8062847`. The `CHANGELOG.md` "perf-audit round" section has the
+full per-PR forensic trail; this is the milestone-view tracking
+entry.
+
+Net result: **−68.1 KiB flash** and **+2.6 KiB largest contiguous
+heap block** (6 656 → 9 216 B — the block the supervised-TLS handshake
+transient contends for). Highlights:
+
+- [x] **PPP component fully off** (−21.4 KiB). The WG netif is a
+  raw-IP carrier with a no-op netstack now that `IS_PPP` is gone (see
+  `ARCHITECTURE.md` § WG netif); nothing in the build needs PPP.
+- [x] **`NEWLIB_NANO` formatted I/O** (−30.3 KiB). The firmware logs
+  no floats and no wide format specifiers, so the nano printf is a
+  free win.
+- [x] **mbedTLS 4-stage prune** (−13.6 KiB). Curve set trimmed to the
+  ones the live `controlplane.tailscale.com` + DERP cert chains
+  actually present (P-256 leaf + P-384 chain to ISRG Root X2, plus a
+  Curve25519 TLS-1.3 hedge); 8 unused `MBEDTLS_ECP_DP_*` curves
+  disabled. Each TLS endpoint was `openssl s_client -showcerts`-checked
+  before any curve was dropped.
+- [x] **5 stack trims — 2 reverted.** LP-task and `ep_up` trims were
+  caught and reverted (PR #99 → #103, PR #102 → #104): a 100 s
+  post-boot smoke is insufficient for tasks with TLS-reconnect /
+  retry loops, whose lifetime stack peak only shows up minutes into a
+  soak (#99's real LP peak was 20 KiB at 18 min uptime, not the 11
+  KiB boot peak it was trimmed against; #102's `ep_up` peak surfaced
+  under a NAT-rebind + heap-frag panic in a 30-min stress soak). PR
+  #104 also bumped `CONFIG_LWIP_TCPIP_TASK_STACK_SIZE` 3 K → 4.5 K
+  (the `tiT` task was a latent 95.5 % steady-state, overflowing under
+  `ENOMEM` `sendto` pressure). Lesson recorded: reconnect-loop stack
+  trims need a multi-hour soak with 60 s diag dumps before landing;
+  single-shot deterministic paths (DERP / `stun_r` / `ep_up` spawn)
+  are fine on a short smoke.
+
+Final 30-min stress soak after the round: 0 panics, 361 telemetry
+datagrams, heap stable.
+
+ES: idem.
+
+## M11 — Security round (PR #105)
+
+The first dedicated security-audit PR after the perf round, on top of
+HEAD `8062847`.
+
+- [x] **WGN-1 (HIGH) writer-side close.** The unlocked WG-session swap
+  in the `session_init` writer could expose a `(key, nonce)` reuse
+  window; the swap now happens under `g.lock`. HW-verified rekey at
+  session_age ≈ 110 s. (The companion rx-path lock landed in M12 —
+  see below — together they fully close WGN-1.)
+- [x] **ROAM-3 — DISCO pong source binding.** Outbound DISCO probes
+  now record their tx-id (the `disco_prober.c` table that replaced the
+  deleted `disco_replay.{c,h}` in `31de72d`), so an unsolicited pong
+  from an attacker-chosen source can no longer drive an endpoint roam.
+- [x] **`secure_zero` introduction + ROAM-2 + RC-2.** First
+  `tl_secure_zero` scrub primitive; `GOT_IP → reprobe` (ROAM-2) so a
+  WiFi reassociation re-runs STUN; exponential backoff on a class of
+  reconnect (RC-2). The full `secure_zero` sweep across all key
+  material landed in M12.
+
+WGN-2 was skipped (dead primitive without a consumer — landing a
+primitive without its trigger is a maintenance burden).
+
+ES: idem.
+
+## M12 — Audit-fix round (2026-06-10)
+
+Six audit fixes, all landed on branch `fix/audit-cluster-1-protocol-wg`
+and **hardware-validated against `tailscale.com`**. Host suite is now
+**531 assertions across 20 binaries** in `tools/test`
+(`test_keys_regen` +9, `test_skip_value` +9 over the prior 513 / 18).
+
+- [x] **(`971419c`) capver 138 at the Noise layer + stream
+  early-payload.** `TINYLINK_CAPVER = 138` (= Tailscale v1.98) in
+  `components/tinylink/include/tinylink.h:61` is now the single source
+  of truth that derives the ts2021 Noise initiation header + prologue
+  (`"Tailscale Control Protocol v138"`, was hardcoded `1` in
+  `ts2021_client.h`), `RegisterRequest.Version`, and
+  `MapRequest.Version`. This clears headscale's `earlyNoise`
+  `MinSupportedCapabilityVersion` floor of **113** (= v1.80) — the
+  prior advertised `1` was rejected by current headscale.
+  Upstream `CurrentCapabilityVersion` is **141** for reference; the
+  `GET /key?v=100` bootstrap is a deliberately separate, lower floor
+  (`control_key.c`). `consume_early_payload` was rewritten to read the
+  9-byte EarlyNoise header (`magic[5] || BE32 len || JSON`) as a byte
+  **stream** spanning Noise records (the server flushes the 5-byte
+  magic as its own record); the `NodeKeyChallenge` is drained and
+  discarded.
+- [x] **(`e8997d7`) WGN-1 rx-path close + relayed-DISCO gate.**
+  `g.lock` now wraps `wg_transport_decrypt` in `handle_transport`
+  (previously unlocked across the `wg_rx` + `tinylink_derp` tasks;
+  PR #105 had locked only the writer). Combined with M11's writer
+  lock, the WGN-1 replay-window / `recv_key` race is fully closed.
+  Plus a **relayed-DISCO gate**: `handle_disco_relayed` now drops a
+  relayed PING/CallMeMaybe whose decrypted sender DiscoKey ≠ the
+  active WG peer's (new `wg_netif_get_peer_disco_pub` accessor),
+  mirroring the direct-UDP path's `knownPeerDiscoKey` gate — closes
+  the CallMeMaybe-triggered UDP ping-flood to attacker-chosen
+  endpoints (`tinylink.c:714`).
+- [x] **(`573312f`) atomic machine+node identity regen.** `keys.c`
+  now regenerates the MachineKey and NodeKey as one unit (headscale's
+  new 1:1 `NodeKey ↔ MachineKey` binding, upstream `eb57a3a6` +
+  `4914f9f2`): if either is absent or corrupt, **both** regenerate;
+  DiscoKey stays independent. The policy lives in the pure header
+  `keys_regen.h` and is host-tested across 8 combinations.
+- [x] **(`0d5ec30`) depth-bounded `skip_value`.** `jsmn_skip.h`
+  enforces `JSMN_SKIP_MAX_DEPTH = 64`, so an adversarial
+  deeply-nested MapResponse can no longer overflow the long-poll
+  task stack. Legit netmaps are unchanged. Host-tested.
+- [x] **(`df7b6bd`) complete `secure_zero` sweep.** `tl_secure_zero`
+  now scrubs **all** secret key material — **39 call sites** across
+  `wg_netif.c` (WG session keys), `wg_handshake.c` (DH / chaining /
+  tau / derived keys + `wg_handshake_scrub`), `salsa20.c`,
+  `hkdf_blake2s.c`, `chacha20poly1305.c`. WG session/handshake keys
+  are no longer scrubbed with a plain `memset` (which the optimizer
+  can elide). Public values (nonces / timestamps / wire messages)
+  keep `memset`.
+- [x] **(`22969c4`) hygiene.** `esp_wifi_connect()` return is now
+  logged on failure (`app_wifi.c`); the dead `control_key_refresh()`
+  primitive was removed (it had no caller and overwrote the TOFU
+  pin); the dead `CONFIG_TINYLINK_LOG_LEVEL` Kconfig was removed; the
+  `derp_client.c` DERPPort comment was fixed; `.gitignore` now
+  self-maintains the `test_*` pattern + ignores `.claude/`; the
+  orphan `test_disco_replay` binary was removed.
+
+ES: idem.
+
+## Open backlog (roadmap — NOT done)
+
+These are the genuinely remaining protocol/data-plane follow-ups, kept
+separate from the accepted-risk GAPS below. None block the current
+sensor-→-collector workload.
+
+- **Netmap `PeersChanged` / `PeersRemoved` delta-merge.** The
+  long-poll currently treats each MapResponse as a fresh snapshot;
+  proper incremental delta application needs a multi-peer tailnet to
+  validate, which we don't have.
+- **Backoff consolidation.** Three divergent backoff
+  implementations remain (the DERP supervisor's, plus `endpoint_push`
+  and one other that lack jitter). Folding them into a single
+  `tl_backoff_ms` helper needs an extended soak — `ep_push` is
+  regression-sensitive (it already cost us PRs #102/#104).
+- **Forced-flap relay soak.** PR #83's DERP-relay WG-transport
+  fallback (the RX-stale branch) has only been exercised on the
+  healthy path. Exercising it for real needs an iptables-DROP on
+  Servidor1 (root on the peer), per `CHANGELOG.md`'s recipe.
+
+## GAPS — accepted-risk / next-round (NOT fixed)
+
+Surfaced honestly so downstream deployers know exactly what is and
+isn't covered. Each is a conscious deferral, not an oversight.
+
+- **No task watchdog / `esp_restart` self-recovery.** A wedged task
+  bricks the device until a physical reset — there is no software
+  watchdog kicking a recovery reboot.
+- **NVS private keys are PLAINTEXT.** `CONFIG_SECURE_FLASH_ENC_ENABLED`
+  is off and `keys.c` uses the default plain NVS partition. The
+  MachineKey / NodeKey / DiscoKey / auth_key sit in cleartext on
+  flash. At-rest / eFuse-HMAC encryption is **aspirational, not
+  currently enabled** (physical-access attacker is out of scope per
+  `SECURITY-MODEL.md`; see also the three irreversible M7 items).
+- **No SNTP-backed TLS time validation.** `MBEDTLS_HAVE_TIME_DATE` is
+  off, so all three TLS clients (controlplane, DERP, OTA-to-be) never
+  check certificate `notBefore` / `notAfter`. The pinned-control-key
+  TOFU + the published cert chain are the only trust anchors.
+- **CI runs `idf.py build` only, not `make test`.** And it pins the
+  floating `v5.5`, not the frozen `v5.5.4` the project actually builds
+  against. The 531-assertion host suite is run manually.
+- **Telemetry / TMP117 path unaudited.** The partition table is
+  OTA-shaped, but there is no `esp_ota` path and no coredump capture
+  wired up yet; OTA firmware update (above, Future directions) is the
+  vehicle that would close this.

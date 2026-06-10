@@ -6,6 +6,7 @@
 #include <string.h>
 
 #include "blake2s.h"
+#include "secure_zero.h"
 
 #define BLOCK_LEN 64
 
@@ -49,9 +50,9 @@ int hmac_blake2s(uint8_t out[HKDF_BLAKE2S_HASHLEN],
     if (blake2s_final(&S, out, HKDF_BLAKE2S_HASHLEN) != 0) return -1;
 
     /* Best-effort scrub. */
-    memset(k, 0, sizeof(k));
-    memset(ipad, 0, sizeof(ipad));
-    memset(opad, 0, sizeof(opad));
+    tl_secure_zero(k, sizeof(k));
+    tl_secure_zero(ipad, sizeof(ipad));
+    tl_secure_zero(opad, sizeof(opad));
     memset(inner, 0, sizeof(inner));
     return 0;
 }
@@ -66,10 +67,10 @@ int noise_hkdf1(const uint8_t ck[HKDF_BLAKE2S_HASHLEN],
     if (hmac_blake2s(temp_key, ck, HKDF_BLAKE2S_HASHLEN,
                      input, input_len) != 0) return -1;
     if (hmac_blake2s(out1, temp_key, HKDF_BLAKE2S_HASHLEN, &one, 1) != 0) {
-        memset(temp_key, 0, sizeof(temp_key));
+        tl_secure_zero(temp_key, sizeof(temp_key));
         return -1;
     }
-    memset(temp_key, 0, sizeof(temp_key));
+    tl_secure_zero(temp_key, sizeof(temp_key));
     return 0;
 }
 
@@ -86,19 +87,19 @@ int noise_hkdf2(const uint8_t ck[HKDF_BLAKE2S_HASHLEN],
     if (hmac_blake2s(temp_key, ck, HKDF_BLAKE2S_HASHLEN,
                      input, input_len) != 0) return -1;
     if (hmac_blake2s(out1, temp_key, HKDF_BLAKE2S_HASHLEN, &one, 1) != 0) {
-        memset(temp_key, 0, sizeof(temp_key));
+        tl_secure_zero(temp_key, sizeof(temp_key));
         return -1;
     }
     memcpy(buf, out1, HKDF_BLAKE2S_HASHLEN);
     buf[HKDF_BLAKE2S_HASHLEN] = two;
     if (hmac_blake2s(out2, temp_key, HKDF_BLAKE2S_HASHLEN,
                      buf, HKDF_BLAKE2S_HASHLEN + 1) != 0) {
-        memset(temp_key, 0, sizeof(temp_key));
-        memset(buf, 0, sizeof(buf));
+        tl_secure_zero(temp_key, sizeof(temp_key));
+        tl_secure_zero(buf, sizeof(buf));
         return -1;
     }
-    memset(temp_key, 0, sizeof(temp_key));
-    memset(buf, 0, sizeof(buf));
+    tl_secure_zero(temp_key, sizeof(temp_key));
+    tl_secure_zero(buf, sizeof(buf));
     return 0;
 }
 
@@ -119,12 +120,12 @@ int noise_hkdf3(const uint8_t ck[HKDF_BLAKE2S_HASHLEN],
     buf[HKDF_BLAKE2S_HASHLEN] = 0x03;
     if (hmac_blake2s(out3, temp_key, HKDF_BLAKE2S_HASHLEN,
                      buf, HKDF_BLAKE2S_HASHLEN + 1) != 0) {
-        memset(temp_key, 0, sizeof(temp_key));
-        memset(buf, 0, sizeof(buf));
+        tl_secure_zero(temp_key, sizeof(temp_key));
+        tl_secure_zero(buf, sizeof(buf));
         return -1;
     }
-    memset(temp_key, 0, sizeof(temp_key));
-    memset(buf, 0, sizeof(buf));
+    tl_secure_zero(temp_key, sizeof(temp_key));
+    tl_secure_zero(buf, sizeof(buf));
     return 0;
 }
 
@@ -175,7 +176,7 @@ int hkdf_blake2s_expand(const uint8_t prk[HKDF_BLAKE2S_HASHLEN],
         off += take;
         counter++;
     }
-    memset(t, 0, sizeof(t));
-    memset(buf, 0, sizeof(buf));
+    tl_secure_zero(t, sizeof(t));
+    tl_secure_zero(buf, sizeof(buf));
     return 0;
 }

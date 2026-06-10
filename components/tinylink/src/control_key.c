@@ -236,30 +236,3 @@ esp_err_t control_key_get(uint8_t out_pub[CONTROL_KEY_LEN])
     }
     return err;
 }
-
-/* Force-refresh the pin from /key?v=100. If a compile-in fallback is
- * configured, the fetched key MUST match it — otherwise we refuse and
- * leave the existing NVS pin untouched. This closes the malicious-
- * refresh vector where an attacker with control of /key (or DNS) tries
- * to rotate the pinned key out from under us after first boot. */
-esp_err_t control_key_refresh(uint8_t out_pub[CONTROL_KEY_LEN])
-{
-    if (out_pub == NULL) return ESP_ERR_INVALID_ARG;
-    esp_err_t err = fetch_pubkey(out_pub);
-    if (err != ESP_OK) return err;
-
-    uint8_t fallback[CONTROL_KEY_LEN];
-    esp_err_t fb_err = parse_fallback(fallback);
-    if (fb_err == ESP_OK) {
-        if (memcmp(out_pub, fallback, CONTROL_KEY_LEN) != 0) {
-            ESP_LOGE(TAG,
-                "fetched control pub disagrees with compile-in fallback — "
-                "refusing refresh (existing NVS pin left intact)");
-            return ESP_ERR_INVALID_RESPONSE;
-        }
-    } else if (fb_err != ESP_ERR_NOT_FOUND) {
-        return fb_err;  /* malformed Kconfig */
-    }
-
-    return persist(out_pub);
-}

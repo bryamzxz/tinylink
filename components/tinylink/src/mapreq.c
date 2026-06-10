@@ -19,6 +19,7 @@
 
 #define JSMN_STATIC
 #include "jsmn.h"
+#include "jsmn_skip.h"
 
 #ifdef ESP_PLATFORM
 static const char *TAG = "mapreq";
@@ -121,24 +122,12 @@ static esp_err_t parse_keyed_hex(const char *s, size_t len,
  * returning the next sibling index. jsmn produces tokens in document order
  * with `size` = number of immediate children, so this is just a recursive
  * skip without re-parsing. */
+/* Skip the JSON value at toks[i], returning the index just past its
+ * subtree. Depth-bounded (see jsmn_skip.h) so an adversarially deep
+ * MapResponse can't overflow the long-poll task stack. */
 static int skip_value(const jsmntok_t *toks, int i)
 {
-    int children = toks[i].size;
-    int next = i + 1;
-    if (toks[i].type == JSMN_OBJECT) {
-        for (int k = 0; k < children; k++) {
-            next = skip_value(toks, next);  /* key (string) */
-            next = skip_value(toks, next);  /* value         */
-        }
-        return next;
-    }
-    if (toks[i].type == JSMN_ARRAY) {
-        for (int k = 0; k < children; k++) {
-            next = skip_value(toks, next);
-        }
-        return next;
-    }
-    return i + 1;
+    return jsmn_skip(toks, i);
 }
 
 /* ------------------------------ parsers ----------------------------------- */
@@ -511,11 +500,12 @@ static int build_request_body(const tinylink_keys_t *keys,
     memcpy(disco_key_hex, "discokey:", 9);
     hex_encode(keys->disco_pub, 32, disco_key_hex + 9);
 
-    /* Version is the Tailscale CapabilityVersion. Same as RegisterRequest:
-     * production clients use tailcfg.CurrentCapabilityVersion (138 as of
-     * 2026-05-02). M1 hardcoded 1 here too — server rejects a v1
-     * MapRequest with HTTP 422 because the response shape it would have
-     * to emit is no longer wire-compatible with anything that old. */
+    /* Version is the Tailscale CapabilityVersion (TINYLINK_CAPVER, single
+     * source of truth). Same as RegisterRequest: production clients use
+     * tailcfg.CurrentCapabilityVersion. M1 hardcoded 1 here too — server
+     * rejects a v1 MapRequest with HTTP 422 because the response shape it
+     * would have to emit is no longer wire-compatible with anything that
+     * old. Emitted into the JSON below via TINYLINK_STR(TINYLINK_CAPVER). */
     /* Compress="" tells the server we cannot decode zstd (we don't link
      * a zstd library). Field is omitzero in upstream Go so omitting it
      * is equivalent in the wire JSON, BUT — first hardware run on
@@ -586,7 +576,7 @@ static int build_request_body(const tinylink_keys_t *keys,
      * server's KeepAlive=true behaviour we already parse on receipt. */
     int n = snprintf(out, out_size,
         "{"
-        "\"Version\":138,"
+        "\"Version\":" TINYLINK_STR(TINYLINK_CAPVER) ","
         "\"Compress\":\"\","
         "\"NodeKey\":\"%s\","
         "\"DiscoKey\":\"%s\","

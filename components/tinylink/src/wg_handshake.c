@@ -9,6 +9,7 @@
 #include "crypto/chacha20poly1305.h"
 #include "crypto/curve25519.h"
 #include "crypto/hkdf_blake2s.h"
+#include "crypto/secure_zero.h"
 #include "wg_proto.h"
 
 /* Build the 12-byte AEAD nonce used during handshake. WG handshake
@@ -130,8 +131,8 @@ int wg_handshake_create_initiation(struct wg_handshake_state *st,
     rc = 0;
 
 out_scrub:
-    memset(key,        0, sizeof(key));
-    memset(dh_e_s,     0, sizeof(dh_e_s));
+    tl_secure_zero(key,        sizeof(key));
+    tl_secure_zero(dh_e_s,     sizeof(dh_e_s));
     memset(timestamp,  0, sizeof(timestamp));
     memset(nonce,      0, sizeof(nonce));
     return rc;
@@ -186,7 +187,7 @@ int wg_handshake_process_response(struct wg_handshake_state *st,
         noise_hkdf3(st->chain_key, st->preshared_key, WG_KEY_LEN,
                     new_ck, tau, key);
         memcpy(st->chain_key, new_ck, WG_HASH_LEN);
-        memset(new_ck, 0, sizeof(new_ck));
+        tl_secure_zero(new_ck, sizeof(new_ck));
     }
     wg_mix_hash(st->hash, tau, WG_HASH_LEN);
 
@@ -216,22 +217,22 @@ int wg_handshake_process_response(struct wg_handshake_state *st,
     rc = 0;
 
 out_scrub:
-    memset(key,             0, sizeof(key));
-    memset(dh_e_e,          0, sizeof(dh_e_e));
-    memset(dh_e_s,          0, sizeof(dh_e_s));
-    memset(tau,             0, sizeof(tau));
+    tl_secure_zero(key,             sizeof(key));
+    tl_secure_zero(dh_e_e,          sizeof(dh_e_e));
+    tl_secure_zero(dh_e_s,          sizeof(dh_e_s));
+    tl_secure_zero(tau,             sizeof(tau));
     memset(plaintext_zero,  0, sizeof(plaintext_zero));
     memset(nonce,           0, sizeof(nonce));
     if (rc != 0) {
         /* On failure, scrub any transport keys we may have partially
          * written so the caller doesn't leak them. */
-        memset(send_key, 0, WG_KEY_LEN);
-        memset(recv_key, 0, WG_KEY_LEN);
+        tl_secure_zero(send_key, WG_KEY_LEN);
+        tl_secure_zero(recv_key, WG_KEY_LEN);
     }
     return rc;
 }
 
 void wg_handshake_scrub(struct wg_handshake_state *st)
 {
-    memset(st, 0, sizeof(*st));
+    tl_secure_zero(st, sizeof(*st));
 }

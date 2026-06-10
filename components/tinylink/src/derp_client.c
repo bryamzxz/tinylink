@@ -137,9 +137,10 @@ esp_err_t derp_client_connect_login(derp_client_t *out,
         client_priv == NULL || client_pub == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
-    /* DERPMap nodes have no DERPPort field in the wire JSON, so the
-     * parser leaves tl_derp_node_t.port at 0. Treat 0 as "use the DERP
-     * default" so callers can pass dn->port unchanged. */
+    /* DERPNode.DERPPort is json:",omitempty" (tailcfg/derpmap.go) — it is
+     * on the wire only when non-default; mapreq.c parses it into
+     * tl_derp_node_t.port, leaving it 0 when absent. Treat 0 as "use the
+     * DERP default" so callers can pass dn->port unchanged. */
     if (port == 0) port = 443;
     memset(out, 0, sizeof(*out));
 

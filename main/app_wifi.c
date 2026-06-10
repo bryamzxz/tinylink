@@ -37,11 +37,20 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
 
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
         ESP_LOGI(TAG, "STA start, connecting");
-        esp_wifi_connect();
+        esp_err_t cerr = esp_wifi_connect();
+        if (cerr != ESP_OK) {
+            /* A synchronous error queues no DISCONNECTED event, so the
+             * reconnect chain below never fires — surface it instead of
+             * silently going offline. */
+            ESP_LOGW(TAG, "esp_wifi_connect (STA start) failed: 0x%x", cerr);
+        }
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
         s_retry_count++;
         ESP_LOGW(TAG, "disconnected, retry %d", s_retry_count);
-        esp_wifi_connect();
+        esp_err_t cerr = esp_wifi_connect();
+        if (cerr != ESP_OK) {
+            ESP_LOGW(TAG, "esp_wifi_connect (reconnect) failed: 0x%x", cerr);
+        }
         xEventGroupClearBits(s_wifi_events, WIFI_CONNECTED_BIT);
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)data;

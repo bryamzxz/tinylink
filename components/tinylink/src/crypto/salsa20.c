@@ -9,6 +9,8 @@
 
 #include <string.h>
 
+#include "secure_zero.h"
+
 static inline uint32_t load32_le(const uint8_t *p)
 {
     return ((uint32_t)p[0])       |
@@ -162,6 +164,6 @@ void xsalsa20_keystream(uint8_t *out, size_t out_len,
     uint8_t subkey[HSALSA20_OUT_LEN];
     hsalsa20(subkey, key, nonce);
     salsa20_keystream(out, out_len, subkey, nonce + 16);
-    /* Best-effort scrub. */
-    memset(subkey, 0, sizeof(subkey));
+    /* Scrub the derived subkey (CWE-14). */
+    tl_secure_zero(subkey, sizeof(subkey));
 }

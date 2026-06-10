@@ -155,36 +155,81 @@ static esp_err_t recv_record_plaintext(ts2021_conn_t *c,
     return noise_ik_decrypt(&c->noise, out, out_max, ct, ct_len, out_len);
 }
 
-/* After the Noise handshake, the very first 9 plaintext bytes are
- * either the EarlyPayload sentinel or the start of HTTP/2 SETTINGS.
- *  - On magic: skip the JSON of declared length, residual = anything past it.
- *  - Otherwise: residual = those 9 bytes (HTTP/2 begins there). */
+/* After the Noise handshake the server may send an optional
+ * tailcfg.EarlyNoise payload before the HTTP/2 session begins:
+ *     magic[5] || BE32 length || JSON[length]
+ * followed by the HTTP/2 stream. The early payload is optional; some
+ * servers (and pre-capver-113 clients) never receive one.
+ *
+ * CRITICAL: the control plane does NOT pack this header into a single
+ * Noise record. Observed in vivo against tailscale.com for a capver>=113
+ * client, the 5-byte magic arrives as its OWN record, with the BE32
+ * length and the JSON in later records. So the 9-byte header must be read
+ * as a byte STREAM that can span record boundaries — exactly like upstream
+ * control/ts2021/conn.go readHeader (which does io.ReadFull(conn, hdr[:9])
+ * over the decrypted stream). The earlier record-aligned version assumed
+ * the whole 9-byte header fit in the first record and mis-stashed a short
+ * 5-byte magic record as HTTP/2 data, desyncing the stream so the server
+ * closed the connection (h2_session_init -> EOF).
+ *
+ * We read records into `rec` and consume them byte-wise. Whatever remains
+ * unconsumed once the header (and any JSON) is dealt with becomes the
+ * HTTP/2 residual replayed to nghttp2. */
 static esp_err_t consume_early_payload(ts2021_conn_t *c)
 {
-    uint8_t pt[TS2021_RECORD_PLAINTEXT_MAX];
-    size_t  pt_len = 0;
-    if (recv_record_plaintext(c, pt, sizeof(pt), &pt_len) != ESP_OK) {
-        return ESP_FAIL;
+    uint8_t rec[TS2021_RECORD_PLAINTEXT_MAX];
+    size_t  rec_len = 0, rec_off = 0;
+
+    /* 1) Read up to the 9-byte early-payload header from the record stream.
+     *    Bail to the "no early payload" path the instant the first 5 bytes
+     *    fail to match the magic — those bytes are HTTP/2. */
+    uint8_t hdr[TS2021_EARLY_PAYLOAD_HDR_LEN];
+    size_t  hdr_have = 0;
+    bool    is_early = true;
+
+    while (hdr_have < TS2021_EARLY_PAYLOAD_HDR_LEN) {
+        if (rec_off == rec_len) {
+            if (recv_record_plaintext(c, rec, sizeof(rec), &rec_len) != ESP_OK)
+                return ESP_FAIL;
+            rec_off = 0;
+            if (rec_len == 0) continue;  /* empty record: pull the next one */
+        }
+        size_t avail = rec_len - rec_off;
+        size_t take  = TS2021_EARLY_PAYLOAD_HDR_LEN - hdr_have;
+        if (take > avail) take = avail;
+        memcpy(hdr + hdr_have, rec + rec_off, take);
+        hdr_have += take;
+        rec_off  += take;
+
+        if (hdr_have >= TS2021_EARLY_PAYLOAD_MAGIC_LEN &&
+            memcmp(hdr, TS2021_EARLY_PAYLOAD_MAGIC,
+                   TS2021_EARLY_PAYLOAD_MAGIC_LEN) != 0) {
+            is_early = false;
+            break;
+        }
     }
-    if (pt_len < TS2021_EARLY_PAYLOAD_HDR_LEN) {
-        /* Pathologically small first record. Stash whatever we have. */
-        memcpy(c->rx_residual, pt, pt_len);
-        c->rx_residual_len = pt_len;
+
+    if (!is_early) {
+        /* No early payload: the header bytes we pulled plus whatever is left
+         * in the current record are the first HTTP/2 bytes, in order. */
+        size_t tail = rec_len - rec_off;
+        if (hdr_have + tail > sizeof(c->rx_residual)) {
+            ESP_LOGE(TAG, "early-payload residual overflow (%u)",
+                     (unsigned)(hdr_have + tail));
+            return ESP_FAIL;
+        }
+        memcpy(c->rx_residual, hdr, hdr_have);
+        if (tail > 0) memcpy(c->rx_residual + hdr_have, rec + rec_off, tail);
+        c->rx_residual_len = hdr_have + tail;
         c->rx_residual_off = 0;
         return ESP_OK;
     }
 
-    if (memcmp(pt, TS2021_EARLY_PAYLOAD_MAGIC,
-               TS2021_EARLY_PAYLOAD_MAGIC_LEN) != 0) {
-        /* No early payload: those 9 bytes are HTTP/2 SETTINGS. */
-        memcpy(c->rx_residual, pt, pt_len);
-        c->rx_residual_len = pt_len;
-        c->rx_residual_off = 0;
-        return ESP_OK;
-    }
-
-    uint32_t ep_len = ((uint32_t)pt[5] << 24) | ((uint32_t)pt[6] << 16) |
-                     ((uint32_t)pt[7] <<  8) |  (uint32_t)pt[8];
+    /* 2) Magic matched and we have all 9 header bytes — parse the BE32 JSON
+     *    length and skip that many bytes (which may span further records),
+     *    leaving anything after the JSON as the HTTP/2 residual. */
+    uint32_t ep_len = ((uint32_t)hdr[5] << 24) | ((uint32_t)hdr[6] << 16) |
+                      ((uint32_t)hdr[7] <<  8) |  (uint32_t)hdr[8];
     if (ep_len > 64 * 1024) {
         ESP_LOGE(TAG, "EarlyPayload too large: %u", (unsigned)ep_len);
         return ESP_FAIL;
@@ -192,37 +237,33 @@ static esp_err_t consume_early_payload(ts2021_conn_t *c)
     ESP_LOGI(TAG, "EarlyPayload sentinel found, %u bytes JSON (skipping)",
              (unsigned)ep_len);
 
-    /* Bytes already consumed past the 9-byte sentinel header. */
-    size_t already = pt_len - TS2021_EARLY_PAYLOAD_HDR_LEN;
-    if (already >= ep_len) {
-        /* JSON fully fits in this record. Residual starts after. */
-        size_t residual = already - ep_len;
-        if (residual > 0) {
-            memcpy(c->rx_residual,
-                   pt + TS2021_EARLY_PAYLOAD_HDR_LEN + ep_len, residual);
-        }
-        c->rx_residual_len = residual;
-        c->rx_residual_off = 0;
-        return ESP_OK;
-    }
-    /* Need more records to drain ep_len bytes. */
-    size_t to_skip = ep_len - already;
+    size_t to_skip = ep_len;
     while (to_skip > 0) {
-        size_t got = 0;
-        if (recv_record_plaintext(c, pt, sizeof(pt), &got) != ESP_OK) {
-            return ESP_FAIL;
+        if (rec_off == rec_len) {
+            if (recv_record_plaintext(c, rec, sizeof(rec), &rec_len) != ESP_OK)
+                return ESP_FAIL;
+            rec_off = 0;
+            if (rec_len == 0) continue;
         }
-        if (got <= to_skip) {
-            to_skip -= got;
+        size_t avail = rec_len - rec_off;
+        if (avail <= to_skip) {
+            to_skip -= avail;
+            rec_off  = rec_len;
         } else {
-            size_t residual = got - to_skip;
-            memcpy(c->rx_residual, pt + to_skip, residual);
-            c->rx_residual_len = residual;
-            c->rx_residual_off = 0;
-            return ESP_OK;
+            rec_off += to_skip;
+            to_skip  = 0;
         }
     }
-    c->rx_residual_len = 0;
+
+    /* Residual = whatever is left in the current record after the JSON. */
+    size_t residual = rec_len - rec_off;
+    if (residual > sizeof(c->rx_residual)) {
+        ESP_LOGE(TAG, "early-payload post-JSON residual overflow (%u)",
+                 (unsigned)residual);
+        return ESP_FAIL;
+    }
+    if (residual > 0) memcpy(c->rx_residual, rec + rec_off, residual);
+    c->rx_residual_len = residual;
     c->rx_residual_off = 0;
     return ESP_OK;
 }
@@ -253,10 +294,12 @@ esp_err_t ts2021_connect(ts2021_conn_t *out,
         return ESP_FAIL;
     }
 
-    /* Noise IK with prologue = "Tailscale Control Protocol v1". The
-     * version is also placed in the cleartext header of the initiation
-     * frame; mixing it into the prologue binds the encrypted handshake
-     * to the advertised version. */
+    /* Noise IK with prologue = "Tailscale Control Protocol v<CAPVER>"
+     * (TS2021_PROTOCOL_VERSION = TINYLINK_CAPVER). The same version is
+     * also placed in the cleartext BE16 header of the initiation frame;
+     * mixing it into the prologue binds the encrypted handshake to the
+     * advertised version. The server reconstructs this prologue from the
+     * version we claim in the header, so the two must match. */
     char prologue[40];
     int plen = snprintf(prologue, sizeof(prologue), "%s%d",
                         TS2021_PROLOGUE_PREFIX, TS2021_PROTOCOL_VERSION);

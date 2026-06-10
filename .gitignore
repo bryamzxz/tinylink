@@ -48,20 +48,10 @@ logs/
 .DS_Store
 Thumbs.db
 
-# Compiled host-side test binaries
-tools/test/test_blake2s
-tools/test/test_curve25519
-tools/test/test_mapresp
-tools/test/test_chacha20
-tools/test/test_poly1305
-tools/test/test_chacha20poly1305
-tools/test/test_hkdf_noise
-tools/test/test_wg_handshake
-tools/test/test_wg_transport
-tools/test/test_wg_demux
-tools/test/test_stun
-tools/test/test_tls_io
-tools/test/test_derp
-tools/test/test_disco
-tools/test/test_disco_handler
-tools/test/test_disco_replay
+# Compiled host-side test binaries (pattern self-maintains as tests are
+# added/removed; keep the .c sources tracked).
+tools/test/test_*
+!tools/test/test_*.c
+
+# Editor / local Claude Code settings
+.claude/
