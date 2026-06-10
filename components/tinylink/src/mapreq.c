@@ -19,6 +19,7 @@
 
 #define JSMN_STATIC
 #include "jsmn.h"
+#include "jsmn_skip.h"
 
 #ifdef ESP_PLATFORM
 static const char *TAG = "mapreq";
@@ -121,24 +122,12 @@ static esp_err_t parse_keyed_hex(const char *s, size_t len,
  * returning the next sibling index. jsmn produces tokens in document order
  * with `size` = number of immediate children, so this is just a recursive
  * skip without re-parsing. */
+/* Skip the JSON value at toks[i], returning the index just past its
+ * subtree. Depth-bounded (see jsmn_skip.h) so an adversarially deep
+ * MapResponse can't overflow the long-poll task stack. */
 static int skip_value(const jsmntok_t *toks, int i)
 {
-    int children = toks[i].size;
-    int next = i + 1;
-    if (toks[i].type == JSMN_OBJECT) {
-        for (int k = 0; k < children; k++) {
-            next = skip_value(toks, next);  /* key (string) */
-            next = skip_value(toks, next);  /* value         */
-        }
-        return next;
-    }
-    if (toks[i].type == JSMN_ARRAY) {
-        for (int k = 0; k < children; k++) {
-            next = skip_value(toks, next);
-        }
-        return next;
-    }
-    return i + 1;
+    return jsmn_skip(toks, i);
 }
 
 /* ------------------------------ parsers ----------------------------------- */
