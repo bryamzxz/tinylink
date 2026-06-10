@@ -1,39 +1,33 @@
 # tinylink
 
 A minimalist Tailscale-compatible client for **ESP32-WROOM-32E (no PSRAM)**,
-written in pure C on **ESP-IDF v5.5.x**.
+written in pure C on **ESP-IDF v5.5.x**. It registers with the Tailscale
+control plane over ts2021 (Noise IK over TLS), brings up a WireGuard data
+plane on a single UDP socket, NAT-punches to a direct path with DISCO + STUN,
+falls back to DERP when it must, and ships TMP117 sensor telemetry over the
+tunnel.
+
+> **Not production-ready. Not affiliated with Tailscale Inc.** The Tailscale
+> name and logo are trademarks of Tailscale Inc.; this project is a
+> clean-room reimplementation of the documented wire protocols.
+
+## Why
+
+The official Tailscale client is ~23 MB (~4.5 MB with `extra-small` + UPX),
+which does not fit a 4 MiB flash budget. MicroLink is the closest existing
+reference (~950 KiB flash, **requires PSRAM** in any realistic
+configuration). tinylink targets the gap below MicroLink: a bare ESP32 with
+**no PSRAM** and 520 KiB of internal SRAM, made possible by cutting scope to
+a single peer. The current app image is ~925 KiB (2026-06 build) and fits
+one of the two 1.5 MiB OTA slots of a stock 4 MB module.
 
 ## Status
 
-**Stable — direct UDP + ICMP-over-WG live end-to-end on real hardware,
-M1–M7 all landed, perf round 2026-05-10 closed, sdkconfig perf-trim
-round 2026-05-12 PM merged (5 PRs), DERP outbound round 2026-05-12
-evening merged (PR-D0 + PR-D1: lossless transport during peer NAT
-flap), perf-audit round (#88–#104) net −68.1 KiB flash + largest
-contig heap 6656→9216, security round #105 (WGN-1 writer + ROAM-3 +
-secure_zero intro + RC-2 + ROAM-2), and the 2026-06-10 audit-fix
-round — 6 fixes hardware-validated against tailscale.com (capver 138
-at the Noise layer, WGN-1 rx-path lock + relayed-DISCO peer gate,
-atomic machine+node key regen, depth-bounded MapResponse skip,
-complete secure_zero key-scrub sweep, dead-primitive removals).**
-
-| Layer                          | State                                  |
-|--------------------------------|----------------------------------------|
-| ts2021 control plane (M1)      | done                                   |
-| MapRequest + WireGuard (M2)    | done                                   |
-| TMP117 telemetry (M3)          | done                                   |
-| DISCO ping/pong (M3)           | done — direct + DERP                   |
-| STUN binding probe (M4)        | done — runs over WG socket             |
-| DERP supervised recv (M5)      | done                                   |
-| Direct UDP NAT punching (M5)   | done                                   |
-| ICMP over WG transport         | **done** — `ping <our-tailnet-ip>` flows |
-| Production hardening (M7)      | done — within scope                    |
-| Perf + power round (2026-05-10)| done — constant-time crypto, light-sleep PM, QIO@80, -O2 |
-| sdkconfig perf-trim (2026-05-12 PM) | 5 PRs merged: −158.7 KiB flash · DRAM −2.9 KiB · IRAM −30.5 KiB (80%→56%) |
-| DERP outbound round (2026-05-12 evening) | 2 PRs merged: derp supervisor finally spawns + WG transport relay fallback (lossless on path-stale or sendto errno) |
-| Perf-audit round (#88–#104)    | done — net −68.1 KiB flash · largest-contig heap 6656→9216 (PPP off, NEWLIB_NANO, mbedTLS 4-stage prune, stack trims) |
-| Security round (#105)          | done — WGN-1 session-init writer lock + ROAM-3 pong src-binding + secure_zero intro + RC-2 backoff + ROAM-2 reprobe |
-| Audit-fix round (2026-06-10)   | done — 6 fixes, hardware-validated against tailscale.com: capver 138 Noise layer, WGN-1 rx lock + relayed-DISCO gate, atomic key regen, depth-bounded skip, full secure_zero sweep |
+**Stable — within the single-peer scope.** Milestones M1–M12 are all done
+and hardware-validated; the latest round (2026-06-10 audit fix, PR #106) was
+validated end-to-end against tailscale.com. Per-milestone breakdown in
+[`docs/ROADMAP.md`](docs/ROADMAP.md), per-PR history in
+[`CHANGELOG.md`](CHANGELOG.md).
 
 What works today, verified on real hardware:
 
@@ -46,211 +40,46 @@ What works today, verified on real hardware:
 - The Tailscale admin panel shows `Endpoints: 190.x.x.x:<port>` and
   `Client connectivity → UDP: Yes`.
 
-What's still pending (deferred / next-round — none are blocking the
-current sensor-→-collector path):
+| #  | Milestone                                      | Status |
+|----|------------------------------------------------|--------|
+| 1  | ts2021 control plane                           | done |
+| 2  | MapRequest + WireGuard data plane              | done |
+| 3  | DISCO P2P discovery + TMP117 telemetry         | done |
+| 4  | STUN minimal binding                           | done |
+| 5  | DERP relay fallback + direct-UDP NAT traversal | done |
+| 6  | ICMP-over-WG end-to-end                        | done |
+| 7  | Production hardening                           | done — within scope |
+| 8  | Perf + power round (2026-05-10, #61–#65)       | done — constant-time crypto, light-sleep PM, QIO@80, -O2 |
+| 9  | Protocol + crypto follow-ups (#85–#87)         | done |
+| 10 | Perf-trim + footprint round (#88–#104)         | done — net −68.1 KiB flash, largest-contig heap 6656 → 9216 B |
+| 11 | Security round (#105)                          | done — WGN-1 nonce-reuse race closed + 4 hardenings |
+| 12 | Audit-fix round (2026-06-10, #106)             | done — capver 138 at the Noise layer, WG rx-path lock + relayed-DISCO peer gate, atomic key regen, depth-bounded MapResponse skip, secure_zero sweep |
 
-- Multi-peer (single-peer today); the netmap `PeersChanged`/
-  `PeersRemoved` delta-merge is stubbed pending a multi-peer tailnet
-  to validate against.
-- Backoff consolidation — three divergent backoffs (DERP supervisor +
-  `endpoint_push`, the latter two without jitter) want folding into a
-  single `tl_backoff_ms`; deferred pending an extended soak
-  (`endpoint_push` is regression-sensitive).
-- Forced-flap relay soak — exercise PR-D1's RX-stale relay branch
-  under a real Servidor1 outage (needs Servidor1 root). Healthy path
-  is validated; the relay path is in place but dormant.
-- **No task watchdog / `esp_restart` self-recovery** — a wedged task
-  is a brick until physical reset.
+Two further 2026-05-12 rounds — sdkconfig perf-trim (#76–#80) and DERP
+outbound (#82–#83: supervisor spawn + lossless relay fallback during peer
+NAT flap) — are documented in the CHANGELOG.
+
+### Known limitations
+
+None of these block the current sensor-→-collector path:
+
+- **Single-peer only** — the netmap `PeersChanged`/`PeersRemoved`
+  delta-merge is stubbed pending a multi-peer tailnet to validate against.
+- **No task watchdog / `esp_restart` self-recovery** — a wedged task is a
+  brick until physical reset.
 - **NVS private keys are stored in PLAINTEXT** — there is no
-  `CONFIG_SECURE_FLASH_ENC_ENABLED` and `keys.c` uses the default
-  plain partition. At-rest/eFuse key encryption is aspirational, not
-  currently enabled (see *Provisioning* below).
-- **No SNTP / wall-clock** — `MBEDTLS_HAVE_TIME_DATE` is off, so the
-  three TLS clients never validate cert `notBefore`/`notAfter`.
-
-## Performance + power round (2026-05-10)
-
-Five consecutive PRs took the firmware from the M7-close baseline to
-a constant-time, power-managed, QIO@80, -O2 build. The CHANGELOG has
-the per-PR detail; one-liner summary:
-
-| PR  | Change                          | Flash Δ  | What it unlocks                                                  |
-|-----|---------------------------------|----------|------------------------------------------------------------------|
-| #61 | `curve25519-donna` swap         | +8.6 KiB | Constant-time MachineKey scalarmult (eliminates timing channel) |
-| #62 | `esp_pm_configure` + `WIFI_PS_MIN_MODEM` | +2.2 KiB | Tickless idle actually enters light sleep; DTIM-paced modem sleep |
-| #63 | Flash `QIO@80` (was DIO@40)     | −0.1 KiB | ~8× effective flash-read bandwidth (boot + cold-cache paths)    |
-| #64 | `FREERTOS_HZ` 1000 → 100        | +0.1 KiB | Lower tick-ISR overhead, deeper tickless sleeps                  |
-| #65 | `-O2` per-component (`tinylink` + `main` + `mbedcrypto`) | +2.3 KiB | Aggressive inlining/unrolling on the hot crypto + WG paths      |
-
-Total cost: ~+13 KiB flash on top of the M7-close baseline.
-26 % of the app partition is still free.
-RAM unchanged.
-
-The 60-min mega-ping regression gate (3.86 % loss / 154 ms avg from
-the M5 baseline) is preserved across every PR; on-device captures
-show 0 `bcn_timeout`, 0 disconnects, 0 panics, and exact 5 s
-telemetry cadence on every flash.
-
-## sdkconfig perf-trim round (2026-05-12 afternoon)
-
-Five `feat/perf-*` branches pushed to GitHub the same day as the
-audit-driven round closed. **sdkconfig only — no `.c`/`.h` changes,
-no API surface change.** Each PR validated by a 60-120 s smoke
-(boot + register + initial netmap + ≥5 telemetry @ 5 s + 0 panic).
-The CHANGELOG `[Unreleased]` section has the per-PR detail;
-one-liner summary:
-
-| PR (branch)                                | Δ flash app | Δ DRAM | Δ IRAM   |
-|--------------------------------------------|------------:|-------:|---------:|
-| `feat/perf-error-strings-and-assertions`   | −75.6 KiB   | −2.6 KiB | −3.4 KiB |
-| `feat/perf-vfs-trim`                       | −9.4 KiB    | 0      | −1.1 KiB |
-| `feat/perf-bootloader-log-none`            | 0 (bootloader.bin −8 KiB) | 0 | 0 |
-| `feat/perf-wifi-station-only-no-wpa3`      | −74.6 KiB   | −0.3 KiB | −0.1 KiB |
-| `feat/perf-iram-to-flash-moves`            | +0.9 KiB    | 0      | **−25.9 KiB** |
-| **Combined (projected)**                   | **−158.7 KiB** | **−2.9 KiB** | **−30.5 KiB** |
-
-The IRAM relief is the headline: 79.64 % → ~56.4 % unlocks future
-work that needs IRAM (a second persistent TLS connection, selective
-IRAM_ATTR on hot WG paths, multi-peer state) without crowding wifi/
-rtos/lwip.
-
-Skipped after measurement (research-suggested but no-op on this
-target):
-- `COMPILER_SAVE_RESTORE_LIBCALLS` — Kconfig does not exist for
-  Xtensa LX6 in IDF v5.5.4 (it's a GCC RISC-V flag, ESP32-C3/C6
-  only).
-- `MBEDTLS_PEM_WRITE_C off` — section GC already strips it (cert
-  bundle path needs only PEM_PARSE). Δ = 8 B.
-- `MBEDTLS_ERROR_STRINGS off` — `nm tinylink.elf` shows zero
-  references to `mbedtls_strerror`; the table is already dead-
-  stripped. Δ = 0.
-- `LOG_MAXIMUM_LEVEL=WARN` — Kconfig clamps `MAXIMUM ≥ DEFAULT`
-  (`depends on LOG_DEFAULT_LEVEL < N`), so the only real win is
-  dropping DEFAULT to WARN. That strips every `ESP_LOGI` call site
-  and breaks the serial-grep smoke (no more "tinylink up",
-  "telemetry tx seq", "netmap (initial)"). Deferred until the
-  smoke can verify operation via tcpdump on the sensor_app
-  receiver instead of UART logs.
-
-A 4-hour soak with the COMBINED set is the remaining validation
-gate before declaring the round closed.
-
-Intentionally out of scope (irreversible per-device operations —
-see `docs/ROADMAP.md` § "M7 — Hardening"):
-
-- NVS encryption with HMAC key in eFuses.
-- Secure boot V2 + flash encryption.
-- Auth-key rotation API (no remote trigger mechanism without
-  control-plane / OTA delivery).
-
-## DERP outbound round (2026-05-12 evening)
-
-Two PRs that unlock the full DERP-mediated fallback path. Motivated
-by a 2026-05-12 PM incident where Servidor1's WAN endpoint changed
-(HA-failover ISP setup), the ESP32's cached endpoints went stale,
-and direct UDP went into a 35-minute blackhole because the ESP32
-had no fallback channel to learn the peer's new endpoints.
-
-| PR (branch)                                            | Function                                                                            |
-|--------------------------------------------------------|--------------------------------------------------------------------------------------|
-| `feat/derp-supervisor-spawn-pre-tls` (**PR-D0**)       | Move derp supervisor xTaskCreate to pre-TLS bringup (heap pristine, 12 KiB contig OK); wait-for-netmap moves into the task body. Closes the chronic `xTaskCreate(derp supervisor) failed` that fired on every boot. |
-| `feat/derp-outbound-wg-transport-fallback` (**PR-D1**) | Lossless WG transport via DERP relay when direct UDP looks broken (path-stale watchdog OR sendto errno). Adds `wg_netif_relay_fn` callback + `tinylink_relay_via_derp` glue. |
-
-Combined size impact: flash **+0.39 KiB**, DRAM **+32 B**, IRAM 0.
-
-Architectural insight: most of the recovery machinery (CMM ingestion
-via DERP, `send_disco_pings_to_cmm_endpoints`, the disco_prober that
-matches txids on response pongs) already existed in source from
-prior PRs. PR-D0 was the unblocker — the supervisor was the missing
-piece because its xTaskCreate kept failing. Once the supervisor
-spawned, the existing flow lit up:
-
-```
-peer NAT changes → peer's tailscaled detects new endpoint
-   → CMM via DERP to our supervisor       ← PR-D0 enables this
-      → handle_disco_relayed (CMM case)   ← existed
-         → send_disco_pings_to_cmm_endpoints(new endpoints)
-            → disco_prober tracks new txids
-               → peer responds → prober matches → endpoint roam
-                  → direct UDP resumes (recovery time: seconds)
-```
-
-PR-D1 then closes the "telemetry during recovery window" gap:
-while the prober is still matching the new endpoint, the TX worker
-ships any outbound packets through DERP instead of letting them
-blackhole at the stale endpoint. The TX path checks
-`last_transport_recv_us > WG_RX_STALE_THRESHOLD_MS` preemptively;
-on a match it routes via `g.relay_cb` and skips direct sendto
-entirely. Three new stats (`relayed_stale`, `relayed_errno`,
-`relay_errors`) for soak observability.
-
-Smoke validated (30-min capture, INTELCOM-CARDONA WPA2+PMF):
-- 0 panics / xTaskCreate fails / WDT
-- derp supervisor task spawned t=5.9 s + login OK at t=16.9 s
-- **9 CMMs processed via DERP** (peer Servidor1 sending them as
-  part of its NAT-punch routine; observable evidence the supervisor
-  recv loop is actually delivering frames)
-- 361 telemetry packets at 5 s cadence, single WG session whole
-  window (`remote_idx=0x049221a7` constant)
-- Relay paths dormant — direct UDP stayed healthy throughout, no
-  path-stale event fired. The relay is in place; whether it fires
-  under a forced flap is a follow-up soak.
-- External validation: peer-side `ping 100.67.60.92` for 2755
-  packets returned 95.83 % delivery / RTT avg 137 ms — matches
-  pre-DERP-round baseline (no regression).
-
-The combined recovery time for a real Servidor1 WAN flap is now
-estimated **~30 s** (path-stale watchdog) instead of **35 min**
-(waiting for `PeersChangedPatch[]` via long-poll), with zero
-packets lost during the recovery window when PR-D1's relay path
-activates.
-
-## Possible future directions
-
-These are not commitments — they are bigger-than-QoL extensions that
-would meaningfully expand what tinylink can do. None are blocking the
-current sensor-→-collector use case. See
-[`docs/ROADMAP.md` § "Future directions"](docs/ROADMAP.md#future-directions)
-for the rationale and rough effort sketch for each.
-
-- **Streaming JSON parser** (yajl/jsmn-streaming style) to eliminate
-  the `RESPONSE_BUF_SZ` body buffer entirely — would unlock larger
-  tailnets without DRAM pressure and remove the BSS ceiling that
-  currently caps `TL_MAX_PEERS = 4` and `TL_MAX_DERP_REGIONS = 28`.
-- **Multi-peer support** — generalize the single-peer assumption in
-  `wg_netif.c` (one `g.peer`, one `g.transport` session) to a peer
-  table. Touches the replay window scheme (would need RFC 6479 2000-
-  entry windows per peer) and the netmap-driven peer add/remove path.
-- **PSRAM support** — moving lwIP pools, mbedtls handshake transients,
-  and the WG demux scratch out of internal DRAM into PSRAM would lift
-  the heap budget that today gates `CONFIG_TINYLINK_DERP_SUPERVISED`
-  on some boards.
-- **OTA over the tailnet** — fetch a signed firmware image from a
-  tailnet peer (HTTPS or DERP-relayed) without touching WiFi
-  credentials. Would close the "auth-key rotation needs a trigger
-  mechanism" gap by giving us a signed-update path.
-- **Power management with WG state preservation** — deep-sleep with
-  WG session checkpoint to NVS so the device wakes back into an
-  established tunnel without a fresh handshake. The TAI64N persistence
-  in PR #51 is the foundation; would need session-key serialization
-  + a re-establish-on-wake handshake budget.
-- **Other sensor families** — current TMP117 driver is single-purpose.
-  An I²C/SPI driver framework would let the same firmware base support
-  BME280, SCD30, ADS1115, etc. without rebuilding the WG stack.
-- **Mesh of devices** — once multi-peer lands, a sensor↔sensor topology
-  (rather than star → collector) becomes possible. Useful for
-  store-and-forward when the collector is offline.
-- **Diagnostics web endpoint** — a tiny HTTP server on the WG netif
-  that exposes `/stats` (heap, rekey count, RX-stale events,
-  endpoint roams) for inspection from any tailnet peer with a
-  browser.
-
-Each item below has a longer write-up in `docs/ROADMAP.md` with
-expected effort, dependencies, and what the firmware would unlock.
-
-Not production-ready. Not affiliated with Tailscale Inc. The Tailscale
-name and logo are trademarks of Tailscale Inc.; this project is a
-clean-room reimplementation of the documented wire protocols.
+  `CONFIG_SECURE_FLASH_ENC_ENABLED` and `keys.c` uses the default plain
+  partition. At-rest/eFuse key encryption is aspirational (see
+  *Provisioning*).
+- **No SNTP / wall-clock** — `MBEDTLS_HAVE_TIME_DATE` is off, so the three
+  TLS clients never validate cert `notBefore`/`notAfter`.
+- **Three divergent backoffs** (DERP supervisor + `endpoint_push`, the
+  latter two without jitter) want folding into a single `tl_backoff_ms`;
+  deferred pending an extended soak (`endpoint_push` is
+  regression-sensitive).
+- **DERP relay TX path validated only dormant** — the PR-D1 relay fallback
+  is in place but has not yet fired under a real forced flap; that soak
+  needs peer-side (Servidor1) access.
 
 ## Scope (what tinylink IS)
 
@@ -270,21 +99,13 @@ clean-room reimplementation of the documented wire protocols.
 - Battery-powered deep-sleep workloads.
 - A drop-in replacement for `tailscaled`.
 
-## Why
-
-The official Tailscale client is ~23 MB (~4.5 MB with `extra-small` + UPX),
-which does not fit a 4 MiB flash budget. MicroLink is the closest existing
-reference (~950 KiB flash, **requires PSRAM** in any realistic configuration).
-tinylink targets the gap below MicroLink: bare ESP32 with no PSRAM,
-single-peer, ~600 KiB flash.
-
 ## Hardware
 
 - Freenove ESP32-WROOM-32E DevKit (CH340 USB-UART).
-- TMP117 high-accuracy temperature sensor on I²C. Default wiring per
-  the Freenove DevKit pinout: SDA=GPIO21, SCL=GPIO22, ADD0 tied to
-  GND for I²C address `0x48`. All three are overridable in
-  `idf.py menuconfig` → *tinylink application* → *Telemetry*.
+- TMP117 high-accuracy temperature sensor on I²C. Default wiring per the
+  Freenove DevKit pinout: SDA=GPIO21, SCL=GPIO22, ADD0 tied to GND for I²C
+  address `0x48`. All three are overridable in `idf.py menuconfig` →
+  *tinylink application* → *Telemetry*.
 
 ## Architecture
 
@@ -338,14 +159,14 @@ Three properties that are non-obvious from a casual read of the code:
 2. **The WG netif is a raw-IP carrier with no PPP/Ethernet baggage.**
    The IDF-v5.5 `dhcpc_cb` panic that historically forced an
    `ESP_NETIF_FLAG_IS_PPP` workaround is now patched at the source —
-   the firmware ships two minimal patches in `idf-patches/` (a
-   DHCP_CLIENT whitelist in `esp_netif_lwip.c` plus a NULL-guard in
+   the firmware ships two minimal patches in [`idf-patches/`](idf-patches/)
+   (a DHCP_CLIENT whitelist in `esp_netif_lwip.c` plus a NULL-guard in
    `dhcp_state.c`). With those applied, the netif uses
    `ESP_NETIF_FLAG_AUTOUP` and a custom no-op netstack whose `init_fn`
    installs WG-aware `output`/`linkoutput` directly into the lwIP
    netif. End result: raw IP both directions, no PPP allocations, no
    LCP retry storm at boot, ~4.4 KiB more heap free. See
-   `BUILDING.md` for the patch-apply step.
+   [`docs/BUILDING.md`](docs/BUILDING.md) for the patch-apply step.
 
 3. **Endpoints are pushed via a "lite" MapRequest** (Stream=false +
    OmitPeers=true), the only shape modern Tailscale.com persists at
@@ -360,62 +181,53 @@ Three properties that are non-obvious from a casual read of the code:
    `/key?v=100` floor in `control_key.c` is a deliberately lower,
    independent value for the legacy TOFU control-key fetch.
 
-## Roadmap
-
-| # | Milestone                                       | Status                |
-|---|-------------------------------------------------|-----------------------|
-| 1 | ts2021 control plane (register only)            | done                  |
-| 2 | MapRequest streaming + WireGuard data plane     | done                  |
-| 3 | DISCO P2P discovery + TMP117 telemetry          | done                  |
-| 4 | STUN minimal binding                            | done                  |
-| 5 | DERP relay fallback + direct-UDP NAT traversal  | done                  |
-| 6 | ICMP-over-WG end-to-end                         | done                  |
-| 7 | Production hardening                            | done — within scope   |
-| 8 | Perf + power round (2026-05-10)                 | done                  |
-| 9 | sdkconfig perf-trim round (2026-05-12 PM)       | done — 5 PRs merged (#76-#80) |
-| 10 | DERP outbound round (2026-05-12 evening)       | done — PR-D0 + PR-D1 merged (#82, #83), 30-min smoke OK, relay dormant pending forced flap test |
-| 11 | Perf-audit round (#88–#104)                    | done — net −68.1 KiB flash, largest-contig heap 6656→9216; two stack trims reverted (#103, #104) after extended soak caught them |
-| 12 | Security round (#105)                          | done — WGN-1 session-init writer + ROAM-3 + secure_zero intro + RC-2 + ROAM-2 |
-| 13 | Audit-fix round (2026-06-10)                   | done — 6 fixes hardware-validated vs tailscale.com: capver 138 at the Noise layer (clears headscale's earlyNoise floor 113), WGN-1 rx-path lock + relayed-DISCO peer-DiscoKey gate, atomic machine+node key regen, depth-bounded MapResponse skip, complete secure_zero key-scrub sweep, dead-primitive removals. `disco_replay` deleted, replaced by `disco_prober`. Host suite 531 assertions / 20 binaries |
-
-See [`docs/ROADMAP.md`](docs/ROADMAP.md) for the per-milestone breakdown.
-
 ## Building
 
-See [`docs/BUILDING.md`](docs/BUILDING.md). TL;DR:
+See [`docs/BUILDING.md`](docs/BUILDING.md) for the full walkthrough
+(prerequisites, flash, monitor, serial capture). TL;DR:
 
 ```bash
-source ~/entorno_investigación/bin/activate
+source ~/entorno_investigación/bin/activate   # your IDF python venv
 . ~/esp/esp-idf-v5.5.4/export.sh
 idf.py set-target esp32
 idf.py build
 ```
 
-Host-side codec tests:
+**Before the first flash**: apply the two **required** ESP-IDF patches in
+[`idf-patches/`](idf-patches/) (see
+[`docs/BUILDING.md`](docs/BUILDING.md#required-apply-idf-patches)).
+Without them the firmware compiles cleanly but panics with
+`LoadProhibited` at `dhcp_state.c:52` the first time the WG netif comes up.
+
+### Tests
+
+Host-side codec + crypto + state-machine tests — stock gcc, no ESP-IDF
+needed:
 
 ```bash
 cd tools/test
-make test                          # 20 binaries · 531 assertions, all should report PASS
+make test          # 20 binaries · 531 assertions, all should report PASS
 ```
 
-On-device AEAD micro-bench (opt-in via `CONFIG_TINYLINK_BENCH_AEAD`,
-off by default — see [`docs/BUILDING.md`](docs/BUILDING.md#benchmarking-aead)).
-Used to measure the ChaCha20-Poly1305 hot path. The pre-perf-round
-baseline on ESP32 LX6 was ~660 µs/encrypt and ~654 µs/decrypt at
-1500 B; the post-`-O2` build (PR #65) ships the same code with
-component-scoped `-O2` and donna-backed curve25519 — re-measure with
-`CONFIG_TINYLINK_BENCH_AEAD=y` if you need hard numbers for your
-build. `CHANGELOG.md` has the full change log including the perf
-round detail.
+CI ([`.github/workflows/build.yml`](.github/workflows/build.yml)) builds
+the firmware against ESP-IDF v5.5 on every push/PR; the host suite runs
+locally.
+
+On-device AEAD micro-bench: opt-in via `CONFIG_TINYLINK_BENCH_AEAD=y`
+(off by default — see
+[`docs/BUILDING.md`](docs/BUILDING.md#benchmarking-aead)). The
+pre-perf-round baseline on the ESP32 LX6 was ~660 µs/encrypt and
+~654 µs/decrypt at 1500 B; re-measure on your build if you need hard
+numbers.
 
 ## Provisioning
 
-Credentials (WiFi + Tailscale auth key) are stored in NVS. The
-Curve25519 node identities are generated on first boot and persisted
-automatically. **NVS is currently a plaintext partition** —
+Credentials (WiFi + Tailscale auth key) are stored in NVS. The Curve25519
+node identities are generated on first boot and persisted automatically.
+**NVS is currently a plaintext partition** —
 `CONFIG_SECURE_FLASH_ENC_ENABLED` is not set, so at-rest/eFuse key
-encryption is aspirational, not enabled (tracked under *What's still
-pending*). See [`docs/PROVISIONING.md`](docs/PROVISIONING.md).
+encryption is aspirational, not enabled (tracked under *Known
+limitations*). See [`docs/PROVISIONING.md`](docs/PROVISIONING.md).
 
 ## Examples
 
@@ -423,11 +235,59 @@ pending*). See [`docs/PROVISIONING.md`](docs/PROVISIONING.md).
   register the device with the Tailscale control plane and watch it
   appear in the admin panel.
 
-## License
+## Repository layout & documentation
 
-MIT — see [LICENSE](LICENSE).
+```
+components/tinylink/   protocol implementation: control plane, data plane, vendored crypto
+main/                  app entry: WiFi bring-up, tinylink start, telemetry app
+docs/                  the documents indexed below
+idf-patches/           two REQUIRED patches to ESP-IDF v5.5 (see Building)
+tools/                 NVS provisioning + serial-capture helpers
+tools/test/            host-side test suite (make test)
+examples/              minimal register-only example
+```
+
+| Document | Contents |
+|----------|----------|
+| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Component call graphs, task model, the WG-netif raw-IP design |
+| [`docs/PROTOCOL.md`](docs/PROTOCOL.md) | Clean-room wire-protocol map (ts2021, MapRequest, WG, DISCO, DERP, STUN) with upstream citations |
+| [`docs/BUILDING.md`](docs/BUILDING.md) | Environment setup, required IDF patches, build/flash/monitor, AEAD bench |
+| [`docs/PROVISIONING.md`](docs/PROVISIONING.md) | NVS credential provisioning (WiFi + auth key) |
+| [`docs/ROADMAP.md`](docs/ROADMAP.md) | Per-milestone breakdown M1–M12, open backlog, future directions |
+| [`docs/SECURITY-MODEL.md`](docs/SECURITY-MODEL.md) | Threat model + audit history |
+| [`CHANGELOG.md`](CHANGELOG.md) | Per-PR history of every round |
+| [`CONTRIBUTING.md`](CONTRIBUTING.md) | Contribution guidelines |
+| [`SECURITY.md`](SECURITY.md) | Disclosure policy |
+
+## Possible future directions
+
+Not commitments — bigger-than-QoL extensions, none blocking the current
+sensor-→-collector use case. Rationale and effort sketches in
+[`docs/ROADMAP.md` § "Future directions"](docs/ROADMAP.md#future-directions).
+
+- **Streaming JSON parser** — eliminate the `RESPONSE_BUF_SZ` body buffer;
+  lifts the BSS ceiling behind `TL_MAX_PEERS = 4`.
+- **Multi-peer support** — peer table in `wg_netif.c`, per-peer RFC 6479
+  replay windows, netmap-driven peer add/remove.
+- **PSRAM support** — move lwIP pools, mbedTLS transients, and the WG
+  demux scratch out of internal DRAM.
+- **OTA over the tailnet** — signed image fetch from a tailnet peer; also
+  gives auth-key rotation the trigger mechanism it lacks.
+- **Deep-sleep with WG state preservation** — session checkpoint to NVS so
+  the device wakes into an established tunnel (the TAI64N persistence from
+  PR #51 is the foundation).
+- **Other sensor families** — an I²C/SPI driver framework beyond TMP117
+  (BME280, SCD30, ADS1115, …).
+- **Mesh of devices** — sensor↔sensor store-and-forward once multi-peer
+  lands.
+- **Diagnostics web endpoint** — tiny HTTP `/stats` on the WG netif (heap,
+  rekey count, RX-stale events, endpoint roams).
 
 ## Security
 
-See [SECURITY.md](SECURITY.md) for the disclosure policy and
+See [`SECURITY.md`](SECURITY.md) for the disclosure policy and
 [`docs/SECURITY-MODEL.md`](docs/SECURITY-MODEL.md) for the threat model.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
