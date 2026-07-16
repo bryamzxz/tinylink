@@ -16,6 +16,27 @@ permissions:
   contents: read
 
 jobs:
+  host-tests:
+    name: host KATs (gcc, no IDF)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # The suite is plain C11 + stock gcc — no ESP-IDF needed. Each
+      # test binary exits non-zero on any failed assertion, and the
+      # Makefile propagates that, so `make test` alone is the gate;
+      # the grep summary is belt-and-braces (uppercase FAIL only —
+      # negative-path case *names* contain lowercase "fail" and
+      # legitimately print OK).
+      - name: Run host suite
+        run: |
+          make -C tools/test test 2>&1 | tee /tmp/host-tests.log
+          okpass=$(grep -cE 'OK|PASS' /tmp/host-tests.log)
+          fails=$(grep -c 'FAIL' /tmp/host-tests.log || true)
+          echo "summary: OK|PASS=$okpass FAIL=$fails"
+          test "$fails" -eq 0
+
   idf-build:
     name: idf-build (${{ matrix.target }}, ESP-IDF ${{ matrix.idf_version }})
     runs-on: ubuntu-latest
@@ -23,7 +44,10 @@ jobs:
       fail-fast: false
       matrix:
         target: [esp32]
-        idf_version: ["v5.5"]
+        # Pinned to the exact release the project freezes on (see the
+        # "no IDF upgrade until v5.5 EOL" policy) so CI can't silently
+        # drift ahead of the local toolchain via the floating v5.5 tag.
+        idf_version: ["v5.5.4"]
 
     steps:
       - name: Checkout

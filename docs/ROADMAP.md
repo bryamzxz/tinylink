@@ -961,9 +961,11 @@ isn't covered. Each is a conscious deferral, not an oversight.
   off, so all three TLS clients (controlplane, DERP, OTA-to-be) never
   check certificate `notBefore` / `notAfter`. The pinned-control-key
   TOFU + the published cert chain are the only trust anchors.
-- **CI runs `idf.py build` only, not `make test`.** And it pins the
-  floating `v5.5`, not the frozen `v5.5.4` the project actually builds
-  against. The 531-assertion host suite is run manually.
+- ~~CI runs `idf.py build` only, not `make test`~~ **Closed 2026-07-16**:
+  `build.yml` now runs the 546-assertion host suite as its own job and
+  pins the exact `v5.5.4` the project freezes on (was the floating
+  `v5.5`). Remaining CI wish: hardware-in-the-loop, tracked under
+  Future directions.
 - **Telemetry / TMP117 path unaudited.** The partition table is
   OTA-shaped, but there is no `esp_ota` path and no coredump capture
   wired up yet; OTA firmware update (above, Future directions) is the

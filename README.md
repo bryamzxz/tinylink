@@ -220,9 +220,9 @@ cd tools/test
 make test          # 20 binaries · 546 assertions, all should report PASS
 ```
 
-CI ([`.github/workflows/build.yml`](.github/workflows/build.yml))
-builds the firmware against ESP-IDF v5.5 on every push/PR; the host
-suite runs locally.
+CI ([`.github/workflows/build.yml`](.github/workflows/build.yml)) runs
+the host suite **and** builds the firmware against the pinned ESP-IDF
+v5.5.4 on every push/PR.
 
 On-device AEAD micro-bench: opt-in via `CONFIG_TINYLINK_BENCH_AEAD=y`
 (off by default — see
