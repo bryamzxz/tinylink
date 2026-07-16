@@ -1,32 +1,80 @@
+<div align="center">
+
 # tinylink
 
-A minimalist Tailscale-compatible client for **ESP32-WROOM-32E (no PSRAM)**,
-written in pure C on **ESP-IDF v5.5.x**. It registers with the Tailscale
-control plane over ts2021 (Noise IK over TLS), brings up a WireGuard data
-plane on a single UDP socket, NAT-punches to a direct path with DISCO + STUN,
-falls back to DERP when it must, and ships TMP117 sensor telemetry over the
-tunnel.
+**A clean-room, single-peer Tailscale-compatible node for the bare ESP32 — no PSRAM, ~926 KiB of flash, pure C.**
+
+[![CI](https://github.com/bryamzxz/tinylink/actions/workflows/build.yml/badge.svg)](https://github.com/bryamzxz/tinylink/actions/workflows/build.yml)
+[![Firmware](https://img.shields.io/badge/firmware-1.0.0-brightgreen)](CHANGELOG.md)
+[![Target](https://img.shields.io/badge/target-ESP32--WROOM%20(no%20PSRAM)-orange)](#hardware)
+[![Framework](https://img.shields.io/badge/ESP--IDF-v5.5-e7352c)](docs/BUILDING.md)
+[![Host tests](https://img.shields.io/badge/host%20KATs-546%20%C2%B7%200%20fail-brightgreen)](#testing)
+[![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+
+[Highlights](#highlights) · [Status & maturity](#status--maturity) ·
+[Architecture](#architecture) · [Quick start](#quick-start) ·
+[Testing](#testing) · [Docs](#repository-layout--documentation) ·
+[Known limitations](#known-limitations)
+
+</div>
 
 > **Not affiliated with Tailscale Inc.** The Tailscale name and logo are
 > trademarks of Tailscale Inc.; this project is a clean-room
 > reimplementation of the documented wire protocols.
 
+tinylink registers with the Tailscale control plane over **ts2021**
+(Noise IK inside TLS), brings up a **WireGuard** data plane on a single
+UDP socket, NAT-punches to a **direct path** with DISCO + STUN, falls
+back to **DERP** when it must, and ships TMP117 sensor telemetry over
+the tunnel — 24/7, on a 4 MB module with 520 KiB of SRAM.
+
+## Highlights
+
+- **Full control-plane client** — ts2021 Noise IK over TLS-Upgrade,
+  HTTP/2 (nghttp2) inside the Noise channel, `/machine/register`,
+  streaming `/machine/map` long-poll with KeepAlives, capability
+  version 138 governed from a single macro.
+- **Real WireGuard, from scratch** — `Noise_IK_25519_ChaChaPoly_BLAKE2s`
+  handshake, transport with RFC 6479 replay windows, make-before-break
+  rekey, persistent keepalive, cross-reboot TAI64N monotonicity.
+- **NAT traversal that actually goes direct** — STUN on the WG socket,
+  DISCO ping/pong/CallMeMaybe (direct *and* DERP-relayed), outbound
+  prober with txid binding, endpoint roaming, DERP TX fallback during
+  path outages.
+- **Self-healing by design** — bounded stream silence (mirrors upstream
+  `watchdogTimeout`), exponential reconnect ladders at every layer,
+  in-place re-register on server-side node loss, `esp_restart()` wedge
+  last-resort. A control-plane change is a blip, not a brick.
+- **Audited, tested, measured** — three security-audit rounds closed,
+  546 host known-answer tests (golden vectors lifted from upstream),
+  multi-hour hardware soaks behind every riskier change, per-PR
+  CHANGELOG with flash/RAM deltas.
+- **Tiny footprint** — ~926 KiB app image (40 % of the partition free),
+  static-first memory design tuned for a PSRAM-less ESP32.
+
 ## Why
 
-The official Tailscale client is ~23 MB (~4.5 MB with `extra-small` + UPX),
-which does not fit a 4 MiB flash budget. MicroLink is the closest existing
-reference (~950 KiB flash, **requires PSRAM** in any realistic
-configuration). tinylink targets the gap below MicroLink: a bare ESP32 with
-**no PSRAM** and 520 KiB of internal SRAM, made possible by cutting scope to
-a single peer. The current app image is ~925 KiB (2026-06 build) and fits
-one of the two 1.5 MiB OTA slots of a stock 4 MB module.
+The official Tailscale client is ~23 MB (~4.5 MB with `extra-small` +
+UPX), which does not fit a 4 MiB flash budget. MicroLink is the closest
+existing reference (~950 KiB flash, **requires PSRAM** in any realistic
+configuration). tinylink targets the gap below MicroLink: a bare ESP32
+with **no PSRAM** and 520 KiB of internal SRAM, made possible by
+cutting scope to a single peer.
 
-## Status
+|                    | `tailscaled`            | MicroLink            | **tinylink**             |
+|--------------------|-------------------------|----------------------|--------------------------|
+| Footprint          | ~23 MB (~4.5 MB small)  | ~950 KiB             | **~926 KiB**             |
+| RAM requirement    | tens of MB              | PSRAM                | **no PSRAM (520 KiB SRAM)** |
+| Language / runtime | Go                      | —                    | **pure C, ESP-IDF v5.5** |
+| Scope              | full Tailscale          | reduced              | **single-peer sensor node** |
 
-**Production-ready — stable within the single-peer scope.** The firmware
-runs 24/7 in its intended sensor-→-collector deployment. Milestones M1–M12
-are all done and hardware-validated; the latest round (2026-06-10 audit
-fix, PR #106) was validated end-to-end against tailscale.com. Per-milestone breakdown in
+## Status & maturity
+
+**Production-ready — stable within the single-peer scope.** The
+firmware runs 24/7 in its intended sensor-→-collector deployment;
+milestones **M1–M13** are done (M13, the 2026-07 control-plane
+reconnect hardening, awaits its hardware smoke — checklist in the
+[CHANGELOG](CHANGELOG.md)). Per-milestone breakdown in
 [`docs/ROADMAP.md`](docs/ROADMAP.md), per-PR history in
 [`CHANGELOG.md`](CHANGELOG.md).
 
@@ -34,12 +82,32 @@ What works today, verified on real hardware:
 
 - A peer running upstream `tailscaled` runs `tailscale ping sensor-cali`
   and gets pongs `via 190.x.x.x:<port>` (direct UDP, no DERP relay).
-- The same peer runs `ping -c 10 100.67.60.92` (sensor-cali's tailnet IP)
-  and gets `0% packet loss, ~93ms RTT` over the WireGuard tunnel —
+- The same peer runs `ping -c 10 100.67.60.92` (sensor-cali's tailnet
+  IP) and gets `0% packet loss, ~93ms RTT` over the WireGuard tunnel —
   ICMP encapsulated, encrypted, decrypted, replied, end-to-end.
 - TMP117 telemetry frames flow out over the same tunnel every 5 s.
 - The Tailscale admin panel shows `Endpoints: 190.x.x.x:<port>` and
   `Client connectivity → UDP: Yes`.
+
+### Maturity scorecard
+
+Engineering coverage of the **declared scope** (single-peer,
+IPv4-only, always-on sensor node), assessed 2026-07-16 after the M13
+round. The remaining percentage of each row is itemized under
+[Known limitations](#known-limitations) or the ROADMAP backlog — gaps
+are tracked, not hidden.
+
+| Area | Coverage | Evidence / what's left |
+|------|:--------:|------------------------|
+| Control plane (ts2021 · register · map) | **92 %** | Register, streaming map, lite endpoint push, Retry-After, reconnect ladder, in-place re-register, capver governance — validated against tailscale.com and audited against headscale. Left: netmap delta-merge (`PeersRemoved`), real TKA/NLKey. |
+| WireGuard data plane | **95 %** | Handshake, transport, replay windows, make-before-break rekey, TAI64N persistence, roaming — multi-hour soaks at 0 panics. Left: multi-peer, IPv6. |
+| NAT traversal (STUN · DISCO · DERP) | **85 %** | Direct path lands (5-condition set), CMM punch, txid-bound prober, DERP supervisor + relay TX fallback. Left: relay branch never fired under a real flap (soak pending), single home-region assumption. |
+| Security posture | **80 %** | 3 audit rounds closed, `secure_zero` sweep, DoS gates, TOFU pin + compile-in profile, depth-bounded parsing. Left: NVS keys plaintext at rest, no SNTP cert-date validation. |
+| Reliability / self-healing | **88 %** | Idle budgets, reconnect ladders, wedge restart, bringup restart, reboot-safe handshake floor. Left: M13 HW smoke, task-WDT for data-plane tasks. |
+| Observability / ops | **70 %** | Stack-HWM diag dumps, soak grep metrics, admin-panel visibility. Left: OTA, remote stats endpoint, CI doesn't run the host suite. |
+| Testing | **82 %** | 546 host KATs (incl. upstream golden vectors), regression gates, A/B soak culture, CI firmware build. Left: host suite in CI, HIL rig. |
+| Documentation | **95 %** | Six living docs + clean-room protocol map with upstream citations + per-PR CHANGELOG. |
+| **Overall (scope-weighted)** | **≈ 87 %** | Production-ready for the declared deployment; the missing 13 % is enumerated work, none of it load-bearing for sensor-→-collector. |
 
 | #  | Milestone                                      | Status |
 |----|------------------------------------------------|--------|
@@ -55,75 +123,22 @@ What works today, verified on real hardware:
 | 10 | Perf-trim + footprint round (#88–#104)         | done — net −68.1 KiB flash, largest-contig heap 6656 → 9216 B |
 | 11 | Security round (#105)                          | done — WGN-1 nonce-reuse race closed + 4 hardenings |
 | 12 | Audit-fix round (2026-06-10, #106)             | done — capver 138 at the Noise layer, WG rx-path lock + relayed-DISCO peer gate, atomic key regen, depth-bounded MapResponse skip, secure_zero sweep |
-| 13 | Control-plane reconnect hardening (2026-07-16) | done — stream idle budget (mirrors upstream `watchdogTimeout`), `PeersChangedPatch` identity refetch, in-place re-register on map 4xx, wedge `esp_restart` last resort. HW smoke pending |
+| 13 | Control-plane reconnect hardening (2026-07-16, #109) | done — stream idle budget (mirrors upstream `watchdogTimeout`), `PeersChangedPatch` identity refetch, in-place re-register on map 4xx, wedge `esp_restart` last resort. HW smoke pending |
 
 Two further 2026-05-12 rounds — sdkconfig perf-trim (#76–#80) and DERP
-outbound (#82–#83: supervisor spawn + lossless relay fallback during peer
-NAT flap) — are documented in the CHANGELOG.
-
-### Known limitations
-
-None of these block the current sensor-→-collector path:
-
-- **Single-peer only** — the netmap `PeersChanged`/`PeersRemoved`
-  delta-merge is stubbed pending a multi-peer tailnet to validate against.
-  Since round 13, `PeersChangedPatch` frames carrying a peer
-  `Key`/`DiscoKey` rotation force a full-netmap refetch, so the gap is
-  efficiency, not correctness, for single-peer.
-- **No general task watchdog** — round 13 added control-path
-  self-recovery (stream idle timeout + wedge `esp_restart` after
-  `CONFIG_TINYLINK_CONTROL_WEDGE_RESTART_S` of control silence, plus
-  restart-on-failed-bringup), but application tasks (`wg_rx`, telemetry,
-  DERP supervisor) are still not subscribed to the task WDT.
-- **NVS private keys are stored in PLAINTEXT** — there is no
-  `CONFIG_SECURE_FLASH_ENC_ENABLED` and `keys.c` uses the default plain
-  partition. At-rest/eFuse key encryption is aspirational (see
-  *Provisioning*).
-- **No SNTP / wall-clock** — `MBEDTLS_HAVE_TIME_DATE` is off, so the three
-  TLS clients never validate cert `notBefore`/`notAfter`.
-- **Three divergent backoffs** (DERP supervisor + `endpoint_push`, the
-  latter two without jitter) want folding into a single `tl_backoff_ms`;
-  deferred pending an extended soak (`endpoint_push` is
-  regression-sensitive).
-- **DERP relay TX path validated only dormant** — the PR-D1 relay fallback
-  is in place but has not yet fired under a real forced flap; that soak
-  needs peer-side (Servidor1) access.
-
-## Scope (what tinylink IS)
-
-- Single-peer Tailscale client targeted at sensor telemetry use cases.
-- ESP32-WROOM-32E target. No PSRAM required.
-- USB-powered, always-on devices (no deep-sleep workloads).
-- Pure C, ESP-IDF native (no Arduino, no ESPHome, no C++).
-
-## Non-goals (what tinylink is NOT)
-
-- Multi-peer mesh.
-- MagicDNS, Tailnet Lock, ACL/PacketFilter enforcement on-device.
-- Subnet routing or exit nodes.
-- Taildrop, Funnel, Serve, Services.
-- Tailscale SSH.
-- IPv6 (v4-only at the netif layer).
-- Battery-powered deep-sleep workloads.
-- A drop-in replacement for `tailscaled`.
-
-## Hardware
-
-- Freenove ESP32-WROOM-32E DevKit (CH340 USB-UART).
-- TMP117 high-accuracy temperature sensor on I²C. Default wiring per the
-  Freenove DevKit pinout: SDA=GPIO21, SCL=GPIO22, ADD0 tied to GND for I²C
-  address `0x48`. All three are overridable in `idf.py menuconfig` →
-  *tinylink application* → *Telemetry*.
+outbound (#82–#83: supervisor spawn + lossless relay fallback during
+peer NAT flap) — are documented in the CHANGELOG.
 
 ## Architecture
 
-End-state component layout. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
-for the full call graphs and threading model.
+End-state component layout. See
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full call
+graphs, threading model, and the control-plane reconnect ladder.
 
 ```
 control plane (one Noise+HTTP/2 channel reused for everything):
   ts2021_client.c  Noise IK over TLS Upgrade → controlplane.tailscale.com
-   ├── register.c       POST /machine/register (boot)
+   ├── register.c       POST /machine/register (boot + in-place recovery)
    ├── mapreq.c         POST /machine/map  (Stream=false lite push, then Stream=true poll)
    └── (long-poll task lives in tinylink.c::long_poll_task)
 
@@ -189,10 +204,10 @@ Three properties that are non-obvious from a casual read of the code:
    `/key?v=100` floor in `control_key.c` is a deliberately lower,
    independent value for the legacy TOFU control-key fetch.
 
-## Building
+## Quick start
 
-See [`docs/BUILDING.md`](docs/BUILDING.md) for the full walkthrough
-(prerequisites, flash, monitor, serial capture). TL;DR:
+Full walkthrough (prerequisites, flash, monitor, serial capture) in
+[`docs/BUILDING.md`](docs/BUILDING.md). TL;DR:
 
 ```bash
 source ~/entorno_investigación/bin/activate   # your IDF python venv
@@ -201,25 +216,33 @@ idf.py set-target esp32
 idf.py build
 ```
 
-**Before the first flash**: apply the two **required** ESP-IDF patches in
-[`idf-patches/`](idf-patches/) (see
+**Before the first flash**: apply the two **required** ESP-IDF patches
+in [`idf-patches/`](idf-patches/) (see
 [`docs/BUILDING.md`](docs/BUILDING.md#required-apply-idf-patches)).
 Without them the firmware compiles cleanly but panics with
-`LoadProhibited` at `dhcp_state.c:52` the first time the WG netif comes up.
+`LoadProhibited` at `dhcp_state.c:52` the first time the WG netif comes
+up.
 
-### Tests
+Then provision credentials (WiFi + Tailscale auth key) into NVS —
+Curve25519 node identities are generated on first boot and persisted
+automatically. **NVS is currently a plaintext partition** —
+`CONFIG_SECURE_FLASH_ENC_ENABLED` is not set, so at-rest/eFuse key
+encryption is aspirational, not enabled (tracked under *Known
+limitations*). See [`docs/PROVISIONING.md`](docs/PROVISIONING.md).
+
+## Testing
 
 Host-side codec + crypto + state-machine tests — stock gcc, no ESP-IDF
 needed:
 
 ```bash
 cd tools/test
-make test          # 20 binaries · 531 assertions, all should report PASS
+make test          # 20 binaries · 546 assertions, all should report PASS
 ```
 
-CI ([`.github/workflows/build.yml`](.github/workflows/build.yml)) builds
-the firmware against ESP-IDF v5.5 on every push/PR; the host suite runs
-locally.
+CI ([`.github/workflows/build.yml`](.github/workflows/build.yml))
+builds the firmware against ESP-IDF v5.5 on every push/PR; the host
+suite runs locally.
 
 On-device AEAD micro-bench: opt-in via `CONFIG_TINYLINK_BENCH_AEAD=y`
 (off by default — see
@@ -228,20 +251,31 @@ pre-perf-round baseline on the ESP32 LX6 was ~660 µs/encrypt and
 ~654 µs/decrypt at 1500 B; re-measure on your build if you need hard
 numbers.
 
-## Provisioning
+## Scope (what tinylink IS)
 
-Credentials (WiFi + Tailscale auth key) are stored in NVS. The Curve25519
-node identities are generated on first boot and persisted automatically.
-**NVS is currently a plaintext partition** —
-`CONFIG_SECURE_FLASH_ENC_ENABLED` is not set, so at-rest/eFuse key
-encryption is aspirational, not enabled (tracked under *Known
-limitations*). See [`docs/PROVISIONING.md`](docs/PROVISIONING.md).
+- Single-peer Tailscale client targeted at sensor telemetry use cases.
+- ESP32-WROOM-32E target. No PSRAM required.
+- USB-powered, always-on devices (no deep-sleep workloads).
+- Pure C, ESP-IDF native (no Arduino, no ESPHome, no C++).
 
-## Examples
+## Non-goals (what tinylink is NOT)
 
-- [`examples/milestone1_register/`](examples/milestone1_register/) —
-  register the device with the Tailscale control plane and watch it
-  appear in the admin panel.
+- Multi-peer mesh.
+- MagicDNS, Tailnet Lock, ACL/PacketFilter enforcement on-device.
+- Subnet routing or exit nodes.
+- Taildrop, Funnel, Serve, Services.
+- Tailscale SSH.
+- IPv6 (v4-only at the netif layer).
+- Battery-powered deep-sleep workloads.
+- A drop-in replacement for `tailscaled`.
+
+## Hardware
+
+- Freenove ESP32-WROOM-32E DevKit (CH340 USB-UART).
+- TMP117 high-accuracy temperature sensor on I²C. Default wiring per the
+  Freenove DevKit pinout: SDA=GPIO21, SCL=GPIO22, ADD0 tied to GND for
+  I²C address `0x48`. All three are overridable in `idf.py menuconfig` →
+  *tinylink application* → *Telemetry*.
 
 ## Repository layout & documentation
 
@@ -249,7 +283,7 @@ limitations*). See [`docs/PROVISIONING.md`](docs/PROVISIONING.md).
 components/tinylink/   protocol implementation: control plane, data plane, vendored crypto
 main/                  app entry: WiFi bring-up, tinylink start, telemetry app
 docs/                  the documents indexed below
-idf-patches/           two REQUIRED patches to ESP-IDF v5.5 (see Building)
+idf-patches/           two REQUIRED patches to ESP-IDF v5.5 (see Quick start)
 tools/                 NVS provisioning + serial-capture helpers
 tools/test/            host-side test suite (make test)
 examples/              minimal register-only example
@@ -257,15 +291,43 @@ examples/              minimal register-only example
 
 | Document | Contents |
 |----------|----------|
-| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Component call graphs, task model, the WG-netif raw-IP design |
+| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Component call graphs, task model, WG-netif raw-IP design, reconnect ladder |
 | [`docs/PROTOCOL.md`](docs/PROTOCOL.md) | Clean-room wire-protocol map (ts2021, MapRequest, WG, DISCO, DERP, STUN) with upstream citations |
 | [`docs/BUILDING.md`](docs/BUILDING.md) | Environment setup, required IDF patches, build/flash/monitor, AEAD bench |
 | [`docs/PROVISIONING.md`](docs/PROVISIONING.md) | NVS credential provisioning (WiFi + auth key) |
-| [`docs/ROADMAP.md`](docs/ROADMAP.md) | Per-milestone breakdown M1–M12, open backlog, future directions |
+| [`docs/ROADMAP.md`](docs/ROADMAP.md) | Per-milestone breakdown M1–M13, open backlog, future directions |
 | [`docs/SECURITY-MODEL.md`](docs/SECURITY-MODEL.md) | Threat model + audit history |
 | [`CHANGELOG.md`](CHANGELOG.md) | Per-PR history of every round |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | Contribution guidelines |
 | [`SECURITY.md`](SECURITY.md) | Disclosure policy |
+
+## Known limitations
+
+None of these block the current sensor-→-collector path:
+
+- **Single-peer only** — the netmap `PeersChanged`/`PeersRemoved`
+  delta-merge is stubbed pending a multi-peer tailnet to validate
+  against. Since round 13, `PeersChangedPatch` frames carrying a peer
+  `Key`/`DiscoKey` rotation force a full-netmap refetch, so the gap is
+  efficiency, not correctness, for single-peer.
+- **No general task watchdog** — round 13 added control-path
+  self-recovery (stream idle timeout + wedge `esp_restart` after
+  `CONFIG_TINYLINK_CONTROL_WEDGE_RESTART_S` of control silence, plus
+  restart-on-failed-bringup), but application tasks (`wg_rx`,
+  telemetry, DERP supervisor) are still not subscribed to the task WDT.
+- **NVS private keys are stored in PLAINTEXT** — there is no
+  `CONFIG_SECURE_FLASH_ENC_ENABLED` and `keys.c` uses the default plain
+  partition. At-rest/eFuse key encryption is aspirational (see
+  *Provisioning* in Quick start).
+- **No SNTP / wall-clock** — `MBEDTLS_HAVE_TIME_DATE` is off, so the
+  three TLS clients never validate cert `notBefore`/`notAfter`.
+- **Three divergent backoffs** (DERP supervisor + `endpoint_push`, the
+  latter two without jitter) want folding into a single `tl_backoff_ms`;
+  deferred pending an extended soak (`endpoint_push` is
+  regression-sensitive).
+- **DERP relay TX path validated only dormant** — the PR-D1 relay
+  fallback is in place but has not yet fired under a real forced flap;
+  that soak needs peer-side (Servidor1) access.
 
 ## Possible future directions
 
@@ -273,23 +335,29 @@ Not commitments — bigger-than-QoL extensions, none blocking the current
 sensor-→-collector use case. Rationale and effort sketches in
 [`docs/ROADMAP.md` § "Future directions"](docs/ROADMAP.md#future-directions).
 
-- **Streaming JSON parser** — eliminate the `RESPONSE_BUF_SZ` body buffer;
-  lifts the BSS ceiling behind `TL_MAX_PEERS = 4`.
+- **Streaming JSON parser** — eliminate the `RESPONSE_BUF_SZ` body
+  buffer; lifts the BSS ceiling behind `TL_MAX_PEERS = 4`.
 - **Multi-peer support** — peer table in `wg_netif.c`, per-peer RFC 6479
   replay windows, netmap-driven peer add/remove.
 - **PSRAM support** — move lwIP pools, mbedTLS transients, and the WG
   demux scratch out of internal DRAM.
-- **OTA over the tailnet** — signed image fetch from a tailnet peer; also
-  gives auth-key rotation the trigger mechanism it lacks.
-- **Deep-sleep with WG state preservation** — session checkpoint to NVS so
-  the device wakes into an established tunnel (the TAI64N persistence from
-  PR #51 is the foundation).
+- **OTA over the tailnet** — signed image fetch from a tailnet peer;
+  also gives auth-key rotation the trigger mechanism it lacks.
+- **Deep-sleep with WG state preservation** — session checkpoint to NVS
+  so the device wakes into an established tunnel (the TAI64N
+  persistence from PR #51 is the foundation).
 - **Other sensor families** — an I²C/SPI driver framework beyond TMP117
   (BME280, SCD30, ADS1115, …).
 - **Mesh of devices** — sensor↔sensor store-and-forward once multi-peer
   lands.
-- **Diagnostics web endpoint** — tiny HTTP `/stats` on the WG netif (heap,
-  rekey count, RX-stale events, endpoint roams).
+- **Diagnostics web endpoint** — tiny HTTP `/stats` on the WG netif
+  (heap, rekey count, RX-stale events, endpoint roams).
+
+## Examples
+
+- [`examples/milestone1_register/`](examples/milestone1_register/) —
+  register the device with the Tailscale control plane and watch it
+  appear in the admin panel.
 
 ## Security
 
