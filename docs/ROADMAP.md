@@ -27,6 +27,7 @@ Go implementation, which is the authoritative reference for wire format.
 | M11| Security round                                | done — PR #105 (WGN-1 writer + 4 hardenings) | v0.7    | landed   |
 | M12| Audit-fix round (2026-06-10)                  | done — 6 fixes, HW-validated vs tailscale.com | v0.7   | landed   |
 | M13| Control-plane reconnect hardening (2026-07-16)| done — stream idle budget, patch-driven refetch, in-place re-register, wedge restart. **HW smoke pending** | v0.8   | landed   |
+| —  | Next rounds                                   | queued — see "Execution queue" below (HW smoke → task WDT → SNTP → /stats → OTA; eFuse encryption explicitly out) | —      | queued   |
 
 End-to-end verification on hardware (sensor-cali next to router,
 Servidor1 WG peer with public IP):
@@ -914,6 +915,55 @@ Commit-level detail in `CHANGELOG.md`; threat-model view in
   `CHANGELOG.md` (boot smoke, ≥15-min stream stability, forced
   half-open, ≥60-min wedge restart, admin-panel node delete).
 
+## Execution queue — next rounds (agreed 2026-07-16)
+
+Owner-approved order for closing the remaining gaps toward ~100 % of
+the declared scope. Each item waits on its stated gate; none blocks
+the current deployment. Items get their M-number when their round
+lands.
+
+**Gate: a test ESP32 attached** (never reflash the deployed sensor for
+experiments):
+
+1. **M13 hardware smoke** — run the 5-step checklist in the CHANGELOG
+   M13 entry: 90-s boot smoke, ≥15-min stream stability (no idle
+   timeout between KeepAlives), forced half-open (expect reconnect
+   ≤ ~2.5 min, no reboot), ≥60-min drop (expect wedge restart +
+   recovery), admin-panel node delete (expect self re-register).
+2. **Task WDT for application tasks** — `esp_task_wdt_add` + feed
+   points for `wg_rx` / telemetry / DERP supervisor. Validation is a
+   multi-hour soak: the stack-trim lesson applies (short post-boot
+   smokes are insufficient for tasks with reconnect/retry loops).
+3. **SNTP + `MBEDTLS_HAVE_TIME_DATE`** — TLS certificate
+   `notBefore`/`notAfter` validation with a boot fallback when NTP is
+   unreachable (an offline boot must not brick). Re-smoke all three
+   TLS clients (control, DERP, future OTA) + flash-budget check.
+4. **`/stats` diagnostics endpoint** on the WG netif — heap, rekey
+   count, RX-stale events, endpoint roams (see Future directions).
+5. **OTA over the tailnet** — signed image fetch from a tailnet peer;
+   the partition table is already OTA-shaped. Also provides the
+   remote trigger that auth-key rotation lacked.
+
+**Gate: Servidor1 (peer-side) access:**
+
+- Forced-flap relay soak (see Open backlog below). If Servidor1 runs
+  headscale, upgrade it to ≥ 0.29.2 first — the issue-#3346 cluster
+  fixed three server-side "client retries forever after a control
+  change" bugs (2026-07 upstream audit).
+
+**Gate: an extended soak window:**
+
+- Backoff consolidation (see Open backlog below).
+
+**Explicitly out — owner decision (2026-07-16), reaffirming the M7
+call:** NVS/flash encryption via eFuse. Burning eFuses is irreversible
+and recovery from any provisioning mishap would depend on a control
+plane the project does not operate (tailscale.com) — an unrecoverable
+failure mode for a remote sensor. Plaintext NVS stays an accepted,
+documented risk (physical-access attackers are out of scope per
+`SECURITY-MODEL.md`); this item must not be re-proposed as roadmap
+work.
+
 ## Open backlog (roadmap — NOT done)
 
 These are the genuinely remaining protocol/data-plane follow-ups, kept
@@ -954,9 +1004,10 @@ isn't covered. Each is a conscious deferral, not an oversight.
 - **NVS private keys are PLAINTEXT.** `CONFIG_SECURE_FLASH_ENC_ENABLED`
   is off and `keys.c` uses the default plain NVS partition. The
   MachineKey / NodeKey / DiscoKey / auth_key sit in cleartext on
-  flash. At-rest / eFuse-HMAC encryption is **aspirational, not
-  currently enabled** (physical-access attacker is out of scope per
-  `SECURITY-MODEL.md`; see also the three irreversible M7 items).
+  flash. At-rest / eFuse encryption **will not be implemented — owner
+  decision 2026-07-16** (see the Execution queue above for the
+  rationale); accepted risk, physical-access attacker out of scope per
+  `SECURITY-MODEL.md`.
 - **No SNTP-backed TLS time validation.** `MBEDTLS_HAVE_TIME_DATE` is
   off, so all three TLS clients (controlplane, DERP, OTA-to-be) never
   check certificate `notBefore` / `notAfter`. The pinned-control-key

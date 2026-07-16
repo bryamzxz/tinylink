@@ -205,10 +205,11 @@ up.
 
 Then provision credentials (WiFi + Tailscale auth key) into NVS —
 Curve25519 node identities are generated on first boot and persisted
-automatically. **NVS is currently a plaintext partition** —
-`CONFIG_SECURE_FLASH_ENC_ENABLED` is not set, so at-rest/eFuse key
-encryption is aspirational, not enabled (tracked under *Known
-limitations*). See [`docs/PROVISIONING.md`](docs/PROVISIONING.md).
+automatically. **NVS is a plaintext partition by deliberate decision**
+— `CONFIG_SECURE_FLASH_ENC_ENABLED` is not set and eFuse-backed
+encryption is declined (irreversible burns + third-party control-plane
+recovery don't mix; see *Known limitations*). See
+[`docs/PROVISIONING.md`](docs/PROVISIONING.md).
 
 ## Testing
 
@@ -297,8 +298,11 @@ None of these block the current sensor-→-collector path:
   telemetry, DERP supervisor) are still not subscribed to the task WDT.
 - **NVS private keys are stored in PLAINTEXT** — there is no
   `CONFIG_SECURE_FLASH_ENC_ENABLED` and `keys.c` uses the default plain
-  partition. At-rest/eFuse key encryption is aspirational (see
-  *Provisioning* in Quick start).
+  partition. At-rest/eFuse key encryption is **deliberately declined**
+  (owner decision — irreversible eFuse burns paired with a third-party
+  control plane are a worse failure mode than the out-of-scope
+  physical-access risk; rationale in
+  [`docs/ROADMAP.md` § Execution queue](docs/ROADMAP.md)).
 - **No SNTP / wall-clock** — `MBEDTLS_HAVE_TIME_DATE` is off, so the
   three TLS clients never validate cert `notBefore`/`notAfter`.
 - **Three divergent backoffs** (DERP supervisor + `endpoint_push`, the
