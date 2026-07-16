@@ -20,6 +20,17 @@ static const char *TAG = "derp_client";
 /* Same budget as ts2021 — covers cert chain verify + ECDSA. */
 #define DERP_TLS_TIMEOUT_MS 30000
 
+/* Liveness budget, same shape as ts2021_client.c: consecutive silent
+ * SO_RCVTIMEO polls tolerated before the DERP stream is declared dead.
+ * The DERP server keepalives roughly every minute; the shared default
+ * (120 s = 4 polls) is two missed keepalives. Without it a half-open
+ * TCP conn parks derp_client_run forever and the supervisor never
+ * reconnects — the relay fallback silently dies for the rest of the
+ * session. */
+#define DERP_MAX_IDLE_POLLS \
+    ((uint32_t)((CONFIG_TINYLINK_STREAM_IDLE_TIMEOUT_S * 1000 \
+                 + DERP_TLS_TIMEOUT_MS - 1) / DERP_TLS_TIMEOUT_MS))
+
 /* Largest single read for either the upgrade response or any login
  * frame. ServerKey ≈ 40 B, ServerInfo box typically ≤ 100 B. 256 B
  * leaves comfortable headroom and stays small enough for the stack. */
@@ -48,9 +59,15 @@ static ssize_t derp_tls_read(void *ctx, uint8_t *buf, size_t len) {
 
 static esp_err_t tls_read_full(esp_tls_t *tls, uint8_t *buf, size_t need)
 {
-    int rc = tls_io_read_full(derp_tls_read_raw, tls, buf, need);
+    int rc = tls_io_read_full(derp_tls_read_raw, tls, buf, need,
+                              DERP_MAX_IDLE_POLLS);
     if (rc != 0) {
-        ESP_LOGE(TAG, "tls_read_full failed: %d", rc);
+        if (rc == TLS_IO_ERR_IDLE_TIMEOUT) {
+            ESP_LOGW(TAG, "DERP stream silent past %d s — declaring dead",
+                     CONFIG_TINYLINK_STREAM_IDLE_TIMEOUT_S);
+        } else {
+            ESP_LOGE(TAG, "tls_read_full failed: %d", rc);
+        }
         return ESP_FAIL;
     }
     return ESP_OK;
@@ -58,7 +75,8 @@ static esp_err_t tls_read_full(esp_tls_t *tls, uint8_t *buf, size_t need)
 
 static esp_err_t tls_write_full(esp_tls_t *tls, const uint8_t *buf, size_t len)
 {
-    int rc = tls_io_write_full(derp_tls_write_raw, tls, buf, len);
+    int rc = tls_io_write_full(derp_tls_write_raw, tls, buf, len,
+                               DERP_MAX_IDLE_POLLS);
     if (rc != 0) {
         ESP_LOGE(TAG, "tls_write_full failed: %d", rc);
         return ESP_FAIL;
@@ -73,13 +91,22 @@ static esp_err_t tls_write_full(esp_tls_t *tls, const uint8_t *buf, size_t len)
 static esp_err_t read_upgrade_response(esp_tls_t *tls,
                                        uint8_t *buf, size_t buf_size)
 {
-    size_t total = 0;
+    size_t   total = 0;
+    uint32_t idle  = 0;
     while (total < buf_size - 1) {
         ssize_t r = esp_tls_conn_read(tls, buf + total, 1);
         if (r == MBEDTLS_ERR_SSL_WANT_READ ||
             r == MBEDTLS_ERR_SSL_WANT_WRITE) {
+            /* Bounded like the frame reader — a server that accepts
+             * TLS but never answers the upgrade must not hang us. */
+            if (++idle >= DERP_MAX_IDLE_POLLS) {
+                ESP_LOGE(TAG, "no 101 response within %d s — giving up",
+                         CONFIG_TINYLINK_STREAM_IDLE_TIMEOUT_S);
+                return ESP_FAIL;
+            }
             continue;
         }
+        idle = 0;
         if (r <= 0) {
             ESP_LOGE(TAG, "tls read while waiting for 101: %d", (int)r);
             return ESP_FAIL;
@@ -293,9 +320,11 @@ static int derp_send_frame_locked(void *ctx, derp_frame_type_t type,
     derp_write_frame_header(hdr, type, (uint32_t)plen);
 
     xSemaphoreTake(c->write_lock, portMAX_DELAY);
-    int rc = tls_io_write_full(derp_tls_write_raw, c->tls, hdr, sizeof(hdr));
+    int rc = tls_io_write_full(derp_tls_write_raw, c->tls, hdr, sizeof(hdr),
+                               DERP_MAX_IDLE_POLLS);
     if (rc == 0 && plen > 0) {
-        rc = tls_io_write_full(derp_tls_write_raw, c->tls, payload, plen);
+        rc = tls_io_write_full(derp_tls_write_raw, c->tls, payload, plen,
+                               DERP_MAX_IDLE_POLLS);
     }
     xSemaphoreGive(c->write_lock);
     return rc;
@@ -309,7 +338,8 @@ esp_err_t derp_client_run(derp_client_t *c,
         return ESP_ERR_INVALID_STATE;
     }
     int rc = derp_run_loop(derp_tls_read, derp_send_frame_locked, c,
-                           frame_buf, frame_cap, cb, cb_ctx);
+                           frame_buf, frame_cap, cb, cb_ctx,
+                           DERP_MAX_IDLE_POLLS);
     switch (rc) {
         case  0: return ESP_OK;                          /* cb stop */
         case -2: return ESP_ERR_INVALID_RESPONSE;        /* RESTARTING */
@@ -338,12 +368,15 @@ esp_err_t derp_client_send_packet(derp_client_t *c,
                             (uint32_t)total_payload);
 
     xSemaphoreTake(c->write_lock, portMAX_DELAY);
-    int rc = tls_io_write_full(derp_tls_write_raw, c->tls, hdr, sizeof(hdr));
+    int rc = tls_io_write_full(derp_tls_write_raw, c->tls, hdr, sizeof(hdr),
+                               DERP_MAX_IDLE_POLLS);
     if (rc == 0) {
-        rc = tls_io_write_full(derp_tls_write_raw, c->tls, dst_pub, DERP_KEY_LEN);
+        rc = tls_io_write_full(derp_tls_write_raw, c->tls, dst_pub,
+                               DERP_KEY_LEN, DERP_MAX_IDLE_POLLS);
     }
     if (rc == 0 && plen > 0) {
-        rc = tls_io_write_full(derp_tls_write_raw, c->tls, packet, plen);
+        rc = tls_io_write_full(derp_tls_write_raw, c->tls, packet, plen,
+                               DERP_MAX_IDLE_POLLS);
     }
     xSemaphoreGive(c->write_lock);
     return (rc == 0) ? ESP_OK : ESP_FAIL;

@@ -21,6 +21,24 @@ static const char *TAG = "ts2021";
 #define TLS_TIMEOUT_MS 30000
 #define HTTP_RESPONSE_BUF 4096
 
+/* Liveness budget for every blocking read/write on the control conn:
+ * consecutive WANT_READ/WANT_WRITE polls (one SO_RCVTIMEO period =
+ * TLS_TIMEOUT_MS each) tolerated before the stream is declared dead.
+ * The server emits a KeepAlive on the map stream every ~60 s
+ * (direct.go:1051 "we should be receiving a keep alive ping every
+ * minute"), and the upstream client kills the poll after 120 s of
+ * read inactivity (direct.go:1054 `watchdogTimeout = 120s`, re-armed
+ * per read-loop iteration). The default 120 s budget (4 polls) mirrors
+ * that: two missed KeepAlives. Without this bound a half-open TCP conn
+ * — control plane instance replaced without FIN/RST, NAT flow expired
+ * — parks the long-poll task in the retry loop FOREVER and the node
+ * never reconnects until a manual power cycle (the "device stops
+ * reconnecting after a control-plane change" failure observed in
+ * production, 2026-07). */
+#define TS2021_MAX_IDLE_POLLS \
+    ((uint32_t)((CONFIG_TINYLINK_STREAM_IDLE_TIMEOUT_S * 1000 \
+                 + TLS_TIMEOUT_MS - 1) / TLS_TIMEOUT_MS))
+
 /* base64 encoder used for the X-Tailscale-Handshake header. */
 static int b64_encode(const uint8_t *in, size_t in_len,
                       char *out, size_t out_size)
@@ -57,9 +75,15 @@ static ssize_t ts2021_tls_write(void *ctx, const uint8_t *buf, size_t len) {
 
 static esp_err_t tls_read_full(esp_tls_t *tls, uint8_t *buf, size_t need)
 {
-    int rc = tls_io_read_full(ts2021_tls_read, tls, buf, need);
+    int rc = tls_io_read_full(ts2021_tls_read, tls, buf, need,
+                              TS2021_MAX_IDLE_POLLS);
     if (rc != 0) {
-        ESP_LOGE(TAG, "tls_read_full failed: %d", rc);
+        if (rc == TLS_IO_ERR_IDLE_TIMEOUT) {
+            ESP_LOGW(TAG, "control stream silent past %d s — declaring dead",
+                     CONFIG_TINYLINK_STREAM_IDLE_TIMEOUT_S);
+        } else {
+            ESP_LOGE(TAG, "tls_read_full failed: %d", rc);
+        }
         return ESP_FAIL;
     }
     return ESP_OK;
@@ -67,7 +91,8 @@ static esp_err_t tls_read_full(esp_tls_t *tls, uint8_t *buf, size_t need)
 
 static esp_err_t tls_write_full(esp_tls_t *tls, const uint8_t *buf, size_t len)
 {
-    int rc = tls_io_write_full(ts2021_tls_write, tls, buf, len);
+    int rc = tls_io_write_full(ts2021_tls_write, tls, buf, len,
+                               TS2021_MAX_IDLE_POLLS);
     if (rc != 0) {
         ESP_LOGE(TAG, "tls_write_full failed: %d", rc);
         return ESP_FAIL;
@@ -78,7 +103,8 @@ static esp_err_t tls_write_full(esp_tls_t *tls, const uint8_t *buf, size_t len)
 static esp_err_t read_upgrade_response(esp_tls_t *tls,
                                        uint8_t *buf, size_t buf_size)
 {
-    size_t total = 0;
+    size_t   total = 0;
+    uint32_t idle  = 0;
     while (total < buf_size - 1) {
         ssize_t r = esp_tls_conn_read(tls, buf + total, 1);
         if (r == MBEDTLS_ERR_SSL_WANT_READ ||
@@ -86,9 +112,17 @@ static esp_err_t read_upgrade_response(esp_tls_t *tls,
             /* Same transient-timeout class as tls_io_read_full handles
              * — but here we read one byte at a time scanning for
              * "\r\n\r\n", so we open-code the retry instead of
-             * pulling the helper. */
+             * pulling the helper. Same liveness budget as the record
+             * reader: a server that accepts TLS but never answers the
+             * upgrade must not park the caller forever. */
+            if (++idle >= TS2021_MAX_IDLE_POLLS) {
+                ESP_LOGE(TAG, "no 101 response within %d s — giving up",
+                         CONFIG_TINYLINK_STREAM_IDLE_TIMEOUT_S);
+                return ESP_FAIL;
+            }
             continue;
         }
+        idle = 0;
         if (r <= 0) {
             ESP_LOGE(TAG, "tls read while waiting for 101: %d", (int)r);
             return ESP_FAIL;

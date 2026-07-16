@@ -51,13 +51,14 @@ extern "C" {
  * to this macro.
  *
  * Floor check (verify on every upstream-audit round): headscale main
- * enforces MinSupportedCapabilityVersion = 113 (= Tailscale v1.80) and
- * climbs ~1 minor/month (oldest of the latest 10 minors). Upstream
- * tailcfg.CurrentCapabilityVersion is 141 as of 2026-06. 138 (= v1.98)
- * is >= the headscale floor with ~9-10 minors of headroom. Bumping the
- * value changes the Noise prologue hash, so it requires a hardware A/B
- * smoke against the live control plane per the repo's verify-regression
- * rule. */
+ * enforces MinSupportedCapabilityVersion = 113 (= Tailscale v1.80);
+ * unchanged through 0.30.0-dev (audit 2026-07-16, capver_generated.go:89).
+ * Upstream tailcfg.CurrentCapabilityVersion is 142 as of 2026-07
+ * (141→142 gates only the c2n localapi proxy — no wire impact for a
+ * register+map+disco+derp client). 138 (= v1.98) remains >= the
+ * headscale floor with wide headroom. Bumping the value changes the
+ * Noise prologue hash, so it requires a hardware A/B smoke against the
+ * live control plane per the repo's verify-regression rule. */
 #define TINYLINK_CAPVER 138
 
 #define TINYLINK_KEY_LEN 32
@@ -283,17 +284,28 @@ esp_err_t tinylink_stun_reprobe_start(void);
  * signals this task; if the task isn't up the signal is dropped with a
  * warning). Idempotent — second call returns ESP_OK without re-spawning.
  *
- * Stack: TINYLINK_EP_PUSH_TASK_STACK (16 KiB) — sized for the mbedtls
- * cert chain verify + Noise IK init peak (~12 KiB) plus margin. Allocated
- * once at boot to avoid the heap-fragmentation failure that took out the
- * legacy one-shot-task design (see endpoint_updater_task comment in
- * tinylink.c for the failure capture). */
+ * Stack: TINYLINK_EP_PUSH_TASK_STACK (12 KiB, BSS-static) — sized by the
+ * 30-min stress soak of 2026-05-13 (see the block comment over the
+ * #define in tinylink.c). Allocated once at boot to avoid the
+ * heap-fragmentation failure that took out the legacy one-shot-task
+ * design (see endpoint_updater_task comment in tinylink.c for the
+ * failure capture). */
 esp_err_t tinylink_endpoint_updater_start(void);
 
 /* Read-only accessor for the cached STUN result. Returns true and
  * fills *addr_v4 / *port if a successful probe has run; returns false
  * otherwise. mapreq.c queries this when building the HostInfo block. */
 bool tinylink_get_public_endpoint(uint8_t addr_v4[4], uint16_t *port);
+
+/* Control-plane liveness note. Called by mapreq.c's streaming chunk
+ * callback (long_poll_task context) every time bytes arrive from the
+ * control plane — including KeepAlive frames. Feeds the wedge-restart
+ * last resort (CONFIG_TINYLINK_CONTROL_WEDGE_RESTART_S): if this stops
+ * being called for that long, the long-poll task concludes the device
+ * cannot reach the control plane by any means available to it and
+ * esp_restart()s back to the known-good boot path. Single writer +
+ * single reader (both long_poll_task), so no locking. */
+void tinylink_control_mark_alive(void);
 
 const char *tinylink_version_string(void);
 

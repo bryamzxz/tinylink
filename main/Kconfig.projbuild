@@ -85,6 +85,48 @@ menu "tinylink application"
             MachineAuthorized=false (e.g. waiting for the operator to approve
             the node in the admin panel).
 
+    config TINYLINK_STREAM_IDLE_TIMEOUT_S
+        int "Control/DERP stream idle timeout (s)"
+        default 120
+        range 60 3600
+        help
+            Maximum continuous silence tolerated on the control-plane
+            long-poll and the supervised DERP stream before the
+            connection is declared dead and re-established. The control
+            plane emits a KeepAlive on the map stream every ~60 s and
+            DERP relays keepalive at a similar cadence, so the default
+            (120 s — mirroring the upstream client's watchdogTimeout in
+            control/controlclient/direct.go) means two missed
+            KeepAlives. This is what converts a half-open TCP
+            connection (control instance replaced without FIN/RST,
+            expired NAT flow) from a permanent hang into a normal
+            reconnect. Internally rounded up to a whole number of 30-s
+            socket-timeout polls.
+
+    config TINYLINK_CONTROL_WEDGE_RESTART_S
+        int "Restart if control plane is unreachable this long (s, 0 = off)"
+        default 3600
+        range 0 86400
+        help
+            Last-resort self-heal: if the long-poll task has not seen a
+            single byte from the control plane for this long — despite
+            its bounded per-connection timeouts and reconnect backoff —
+            dump task diagnostics and esp_restart(). This covers wedge
+            classes that per-connection timeouts cannot reach:
+            persistent heap fragmentation starving new TLS handshakes,
+            lwIP/DNS wedges, or control-side node-state loss that a
+            fresh boot (register + map) recovers from.
+
+            The WireGuard data plane can outlive a control outage, so
+            the default is deliberately long (60 min) to avoid
+            restarting a device whose telemetry still flows during a
+            pure control-plane outage.
+
+            When enabled, a failed bringup (e.g. WiFi absent at boot)
+            also restarts after 60 s instead of parking in diagnostics
+            mode forever. Set to 0 to disable both behaviors and keep
+            the stay-up-for-diagnostics semantics.
+
     config TINYLINK_STUN_HOST
         string "STUN server hostname (M4)"
         default "stun.l.google.com"

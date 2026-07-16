@@ -1137,13 +1137,41 @@ static esp_err_t long_poll_handler(const tl_netmap_t *nm, void *ctx)
 #define LP_BACKOFF_CAP_MS  ((uint32_t)CONFIG_TINYLINK_REGISTER_RETRY_MS)
 #define LP_HEALTHY_MS      10000LL
 
+/* Defined in the endpoint-updater section below; the long-poll task
+ * signals it after a successful in-place re-register so the fresh node
+ * record learns our current public endpoint (Stream=true is read-only
+ * server-side). */
+static void tinylink_endpoint_push_async(void);
+
+/* Last time any control-plane byte reached us on the map stream. Set
+ * from mapreq.c's chunk callback, which runs inside mapreq_run_stream
+ * — i.e. in this task's context. Single writer + single reader, no
+ * lock. Basis for the wedge-restart last resort below. */
+static int64_t s_control_last_rx_us;
+
+void tinylink_control_mark_alive(void)
+{
+    s_control_last_rx_us = esp_timer_get_time();
+}
+
 static void long_poll_task(void *arg)
 {
     (void)arg;
     ESP_LOGI(TAG, "long-poll task: starting");
     uint32_t fail_attempt = 0;
+    /* Consecutive map cycles the server REJECTED with a non-throttle
+     * HTTP 4xx. Distinct from transport failures: a 4xx means the
+     * control plane is reachable but no longer accepts our node state
+     * (node deleted/expired server-side, control migrated). The
+     * upstream client never re-registers from the map loop — it
+     * surfaces NeedsLogin to a human. A headless sensor has no human,
+     * but it does have the authkey in NVS, so the equivalent recovery
+     * is an in-place re-register (the exact path every boot exercises). */
+    uint32_t consec_4xx = 0;
+    tinylink_control_mark_alive();  /* arm the wedge clock from task start */
     for (;;) {
         int retry_after_s = 0;
+        int http_status   = 0;
         esp_err_t err = ensure_control_conn();
         if (err == ESP_OK) {
             const int64_t t0 = esp_timer_get_time();
@@ -1151,8 +1179,10 @@ static void long_poll_task(void *arg)
             /* Stream ended: either the server closed it (idle / ping
              * failure / restart) or our side errored. Capture any
              * Retry-After hint from the response (mapreq.c parses it on
-             * 429/503) before drop_control_conn clears the conn. */
+             * 429/503) and the HTTP status before drop_control_conn
+             * clears the conn. */
             retry_after_s = s_conn.h2_retry_after_s;
+            http_status   = s_conn.h2_status;
             const int64_t up_us = esp_timer_get_time() - t0;
             ESP_LOGW(TAG, "long-poll stream ended: 0x%x — reconnecting", err);
             drop_control_conn();
@@ -1161,6 +1191,55 @@ static void long_poll_task(void *arg)
         } else {
             ESP_LOGW(TAG, "long-poll connect failed: 0x%x — backing off", err);
         }
+
+        const bool rejected_4xx = (err != ESP_OK &&
+                                   http_status >= 400 && http_status < 500 &&
+                                   http_status != 429);
+        if (rejected_4xx) {
+            if (consec_4xx < 1024u) consec_4xx++;
+            /* Power-of-two schedule (2, 4, 8, ... cycles) so a control
+             * plane that keeps rejecting us isn't hammered with one
+             * register per reconnect cycle, yet a transient server-side
+             * state loss recovers within a couple of cycles. */
+            if (consec_4xx >= 2u && (consec_4xx & (consec_4xx - 1u)) == 0u) {
+                ESP_LOGW(TAG, "map rejected %u consecutive times (HTTP %d) — "
+                              "re-registering with stored authkey",
+                         (unsigned)consec_4xx, http_status);
+                esp_err_t rr = tinylink_register();
+                if (rr == ESP_OK) {
+                    ESP_LOGI(TAG, "re-register OK — refreshing endpoints");
+                    /* Stream=true is read-only server-side; make sure the
+                     * fresh node record gets our current endpoint. */
+                    tinylink_endpoint_push_async();
+                    consec_4xx = 0;
+                } else {
+                    ESP_LOGW(TAG, "re-register failed: 0x%x — map retry "
+                                  "continues", rr);
+                }
+            }
+        } else {
+            consec_4xx = 0;
+        }
+
+#if CONFIG_TINYLINK_CONTROL_WEDGE_RESTART_S > 0
+        /* Last resort: nothing from the control plane for the whole
+         * wedge window despite bounded timeouts + reconnects. Restart
+         * into the known-good boot path (register + map) rather than
+         * stay wedged forever — the failure classes that land here
+         * (heap fragmentation starving TLS, lwIP/DNS wedges) all
+         * recover with a reboot, and a reboot costs ~30 s of telemetry
+         * against an already hour-long control outage. */
+        const int64_t silent_us = esp_timer_get_time() - s_control_last_rx_us;
+        if (silent_us >
+            (int64_t)CONFIG_TINYLINK_CONTROL_WEDGE_RESTART_S * 1000000LL) {
+            ESP_LOGE(TAG, "control plane silent for %lu s (limit %d s) — "
+                          "restarting as last resort",
+                     (unsigned long)(silent_us / 1000000LL),
+                     CONFIG_TINYLINK_CONTROL_WEDGE_RESTART_S);
+            tinylink_diag_dump_stacks();
+            esp_restart();
+        }
+#endif
 
         uint32_t delay_ms;
         if (retry_after_s > 0) {
