@@ -138,13 +138,57 @@ solved. None is fixed in the current firmware.
 - **NVS private keys are plaintext at rest.** See "Long-term keys":
   flash encryption is off, so the Curve25519 identities are recoverable
   from a raw flash dump. Highest-value hardening item.
-- **No self-recovery watchdog for application tasks.** The task WDT is
-  compiled in (`CONFIG_ESP_TASK_WDT_EN=y`) but `CONFIG_..._WDT_PANIC` is
-  unset and it only subscribes the two idle tasks — no application task
-  (`wg_rx`, long-poll, DERP supervisor, telemetry) calls
-  `esp_task_wdt_add`. So a wedged application task does **not** trigger a
-  reset: the device stays bricked until a physical power-cycle. There is
-  no `esp_restart` self-recovery path.
+- **No general task-WDT coverage for application tasks.** The task WDT
+  is compiled in (`CONFIG_ESP_TASK_WDT_EN=y`) but `CONFIG_..._WDT_PANIC`
+  is unset and it only subscribes the two idle tasks — no application
+  task (`wg_rx`, DERP supervisor, telemetry) calls `esp_task_wdt_add`.
+  *Narrowed in the 2026-07 round:* the control path now has a dedicated
+  self-recovery ladder (bounded stream silence → reconnect → in-place
+  re-register → `esp_restart` after
+  `CONFIG_TINYLINK_CONTROL_WEDGE_RESTART_S` of total control silence,
+  plus restart-on-failed-bringup), so a control-plane wedge is no longer
+  a brick. A wedge confined to a *data-plane* task still bricks that
+  function until the control-path watchdog happens to reboot the device
+  (only if the wedge also starves the control stream) or a physical
+  power-cycle.
+
+## Reconnect-hardening round (2026-07) — control-path availability
+
+Four fixes, driven by the observed production failure "node stops
+reconnecting after a control-plane change" and a fresh two-sided
+upstream audit (zero wire drift; capver 138 still valid — headscale
+floor unchanged at 113, upstream current 142). This round is an
+**availability** hardening: none of it changes the confidentiality /
+integrity posture, all of it removes ways the device can silently fall
+off the tailnet. Commit detail in `CHANGELOG.md`. **HW smoke pending**
+(no device attached when the round landed).
+
+- **Bounded stream silence.** All blocking control/DERP TLS I/O now
+  carries an idle budget (`CONFIG_TINYLINK_STREAM_IDLE_TIMEOUT_S`,
+  default 120 s, mirroring upstream `watchdogTimeout`): a half-open TCP
+  connection — control instance replaced without FIN/RST, NAT flow
+  expired, or an adversary black-holing the flow — can park the
+  long-poll / DERP supervisor for at most one budget window instead of
+  forever. Availability note: an *active* MITM able to drop packets
+  could always deny control-plane service; the change removes the
+  amplification where one dropped flow denied it permanently.
+- **`PeersChangedPatch` identity refetch.** A patch rotating the peer's
+  `NodeKey`/`DiscoKey` forces a full-netmap refetch instead of being
+  silently ignored — the data plane no longer keeps handshaking against
+  dead peer keys for hours. (Trust in the patch content itself is
+  unchanged: it arrives over the Noise-authenticated control channel,
+  and tinylink acts on it only by refetching from the same channel.)
+- **In-place re-register on persistent map 4xx.** Server-side
+  node-state loss (node deleted, control DB migrated) self-heals with
+  the NVS authkey instead of requiring a power-cycle. The authkey was
+  already the boot-time trust anchor; this reuses the identical code
+  path at runtime, introducing no new credential exposure.
+- **Wedge `esp_restart` last resort.** One hour
+  (`CONFIG_TINYLINK_CONTROL_WEDGE_RESTART_S`) of *zero* control-plane
+  bytes → diagnostic dump + reboot into the known-good boot path; a
+  failed bringup likewise retries via reboot after 60 s. TAI64N floor
+  persistence (2026-05) is what makes surprise reboots safe against WG
+  handshake-replay rejection, so the two mechanisms compose.
 
 ## Audit-fix round (2026-06) — control + transport posture
 

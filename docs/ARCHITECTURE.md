@@ -309,6 +309,62 @@ RTT direct UDP). See `MEMORY.md` entry
 `reference_tinylink_direct_udp.md` and PR commit messages for the
 forensic detail.
 
+## Control-plane liveness + reconnect ladder (M13, 2026-07)
+
+The long-poll task (`tinylink.c::long_poll_task`) owns the control
+channel end-to-end: `ensure_control_conn` (TLS + Noise IK + h2 session)
+→ `mapreq_run_stream` (blocking read loop) → `drop_control_conn` →
+backoff → repeat. Before M13 the *only* exits from the read loop were
+server-initiated (FIN, RST, GOAWAY, HTTP error) — a **half-open** TCP
+conn (control instance replaced without FIN, NAT flow expired) parked
+the task in `tls_io_read_full`'s WANT_READ retry forever, which is
+exactly the "device stops reconnecting after a control change" failure
+seen in production. Four escalation layers now guarantee the loop
+always cycles and the device always converges back to a working
+control channel:
+
+1. **Per-I/O idle budget** (`tls_io.{c,h}` `max_idle`): every blocking
+   control/DERP read *and* write tolerates at most
+   `CONFIG_TINYLINK_STREAM_IDLE_TIMEOUT_S` (default 120 s = 4× the
+   30-s socket timeout ≈ two missed server KeepAlives — mirroring
+   upstream `direct.go` `watchdogTimeout`) of consecutive
+   zero-progress polls, then fails with `TLS_IO_ERR_IDLE_TIMEOUT`.
+   Any received byte resets the budget, so healthy KeepAlive cadence
+   (~50-60 s) never trips it. Applies equally to the DERP supervisor's
+   frame loop (`derp_run_loop`) — a half-open relay conn previously
+   killed the CMM/relay fallback silently for the rest of the session.
+2. **Reconnect with fresh handshake + capped backoff** (pre-existing
+   RC-2 shape, unchanged): on any stream end the conn is dropped
+   entirely and re-established from scratch — `tl_backoff_ms`
+   exponential, 30 s cap, jitter, reset after ≥10 s of healthy stream.
+   Upstream never resumes a dead Noise session either.
+3. **In-place re-register on persistent 4xx** (M13): the reconnect
+   loop can spin forever if the server *actively rejects* the node
+   (headscale: 404 on unknown node / machine-key mismatch — e.g. node
+   deleted in the admin, control DB migrated). After 2 consecutive
+   non-429 4xx cycles (then 4, 8, … — power-of-two schedule) the task
+   re-runs `tinylink_register()` with the NVS authkey — the same code
+   every boot exercises — and on success signals the endpoint-updater
+   so the fresh node record learns the current public endpoint.
+4. **Wedge restart last resort** (M13,
+   `CONFIG_TINYLINK_CONTROL_WEDGE_RESTART_S`, default 3600 s, 0=off):
+   `mapreq.c`'s chunk callback stamps `tinylink_control_mark_alive()`
+   on every control-plane byte. If the stamp goes stale for the whole
+   window — layers 1-3 keep the loop cycling, so the check is
+   guaranteed to run — the task dumps stack diagnostics and
+   `esp_restart()`s. Covers what per-connection logic can't: heap
+   fragmentation starving mbedtls handshakes, lwIP/DNS wedges. The
+   same option converts a failed `bringup()` into a 60-s-delayed
+   restart instead of the historical park-for-diagnostics, so a
+   wedge-reboot during an AP outage cannot strand the device.
+
+Related M13 stream-content change: a `PeersChangedPatch` carrying a
+peer `Key`/`DiscoKey` rotation makes `stream_dispatch` recycle the
+stream (clean h2 stop → layer-2 reconnect → guaranteed-full first
+netmap) instead of ignoring the patch and leaving the WG data plane
+handshaking against dead peer keys. Endpoint-only patches remain
+DISCO's problem, as upstream.
+
 ## WireGuard handshake lifecycle
 
 The data plane is **initiator-only by design** — `wg_handshake.{c,h}`
