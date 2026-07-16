@@ -11,7 +11,7 @@
 [![Host tests](https://img.shields.io/badge/host%20KATs-546%20%C2%B7%200%20fail-brightgreen)](#testing)
 [![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
-[Highlights](#highlights) · [Status & maturity](#status--maturity) ·
+[Highlights](#highlights) · [Status](#status) ·
 [Architecture](#architecture) · [Quick start](#quick-start) ·
 [Testing](#testing) · [Docs](#repository-layout--documentation) ·
 [Known limitations](#known-limitations)
@@ -68,7 +68,7 @@ cutting scope to a single peer.
 | Language / runtime | Go                      | —                    | **pure C, ESP-IDF v5.5** |
 | Scope              | full Tailscale          | reduced              | **single-peer sensor node** |
 
-## Status & maturity
+## Status
 
 **Production-ready — stable within the single-peer scope.** The
 firmware runs 24/7 in its intended sensor-→-collector deployment;
@@ -88,26 +88,6 @@ What works today, verified on real hardware:
 - TMP117 telemetry frames flow out over the same tunnel every 5 s.
 - The Tailscale admin panel shows `Endpoints: 190.x.x.x:<port>` and
   `Client connectivity → UDP: Yes`.
-
-### Maturity scorecard
-
-Engineering coverage of the **declared scope** (single-peer,
-IPv4-only, always-on sensor node), assessed 2026-07-16 after the M13
-round. The remaining percentage of each row is itemized under
-[Known limitations](#known-limitations) or the ROADMAP backlog — gaps
-are tracked, not hidden.
-
-| Area | Coverage | Evidence / what's left |
-|------|:--------:|------------------------|
-| Control plane (ts2021 · register · map) | **92 %** | Register, streaming map, lite endpoint push, Retry-After, reconnect ladder, in-place re-register, capver governance — validated against tailscale.com and audited against headscale. Left: netmap delta-merge (`PeersRemoved`), real TKA/NLKey. |
-| WireGuard data plane | **95 %** | Handshake, transport, replay windows, make-before-break rekey, TAI64N persistence, roaming — multi-hour soaks at 0 panics. Left: multi-peer, IPv6. |
-| NAT traversal (STUN · DISCO · DERP) | **85 %** | Direct path lands (5-condition set), CMM punch, txid-bound prober, DERP supervisor + relay TX fallback. Left: relay branch never fired under a real flap (soak pending), single home-region assumption. |
-| Security posture | **80 %** | 3 audit rounds closed, `secure_zero` sweep, DoS gates, TOFU pin + compile-in profile, depth-bounded parsing. Left: NVS keys plaintext at rest, no SNTP cert-date validation. |
-| Reliability / self-healing | **88 %** | Idle budgets, reconnect ladders, wedge restart, bringup restart, reboot-safe handshake floor. Left: M13 HW smoke, task-WDT for data-plane tasks. |
-| Observability / ops | **70 %** | Stack-HWM diag dumps, soak grep metrics, admin-panel visibility. Left: OTA, remote stats endpoint, CI doesn't run the host suite. |
-| Testing | **82 %** | 546 host KATs (incl. upstream golden vectors), regression gates, A/B soak culture, CI firmware build. Left: host suite in CI, HIL rig. |
-| Documentation | **95 %** | Six living docs + clean-room protocol map with upstream citations + per-PR CHANGELOG. |
-| **Overall (scope-weighted)** | **≈ 87 %** | Production-ready for the declared deployment; the missing 13 % is enumerated work, none of it load-bearing for sensor-→-collector. |
 
 | #  | Milestone                                      | Status |
 |----|------------------------------------------------|--------|
