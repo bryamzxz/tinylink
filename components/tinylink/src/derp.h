@@ -220,16 +220,23 @@ typedef int (*derp_send_frame_fn)(void *ctx, derp_frame_type_t type,
  * payload length at frame_cap; oversized frames are fatal (we cannot
  * skip-without-reading through the tls_io abstraction).
  *
+ * `max_idle` is threaded to every tls_io_read_full call: the number of
+ * consecutive zero-progress WANT_READ polls (one SO_RCVTIMEO period
+ * each on target) tolerated before the stream is declared dead and the
+ * loop returns -1 so the supervisor reconnects. The DERP server sends
+ * a keepalive frame roughly every minute, so the caller should budget
+ * ≥2 keepalive intervals. 0 = unlimited (hosts tests / legacy).
+ *
  * Return values:
  *    0  cb returned non-zero — caller-driven termination
- *   -1  read/write failure or oversized frame
+ *   -1  read/write failure, idle timeout, or oversized frame
  *   -2  server FrameRestarting — supervisor must honor restart timing
  *   -3  bad frame parse
  *   -4  unexpected post-login frame (ServerKey / ServerInfo)
  *   -5  bad arg / capacity too small */
 int derp_run_loop(tls_io_read_fn rd, derp_send_frame_fn send, void *io_ctx,
                   uint8_t *frame_buf, size_t frame_cap,
-                  derp_event_cb_t cb, void *cb_ctx);
+                  derp_event_cb_t cb, void *cb_ctx, uint32_t max_idle);
 
 #ifdef __cplusplus
 }

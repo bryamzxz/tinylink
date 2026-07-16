@@ -249,7 +249,7 @@ int derp_parse_restarting(const uint8_t *payload, size_t plen,
 
 int derp_run_loop(tls_io_read_fn rd, derp_send_frame_fn send, void *io_ctx,
                   uint8_t *frame_buf, size_t frame_cap,
-                  derp_event_cb_t cb, void *cb_ctx)
+                  derp_event_cb_t cb, void *cb_ctx, uint32_t max_idle)
 {
     if (rd == NULL || send == NULL || frame_buf == NULL) return -5;
     /* Need at least 32 (key) + 8 (ping echo) to handle the smallest
@@ -259,7 +259,9 @@ int derp_run_loop(tls_io_read_fn rd, derp_send_frame_fn send, void *io_ctx,
 
     for (;;) {
         uint8_t hdr[DERP_FRAME_HDR_LEN];
-        if (tls_io_read_full(rd, io_ctx, hdr, sizeof(hdr)) != 0) return -1;
+        if (tls_io_read_full(rd, io_ctx, hdr, sizeof(hdr), max_idle) != 0) {
+            return -1;
+        }
 
         derp_frame_type_t ftype;
         uint32_t plen;
@@ -272,7 +274,11 @@ int derp_run_loop(tls_io_read_fn rd, derp_send_frame_fn send, void *io_ctx,
             return -1;
         }
         if (plen > 0) {
-            if (tls_io_read_full(rd, io_ctx, frame_buf, plen) != 0) return -1;
+            /* Header already arrived, so the payload is in flight —
+             * mid-frame silence is bounded by the same budget. */
+            if (tls_io_read_full(rd, io_ctx, frame_buf, plen, max_idle) != 0) {
+                return -1;
+            }
         }
 
         switch (ftype) {

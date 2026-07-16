@@ -491,7 +491,7 @@ static void test_loop_recv_packet(void) {
     cap_ctx_t cap = { .stop_on_kind = (int)DERP_EVT_RECV_PACKET };
     uint8_t fbuf[1600];
     int rc = derp_run_loop(loop_read, loop_send, &io,
-                           fbuf, sizeof(fbuf), cap_cb, &cap);
+                           fbuf, sizeof(fbuf), cap_cb, &cap, 0);
     fails += eq_int_named("loop/recv-packet/rc", rc, 0);
     fails += ok("loop/recv-packet/n", cap.n == 1);
     fails += ok("loop/recv-packet/kind", cap.evts[0].kind == DERP_EVT_RECV_PACKET);
@@ -517,7 +517,7 @@ static void test_loop_ping_to_pong(void) {
     cap_ctx_t cap = { .stop_on_kind = (int)DERP_EVT_KEEPALIVE };
     uint8_t fbuf[64];
     int rc = derp_run_loop(loop_read, loop_send, &io,
-                           fbuf, sizeof(fbuf), cap_cb, &cap);
+                           fbuf, sizeof(fbuf), cap_cb, &cap, 0);
     fails += eq_int_named("loop/ping/rc", rc, 0);
     fails += ok("loop/ping/one-frame-sent", io.n_sends == 1);
     fails += ok("loop/ping/pong-type",
@@ -536,7 +536,7 @@ static void test_loop_keepalive(void) {
     cap_ctx_t cap = { .stop_on_kind = (int)DERP_EVT_KEEPALIVE };
     uint8_t fbuf[64];
     fails += eq_int_named("loop/keepalive/rc",
-        derp_run_loop(loop_read, loop_send, &io, fbuf, sizeof(fbuf), cap_cb, &cap), 0);
+        derp_run_loop(loop_read, loop_send, &io, fbuf, sizeof(fbuf), cap_cb, &cap, 0), 0);
     fails += ok("loop/keepalive/kind",
                 cap.n == 1 && cap.evts[0].kind == DERP_EVT_KEEPALIVE);
 }
@@ -553,7 +553,7 @@ static void test_loop_peer_gone_reason_byte(void) {
     cap_ctx_t cap = { .stop_on_kind = (int)DERP_EVT_PEER_GONE };
     uint8_t fbuf[64];
     fails += eq_int_named("loop/peer-gone/rc",
-        derp_run_loop(loop_read, loop_send, &io, fbuf, sizeof(fbuf), cap_cb, &cap), 0);
+        derp_run_loop(loop_read, loop_send, &io, fbuf, sizeof(fbuf), cap_cb, &cap, 0), 0);
     fails += ok("loop/peer-gone/kind",
                 cap.n == 1 && cap.evts[0].kind == DERP_EVT_PEER_GONE);
     fails += eq_bytes("loop/peer-gone/pub", cap.evts[0].pub, pl, 32);
@@ -572,7 +572,7 @@ static void test_loop_peer_gone_no_reason(void) {
     loop_io_t io = { .src = stream, .src_len = end };
     cap_ctx_t cap = { .stop_on_kind = (int)DERP_EVT_PEER_GONE };
     uint8_t fbuf[64];
-    (void)derp_run_loop(loop_read, loop_send, &io, fbuf, sizeof(fbuf), cap_cb, &cap);
+    (void)derp_run_loop(loop_read, loop_send, &io, fbuf, sizeof(fbuf), cap_cb, &cap, 0);
     fails += ok("loop/peer-gone-noreason/reason",
                 cap.n == 1 && cap.evts[0].peer_gone_reason == DERP_PEER_GONE_DISCONNECTED);
 }
@@ -586,7 +586,7 @@ static void test_loop_restarting_returns_minus_two(void) {
     cap_ctx_t cap = { .stop_on_kind = -1 };
     uint8_t fbuf[64];
     int rc = derp_run_loop(loop_read, loop_send, &io,
-                           fbuf, sizeof(fbuf), cap_cb, &cap);
+                           fbuf, sizeof(fbuf), cap_cb, &cap, 0);
     fails += eq_int_named("loop/restarting/rc-minus-2", rc, -2);
     fails += ok("loop/restarting/cb-fired",
                 cap.n == 1 && cap.evts[0].kind == DERP_EVT_RESTARTING);
@@ -602,7 +602,7 @@ static void test_loop_oversize_frame_is_fatal(void) {
     cap_ctx_t cap = { .stop_on_kind = -1 };
     uint8_t fbuf[100];
     int rc = derp_run_loop(loop_read, loop_send, &io,
-                           fbuf, sizeof(fbuf), cap_cb, &cap);
+                           fbuf, sizeof(fbuf), cap_cb, &cap, 0);
     fails += eq_int_named("loop/oversize/rc", rc, -1);
 }
 
@@ -617,7 +617,7 @@ static void test_loop_post_login_serverkey_is_fatal(void) {
     cap_ctx_t cap = { .stop_on_kind = -1 };
     uint8_t fbuf[64];
     fails += eq_int_named("loop/serverkey-post-login/rc",
-        derp_run_loop(loop_read, loop_send, &io, fbuf, sizeof(fbuf), cap_cb, &cap), -4);
+        derp_run_loop(loop_read, loop_send, &io, fbuf, sizeof(fbuf), cap_cb, &cap, 0), -4);
 }
 
 static void test_loop_eof_mid_payload_is_fatal(void) {
@@ -630,7 +630,7 @@ static void test_loop_eof_mid_payload_is_fatal(void) {
     cap_ctx_t cap = { .stop_on_kind = -1 };
     uint8_t fbuf[64];
     fails += eq_int_named("loop/eof-mid/rc",
-        derp_run_loop(loop_read, loop_send, &io, fbuf, sizeof(fbuf), cap_cb, &cap), -1);
+        derp_run_loop(loop_read, loop_send, &io, fbuf, sizeof(fbuf), cap_cb, &cap, 0), -1);
 }
 
 static void test_loop_unknown_frame_is_skipped(void) {
@@ -644,7 +644,7 @@ static void test_loop_unknown_frame_is_skipped(void) {
     cap_ctx_t cap = { .stop_on_kind = (int)DERP_EVT_KEEPALIVE };
     uint8_t fbuf[64];
     int rc = derp_run_loop(loop_read, loop_send, &io,
-                           fbuf, sizeof(fbuf), cap_cb, &cap);
+                           fbuf, sizeof(fbuf), cap_cb, &cap, 0);
     fails += eq_int_named("loop/unknown-skip/rc", rc, 0);
     fails += ok("loop/unknown-skip/only-keepalive",
                 cap.n == 1 && cap.evts[0].kind == DERP_EVT_KEEPALIVE);
@@ -663,7 +663,7 @@ static void test_loop_chunked_reads_partial_records(void) {
     cap_ctx_t cap = { .stop_on_kind = (int)DERP_EVT_RECV_PACKET };
     uint8_t fbuf[64];
     int rc = derp_run_loop(loop_read, loop_send, &io,
-                           fbuf, sizeof(fbuf), cap_cb, &cap);
+                           fbuf, sizeof(fbuf), cap_cb, &cap, 0);
     fails += eq_int_named("loop/chunked/rc", rc, 0);
     fails += ok("loop/chunked/data-len",
                 cap.n == 1 && cap.evts[0].data_len == 4);
@@ -674,13 +674,13 @@ static void test_loop_chunked_reads_partial_records(void) {
 static void test_loop_bad_args(void) {
     uint8_t fbuf[64];
     fails += eq_int_named("loop/bad/null-rd",
-        derp_run_loop(NULL, loop_send, NULL, fbuf, sizeof(fbuf), NULL, NULL), -5);
+        derp_run_loop(NULL, loop_send, NULL, fbuf, sizeof(fbuf), NULL, NULL, 0), -5);
     fails += eq_int_named("loop/bad/null-send",
-        derp_run_loop(loop_read, NULL, NULL, fbuf, sizeof(fbuf), NULL, NULL), -5);
+        derp_run_loop(loop_read, NULL, NULL, fbuf, sizeof(fbuf), NULL, NULL, 0), -5);
     fails += eq_int_named("loop/bad/null-buf",
-        derp_run_loop(loop_read, loop_send, NULL, NULL, sizeof(fbuf), NULL, NULL), -5);
+        derp_run_loop(loop_read, loop_send, NULL, NULL, sizeof(fbuf), NULL, NULL, 0), -5);
     fails += eq_int_named("loop/bad/cap-too-small",
-        derp_run_loop(loop_read, loop_send, NULL, fbuf, 8, NULL, NULL), -5);
+        derp_run_loop(loop_read, loop_send, NULL, fbuf, 8, NULL, NULL, 0), -5);
 }
 
 /* When send returns non-zero on a PONG response, the loop must return
@@ -702,7 +702,7 @@ static void test_loop_send_failure_is_fatal(void) {
     uint8_t fbuf[64];
     fails += eq_int_named("loop/send-fail/rc",
         derp_run_loop(loop_read, loop_send_fail, &io,
-                      fbuf, sizeof(fbuf), cap_cb, &cap), -1);
+                      fbuf, sizeof(fbuf), cap_cb, &cap, 0), -1);
 }
 
 /* Two PINGs back-to-back must produce two PONGs in order, each
@@ -721,7 +721,7 @@ static void test_loop_two_pings_two_pongs(void) {
     cap_ctx_t cap = { .stop_on_kind = (int)DERP_EVT_KEEPALIVE };
     uint8_t fbuf[64];
     int rc = derp_run_loop(loop_read, loop_send, &io,
-                           fbuf, sizeof(fbuf), cap_cb, &cap);
+                           fbuf, sizeof(fbuf), cap_cb, &cap, 0);
     fails += eq_int_named("loop/two-pings/rc", rc, 0);
     fails += ok("loop/two-pings/two-sends", io.n_sends == 2);
     fails += ok("loop/two-pings/types",
@@ -742,7 +742,7 @@ static void test_loop_health(void) {
     cap_ctx_t cap = { .stop_on_kind = (int)DERP_EVT_HEALTH };
     uint8_t fbuf[64];
     fails += eq_int_named("loop/health/rc",
-        derp_run_loop(loop_read, loop_send, &io, fbuf, sizeof(fbuf), cap_cb, &cap), 0);
+        derp_run_loop(loop_read, loop_send, &io, fbuf, sizeof(fbuf), cap_cb, &cap, 0), 0);
     fails += ok("loop/health/kind+len",
                 cap.n == 1 && cap.evts[0].kind == DERP_EVT_HEALTH &&
                 cap.evts[0].data_len == mlen);

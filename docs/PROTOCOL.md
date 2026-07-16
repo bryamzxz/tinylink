@@ -21,7 +21,7 @@ honest. None of it is official Tailscale documentation — see the published
 ```
    App: TMP117 telemetry (UDP, JSON)         ← M3
    ────────────────────────────────────────
-   MapResponse: protobuf (long-lived stream) ← M2
+   MapResponse: JSON, LE32-framed stream     ← M2
    HTTP/2 inside Noise (nghttp2)             ← M2
    ────────────────────────────────────────
    /machine/register: HTTP/1.1 inside Noise  ← M1 (current)
@@ -153,12 +153,61 @@ Response fields used today:
 | `MachineAuthorized`  | `true` → registered. `false` → operator must approve. |
 | `Error`              | non-empty on hard failure.                         |
 
-## MapResponse (M2)
+## MapResponse (M2, liveness semantics M13)
 
-Protobuf-framed, length-delimited, streamed over a long-lived HTTP/2
-stream. tinylink will decode only the fields it needs (peer list, derp
-map, self-node info). Packet-filter / ACL fields are **not** enforced
-on-device.
+**JSON, not protobuf** (an early revision of this doc said protobuf —
+wrong; verified on-wire 2026-05-02). Each MapResponse on the
+`Stream:true` long-poll is framed `LE32 length || JSON body`, matching
+upstream `control/controlclient/direct.go`'s read loop; the same
+framing applies to `Stream:false` one-shot responses. tinylink sends
+`Compress:""` (no zstd linked) and decodes only the fields it needs
+(self node, peer list, DERP map). Packet-filter / ACL fields are
+**not** enforced on-device.
+
+Request-side semantics that took real debugging to learn (upstream
+`tailcfg.go:1408+1436`, verified against `controlplane.tailscale.com`):
+
+- `Stream:true` requests are **read-only** at `Version ≥ 68` — the
+  server silently discards their `Hostinfo` and top-level `Endpoints`.
+- The only combination that persists endpoints is
+  `Stream:false && OmitPeers:true` (the "lite" update;
+  `mapreq_push_endpoints`).
+- `KeepAlive:true` in the request asks the server for periodic
+  `{"KeepAlive":true}` frames: cadence ~60 s on tailscale.com
+  (`direct.go:1051`), 50 s + 0–9 s jitter on headscale (`poll.go:24`).
+- Endpoint-propagation caveat (headscale `a5ef3aff`, 2026-07 audit):
+  endpoint-only updates whose `EndpointTypes` are all STUN are stored
+  but **not eagerly broadcast** to peers — peers learn endpoint churn
+  via DISCO/CMM, which is also how upstream behaves. tinylink labels
+  its single pushed endpoint `EndpointTypes:[2]` (STUN) honestly and
+  relies on the DISCO path for propagation.
+
+Stream-frame handling (`mapreq.c`):
+
+- Full frames (`Node` / `Peers` / `PeersChanged`) replace the whole
+  in-memory netmap — no delta merge (single-peer deployments; see
+  ROADMAP).
+- `{"KeepAlive":true}` frames reset the liveness clocks and are
+  otherwise ignored.
+- `PeersChangedPatch` (M13): entries touching a peer's `Key` or
+  `DiscoKey` — how headscale ≥0.29.2 and tailscale.com deliver a peer
+  re-login — force a **stream recycle**: the client stops the stream
+  and reconnects, because the first frame of every new stream is
+  guaranteed to be a full netmap (headscale `f4eeb94b`). Patches
+  touching only `Endpoints`/`DERPRegion`/`Online` are ignored (DISCO
+  owns endpoint discovery). `PeersRemoved` is still not honored.
+
+Client liveness (M13, mirrors upstream `direct.go`
+`watchdogTimeout = 120 s`): every blocking read/write on the control
+conn tolerates at most `CONFIG_TINYLINK_STREAM_IDLE_TIMEOUT_S`
+(default 120 s ≈ two missed KeepAlives) of consecutive silence, then
+the stream is declared dead and the long-poll reconnects with a **full
+fresh Noise handshake** (never resumed), exponential-backoff-capped at
+30 s — same recovery shape as upstream `mapRoutine`. Persistent HTTP
+4xx (non-429) rejections additionally trigger an in-place re-register
+with the stored authkey (tinylink-specific: the headless equivalent of
+upstream's `NeedsLogin`), and one hour of *total* control silence is a
+wedge → `esp_restart()` (see `SECURITY-MODEL.md`).
 
 ## DISCO (M3)
 

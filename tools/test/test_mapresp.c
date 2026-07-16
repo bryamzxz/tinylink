@@ -122,7 +122,71 @@ int main(void)
         return 1;
     }
 
+    /* Full-map frames must never request a patch-driven refetch. */
+    if (nm.patch_identity_changed) {
+        printf("[patch/full-map-clear] FAIL\n");
+        return 1;
+    }
     printf("[mapresp-stub] OK\n");
+
+    /* --- PeersChangedPatch identity detection (2026-07 audit) --------
+     * headscale ≥0.29.2 / tailscale.com deliver a peer's re-login (new
+     * NodeKey + DiscoKey) as a PeersChangedPatch. tinylink doesn't merge
+     * patches; it must FLAG identity-bearing ones so the stream layer
+     * recycles for a full map, and must keep ignoring endpoint-only
+     * churn (covered by DISCO). */
+    static const char *kPatchKey =
+        "{\"PeersChangedPatch\":[{\"NodeID\":99,"
+        "\"Key\":\"nodekey:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\","
+        "\"KeyExpiry\":\"2027-01-01T00:00:00Z\"}]}";
+    if (mapresp_parse(kPatchKey, strlen(kPatchKey), &nm) != ESP_OK ||
+        !nm.patch_identity_changed || nm.n_peers != 0) {
+        printf("[patch/key-flagged] FAIL flag=%d peers=%zu\n",
+               nm.patch_identity_changed, nm.n_peers);
+        return 1;
+    }
+    printf("[patch/key-flagged] OK\n");
+
+    static const char *kPatchDisco =
+        "{\"PeersChangedPatch\":[{\"NodeID\":99,"
+        "\"DiscoKey\":\"discokey:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"}]}";
+    if (mapresp_parse(kPatchDisco, strlen(kPatchDisco), &nm) != ESP_OK ||
+        !nm.patch_identity_changed) {
+        printf("[patch/disco-flagged] FAIL\n");
+        return 1;
+    }
+    printf("[patch/disco-flagged] OK\n");
+
+    /* Endpoint/DERP-only patch: routine churn, must NOT trigger. */
+    static const char *kPatchEndpoints =
+        "{\"PeersChangedPatch\":[{\"NodeID\":99,"
+        "\"Endpoints\":[\"203.0.113.9:41641\"],\"DERPRegion\":16,"
+        "\"Online\":true}]}";
+    if (mapresp_parse(kPatchEndpoints, strlen(kPatchEndpoints), &nm) != ESP_OK ||
+        nm.patch_identity_changed) {
+        printf("[patch/endpoints-ignored] FAIL\n");
+        return 1;
+    }
+    printf("[patch/endpoints-ignored] OK\n");
+
+    /* Mixed frame: full peer list + identity patch. The flag is set but
+     * the stream layer gates the recycle on n_peers==0, because the full
+     * list in the same frame already delivers the fresh keys. Lock both
+     * halves of that contract here. */
+    static const char *kMixed =
+        "{\"Peers\":[{\"ID\":99,"
+        "\"Key\":\"nodekey:0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20\""
+        "}],"
+        "\"PeersChangedPatch\":[{\"NodeID\":99,"
+        "\"DiscoKey\":\"discokey:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"}]}";
+    if (mapresp_parse(kMixed, strlen(kMixed), &nm) != ESP_OK ||
+        !nm.patch_identity_changed || nm.n_peers != 1) {
+        printf("[patch/mixed-frame] FAIL flag=%d peers=%zu\n",
+               nm.patch_identity_changed, nm.n_peers);
+        return 1;
+    }
+    printf("[patch/mixed-frame] OK\n");
+
     printf("ALL OK\n");
     return 0;
 }

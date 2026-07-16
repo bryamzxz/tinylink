@@ -102,6 +102,20 @@ typedef struct {
     /* Bookkeeping for the streaming caller. */
     bool    have_self;
     bool    have_derp_map;
+
+    /* Set when the frame carried a PeersChangedPatch entry touching a
+     * peer's "Key" or "DiscoKey". tinylink does not implement delta
+     * merge (single-peer deployments get full peers on every state
+     * change of consequence — except this one: headscale ≥0.29.2 and
+     * tailscale.com deliver PEER RE-LOGIN, i.e. a NodeKey/DiscoKey
+     * rotation, as a patch). Ignoring such a patch leaves the data
+     * plane handshaking against the peer's dead keys until the next
+     * full netmap, which on a healthy stream may be hours away. The
+     * streaming caller reacts by recycling the stream — the first
+     * frame of the reconnect is always a full netmap. Endpoint-only
+     * patches stay ignored (DISCO/CMM handles endpoint discovery,
+     * same as upstream). */
+    bool    patch_identity_changed;
 } tl_netmap_t;
 
 void tl_netmap_clear(tl_netmap_t *nm);

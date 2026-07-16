@@ -450,6 +450,33 @@ esp_err_t mapresp_parse(const char *json, size_t json_len, tl_netmap_t *out)
              * we treat PeersChanged identically to Peers — replace the
              * full peer list. PeersRemoved is not yet honored. */
             parse_peers_arr(json, toks, val_idx, out);
+        } else if (tok_eq(json, key, "PeersChangedPatch") &&
+                   tok_is_arr(&toks[val_idx])) {
+            /* Minimal patch handling (upstream-audit 2026-07-16): scan
+             * each tailcfg.PeerChange entry for the two fields the data
+             * plane cannot afford to miss — "Key" (NodeKey rotation) and
+             * "DiscoKey". Presence of either flags the netmap so the
+             * streaming caller recycles the stream and refetches a full
+             * map instead of running WG/DISCO against dead peer keys.
+             * All other patch content (Endpoints, DERPRegion, Online...)
+             * is deliberately not merged — see netmap.h. */
+            int pn = toks[val_idx].size;
+            int px = val_idx + 1;
+            for (int pk = 0; pk < pn; pk++) {
+                if (tok_is_obj(&toks[px])) {
+                    int nfields = toks[px].size;
+                    int fx = px + 1;
+                    for (int q = 0; q < nfields; q++) {
+                        const jsmntok_t *fkey = &toks[fx];
+                        if (tok_eq(json, fkey, "Key") ||
+                            tok_eq(json, fkey, "DiscoKey")) {
+                            out->patch_identity_changed = true;
+                        }
+                        fx = skip_value(toks, fx + 1);
+                    }
+                }
+                px = skip_value(toks, px);
+            }
         } else if (tok_eq(json, key, "DERPMap") &&
                    tok_is_obj(&toks[val_idx])) {
             parse_derp_map(json, toks, val_idx, out);
@@ -761,7 +788,11 @@ typedef struct {
     void            *handler_ctx;
 } stream_state_t;
 
-static void stream_dispatch(stream_state_t *s)
+/* Returns 0 to keep the stream running, -1 to stop it (the caller's
+ * chunk callback propagates the stop through nghttp2 so the long-poll
+ * task tears the conn down and reconnects — used when a frame demands
+ * a full-netmap refetch we can't satisfy in-stream). */
+static int stream_dispatch(stream_state_t *s)
 {
     /* Parse the assembled body. KeepAlive messages set `KeepAlive:true`
      * with no peer data — `mapresp_parse` will leave `have_self=false`
@@ -821,20 +852,37 @@ static void stream_dispatch(stream_state_t *s)
                  (unsigned)s->body_have, (unsigned)pe,
                  (unsigned)esp_get_free_heap_size(),
                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
-        return;
+        return 0;
+    }
+    if (nm.patch_identity_changed && nm.n_peers == 0) {
+        /* A peer rotated its NodeKey/DiscoKey and the server told us
+         * via PeersChangedPatch, which we don't merge. Recycle the
+         * stream: the reconnect's first frame is always a full netmap
+         * (headscale f4eeb94b guarantees it; tailscale.com always did),
+         * so the data plane gets the fresh keys within seconds instead
+         * of handshaking against dead ones until the next full push. */
+        ESP_LOGW(TAG, "PeersChangedPatch carries peer Key/DiscoKey change — "
+                      "recycling stream for a full netmap");
+        return -1;
     }
     if (!nm.have_self && nm.n_peers == 0) {
         /* KeepAlive (or empty incremental). Nothing actionable. */
         ESP_LOGD(TAG, "KeepAlive (%u bytes)", (unsigned)s->body_have);
-        return;
+        return 0;
     }
     if (s->on_netmap != NULL) {
         s->on_netmap(&nm, s->handler_ctx);
     }
+    return 0;
 }
 
 static int stream_chunk_cb(const uint8_t *data, size_t len, void *ctx)
 {
+    /* Any byte from the control plane — netmap, delta, KeepAlive, even
+     * an error body — proves the control path works end-to-end. Feeds
+     * the wedge-restart last resort in tinylink.c. */
+    tinylink_control_mark_alive();
+
     stream_state_t *s = (stream_state_t *)ctx;
     size_t off = 0;
     while (off < len) {
@@ -865,11 +913,16 @@ static int stream_chunk_cb(const uint8_t *data, size_t len, void *ctx)
             s->body_have += take;
             off += take;
             if (s->body_have == s->body_size) {
-                stream_dispatch(s);
+                int stop = stream_dispatch(s);
                 s->phase = STREAM_WANT_HDR;
                 s->hdr_have = 0;
                 s->body_size = 0;
                 s->body_have = 0;
+                if (stop != 0) {
+                    /* Propagates through data_chunk_cb → h2_cb_stop →
+                     * h2_drive_request unwinds; long-poll reconnects. */
+                    return -1;
+                }
             }
         }
     }

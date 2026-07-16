@@ -106,7 +106,7 @@ static void test_read_full_simple(void) {
     mock_t m = { .script = script, .script_len = 1, .src = src };
 
     uint8_t buf[16] = {0};
-    int rc = tls_io_read_full(mock_read, &m, buf, 16);
+    int rc = tls_io_read_full(mock_read, &m, buf, 16, 0);
     fails += eq_int("read/simple/rc", rc, 0);
     fails += eq_bytes("read/simple/buf", buf, src, 16);
     fails += eq_int("read/simple/calls", (int)m.script_idx, 1);
@@ -128,7 +128,7 @@ static void test_read_full_retry_on_want_read(void) {
     mock_t m = { .script = script, .script_len = 6, .src = src };
 
     uint8_t buf[13] = {0};
-    int rc = tls_io_read_full(mock_read, &m, buf, 13);
+    int rc = tls_io_read_full(mock_read, &m, buf, 13, 0);
     fails += eq_int("read/want-read-retry/rc", rc, 0);
     fails += eq_bytes("read/want-read-retry/buf", buf, src, 13);
     fails += eq_int("read/want-read-retry/calls", (int)m.script_idx, 6);
@@ -148,14 +148,15 @@ static void test_read_full_retry_on_want_write(void) {
     mock_t m = { .script = script, .script_len = 4, .src = src };
 
     uint8_t buf[8] = {0};
-    int rc = tls_io_read_full(mock_read, &m, buf, 8);
+    int rc = tls_io_read_full(mock_read, &m, buf, 8, 0);
     fails += eq_int("read/want-write-retry/rc", rc, 0);
     fails += eq_bytes("read/want-write-retry/buf", buf, src, 8);
 }
 
-/* The long-poll spends most of its time blocked here. Verify the
- * retry loop has no implicit cap — 1000 WANT_READs in a row must
- * still resolve to a successful read when data finally arrives. */
+/* The long-poll spends most of its time blocked here. Verify that
+ * with max_idle=0 (unlimited — the pre-2026-07 semantics) the retry
+ * loop has no implicit cap: 1000 WANT_READs in a row must still
+ * resolve to a successful read when data finally arrives. */
 static void test_read_full_long_idle(void) {
     enum { N_IDLE = 1000 };
     static ssize_t script[N_IDLE + 1];
@@ -165,7 +166,7 @@ static void test_read_full_long_idle(void) {
     mock_t m = { .script = script, .script_len = N_IDLE + 1, .src = src };
 
     uint8_t buf[4] = {0};
-    int rc = tls_io_read_full(mock_read, &m, buf, 4);
+    int rc = tls_io_read_full(mock_read, &m, buf, 4, 0);
     fails += eq_int("read/long-idle/rc", rc, 0);
     fails += eq_bytes("read/long-idle/buf", buf, src, 4);
     fails += eq_int("read/long-idle/calls", (int)m.script_idx, N_IDLE + 1);
@@ -179,7 +180,7 @@ static void test_read_full_partial_returns(void) {
     mock_t m = { .script = script, .script_len = 4, .src = src };
 
     uint8_t buf[16] = {0};
-    int rc = tls_io_read_full(mock_read, &m, buf, 16);
+    int rc = tls_io_read_full(mock_read, &m, buf, 16, 0);
     fails += eq_int("read/partial/rc", rc, 0);
     fails += eq_bytes("read/partial/buf", buf, src, 16);
 }
@@ -196,7 +197,7 @@ static void test_read_full_propagates_real_error(void) {
     mock_t m = { .script = script, .script_len = 3 };
 
     uint8_t buf[16] = {0};
-    int rc = tls_io_read_full(mock_read, &m, buf, 16);
+    int rc = tls_io_read_full(mock_read, &m, buf, 16, 0);
     fails += eq_int("read/real-error/rc", rc, -30848);
     /* Mock saw exactly the script: 2 retries then the failure. */
     fails += eq_int("read/real-error/calls", (int)m.script_idx, 3);
@@ -214,7 +215,7 @@ static void test_read_full_peer_fin(void) {
     mock_t m = { .script = script, .script_len = 3, .src = src };
 
     uint8_t buf[8] = {0};
-    int rc = tls_io_read_full(mock_read, &m, buf, 8);
+    int rc = tls_io_read_full(mock_read, &m, buf, 8, 0);
     fails += eq_int("read/peer-fin/rc", rc, -1);
 }
 
@@ -222,15 +223,112 @@ static void test_read_full_peer_fin(void) {
 static void test_read_full_zero(void) {
     mock_t m = { .script = NULL, .script_len = 0 };
     uint8_t buf[1] = {0};
-    int rc = tls_io_read_full(mock_read, &m, buf, 0);
+    int rc = tls_io_read_full(mock_read, &m, buf, 0, 0);
     fails += eq_int("read/zero/rc", rc, 0);
     fails += eq_int("read/zero/calls", (int)m.script_idx, 0);
 }
 
 static void test_read_full_null_args(void) {
     uint8_t buf[1] = {0};
-    fails += eq_int("read/null-fn",  tls_io_read_full(NULL, NULL, buf, 1), -1);
-    fails += eq_int("read/null-buf", tls_io_read_full(mock_read, NULL, NULL, 1), -1);
+    fails += eq_int("read/null-fn",  tls_io_read_full(NULL, NULL, buf, 1, 0), -1);
+    fails += eq_int("read/null-buf", tls_io_read_full(mock_read, NULL, NULL, 1, 0), -1);
+}
+
+/* ------------------------------------------------------------------ */
+/* idle-bound tests (2026-07 half-open-conn hardening)                 */
+/* ------------------------------------------------------------------ */
+
+/* The production wedge: a half-open TCP conn yields WANT_READ forever
+ * (SO_RCVTIMEO keeps firing, no FIN/RST ever arrives). With a bound of
+ * N the call must give up after exactly N consecutive silent polls and
+ * return the dedicated idle-timeout code — this is what turns "device
+ * offline until manual power cycle" into a normal reconnect. */
+static void test_read_full_idle_bound_fires(void) {
+    enum { N_IDLE = 8 };
+    static ssize_t script[N_IDLE];
+    for (int i = 0; i < N_IDLE; i++) script[i] = MBEDTLS_ERR_SSL_WANT_READ;
+    mock_t m = { .script = script, .script_len = N_IDLE };
+
+    uint8_t buf[4] = {0};
+    int rc = tls_io_read_full(mock_read, &m, buf, 4, 4);
+    fails += eq_int("read/idle-bound/rc", rc, TLS_IO_ERR_IDLE_TIMEOUT);
+    fails += eq_int("read/idle-bound/calls", (int)m.script_idx, 4);
+}
+
+/* One silent poll below the bound + data ⇒ success, not timeout. */
+static void test_read_full_idle_bound_boundary(void) {
+    static const ssize_t script[] = {
+        MBEDTLS_ERR_SSL_WANT_READ,
+        MBEDTLS_ERR_SSL_WANT_READ,
+        MBEDTLS_ERR_SSL_WANT_READ,
+        4,
+    };
+    static const uint8_t src[] = "Data";
+    mock_t m = { .script = script, .script_len = 4, .src = src };
+
+    uint8_t buf[4] = {0};
+    int rc = tls_io_read_full(mock_read, &m, buf, 4, 4);
+    fails += eq_int("read/idle-boundary/rc", rc, 0);
+    fails += eq_bytes("read/idle-boundary/buf", buf, src, 4);
+}
+
+/* Forward progress must reset the idle budget: a healthy long-poll
+ * sees 1-2 silent polls between KeepAlives indefinitely, and that must
+ * never accumulate into a timeout. Pattern: 3 idles, byte, 3 idles,
+ * byte, ... with max_idle=4 — total idles far exceed the bound but no
+ * consecutive run does. */
+static void test_read_full_idle_reset_on_progress(void) {
+    static ssize_t script[4 * 4];
+    static uint8_t src[4];
+    size_t n = 0;
+    for (int chunk = 0; chunk < 4; chunk++) {
+        script[n++] = MBEDTLS_ERR_SSL_WANT_READ;
+        script[n++] = MBEDTLS_ERR_SSL_WANT_READ;
+        script[n++] = MBEDTLS_ERR_SSL_WANT_READ;
+        script[n++] = 1;
+        src[chunk] = (uint8_t)('A' + chunk);
+    }
+    mock_t m = { .script = script, .script_len = n, .src = src };
+
+    uint8_t buf[4] = {0};
+    int rc = tls_io_read_full(mock_read, &m, buf, 4, 4);
+    fails += eq_int("read/idle-reset/rc", rc, 0);
+    fails += eq_bytes("read/idle-reset/buf", buf, src, 4);
+    fails += eq_int("read/idle-reset/calls", (int)m.script_idx, (int)n);
+}
+
+/* Symmetric bound on the write side: a peer that stopped ACKing keeps
+ * the TCP send buffer full ⇒ endless WANT_WRITE. */
+static void test_write_full_idle_bound_fires(void) {
+    enum { N_IDLE = 6 };
+    static ssize_t script[N_IDLE];
+    for (int i = 0; i < N_IDLE; i++) script[i] = MBEDTLS_ERR_SSL_WANT_WRITE;
+    uint8_t dst[4] = {0};
+    mock_t m = { .script = script, .script_len = N_IDLE,
+                 .dst = dst, .dst_cap = sizeof(dst) };
+
+    int rc = tls_io_write_full(mock_write, &m, (const uint8_t *)"abcd", 4, 3);
+    fails += eq_int("write/idle-bound/rc", rc, TLS_IO_ERR_IDLE_TIMEOUT);
+    fails += eq_int("write/idle-bound/calls", (int)m.script_idx, 3);
+}
+
+static void test_write_full_idle_reset_on_progress(void) {
+    static const ssize_t script[] = {
+        MBEDTLS_ERR_SSL_WANT_WRITE,
+        MBEDTLS_ERR_SSL_WANT_WRITE,
+        2,
+        MBEDTLS_ERR_SSL_WANT_WRITE,
+        MBEDTLS_ERR_SSL_WANT_WRITE,
+        2,
+    };
+    static const uint8_t payload[] = "wxyz";
+    uint8_t dst[4] = {0};
+    mock_t m = { .script = script, .script_len = 6,
+                 .dst = dst, .dst_cap = sizeof(dst) };
+
+    int rc = tls_io_write_full(mock_write, &m, payload, 4, 3);
+    fails += eq_int("write/idle-reset/rc", rc, 0);
+    fails += eq_bytes("write/idle-reset/dst", dst, payload, 4);
 }
 
 /* ------------------------------------------------------------------ */
@@ -246,7 +344,7 @@ static void test_write_full_simple(void) {
         .dst = dst, .dst_cap = sizeof(dst),
     };
 
-    int rc = tls_io_write_full(mock_write, &m, payload, sizeof(payload) - 1);
+    int rc = tls_io_write_full(mock_write, &m, payload, sizeof(payload) - 1, 0);
     fails += eq_int("write/simple/rc", rc, 0);
     fails += eq_bytes("write/simple/dst", dst, payload, sizeof(payload) - 1);
 }
@@ -268,7 +366,7 @@ static void test_write_full_retry_on_want(void) {
         .dst = dst, .dst_cap = sizeof(dst),
     };
 
-    int rc = tls_io_write_full(mock_write, &m, payload, sizeof(payload) - 1);
+    int rc = tls_io_write_full(mock_write, &m, payload, sizeof(payload) - 1, 0);
     fails += eq_int("write/retry/rc", rc, 0);
     fails += eq_bytes("write/retry/dst", dst, payload, 7);
     fails += eq_int("write/retry/calls", (int)m.script_idx, 4);
@@ -283,7 +381,7 @@ static void test_write_full_partial_returns(void) {
         .dst = dst, .dst_cap = sizeof(dst),
     };
 
-    int rc = tls_io_write_full(mock_write, &m, payload, 16);
+    int rc = tls_io_write_full(mock_write, &m, payload, 16, 0);
     fails += eq_int("write/partial/rc", rc, 0);
     fails += eq_bytes("write/partial/dst", dst, payload, 16);
 }
@@ -295,15 +393,15 @@ static void test_write_full_propagates_real_error(void) {
         .script = script, .script_len = 1,
         .dst = dst, .dst_cap = sizeof(dst),
     };
-    int rc = tls_io_write_full(mock_write, &m, (const uint8_t *)"abcd", 4);
+    int rc = tls_io_write_full(mock_write, &m, (const uint8_t *)"abcd", 4, 0);
     fails += eq_int("write/real-error/rc", rc, -30848);
 }
 
 static void test_write_full_null_args(void) {
     fails += eq_int("write/null-fn",
-                    tls_io_write_full(NULL, NULL, (const uint8_t *)"x", 1), -1);
+                    tls_io_write_full(NULL, NULL, (const uint8_t *)"x", 1, 0), -1);
     fails += eq_int("write/null-buf",
-                    tls_io_write_full(mock_write, NULL, NULL, 1), -1);
+                    tls_io_write_full(mock_write, NULL, NULL, 1, 0), -1);
 }
 
 /* ------------------------------------------------------------------ */
@@ -320,6 +418,12 @@ int main(void) {
     test_read_full_peer_fin();
     test_read_full_zero();
     test_read_full_null_args();
+
+    test_read_full_idle_bound_fires();
+    test_read_full_idle_bound_boundary();
+    test_read_full_idle_reset_on_progress();
+    test_write_full_idle_bound_fires();
+    test_write_full_idle_reset_on_progress();
 
     test_write_full_simple();
     test_write_full_retry_on_want();

@@ -55,6 +55,7 @@ What works today, verified on real hardware:
 | 10 | Perf-trim + footprint round (#88–#104)         | done — net −68.1 KiB flash, largest-contig heap 6656 → 9216 B |
 | 11 | Security round (#105)                          | done — WGN-1 nonce-reuse race closed + 4 hardenings |
 | 12 | Audit-fix round (2026-06-10, #106)             | done — capver 138 at the Noise layer, WG rx-path lock + relayed-DISCO peer gate, atomic key regen, depth-bounded MapResponse skip, secure_zero sweep |
+| 13 | Control-plane reconnect hardening (2026-07-16) | done — stream idle budget (mirrors upstream `watchdogTimeout`), `PeersChangedPatch` identity refetch, in-place re-register on map 4xx, wedge `esp_restart` last resort. HW smoke pending |
 
 Two further 2026-05-12 rounds — sdkconfig perf-trim (#76–#80) and DERP
 outbound (#82–#83: supervisor spawn + lossless relay fallback during peer
@@ -66,8 +67,14 @@ None of these block the current sensor-→-collector path:
 
 - **Single-peer only** — the netmap `PeersChanged`/`PeersRemoved`
   delta-merge is stubbed pending a multi-peer tailnet to validate against.
-- **No task watchdog / `esp_restart` self-recovery** — a wedged task is a
-  brick until physical reset.
+  Since round 13, `PeersChangedPatch` frames carrying a peer
+  `Key`/`DiscoKey` rotation force a full-netmap refetch, so the gap is
+  efficiency, not correctness, for single-peer.
+- **No general task watchdog** — round 13 added control-path
+  self-recovery (stream idle timeout + wedge `esp_restart` after
+  `CONFIG_TINYLINK_CONTROL_WEDGE_RESTART_S` of control silence, plus
+  restart-on-failed-bringup), but application tasks (`wg_rx`, telemetry,
+  DERP supervisor) are still not subscribed to the task WDT.
 - **NVS private keys are stored in PLAINTEXT** — there is no
   `CONFIG_SECURE_FLASH_ENC_ENABLED` and `keys.c` uses the default plain
   partition. At-rest/eFuse key encryption is aspirational (see

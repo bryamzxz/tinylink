@@ -7,6 +7,159 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Control-plane reconnect hardening round (2026-07-16, branch `fix/control-reconnect-hardening`)
+
+Closes the one production failure mode observed since the 2026-06 round:
+after weeks of clean uptime, a control-plane-side change (instance
+replaced, LB swap, NAT flow expired) sometimes left the node offline
+until a manual power cycle. Root cause: every blocking read/write on
+the control and DERP TLS conns retried `WANT_READ`/`WANT_WRITE`
+**forever** (`tls_io.c`) — a half-open TCP connection (no FIN/RST ever
+delivered) parked the long-poll task in that loop permanently, and no
+layer above had a liveness bound.
+
+Paired with a fresh upstream audit (tailscale `632293de7..71b90de0d`,
+217 commits, HEAD 2026-07-15; headscale `f585f8a9..04830851`, 135
+commits, spans 0.29.0→0.30.0-dev): **zero wire-format drift** in
+controlbase / disco / STUN / DERP frames / register / map JSON.
+`TINYLINK_CAPVER 138` stays valid — headscale's
+`MinSupportedCapabilityVersion` is still **113**, upstream
+`CurrentCapabilityVersion` is **142** and the single 141→142 bump gates
+only the c2n localapi proxy (no wire impact; no capver bump this round,
+which would anyway require the HW A/B smoke). The audit surfaced one
+silent contract break (`PeersChangedPatch`, fix 2) and supplied the
+reference semantics that fix 1 mirrors. Also relevant server-side:
+headscale 0.29.2's issue-#3346 cluster fixed three bugs that produced
+exactly "client retries forever after a control-plane change"
+(policy-lock stalls on reconnect storms `6f317c75`, empty-200 on
+long-poll setup failure `4e4512c4`, delta-sent-before-initial-map
+`f4eeb94b`) — fixes 1–4 below defend client-side against that entire
+class regardless of server version.
+
+Host suite: `make test` **546/0** (`grep -cE 'OK|PASS'`; was 531 — +11
+`tls_io` idle-bound KATs, +4 `mapresp` patch KATs; strict per-case
+count `^\[..\] OK$` = 526). Δ flash **+1 488 B** (947 136 → 948 624 B,
+app partition 40 % free). **Hardware validation pending** — no device
+was attached this round; smoke checklist at the end of this entry.
+
+#### 1 — bounded stream silence: `tls_io` idle budget (`tls_io.{c,h}`)
+
+`tls_io_read_full` / `tls_io_write_full` gain a `max_idle` parameter:
+the number of **consecutive zero-progress** `WANT_READ`/`WANT_WRITE`
+polls (one 30-s `SO_RCVTIMEO`/`SO_SNDTIMEO` period each) tolerated
+before returning the new `TLS_IO_ERR_IDLE_TIMEOUT` (`-0x10000`,
+deliberately outside the 16-bit mbedtls error space). Forward progress
+resets the budget, so the healthy idle pattern (1–2 silent polls
+between server KeepAlives) can never trip it; `max_idle = 0` keeps the
+legacy unlimited semantics (host tests). The WANT_READ *retry* behavior
+that `test_tls_io`'s regression gate protects (long-poll dying every
+30 s, commit `c2d8d63`) is unchanged — the budget only bounds how long
+"transient" is allowed to last.
+
+Threaded through every blocking control/DERP call site: ts2021 record
+reads + writes, both HTTP-101 upgrade readers (their open-coded retry
+loops got the same counter), the DERP frame loop (`derp_run_loop` gains
+a `max_idle` param) and both DERP send paths. The budget derives from
+the new `CONFIG_TINYLINK_STREAM_IDLE_TIMEOUT_S` (default **120 s** =
+4 polls = two missed KeepAlives), mirroring the upstream client, which
+kills the map poll after 120 s of read silence
+(`control/controlclient/direct.go` `watchdogTimeout = 120s`, re-armed
+per read-loop iteration; server cadence: ~60 s per `direct.go:1051`,
+headscale `poll.go:24` `keepAliveInterval = 50s` + 0–9 s jitter). On
+breach the stream dies like any transport error → normal
+reconnect-with-backoff path (full fresh Noise handshake, as upstream
+does — the pooled-conn resume it *doesn't* do).
+
+#### 2 — `PeersChangedPatch` identity detection → stream recycle
+
+Upstream audit finding: headscale ≥ 0.29.2 (`4da06925`) and
+tailscale.com deliver a peer's re-login — a **NodeKey/DiscoKey
+rotation** — as a `PeersChangedPatch` delta, which tinylink's parser
+ignored entirely (patch-only frames parsed to "no self, no peers" and
+were logged as KeepAlives). On a healthy stream the next full netmap
+may be hours away; until it arrives the data plane keeps handshaking
+against the peer's dead keys — WG **and** DISCO both fail silently.
+(Historical note: the pre-`c2d8d63` firmware never noticed because its
+streams died every 30 s and every reconnect refetched a full map.)
+
+tinylink still does not merge patches (delta-merge stays deferred on
+multi-peer validation): instead `mapresp_parse` scans patch entries for
+`Key` / `DiscoKey` and flags the netmap
+(`tl_netmap_t.patch_identity_changed`), and `stream_dispatch` recycles
+the stream (chunk-cb stop → clean h2 unwind → long-poll reconnect).
+The reconnect's first frame is always a **full** netmap (guaranteed by
+headscale `f4eeb94b`; tailscale.com always did), so the fresh keys
+arrive within seconds. Endpoint/DERP-only patches remain ignored —
+endpoint discovery is DISCO/CMM's job, matching upstream. 4 new host
+KATs lock the contract: `Key` flags, `DiscoKey` flags, endpoints-only
+doesn't, and a mixed frame sets the flag but the full peer list in the
+same frame short-circuits the recycle (`n_peers > 0` gate).
+
+#### 3 — in-place re-register on persistent map 4xx (`tinylink.c`)
+
+If the server **actively rejects** the map request (HTTP 4xx other than
+429) on ≥ 2 consecutive cycles, the long-poll task now re-runs
+`tinylink_register()` with the stored NVS authkey, on a power-of-two
+cycle schedule (2, 4, 8, …, counter saturates at 1024) so a
+permanently-rejecting server isn't hammered. On success it signals the
+endpoint-updater (`tinylink_endpoint_push_async`) so the fresh node
+record learns the current public endpoint — `Stream=true` map requests
+are read-only server-side. Deliberate, documented deviation from
+upstream: the official client never re-registers from the map loop (it
+surfaces `NeedsLogin` to a human; re-register fires only on key expiry
+or `RegisterResponse.NodeKeyExpired`). A headless sensor's equivalent
+of the human pressing "log in" is replaying the boot registration path,
+which is exactly what this does. Covers control-side node-state loss:
+headscale returns **404** on map for an unknown node / machine-key
+mismatch (`hscontrol/noise.go::getAndValidateNode`) — a node deleted in
+the admin (or a control DB migration) now self-heals in ~2 cycles. If
+the authkey itself is spent/expired (headscale ≥ 0.29.0 `e759d9fc`
+re-validates the PAK even for a same-NodeKey re-register of an expired
+node), register fails visibly with the server's error text — the device
+cannot do more without re-provisioning, and the log now says so.
+
+#### 4 — wedge-restart last resort + bringup restart (Kconfig)
+
+New `CONFIG_TINYLINK_CONTROL_WEDGE_RESTART_S` (default **3600**, 0 =
+off): if not a single control-plane byte has arrived for the whole
+window — despite fixes 1–3 keeping the reconnect loop provably live —
+the long-poll task logs, dumps `tinylink_diag_dump_stacks()`, and
+`esp_restart()`s back to the known-good boot path. Liveness is stamped
+by `mapreq.c`'s chunk callback (`tinylink_control_mark_alive`) on every
+control byte: netmaps, deltas, KeepAlives, even 4xx error bodies (a
+reachable-but-rejecting control plane means restart won't help — fix 3
+owns that case; the wedge clock only expires when *nothing* gets
+through). This closes the SECURITY-MODEL "no `esp_restart`
+self-recovery" gap **for the control path** — the wedge classes that
+survive fixes 1–3 (persistent heap fragmentation starving mbedtls
+handshakes, lwIP/DNS wedges) all recover with a reboot, and the TAI64N
+floor exists precisely so reboots don't break WG handshake
+monotonicity. The WG data plane can outlive a pure control outage, so
+the default window is deliberately a full hour.
+
+Paired: when the option is enabled, a failed `bringup()` (WiFi absent
+at boot, NVS hiccup) now restarts after 60 s instead of parking in
+"staying up for diagnostics" forever — a pre-existing brick path that
+became load-bearing once the wedge restart could reboot into it (e.g.
+restarting mid-AP-outage). Set the Kconfig to 0 to restore both legacy
+stay-up behaviors for bench debugging.
+
+#### Hardware smoke checklist (pending — run before merging to a device)
+
+1. 90-s boot smoke: standard grep set — `boots:1 panics:0 initial:1
+   wg_up:1 stun_ok:1 stream_ended:0 tls_read_failed:0`.
+2. Stream stability ≥ 15 min: KeepAlives must keep the idle budget
+   reset — zero `stream silent past` lines on a healthy stream.
+3. Half-open simulation: silently drop the established control conn
+   (router conntrack flush / upstream iptables `DROP` on the flow) →
+   expect `control stream silent past 120 s — declaring dead` +
+   reconnect + node back online, **no reboot**.
+4. Wedge restart: keep the drop in place ≥ 60 min → expect diag dump +
+   `restarting as last resort` + full recovery after reboot.
+5. Node-state loss: delete the node in the admin panel mid-run →
+   expect `map rejected 2 consecutive times` → re-register → node
+   reappears (registered via authkey) without operator action.
+
 ### Audit fix round (2026-06-10, branch `fix/audit-cluster-1-protocol-wg`)
 
 Six fixes from the 2026-06-10 upstream + security audit, each built, host-

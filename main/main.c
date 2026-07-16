@@ -18,6 +18,8 @@
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_pm.h"
+#include "esp_system.h"
+#include "sdkconfig.h"
 
 #include "tinylink.h"
 #include "tinylink_bench.h"
@@ -243,6 +245,19 @@ void app_main(void)
 {
     esp_err_t err = bringup();
     if (err != ESP_OK) {
+#if CONFIG_TINYLINK_CONTROL_WEDGE_RESTART_S > 0
+        /* Unattended-deployment stance (paired with the long-poll's
+         * wedge restart): a failed bringup — WiFi absent, NVS hiccup —
+         * must not park the device in diagnostics mode forever, because
+         * nobody is there to power-cycle it. Retry via clean reboot on
+         * a slow cadence; the 60 s pause keeps a hard fault from
+         * turning into a tight boot loop and leaves a serial window to
+         * catch the error. */
+        ESP_LOGE(TAG, "bringup aborted: 0x%x — restarting in 60 s", err);
+        vTaskDelay(pdMS_TO_TICKS(60000));
+        esp_restart();
+#else
         ESP_LOGE(TAG, "bringup aborted: 0x%x — staying up for diagnostics", err);
+#endif
     }
 }

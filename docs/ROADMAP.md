@@ -26,6 +26,7 @@ Go implementation, which is the authoritative reference for wire format.
 | M10| Perf-trim + footprint round                   | done — PRs #88–#104 (net −68.1 KiB)  | v0.7             | landed   |
 | M11| Security round                                | done — PR #105 (WGN-1 writer + 4 hardenings) | v0.7    | landed   |
 | M12| Audit-fix round (2026-06-10)                  | done — 6 fixes, HW-validated vs tailscale.com | v0.7   | landed   |
+| M13| Control-plane reconnect hardening (2026-07-16)| done — stream idle budget, patch-driven refetch, in-place re-register, wedge restart. **HW smoke pending** | v0.8   | landed   |
 
 End-to-end verification on hardware (sensor-cali next to router,
 Servidor1 WG peer with public IP):
@@ -874,6 +875,45 @@ and **hardware-validated against `tailscale.com`**. Host suite is now
 
 ES: idem.
 
+## M13 — Control-plane reconnect hardening (2026-07-16)
+
+Four fixes on branch `fix/control-reconnect-hardening`, driven by the
+production symptom "after a control-plane change the node sometimes
+never reconnects until power-cycle" plus a fresh two-sided upstream
+audit (tailscale `632293de7..71b90de0d`, headscale
+`f585f8a9..04830851` — zero wire drift, capver 138 still clears the
+unchanged headscale floor of 113; upstream current is 142). Host suite
+**546/0** (`OK|PASS` metric; +15 over M12's 531). Δ flash +1 488 B.
+Commit-level detail in `CHANGELOG.md`; threat-model view in
+`SECURITY-MODEL.md`.
+
+- [x] **Stream idle budget.** `tls_io_read_full`/`tls_io_write_full`
+  take a `max_idle` bound on consecutive zero-progress
+  `WANT_READ`/`WANT_WRITE` polls; breach returns the new
+  `TLS_IO_ERR_IDLE_TIMEOUT`. Wired through ts2021, both 101-upgrade
+  readers, `derp_run_loop`, and the DERP send paths.
+  `CONFIG_TINYLINK_STREAM_IDLE_TIMEOUT_S` (default 120 s) mirrors
+  upstream's `watchdogTimeout` (`direct.go`). Kills the half-open-conn
+  infinite hang — the root cause of the symptom.
+- [x] **`PeersChangedPatch` identity refetch.** Patches carrying a
+  peer `Key`/`DiscoKey` change (how headscale ≥0.29.2 and
+  tailscale.com deliver peer re-login) now recycle the stream so the
+  reconnect's guaranteed-full first netmap refreshes the keys within
+  seconds. Endpoint-only patches stay ignored (DISCO's job). +4 KATs.
+- [x] **In-place re-register on persistent map 4xx.** ≥2 consecutive
+  non-429 4xx map rejections re-run `tinylink_register()` with the NVS
+  authkey (power-of-two schedule) + push endpoints on success. Heals
+  server-side node-state loss (headscale 404 on unknown node) without
+  a reboot.
+- [x] **Wedge-restart last resort.**
+  `CONFIG_TINYLINK_CONTROL_WEDGE_RESTART_S` (default 3600 s, 0=off):
+  zero control-plane bytes for the window → diag dump + `esp_restart()`.
+  Same option arms a 60-s-delay restart on failed `bringup()` (was:
+  park in diagnostics mode forever).
+- [ ] **HW smoke** — device was not attached this round. Checklist in
+  `CHANGELOG.md` (boot smoke, ≥15-min stream stability, forced
+  half-open, ≥60-min wedge restart, admin-panel node delete).
+
 ## Open backlog (roadmap — NOT done)
 
 These are the genuinely remaining protocol/data-plane follow-ups, kept
@@ -883,7 +923,12 @@ sensor-→-collector workload.
 - **Netmap `PeersChanged` / `PeersRemoved` delta-merge.** The
   long-poll currently treats each MapResponse as a fresh snapshot;
   proper incremental delta application needs a multi-peer tailnet to
-  validate, which we don't have.
+  validate, which we don't have. Upstream evidence got stronger in the
+  2026-07 audit (headscale now delivers peer re-login as
+  `PeersChangedPatch`); M13's identity-refetch covers the
+  key-rotation case by recycling the stream, so the remaining exposure
+  is efficiency (full refetch instead of merge) plus `PeersRemoved`,
+  not correctness for single-peer.
 - **Backoff consolidation.** Three divergent backoff
   implementations remain (the DERP supervisor's, plus `endpoint_push`
   and one other that lack jitter). Folding them into a single
@@ -899,9 +944,13 @@ sensor-→-collector workload.
 Surfaced honestly so downstream deployers know exactly what is and
 isn't covered. Each is a conscious deferral, not an oversight.
 
-- **No task watchdog / `esp_restart` self-recovery.** A wedged task
-  bricks the device until a physical reset — there is no software
-  watchdog kicking a recovery reboot.
+- **No general task watchdog.** M13 closed this for the control path
+  (stream idle budget + wedge `esp_restart`, see above) and for failed
+  bringup; what remains open is the general case — no application task
+  (`wg_rx`, telemetry, DERP supervisor) is subscribed to the task WDT,
+  so a wedge in one of *those* still bricks its function (though the
+  control-path watchdog now reboots the whole device if the wedge also
+  starves the control stream for an hour).
 - **NVS private keys are PLAINTEXT.** `CONFIG_SECURE_FLASH_ENC_ENABLED`
   is off and `keys.c` uses the default plain NVS partition. The
   MachineKey / NodeKey / DiscoKey / auth_key sit in cleartext on
