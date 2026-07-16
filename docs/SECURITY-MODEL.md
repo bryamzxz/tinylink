@@ -52,8 +52,10 @@ encryption is **off** on this build (`CONFIG_SECURE_FLASH_ENC_ENABLED`
 and `CONFIG_FLASH_ENCRYPTION_ENABLED` are both unset). Net effect: the
 Curve25519 MachineKey / NodeKey / DiscoKey private blobs sit in flash in
 the clear. Enabling eFuse-backed flash encryption + a real encrypted-NVS
-partition is roadmap hardening, **not** a property the current firmware
-provides — do not assume at-rest confidentiality.
+partition is **explicitly declined** (owner decision 2026-07-16,
+reaffirming the M7 out-of-scope call: eFuse burns are irreversible and
+recovery would depend on a control plane the project does not operate)
+— do not assume at-rest confidentiality, now or in future releases.
 
 The Curve25519 identities are generated on first boot using
 `esp_fill_random()` (RF-derived entropy) and never leave the chip over
@@ -137,7 +139,10 @@ solved. None is fixed in the current firmware.
 
 - **NVS private keys are plaintext at rest.** See "Long-term keys":
   flash encryption is off, so the Curve25519 identities are recoverable
-  from a raw flash dump. Highest-value hardening item.
+  from a raw flash dump. Accepted permanently by owner decision
+  (2026-07-16) — irreversible eFuse burns paired with recovery that
+  depends on a third-party control plane are a worse failure mode than
+  the (out-of-scope) physical-access risk they mitigate.
 - **No general task-WDT coverage for application tasks.** The task WDT
   is compiled in (`CONFIG_ESP_TASK_WDT_EN=y`) but `CONFIG_..._WDT_PANIC`
   is unset and it only subscribes the two idle tasks — no application
