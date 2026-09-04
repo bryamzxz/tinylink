@@ -92,7 +92,10 @@ TLS/WiFi code has run, which the hot loop cannot show. Measured on the
 sensor (ESP32-WROOM-32E, 240 MHz, QIO@80, two bench images flashed back
 to back):
 
-| ChaCha20-Poly1305 | crypto in flash | crypto in IRAM |
+(First measurement — only the AEAD glue had actually landed in IRAM,
+see item 7; the full-placement numbers are there.)
+
+| ChaCha20-Poly1305 | crypto in flash | AEAD glue in IRAM |
 |---|---:|---:|
 | hot loop, 1500 B enc / dec | 374.7 / 375.0 µs (250 ns/B) | 374.5 / 375.2 µs |
 | hot loop, 64 B enc / dec | 31.7 / 32.2 µs | 31.8 / 32.3 µs |
@@ -110,6 +113,68 @@ is what a WG packet actually costs after TLS/WiFi code ran in between;
 
 `test_mapresp` +4 (full vs delta, PeersRemoved ids, oversized element
 skipped). CI floor 570.
+
+#### 7 — ISA pass with the Xtensa ISA Reference Manual (RB-2010.1)
+
+Three things the manual settled, all verified on the compiled objects:
+
+- **Poly1305's block loop was not constant-time.** Table 8-246
+  ("Instruction Idioms") prescribes `add / add / bgeu / addi` for a
+  64-bit add — the LX6 has no carry flag and no `SALT` — and that is
+  what GCC emitted for the five-product accumulation of every limb:
+  **24 `bgeu` per 16-byte block**, branching on the secret-derived carry
+  (PR #86 had removed the same leak from `poly1305_finish` only). Fix:
+  each 32×32→64 product is split at bit 26 (`extui`-style mask + one
+  `SRC` funnel shift) into two 32-bit accumulators that cannot overflow
+  (5 terms < 2^29 and < 2^32), so the carry chain becomes 32-bit
+  shifts/masks. `poly1305_blocks`: 349 → 407 instructions per block,
+  **26 → 2 branches (loop control only)**; bit-identical (RFC 8439 KAT,
+  AEAD, WG, DISCO, NaCl-box suites).
+- **SAR is written once, not per shift.** A constant rotate is
+  `ssai n; src v, v, v`; GCC re-emitted the `ssai` for every `src` even
+  with the four quarter-rounds interleaved. On Xtensa the rotates are now
+  a volatile `ssai` per lockstep step plus bare `src` per rotate
+  (`chacha20.c`: 837 → 757 instructions, `ssai` 64 → 16), and Poly1305's
+  25 funnel shifts share one `ssai 26` per block (512 → 407). The Poly1305
+  `ssai` takes h0..h4 as asm inputs so GCC's own limb-extraction funnel
+  shifts cannot be scheduled past it — the first build did exactly that
+  (caught in the disassembly, would have produced wrong MACs on device
+  while the host KATs stayed green). Hosts keep the plain-C rotates;
+  the on-device oracle is the RFC 8439 §2.8.2 known answer added to
+  `tinylink_bench_aead()`.
+- **`TL_HOT_ATTR` had only moved the AEAD glue.** `tl_hot.h` did not
+  include `sdkconfig.h`, so `CONFIG_TINYLINK_CRYPTO_IN_IRAM` was
+  undefined in `chacha20.c` / `poly1305*` and the linker map showed them
+  still in flash; the −17 % cold number above was measured with only
+  `chacha20poly1305.c` in IRAM. Fixed; final numbers below.
+- Read and not applicable: the `LOOP` body limit of 256 bytes (the
+  ChaCha20 double round is ~480 B, so it stays a counted `bnez` loop —
+  one branch per double round), `MOVNEZ`/`MOVEQZ` idioms (nothing left
+  to make branch-free), `MUL16`/MAC16 (no gain over `MULL`/`MULUH`).
+
+Measured on the sensor with the bench image (all of the above + full
+IRAM placement), RFC 8439 §2.8.2 KAT **OK** on device:
+
+| ChaCha20-Poly1305 | M16 first cut (glue-only IRAM) | **ISA pass (all crypto in IRAM, CT Poly1305, SAR-once)** |
+|---|---:|---:|
+| hot loop, 1500 B enc / dec | 374.5 / 375.2 µs | 385.0 / 378.6 µs (+2.7 % / +1 %) |
+| hot loop, 64 B enc / dec | 31.8 / 32.3 µs | 31.6 / 32.8 µs |
+| cold, 1500 B enc / dec (flash-only: 545 / 527) | 451 / 452 µs | **391 / 392 µs** (−28 % vs flash) |
+| cold, 64 B enc / dec (flash-only: 157 / 162) | 112 / 113 µs | **47 / 48 µs** (−70 % vs flash) |
+| IRAM used | 76 787 B | 78 667 B (+3.6 KiB vs flash-only) |
+
+The constant-time Poly1305 costs ~3 % in the hot loop; the SAR-once
+rotates give most of it back. Cold — the real per-packet case — is now
+within 2 % of hot: the crypto no longer touches the flash cache at all.
+
+Final image with the ISA pass (946 069 B flash, DRAM 107 696 B, IRAM
+78 667 B), flashed and smoked on the sensor: `boots:1 wdt:0 panics:0
+initial:1 wg_up:1 stun_ok:1 stream_ended:0`, NTP sync +6.0 s, register
++7.3 s, WG session up +18.8 s and a **proactive rekey at +131 s
+completed against the peer's real WireGuard** — the branch-free Poly1305
+and the asm rotates interoperate on live traffic, not just against the
+RFC vector. Telemetry every 5 000 ms, `largest=49 152`. The 6-h soak
+(owner item D) was restarted on this image.
 
 #### Hardware (deployed sensor, app partition only; the M15 image read back to `~/tinylink-backups/` first)
 

@@ -119,7 +119,6 @@ poly1305_blocks(poly1305_state_internal_t *st, const unsigned char *m, size_t by
     unsigned long r0,r1,r2,r3,r4;
     unsigned long s1,s2,s3,s4;
     unsigned long h0,h1,h2,h3,h4;
-    unsigned long long d0,d1,d2,d3,d4;
     unsigned long c;
 
     r0 = st->r[0];
@@ -171,20 +170,76 @@ poly1305_blocks(poly1305_state_internal_t *st, const unsigned char *m, size_t by
         h3 += ((t2 >> 14) | (t3 << 18)) & 0x3ffffff;
         h4 += ( t3 >>  8                ) | hibit;
 
-        /* h *= r */
-        d0 = ((unsigned long long)h0 * r0) + ((unsigned long long)h1 * s4) + ((unsigned long long)h2 * s3) + ((unsigned long long)h3 * s2) + ((unsigned long long)h4 * s1);
-        d1 = ((unsigned long long)h0 * r1) + ((unsigned long long)h1 * r0) + ((unsigned long long)h2 * s4) + ((unsigned long long)h3 * s3) + ((unsigned long long)h4 * s2);
-        d2 = ((unsigned long long)h0 * r2) + ((unsigned long long)h1 * r1) + ((unsigned long long)h2 * r0) + ((unsigned long long)h3 * s4) + ((unsigned long long)h4 * s3);
-        d3 = ((unsigned long long)h0 * r3) + ((unsigned long long)h1 * r2) + ((unsigned long long)h2 * r1) + ((unsigned long long)h3 * r0) + ((unsigned long long)h4 * s4);
-        d4 = ((unsigned long long)h0 * r4) + ((unsigned long long)h1 * r3) + ((unsigned long long)h2 * r2) + ((unsigned long long)h3 * r1) + ((unsigned long long)h4 * r0);
+        /* h *= r  (mod 2^130 - 5), radix 2^26.
+         *
+         * tinylink change (2026-09, Xtensa LX6): upstream donna sums the
+         * five 32x32->64 products of each limb in 64-bit accumulators.
+         * The LX6 has no carry flag and no SALT/SALTU, so GCC lowers every
+         * 64-bit add to the manual's preferred idiom (ISA RM table 8-246:
+         * add / add / bgeu / addi) — a branch whose direction depends on
+         * the secret-derived carry, 25 of them per 16-byte block in the
+         * shipped binary (objdump, 2026-09-04). PR #86 removed the same
+         * leak from poly1305_finish; this removes it from the block loop.
+         *
+         * Instead of adding 64-bit values, each product P = a*b (< 2^55:
+         * h < 2^26+eps, r < 2^26, s = 5r < 2^29) is split at bit 26 with
+         * one EXTUI-style mask and one SRC funnel shift (SAR = 26, set
+         * once):  L += P mod 2^26  (5 terms < 2^29, no overflow),
+         *         H += P >> 26     (5 terms < 5*2^29 < 2^32, no overflow).
+         * d_i = H*2^26 + L exactly, so the reduction is
+         *   c = H + (L >> 26),  h_i = L & mask,
+         * with c added into the next limb as (c & mask) -> L, (c >> 26)
+         * -> H. No 64-bit arithmetic survives, no carries, no branches;
+         * instruction count is on par with the 64-bit form (mull + muluh
+         * + mask + src per product vs mull + muluh + add + bgeu + addi).
+         * Bit-identical to upstream (RFC 8439 KATs + AEAD tests). */
+#define POLY_MASK26 0x3ffffffUL
+#if defined(__XTENSA__)
+        /* P >> 26 is a funnel shift (SRC) of the MULUH:MULL pair; GCC would
+         * re-emit `ssai 26` before each of the 25 SRCs. Set SAR once per
+         * block here and issue bare SRCs. Ordering: volatile asms keep
+         * their relative order, but GCC's OWN funnel shifts for the limb
+         * extraction above (`ssai 20/14/18` + `src`) are ordinary insns
+         * that may be scheduled past a volatile asm — seen in the first
+         * build. Making this `ssai` consume h0..h4 forces every limb
+         * extraction (and its SAR writes) to complete before SAR is set
+         * to 26; the products below depend on h0..h4 too, so no other
+         * SAR write can land between this and the last SRC (every shift
+         * in the reduction is an immediate srli/extui/slli). */
+        __asm__ volatile ("ssai 26" : : "a"(h0), "a"(h1), "a"(h2), "a"(h3), "a"(h4));
+#define POLY_P26(a, b, L, H)                                              \
+        do {                                                              \
+            const unsigned long long _p = (unsigned long long)(a) * (b);  \
+            const unsigned long _lo = (unsigned long)_p;                  \
+            const unsigned long _hi = (unsigned long)(_p >> 32);          \
+            unsigned long _sh;                                            \
+            __asm__ volatile ("src %0, %1, %2" : "=a"(_sh) : "a"(_hi), "a"(_lo)); \
+            (L) += _lo & POLY_MASK26;                                     \
+            (H) += _sh;                                                   \
+        } while (0)
+#else
+#define POLY_P26(a, b, L, H)                                              \
+        do {                                                              \
+            const unsigned long long _p = (unsigned long long)(a) * (b);  \
+            (L) += (unsigned long)_p & POLY_MASK26;                       \
+            (H) += (unsigned long)(_p >> 26);                             \
+        } while (0)
+#endif
+        unsigned long L0 = 0, H0 = 0, L1 = 0, H1 = 0, L2 = 0, H2 = 0;
+        unsigned long L3 = 0, H3 = 0, L4 = 0, H4 = 0;
+        POLY_P26(h0, r0, L0, H0); POLY_P26(h1, s4, L0, H0); POLY_P26(h2, s3, L0, H0); POLY_P26(h3, s2, L0, H0); POLY_P26(h4, s1, L0, H0);
+        POLY_P26(h0, r1, L1, H1); POLY_P26(h1, r0, L1, H1); POLY_P26(h2, s4, L1, H1); POLY_P26(h3, s3, L1, H1); POLY_P26(h4, s2, L1, H1);
+        POLY_P26(h0, r2, L2, H2); POLY_P26(h1, r1, L2, H2); POLY_P26(h2, r0, L2, H2); POLY_P26(h3, s4, L2, H2); POLY_P26(h4, s3, L2, H2);
+        POLY_P26(h0, r3, L3, H3); POLY_P26(h1, r2, L3, H3); POLY_P26(h2, r1, L3, H3); POLY_P26(h3, r0, L3, H3); POLY_P26(h4, s4, L3, H3);
+        POLY_P26(h0, r4, L4, H4); POLY_P26(h1, r3, L4, H4); POLY_P26(h2, r2, L4, H4); POLY_P26(h3, r1, L4, H4); POLY_P26(h4, r0, L4, H4);
 
-        /* (partial) h %= p */
-                      c = (unsigned long)(d0 >> 26); h0 = (unsigned long)d0 & 0x3ffffff;
-        d1 += c;      c = (unsigned long)(d1 >> 26); h1 = (unsigned long)d1 & 0x3ffffff;
-        d2 += c;      c = (unsigned long)(d2 >> 26); h2 = (unsigned long)d2 & 0x3ffffff;
-        d3 += c;      c = (unsigned long)(d3 >> 26); h3 = (unsigned long)d3 & 0x3ffffff;
-        d4 += c;      c = (unsigned long)(d4 >> 26); h4 = (unsigned long)d4 & 0x3ffffff;
-        h0 += c * 5;  c =                (h0 >> 26); h0 =                h0 & 0x3ffffff;
+        /* (partial) h %= p — carry chain in 32-bit halves. */
+                                                     c = H0 + (L0 >> 26); h0 = L0 & POLY_MASK26;
+        L1 += c & POLY_MASK26; H1 += c >> 26;        c = H1 + (L1 >> 26); h1 = L1 & POLY_MASK26;
+        L2 += c & POLY_MASK26; H2 += c >> 26;        c = H2 + (L2 >> 26); h2 = L2 & POLY_MASK26;
+        L3 += c & POLY_MASK26; H3 += c >> 26;        c = H3 + (L3 >> 26); h3 = L3 & POLY_MASK26;
+        L4 += c & POLY_MASK26; H4 += c >> 26;        c = H4 + (L4 >> 26); h4 = L4 & POLY_MASK26;
+        h0 += c * 5;  c = (h0 >> 26); h0 = h0 & POLY_MASK26;
         h1 += c;
 
         m += poly1305_block_size;
