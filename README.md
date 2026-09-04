@@ -2,7 +2,7 @@
 
 # tinylink
 
-**A clean-room, single-peer Tailscale-compatible node for the bare ESP32 — no PSRAM, ~926 KiB of flash, pure C.**
+**A clean-room, single-peer Tailscale-compatible node for the bare ESP32 — no PSRAM, ~924 KiB of flash, pure C.**
 
 [![CI](https://github.com/bryamzxz/tinylink/actions/workflows/build.yml/badge.svg)](https://github.com/bryamzxz/tinylink/actions/workflows/build.yml)
 [![Firmware](https://img.shields.io/badge/firmware-1.0.0-brightgreen)](CHANGELOG.md)
@@ -49,7 +49,7 @@ the tunnel — 24/7, on a 4 MB module with 520 KiB of SRAM.
   546 host known-answer tests (golden vectors lifted from upstream),
   multi-hour hardware soaks behind every riskier change, per-PR
   CHANGELOG with flash/RAM deltas.
-- **Tiny footprint** — ~926 KiB app image (40 % of the partition free),
+- **Tiny footprint** — ~924 KiB app image (40 % of the partition free),
   static-first memory design tuned for a PSRAM-less ESP32.
 
 ## Why
@@ -63,7 +63,7 @@ cutting scope to a single peer.
 
 |                    | `tailscaled`            | MicroLink            | **tinylink**             |
 |--------------------|-------------------------|----------------------|--------------------------|
-| Footprint          | ~23 MB (~4.5 MB small)  | ~950 KiB             | **~926 KiB**             |
+| Footprint          | ~23 MB (~4.5 MB small)  | ~950 KiB             | **~924 KiB**             |
 | RAM requirement    | tens of MB              | PSRAM                | **no PSRAM (520 KiB SRAM)** |
 | Language / runtime | Go                      | —                    | **pure C, ESP-IDF v5.5** |
 | Scope              | full Tailscale          | reduced              | **single-peer sensor node** |
@@ -72,9 +72,11 @@ cutting scope to a single peer.
 
 **Production-ready — stable within the single-peer scope.** The
 firmware runs 24/7 in its intended sensor-→-collector deployment;
-milestones **M1–M13** are done (M13, the 2026-07 control-plane
-reconnect hardening, awaits its hardware smoke — checklist in the
-[CHANGELOG](CHANGELOG.md)). Per-milestone breakdown in
+milestones **M1–M14** are done (M14, the 2026-09 audit + optimization
+round, also gave M13 its first hardware run: boot smoke and stream
+stability clean on the deployed sensor; the forced half-open / wedge /
+node-delete items of the M13 checklist remain to be exercised). Per-milestone
+breakdown in
 [`docs/ROADMAP.md`](docs/ROADMAP.md), per-PR history in
 [`CHANGELOG.md`](CHANGELOG.md).
 
@@ -103,7 +105,8 @@ What works today, verified on real hardware:
 | 10 | Perf-trim + footprint round (#88–#104)         | done — net −68.1 KiB flash, largest-contig heap 6656 → 9216 B |
 | 11 | Security round (#105)                          | done — WGN-1 nonce-reuse race closed + 4 hardenings |
 | 12 | Audit-fix round (2026-06-10, #106)             | done — capver 138 at the Noise layer, WG rx-path lock + relayed-DISCO peer gate, atomic key regen, depth-bounded MapResponse skip, secure_zero sweep |
-| 13 | Control-plane reconnect hardening (2026-07-16, #109) | done — stream idle budget (mirrors upstream `watchdogTimeout`), `PeersChangedPatch` identity refetch, in-place re-register on map 4xx, wedge `esp_restart` last resort. HW smoke pending |
+| 13 | Control-plane reconnect hardening (2026-07-16, #109) | done — stream idle budget (mirrors upstream `watchdogTimeout`), `PeersChangedPatch` identity refetch, in-place re-register on map 4xx, wedge `esp_restart` last resort. Boot smoke + 20-min stream check passed 2026-09-04 |
+| 14 | Audit + optimization round (2026-09-04) | done — endpoint-push stack overflow fixed (task removed, −12.6 KiB BSS), headscale `/key` capver gate, TSMP proto-99 drop, DERP close race, Xtensa-tuned ChaCha20/Poly1305 (XOR 19 → 7 instr/word), backoff consolidation, provisioning contract fixed, ASan CI |
 
 Two further 2026-05-12 rounds — sdkconfig perf-trim (#76–#80) and DERP
 outbound (#82–#83: supervisor spawn + lossless relay fallback during
@@ -179,10 +182,11 @@ Three properties that are non-obvious from a casual read of the code:
    (= Tailscale v1.98), set once in `components/tinylink/include/
    tinylink.h` and derived into the Noise prologue, RegisterRequest,
    and MapRequest. It clears headscale's earlyNoise
-   `MinSupportedCapabilityVersion` floor of 113 (= Tailscale v1.80),
-   which the server enforces before any JSON is read. The separate
-   `/key?v=100` floor in `control_key.c` is a deliberately lower,
-   independent value for the legacy TOFU control-key fetch.
+   `MinSupportedCapabilityVersion` floor (115 = Tailscale v1.82 as of
+   2026-09; it tracks the latest ten minor releases), which the server
+   enforces before any JSON is read — and, since headscale `5b6e1e17`,
+   on the legacy `GET /key?v=` TOFU fetch as well, so `control_key.c`
+   sends the same macro.
 
 ## Quick start
 
@@ -190,8 +194,8 @@ Full walkthrough (prerequisites, flash, monitor, serial capture) in
 [`docs/BUILDING.md`](docs/BUILDING.md). TL;DR:
 
 ```bash
-source ~/entorno_investigación/bin/activate   # your IDF python venv
-. ~/esp/esp-idf-v5.5.4/export.sh
+source "$VENV/bin/activate"     # the python venv ESP-IDF was installed into
+. "$IDF_PATH/export.sh"         # ESP-IDF v5.5.4 checkout
 idf.py set-target esp32
 idf.py build
 ```
@@ -219,6 +223,7 @@ needed:
 ```bash
 cd tools/test
 make test          # 20 binaries · 546 assertions, all should report PASS
+make asan          # same suite under ASan + UBSan
 ```
 
 CI ([`.github/workflows/build.yml`](.github/workflows/build.yml)) runs
@@ -305,10 +310,16 @@ None of these block the current sensor-→-collector path:
   [`docs/ROADMAP.md` § Execution queue](docs/ROADMAP.md)).
 - **No SNTP / wall-clock** — `MBEDTLS_HAVE_TIME_DATE` is off, so the
   three TLS clients never validate cert `notBefore`/`notAfter`.
-- **Three divergent backoffs** (DERP supervisor + `endpoint_push`, the
-  latter two without jitter) want folding into a single `tl_backoff_ms`;
-  deferred pending an extended soak (`endpoint_push` is
-  regression-sensitive).
+- **CapabilityVersion 138 has a shelf life against headscale** — its
+  `MinSupportedCapabilityVersion` tracks the latest ten minor releases
+  (113 in 2026-07, 115 in 2026-09) and rejects both `/key` and `/ts2021`
+  below it. 138 (= v1.98) falls under the floor in roughly four more
+  headscale releases; the bump needs a hardware A/B smoke (it changes
+  the Noise prologue). Upstream is at 145.
+- **Static DRAM is at 75.6 %** (136.7 KiB) — dominated by the 40 KiB
+  jsmn token table and the 32 KiB MapResponse body buffer; the
+  streaming/shallow parser in `docs/ROADMAP.md` § "Future directions"
+  is what lifts that.
 - **DERP relay TX path validated only dormant** — the PR-D1 relay
   fallback is in place but has not yet fired under a real forced flap;
   that soak needs peer-side (Servidor1) access.

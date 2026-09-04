@@ -6,7 +6,7 @@
 #   1. Discover the current control-plane pubkey of the server you trust
 #      (run on a machine that has trusted DNS + cert bundle):
 #
-#        curl -s "https://controlplane.tailscale.com/key?v=100" \
+#        curl -s "https://controlplane.tailscale.com/key?v=138" \   # v = TINYLINK_CAPVER; headscale rejects values below its floor
 #          | python3 -c 'import sys, json; print(json.load(sys.stdin)["publicKey"])'
 #
 #      Output looks like: mkey:abcdef0123...64hex...

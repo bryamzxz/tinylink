@@ -10,11 +10,11 @@ honest. None of it is official Tailscale documentation — see the published
 - Tailscale upstream Go source — the wire-format ground truth. Specific
   files cited throughout this doc and inline in the C source via
   `TS2021_VERIFY` comments.
-- Out-of-tree research artifact maintained by the project owner at
-  `/home/bryam/Descargas/compass_artifact_*.md`, which indexes the
-  upstream files, gives memory/flash budgets, and lists the
-  minimum-viable subset for a single-peer ESP32. Cited as
-  `[research §X]`.
+- A maintainer-private research artifact (not in the repository, not
+  needed to build or contribute) that indexed the upstream files, gave
+  memory/flash budgets and listed the minimum-viable subset for a
+  single-peer ESP32. Still cited as `[research §X]` in `docs/ROADMAP.md`
+  for provenance; this document is the in-tree successor.
 
 ## Layered view (M1 + later)
 
@@ -129,7 +129,7 @@ JSON body, fields used today:
 
 | Field               | Notes                                              |
 |---------------------|----------------------------------------------------|
-| `Version`           | `TINYLINK_CAPVER` (currently `138` = Tailscale v1.98) — the Tailscale `CapabilityVersion`, same value as the ts2021 Noise prologue/header (`register.c` adds `cJSON_AddNumberToObject(root, "Version", TINYLINK_CAPVER)`). M1 hardcoded `1`, which sits below headscale's `earlyNoise` floor `MinSupportedCapabilityVersion = 113` (`hscontrol/capver/capver_generated.go`) and aborts the `/ts2021` upgrade before any JSON is read. Feature gating is keyed on `Hostinfo`, not `Version`. |
+| `Version`           | `TINYLINK_CAPVER` (currently `138` = Tailscale v1.98) — the Tailscale `CapabilityVersion`, same value as the ts2021 Noise prologue/header (`register.c` adds `cJSON_AddNumberToObject(root, "Version", TINYLINK_CAPVER)`). M1 hardcoded `1`, which sits below headscale's `earlyNoise` floor `MinSupportedCapabilityVersion` (`hscontrol/capver/capver_generated.go`; 113 in 2026-07, **115** as of 2026-09 — it tracks the latest 10 minor releases and keeps climbing) and aborts the `/ts2021` upgrade before any JSON is read. Since 2026-09 the legacy `GET /key?v=<n>` bootstrap sends the same value: headscale `5b6e1e17` gates `/key` on the same floor. Feature gating is keyed on `Hostinfo`, not `Version`. |
 | `NodeKey`           | `"nodekey:" + 64-hex` of NodeKey public.           |
 | `OldNodeKey`        | `"nodekey:" + 64 zeros` on first registration.     |
 | `NLKey`             | `"nlpub:" + 64 zeros` for M1 (TKA disabled). Real Ed25519 NLPrivate generation lands in M7 hardening. The field has no `omitempty` upstream, so it must be present. |

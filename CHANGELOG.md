@@ -7,6 +7,244 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Audit + optimization round (2026-09-04)
+
+Four inputs: a fresh two-sided upstream audit (tailscale
+`71b90de0d..31d8badb3`, 247 commits, HEAD 2026-09-03, `CurrentCapabilityVersion`
+142 → **145**; headscale `04830851..89fa72e0`, 48 commits, 0.29.3 → 0.30-dev,
+`MinSupportedCapabilityVersion` 113 → **115**), a core-code review, an
+ISA/memory pass over the *compiled* binary (objdump of the release
+objects, `-fstack-usage`, the linker map) and — for the first time since
+M13 landed — a hardware run. Host suite **546/0**, and the same suite now
+also runs clean under ASan + UBSan. Δ flash **−2 331 B** (948 624 →
+946 293 B, 60 % of the partition). Δ static DRAM **−12 656 B** (149 312 →
+136 656 B, 82.6 % → 75.6 %). Compiler warnings: 0.
+
+**Hardware.** Flashed to the deployed sensor (app partition only; a full
+4 MiB flash backup with sha256 was taken first — `~/tinylink-backups/`).
+The device was still on the M12 image (`0d5ec30-dirty`, 2026-06-10), so
+this run is also M13's first smoke. 150-s boot capture: `boots:1
+panics:0 initial:1 wg_up:1 stun_ok:1 stream_ended:0 tls_read_failed:0
+stream_silent:0`; register 200 at +7.8 s, lite endpoint push 200 at
++11.9 s, initial netmap at +17.5 s, DERP login at +20.6 s, WG session up
+at +23.4 s, telemetry every 5 000 ms from +27.6 s. Stack diag at +72 s:
+`heap_free=33 636 largest=21 504` (largest contiguous block was 9–11 KiB
+on the M10–M12 builds), `tinylink_lp hwm=13 496 B free`, no task under
+500 B. The 20-min stream-stability check (M13 checklist item 2) is
+recorded at the end of this entry.
+
+#### 1 — endpoint-push task overflowed its stack on every real push (HIGH) → task removed
+
+`tinylink_ep_up` (PR #49-era design, 12 KiB static stack in BSS) opened
+its own control conn from a **stack-local** `ts2021_conn_t` (8 648 B)
+and then called `ts2021_connect` (9 888 B frame, `entry a1, 0x26a0` in
+the release object) → `recv_record_plaintext` (4 176 B) → the mbedTLS
+handshake (~5 KiB): ≈ 28 KiB on a 12 KiB stack. The long-poll task runs
+the same chain without the local conn and measured a 20 KiB lifetime
+peak (PR #103) — the arithmetic is not in doubt. Every real push
+(NAT rebind, WiFi re-association, M13's in-place re-register) therefore
+wrote ~16 KiB past the stack array into the BSS below it (the DERP frame
+buffer, `pxReadyTasksLists`, WiFi driver tables). It only looked fine
+because that path never runs in steady state — and the one soak that
+forced a rebind (PR #102, 2026-05-13) panicked with
+`InstructionFetchError, PC=0x3ffb2a60 (DRAM)`, which was attributed to
+the 1 KiB stack trim and "fixed" by reverting it. That was this bug.
+
+Fix: the task is gone. `tinylink_endpoint_push_async()` now sets
+`s_ep_push_pending` and calls the new `ts2021_abort_reads()`; the
+long-poll's blocking record read returns `TS2021_ERR_READ_ABORTED` at its
+next 30-s socket poll, the stream is dropped (logged as *recycled for
+endpoint push*, healthy-stream backoff ≈ 1 s) and right after the
+reconnect — before the read-only `Stream=true` cycle claims `s_conn` —
+`long_poll_task` runs `mapreq_push_endpoints(&s_conn)`: the exact
+sequence bringup runs at boot. The re-register path sets the same flag.
+Cost: one extra control reconnect per endpoint change (rare); push
+latency ≤ 30 s + one Noise handshake (the direct path recovers via DISCO
+regardless). Gain: −12 640 B BSS (stack + TCB), no second Noise/TLS conn,
+no overflow. `tinylink_endpoint_updater_start()` is removed from the
+public API and from `main.c`.
+
+#### 2 — headscale now rejects `GET /key?v=100` → `/key?v=` derives from `TINYLINK_CAPVER`
+
+headscale `5b6e1e17` (2026-07-21, "gate /key on supported capability
+version") replaced the old `v >= 39` check with the same
+`MinSupportedCapabilityVersion` floor the Noise handshake enforces —
+**115** on current main. tinylink's TOFU bootstrap sent a fixed `v=100`
+(deliberately "a separate, lower floor" per the M12 notes), which now
+gets `400 unsupported client version`; a fresh device with no NVS pin and
+no compile-in fallback could never bootstrap against headscale ≥ 0.29.3.
+`control_key.c` now sends `TINYLINK_CAPVER` (138), exactly like the
+upstream client (`direct.go: /key?v=%d` with `CurrentCapabilityVersion`),
+so all four wire sites derive from one macro. Note for the calendar: the
+headscale floor is "latest 10 minor versions" and moved 113 → 115 in one
+audit window; 138 (= v1.98) drops below it in roughly four more
+releases, at which point both `/key` and `/ts2021` reject us — a capver
+bump (hardware A/B) is due before then.
+
+#### 3 — TSMP disco-key advertisements (capver 144) answered with ICMP → dropped before lwIP
+
+Since tailscale `3799eaf26` + `b87203b83` (capver 144, 2026-07-31)
+tailscaled sends a `TSMPDiscoKeyAdvertisement` — IPv4 proto 99, 33-byte
+payload — into the tunnel after **every** WireGuard handshake and rekey,
+to any disco-speaking peer, with no receiver-side capver gate. lwIP has
+no proto-99 handler, so `ip4_input` answered each one with an ICMP
+*protocol unreachable* through the tunnel: a pbuf, an encrypt and a TX
+per handshake/rekey for nothing. `wg_rx_inject` now drops proto 99 (and
+anything shorter than an IPv4 header) before allocating the pbuf.
+tinylink keeps learning peer disco keys from the netmap, like every
+pre-144 client — upstream tolerates that.
+
+#### 4 — DERP client teardown raced the wg_tx relay (use-after-free)
+
+`derp_client_close` destroyed the TLS context and **deleted the write
+mutex** while `tinylink_relay_via_derp` → `derp_client_send_packet` on
+the wg_tx task could be inside `esp_tls_conn_write` or blocked on that
+very mutex (its state check ran unlocked, before the take). Now: the
+mutex is created once per client and never deleted; `close` flips
+`connected` first, takes the lock, destroys TLS under it and NULLs the
+pointer; both writers re-validate `tls`/`connected` after acquiring the
+lock. `connect_login` preserves the lock across its `memset`. Companion
+config change: `CONFIG_MBEDTLS_SSL_RENEGOTIATION=n` (with it on,
+`ssl_read` on the supervisor task can itself write on the SSL context the
+wg_tx task writes to; no Tailscale server renegotiates).
+
+#### 5 — ChaCha20-Poly1305: Xtensa LX6 fast paths (measured on the compiled objects)
+
+The LX6 has no unaligned load/store, no byte-insert and no carry flag,
+so for a 4-byte `__builtin_memcpy` from a `uint8_t *` of unknown
+alignment GCC 14 emits 4× `l8ui` + 4× `s8i` *to the stack* + 1× `l32i`
+(a store→load round trip per word). The previous "word-at-a-time" XOR in
+`chacha20.c` therefore compiled to **19 instructions per word with 8 byte
+accesses**; `poly1305_blocks` loaded each 16-byte block through five
+such round trips at byte offsets 0/3/6/9/12 (three of them inherently
+unaligned). Changes:
+
+- `chacha20.c`: the double-round is `always_inline` inside a counted
+  loop (was 10 out-of-line `l32r`+`callx8` calls per 64-B block under
+  `-mlongcalls`, each a windowed `entry`/`retw`); the keystream block is
+  `uint32_t[16]`; the XOR dispatches **once per call on the buffer
+  addresses** (never on data): aligned → `__builtin_assume_aligned` +
+  pointer bumping = `l32i, l32i, addi, xor, s32i, addi, addi` under one
+  zero-overhead `loop` (**7 instructions/word, 0 byte ops**); unaligned →
+  register-only shift/or assembly (no stack bounce). Calls in the object:
+  22 → 2.
+- `poly1305_donna_32.h`: each block is loaded as four LE words and the
+  26-bit limbs are carved with funnel shifts (`ssr`+`src`), bit-identical
+  to the byte-offset form; aligned buffers get 4× `l32i`. Byte ops in
+  the object: 133 → 72 (the remaining ones are the unaligned fallback).
+  `poly1305_init` derives `r` the same way.
+- Alignment attributes on every hot buffer so the fast paths are actually
+  taken: `wg_rx` packet buffer and decrypt buffer, `wg_lwip` chained-pbuf
+  scratch, the AEAD's one-time key / length block / zero pads. The WG
+  transport payload sits at offset 16, so an aligned packet buffer means
+  an aligned AEAD input; lwIP pbuf payloads are `MEM_ALIGNMENT`-aligned.
+
+Correctness: RFC 8439 KATs (§2.4.2, §2.5.2, §2.8.2 — the 114-byte AEAD
+vector exercises the tail), WG transport/handshake and DISCO suites all
+pass, plus the whole suite under UBSan's alignment sanitizer. No on-device
+µs numbers this round (the AEAD bench needs `CONFIG_TINYLINK_BENCH_AEAD`
+and a dedicated build); the static instruction counts above are from the
+release objects.
+
+#### 6 — DERP supervisor backoff folded onto `tl_backoff_ms`
+
+The supervisor's private `TickType_t` doubling (15 s → 30 s, effectively
+one step, no jitter, and a fixed 30-s sleep even after a healthy stream)
+is replaced by the `backoff.h` ladder the long-poll already uses: capped
+exponential with ±25 % jitter counted in consecutive failures (connect
+failures, or streams that died before `DERP_SUP_HEALTHY_MS` = 10 s), reset
+by a healthy stream. Same envelope (base = Kconfig, cap 30 s). With the
+endpoint-push task gone the "three divergent backoffs" item is closed:
+one implementation, host-tested.
+
+#### 7 — provisioning contract matched to the firmware
+
+`docs/PROVISIONING.md` + `tools/credentials.csv.example` said namespace
+`tl_creds` in the `nvs_creds` partition flashed `--encrypt`; the firmware
+read WiFi from namespace `tinylink` in the default `nvs` partition and
+never mounted `nvs_creds`; `nvs_provision.py` demanded five WireGuard keys
+that stopped existing in M2 and defaulted to an encrypted image the
+firmware cannot read (flash encryption is off by decision; the
+`CONFIG_NVS_ENCRYPTION=y` in `sdkconfig.defaults` was inert — it depends
+on flash encryption and Kconfig dropped it silently). The deployed
+sensor's NVS confirms the real layout: WiFi under `tinylink`, auth key
+under `tl_creds`, both in `nvs`; `nvs_creds` blank. Now: `app_nvs_init`
+mounts `nvs_creds` best-effort (never erased, never fatal); every
+credential is looked up in `nvs_creds:tl_creds` → `nvs:tl_creds` →
+`nvs:tinylink` (legacy, with a re-provision warning — visible on the
+sensor's boot log); `read_auth_key` follows the same order;
+`nvs_provision.py` requires exactly `wifi_ssid`/`wifi_pass`/`auth_key`
+(`tskey-` prefix checked) and writes plaintext by default (`--encrypt`
+opt-in). `sdkconfig.defaults` documents NVS encryption as off.
+
+#### 8 — hygiene
+
+- `ts2021_close` scrubs the Noise state (`s_priv` copy of the machine
+  key, ephemeral key, both transport keys) with `tl_secure_zero` —
+  the one secret struct the M12 sweep missed.
+- The 2026-05-02 per-frame framing diagnostic in `stream_dispatch`
+  (hex dump + six `memcmp`-per-byte substring scans over up to 32 KiB +
+  three INFO lines on every long-poll frame) is removed; the
+  `stream peak: body=` soak line stays.
+
+#### 9 — tests / CI
+
+`tools/test/Makefile`: `-Werror`, `EXTRA_CFLAGS` and `RUNNER` hooks, an
+`asan` target (ASan + UBSan incl. alignment, clean rebuild), `.PHONY`
+generated from `TARGETS`. CI: `set -o pipefail` (a compile error or a
+crashing test binary used to leave the step green — `tee` swallowed
+make's status), a floor on the strict `[..] OK` count (526), the
+sanitized run as a second step, `make -j`, a job that dry-runs the two
+`idf-patches/` against the pinned IDF, `idf.py size`/`size-components`
+in the run summary, a `dependencies.lock` unchanged check, a
+concurrency group, and `.github/dependabot.yml` for the action pins.
+
+#### 10 — docs
+
+`docs/PROVISIONING.md`, `tools/README.md`, `tools/test/README.md`,
+`components/tinylink/README.md` (was still "stub / TODO"; component
+version 0.1.0 → 1.0.0), `docs/ARCHITECTURE.md` (the task table now lists
+the eight real tasks with stacks/priorities instead of the M1 plan;
+endpoint-push item rewritten), `docs/BUILDING.md` (size table with this
+round's column, CI section, provisioning wording), `docs/PROTOCOL.md`
+(capver floor 115, `/key` note), `SECURITY.md` (dependency list —
+`droscy/esp_wireguard` has been gone since M2; the "disabling NVS
+encryption" clause), `CONTRIBUTING.md` (testing section was frozen at
+M1), `tinylink.h` (capver audit stamp 2026-09-03: upstream 145, headscale
+floor 115), README (status, numbers, limitations), `docs/ROADMAP.md`
+(M14 entry, improvement list with completion estimates, backlog/GAPS
+refresh).
+
+#### Upstream drift audit — verified no-impact items
+
+controlbase/Noise, DISCO (magic + all message types), STUN, DERP frames
+(`ClientInfo` gained an optional `AppName`, `PeerPresent` grew an app-name
+tail — watchers only), `/machine/register` + `/machine/map` JSON, the
+Go 1.27 `encoding/json/v2` migration (`82cfea90c`, byte-identical wire
+format by design), `DERPRegionID` type rename, the per-peer WireGuard PSK
+plumbing (`31d8badb3`: no PSK field in `tailcfg.Node`, so nothing on the
+wire yet — re-check if one appears, a mismatched PSK is a silent
+handshake failure), `direct.go` (`watchdogTimeout` still 120 s, lite
+update semantics unchanged), headscale's re-registration paths (the
+untagged-node fast path tinylink uses is intact; `d28a6b11` removes a
+spurious-401 race on followup). Cosmetic parity gap left as is: upstream
+`parsePing` now skips an all-zero trailing NodeKey; tinylink never reads a
+received ping's NodeKey.
+
+#### Hardware — 20-min stream stability (M13 checklist item 2)
+
+Second capture on the deployed sensor, 1 200 s starting at +130 s of
+uptime: `boots:0 panics:0 stream_ended:0 tls_read_failed:0
+stream_silent:0`, 22 server KeepAlives on the map stream (one per
+~60 s, `stream peak: body=18`), 241 telemetry datagrams at the exact
+5 000 ms cadence, 33 proactive WG rekey lines, 0 WiFi disconnects, 0
+warnings or errors of any kind, 20 stack-diag dumps with
+`heap_free` 33 328–33 696 B and `largest` pinned at 21 504 B throughout;
+`tinylink_lp hwm=13 496 B free`, `tinylink_derp 5 120 B`, `wg_rx
+2 096 B` unchanged from the first dump to the last. M13 checklist items
+1–2 are therefore done; items 3–5 (forced half-open, ≥ 60-min drop,
+node delete) still need router/admin access.
+
 ### Control-plane reconnect hardening round (2026-07-16, branch `fix/control-reconnect-hardening`)
 
 Closes the one production failure mode observed since the 2026-06 round:

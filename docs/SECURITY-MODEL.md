@@ -44,12 +44,14 @@ We **do not** defend against:
 
 **At-rest key storage — NOT currently encrypted.** The keys are read and
 written through the plain default NVS partition (`keys.c` calls
-`nvs_open("tl_keys", …)` against the default `nvs` namespace; there is no
-`nvs_creds`/`nvs_keys` encrypted partition in `partitions.csv`). Although
-`CONFIG_NVS_ENCRYPTION=y` is present in `sdkconfig`, NVS encryption only
-takes effect once flash encryption derives the XTS key — and flash
-encryption is **off** on this build (`CONFIG_SECURE_FLASH_ENC_ENABLED`
-and `CONFIG_FLASH_ENCRYPTION_ENABLED` are both unset). Net effect: the
+`nvs_open("tl_keys", …)` against the default `nvs` partition; the
+`nvs_creds` slot in `partitions.csv` only ever holds provisioner-written
+credentials, and its `encrypted` flag is inert without flash
+encryption). NVS encryption is off: `sdkconfig.defaults` used to carry
+`CONFIG_NVS_ENCRYPTION=y`, but on the ESP32 that option depends on
+`CONFIG_SECURE_FLASH_ENC_ENABLED`, which is unset, so Kconfig dropped it
+silently — the line was removed 2026-09 and the state documented. Net
+effect: the
 Curve25519 MachineKey / NodeKey / DiscoKey private blobs sit in flash in
 the clear. Enabling eFuse-backed flash encryption + a real encrypted-NVS
 partition is **explicitly declined** (owner decision 2026-07-16,
@@ -157,6 +159,49 @@ solved. None is fixed in the current firmware.
   (only if the wedge also starves the control stream) or a physical
   power-cycle.
 
+## Audit + optimization round (2026-09) — memory safety + upstream drift
+
+Fourth audit round; details per item in `CHANGELOG.md`, threat-model
+view here.
+
+- **Stack overflow in the endpoint-push task (memory safety, HIGH).**
+  `tinylink_ep_up` ran `ts2021_connect` + the TLS handshake from a
+  12 KiB static stack that the call chain (stack-local `ts2021_conn_t`
+  8 648 B + 9 888 B + 4 176 B + ~5 KiB mbedTLS) exceeds by ~16 KiB; every
+  real push wrote into the BSS below the stack (DERP frame buffer,
+  FreeRTOS ready lists, WiFi driver tables). Not attacker-triggerable
+  on its own — it fires on NAT rebind / WiFi re-association /
+  re-register — but a network-positioned attacker can provoke all three
+  (drop the NAT flow, deauth, delete/expire the node). Fixed by removing
+  the task: the push runs on the long-poll task after a cooperative
+  stream recycle. Verified from the compiled `entry` frame sizes.
+- **Use-after-free in the DERP client teardown.** `derp_client_close`
+  freed the TLS context and deleted the write mutex while the wg_tx
+  relay could be inside a write or blocked on the mutex. The mutex is
+  now per-client and permanent, teardown takes it, and both writers
+  re-validate under it. TLS renegotiation is disabled so `ssl_read` on
+  the reader task can never write on the shared SSL context.
+- **Control-plane compatibility.** headscale now gates `/key` on its
+  `MinSupportedCapabilityVersion` (115); the bootstrap sends
+  `TINYLINK_CAPVER`. The floor tracks the ten latest minor releases, so
+  138 has a shelf life of roughly four headscale releases — a tracked
+  dependency, not a vulnerability.
+- **Noise state scrub.** `ts2021_close` now `tl_secure_zero`s the
+  Noise IK state (machine-key copy, ephemeral key, transport keys) —
+  the last secret struct left out of the 2026-06 sweep.
+- **Constant-time posture of the AEAD fast paths.** The new
+  ChaCha20/Poly1305 aligned-vs-unaligned dispatch branches on buffer
+  *addresses* (loop-invariant, set by the caller's buffer layout),
+  never on key or message bytes; the round loop has a fixed trip count.
+  The host suite runs under UBSan's alignment check so the aligned
+  branch can never be reached with an unaligned pointer.
+- **TSMP.** Peer-sent `TSMPDiscoKeyAdvertisement` packets (capver 144)
+  are dropped before lwIP rather than answered with ICMP — one fewer
+  reflected packet per handshake, no parsing of a new in-tunnel format.
+- **Provisioning.** NVS is confirmed plaintext (the inert
+  `CONFIG_NVS_ENCRYPTION=y` was removed so nobody believes otherwise);
+  the credential lookup order is documented in `docs/PROVISIONING.md`.
+
 ## Reconnect-hardening round (2026-07) — control-path availability
 
 Four fixes, driven by the observed production failure "node stops
@@ -207,12 +252,13 @@ threat-model record; the commit-level detail lives in `CHANGELOG.md`.
   into the Noise prologue (`ts2021_client.c`: `"Tailscale Control
   Protocol v138"`, was hardcoded `1`) and into `RegisterRequest.Version`
   / `MapRequest.Version`. 138 clears headscale's
-  `MinSupportedCapabilityVersion = 113` (= v1.80) earlyNoise floor with
-  headroom, so the device is no longer silently rejected by a current
-  headscale. The separate `/key?v=100` TLS-bootstrap floor in
-  `control_key.c` is deliberately lower and is **not** tied to this
-  macro. Changing the macro re-hashes the prologue, so a bump requires
-  a hardware A/B smoke against the live control plane.
+  `MinSupportedCapabilityVersion` earlyNoise floor (113 at the time,
+  115 as of 2026-09 — it moves with every release, so the bump is a
+  tracked dependency), so the device is no longer silently rejected by
+  a current headscale. Since M14 the `/key?v=` TLS-bootstrap fetch in
+  `control_key.c` sends the same macro (headscale gates `/key` on the
+  same floor). Changing the macro re-hashes the prologue, so a bump
+  requires a hardware A/B smoke against the live control plane.
 - **EarlyNoise payload drained, not trusted.** `consume_early_payload`
   (`ts2021_client.c`) now reads the 9-byte EarlyNoise header
   (`magic[5] || BE32 len || JSON`) as a byte **stream** spanning Noise
@@ -255,12 +301,17 @@ threat-model record; the commit-level detail lives in `CHANGELOG.md`.
   netmaps are nowhere near 64 levels deep, so well-formed responses are
   unaffected.
 
-## Verification still TODO before any production use
+## Verification status
 
-- Run RFC 7693 BLAKE2s test vectors through `blake2s_init`/`update`/`final`.
-- Run RFC 7748 X25519 test vectors through `curve25519_scalarmult`.
-- Run RFC 8439 ChaCha20-Poly1305 round-trips through Noise's
-  `EncryptAndHash` to confirm the AAD layout matches the Noise spec.
+Done (host KATs in `tools/test`, run in CI plain and under ASan/UBSan):
+RFC 7693 BLAKE2s, RFC 7748 X25519, RFC 8439 ChaCha20 / Poly1305 /
+AEAD, the WireGuard handshake transcript, DISCO / STUN / DERP codecs.
+
+Still open:
+
+- The ts2021 Noise IK transcript (`noise_ik.c`) end-to-end on the host —
+  today it is validated only by the live control plane accepting the
+  handshake.
 - Cross-check `TS2021_VERIFY` markers in
   `components/tinylink/src/ts2021_client.c` against the live Tailscale
   control plane source (see `PROTOCOL.md` for the exact files).
@@ -296,7 +347,7 @@ Distilled from the protocol research artifact §L.
   to transform mbedTLS's constant-time-select macros into branchy code.
   Do not switch to Clang without disassembling the crypto primitives.
 - **Compile-in fallback control pub** (mitigation available, opt-in).
-  TLS-only TOFU on first `/key?v=100` fetch is the weakest link in
+  TLS-only TOFU on the first `/key?v=<capver>` fetch is the weakest link in
   ts2021 (man-in-the-middle via a corporate TLS root). Set
   `CONFIG_TINYLINK_CONTROL_PUB_FALLBACK_HEX` to the operator's known
   control plane pubkey (64 hex chars): on first boot the device

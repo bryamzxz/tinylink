@@ -17,7 +17,8 @@ small **is** the project. Please read this document before opening a PR.
 ## Workflow
 
 1. Open an issue first for anything bigger than a typo or a one-line bug fix.
-   Describe the milestone you are targeting (1–6, see `docs/ROADMAP.md`).
+   Describe the milestone or backlog item you are targeting (see
+   `docs/ROADMAP.md`).
 2. Branch from `main`. Branch names: `m1/wifi-init`, `m2/ts2021-handshake`,
    `fix/short-description`.
 3. Run `idf.py build` for `esp32` before pushing. CI will reject builds that
@@ -38,9 +39,18 @@ small **is** the project. Please read this document before opening a PR.
 
 ## Testing
 
-Milestone 1 has no automated tests yet (we test on real hardware against a
-known-good WireGuard peer). From Milestone 3 onward we will add Unity tests
-for protocol parsers (decoupled from any radio).
+Run the host suite before pushing — stock gcc, no ESP-IDF needed:
+
+```bash
+make -C tools/test test    # 20 binaries; every case prints "[name] OK"
+make -C tools/test asan    # same suite under ASan + UBSan
+```
+
+CI runs both plus the firmware build. Anything that touches the data
+plane, the control-plane reconnect ladders or a task stack also needs
+an on-device smoke (and a multi-hour soak for reconnect/retry loops —
+see the stack-trim lesson in `docs/ROADMAP.md` § M10); say in the PR
+what was run on hardware and what was not.
 
 ## Code of conduct
 
