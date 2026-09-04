@@ -33,7 +33,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       # The suite is plain C11 + stock gcc — no ESP-IDF needed. Each test
       # binary exits non-zero on any failed assertion and the Makefile
@@ -68,7 +68,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       # The firmware needs the two patches in idf-patches/ applied to the
       # pinned ESP-IDF or it panics at first WG bring-up (README "Quick
@@ -97,7 +97,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: ESP-IDF build
         uses: espressif/esp-idf-ci-action@v1
