@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 Bryam (bryamzxz)
 #
-# Build matrix for tinylink. Treats warnings as errors so the tree
-# stays clean while the code surface is small.
+# CI for tinylink: host KAT suite (plain + sanitized), a check that the
+# two required ESP-IDF patches still apply, and the firmware build
+# against the pinned ESP-IDF release.
 
 name: build
 
@@ -15,6 +16,17 @@ on:
 permissions:
   contents: read
 
+# Rapid pushes to the same ref supersede each other — an IDF build is
+# several minutes; don't queue five of them for one PR.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Strict per-case count of `[name] OK` lines the suite must reach.
+  # Bump when tests are added (see CHANGELOG for the running number).
+  HOST_TESTS_MIN_OK: 526
+
 jobs:
   host-tests:
     name: host KATs (gcc, no IDF)
@@ -23,19 +35,53 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # The suite is plain C11 + stock gcc — no ESP-IDF needed. Each
-      # test binary exits non-zero on any failed assertion, and the
-      # Makefile propagates that, so `make test` alone is the gate;
-      # the grep summary is belt-and-braces (uppercase FAIL only —
-      # negative-path case *names* contain lowercase "fail" and
-      # legitimately print OK).
+      # The suite is plain C11 + stock gcc — no ESP-IDF needed. Each test
+      # binary exits non-zero on any failed assertion and the Makefile
+      # propagates that. `pipefail` makes the tee'd pipeline carry make's
+      # status (without it a compile error or a crashing binary still
+      # produced a green step); the OK floor guards against a silently
+      # truncated run.
       - name: Run host suite
+        shell: bash
         run: |
-          make -C tools/test test 2>&1 | tee /tmp/host-tests.log
-          okpass=$(grep -cE 'OK|PASS' /tmp/host-tests.log)
+          set -o pipefail
+          make -j"$(nproc)" -C tools/test test 2>&1 | tee /tmp/host-tests.log
+          ok=$(grep -cE '^\[.*\] OK$' /tmp/host-tests.log || true)
           fails=$(grep -c 'FAIL' /tmp/host-tests.log || true)
-          echo "summary: OK|PASS=$okpass FAIL=$fails"
+          echo "summary: OK=$ok FAIL=$fails (floor $HOST_TESTS_MIN_OK)"
           test "$fails" -eq 0
+          test "$ok" -ge "$HOST_TESTS_MIN_OK"
+
+      # Same suite under AddressSanitizer + UBSan (alignment, shifts,
+      # overflow). The crypto fast paths dispatch on buffer alignment;
+      # UBSan's -fsanitize=alignment is the cheapest guard that the
+      # aligned branch is never taken on an unaligned pointer.
+      - name: Run host suite (ASan + UBSan)
+        shell: bash
+        run: |
+          set -o pipefail
+          make -C tools/test asan 2>&1 | tee /tmp/host-tests-asan.log
+          test "$(grep -c 'FAIL' /tmp/host-tests-asan.log || true)" -eq 0
+
+  idf-patches:
+    name: idf-patches apply cleanly
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # The firmware needs the two patches in idf-patches/ applied to the
+      # pinned ESP-IDF or it panics at first WG bring-up (README "Quick
+      # start"). Nothing else in CI notices a patch that stopped
+      # applying against a point release, so check it explicitly.
+      - name: Fetch pinned ESP-IDF and dry-run the patches
+        run: |
+          git clone --depth 1 --branch v5.5.4 https://github.com/espressif/esp-idf.git /tmp/esp-idf
+          cd /tmp/esp-idf
+          for p in "$GITHUB_WORKSPACE"/idf-patches/*.patch; do
+            echo "== $p"
+            git apply --check "$p"
+          done
 
   idf-build:
     name: idf-build (${{ matrix.target }}, ESP-IDF ${{ matrix.idf_version }})
@@ -61,7 +107,25 @@ jobs:
           path: "."
           command: |
             idf.py set-target ${{ matrix.target }} && \
-            idf.py build
+            idf.py build && \
+            idf.py size --format json > build/size.json && \
+            idf.py size-components > build/size-components.txt
+
+      # Static-memory report next to the artifacts: DRAM/IRAM/flash totals
+      # and per-archive contributions, so a PR that grows BSS or the app
+      # image shows it in the run without anyone downloading the map.
+      - name: Size summary
+        if: always()
+        run: |
+          echo '## Firmware size' >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          head -40 build/size-components.txt >> "$GITHUB_STEP_SUMMARY" || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      # dependencies.lock is committed for reproducible builds; a build
+      # that rewrites it means the lock and the manifests disagree.
+      - name: dependencies.lock unchanged
+        run: git diff --exit-code dependencies.lock
 
       - name: Upload build artifacts
         if: always()
@@ -72,6 +136,8 @@ jobs:
             build/*.bin
             build/*.elf
             build/*.map
+            build/size.json
+            build/size-components.txt
             build/bootloader/bootloader.bin
             build/partition_table/partition-table.bin
           if-no-files-found: warn

@@ -6,7 +6,7 @@
  *   - Request layout (binding type, attrs len, magic, txid, SOFTWARE attr,
  *     FINGERPRINT attr type+len) and CRC32 self-roundtrip.
  *   - 8 golden response vectors lifted byte-for-byte from upstream
- *     (/home/bryam/dev/tailscale/net/stun/stun_test.go) covering
+ *     (tailscale/tailscale @ 632293de7: net/stun/stun_test.go) covering
  *     google/sipgate/powervoip/Pion/stuntman + IPv4-and-IPv6, plus
  *     SOFTWARE-attr 1- and 3-byte padding edge cases and a no-4in6
  *     vector.
