@@ -46,6 +46,14 @@ typedef ssize_t (*tls_io_write_fn)(void *ctx, const uint8_t *buf, size_t len);
  * TLS_IO_ERR_IDLE_TIMEOUT — this is what converts a half-open TCP
  * connection (control plane replaced/killed without FIN, NAT flow
  * dropped) from an infinite hang into a normal reconnect. */
+/* Optional per-poll hook: invoked once per loop iteration of both
+ * *_full helpers (every WANT_READ/WANT_WRITE poll — one SO_RCVTIMEO
+ * period — and after every partial transfer). tinylink.c installs the
+ * task-WDT feed here so a task parked in a 30-s TLS poll keeps its
+ * watchdog alive without shortening the socket timeouts. NULL = none. */
+typedef void (*tls_io_poll_hook_t)(void);
+void tls_io_set_poll_hook(tls_io_poll_hook_t hook);
+
 int tls_io_read_full(tls_io_read_fn rd, void *ctx,
                      uint8_t *buf, size_t need, uint32_t max_idle);
 

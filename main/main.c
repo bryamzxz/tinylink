@@ -206,12 +206,9 @@ static esp_err_t bringup(void)
         return err;
     }
 
-    err = tinylink_telemetry_start();
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "telemetry start failed: 0x%x — continuing", err);
-        /* fall through: telemetry isn't load-bearing for the rest of
-         * the system. */
-    }
+    /* Telemetry starts from the long-poll handler on the first netmap
+     * (so it never sends to a 100.64.x.y destination before the WG
+     * netif exists) — nothing to start here. */
 
     /* Periodic STUN re-probe so HostInfo.Endpoints stays fresh against
      * NAT rebinds and WAN address changes. Best-effort, silent on

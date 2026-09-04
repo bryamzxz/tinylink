@@ -22,6 +22,7 @@
 
 #include "crypto/nacl_box.h"
 #include "crypto/secure_zero.h"
+#include "tl_wdt.h"
 #include "disco_handler.h"
 #include "disco_prober.h"
 #include "wg_demux.h"
@@ -215,10 +216,6 @@ typedef enum {
     WG_NETIF_IDLE = 0,
     WG_NETIF_HANDSHAKE_PENDING,
     WG_NETIF_UP,
-    WG_NETIF_FAILED,   /* unreachable in current code: handshake budget
-                        * exhaustion now backs off and retries
-                        * indefinitely (see WG_HANDSHAKE_BACKOFF_MS).
-                        * Kept for forward compatibility / external API. */
 } wg_netif_state_t;
 
 static struct {
@@ -674,7 +671,7 @@ static void handle_disco_direct(const uint8_t *buf, size_t len,
         } else {
             char src_ip[INET_ADDRSTRLEN];
             inet_ntop(AF_INET, &src->sin_addr, src_ip, sizeof(src_ip));
-            ESP_LOGI(TAG, "disco ping→pong (direct): src=%s:%u txid=%02x%02x%02x%02x..",
+            ESP_LOGD(TAG, "disco ping→pong (direct): src=%s:%u txid=%02x%02x%02x%02x..",
                      src_ip, (unsigned)ntohs(src->sin_port),
                      txid[0], txid[1], txid[2], txid[3]);
         }
@@ -688,7 +685,7 @@ static void handle_disco_direct(const uint8_t *buf, size_t len,
          * we never sent — either way, do NOT roam. */
         char src_ip[INET_ADDRSTRLEN];
         inet_ntop(AF_INET, &src->sin_addr, src_ip, sizeof(src_ip));
-        ESP_LOGI(TAG, "disco pong (direct): src=%s:%u txid=%02x%02x%02x%02x..",
+        ESP_LOGD(TAG, "disco pong (direct): src=%s:%u txid=%02x%02x%02x%02x..",
                  src_ip, (unsigned)ntohs(src->sin_port),
                  txid[0], txid[1], txid[2], txid[3]);
         /* Bind the match to the AddrPort we actually probed: a captured
@@ -749,7 +746,7 @@ static void handle_disco_direct(const uint8_t *buf, size_t len,
         return;
     }
     if (type == DISCO_TYPE_CALLMEMAYBE) {
-        ESP_LOGI(TAG, "disco call-me-maybe (direct path)");
+        ESP_LOGD(TAG, "disco call-me-maybe (direct path)");
         return;
     }
 }
@@ -767,7 +764,9 @@ static void rx_task(void *arg)
     struct timeval tv = {.tv_sec = 1, .tv_usec = 0};
     setsockopt(g.sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
+    tl_wdt_subscribe();
     while (!g.stop_requested) {
+        tl_wdt_feed();
         struct sockaddr_in src;
         socklen_t srclen = sizeof(src);
         ssize_t n = recvfrom(g.sock, buf, sizeof(buf), 0,
@@ -1006,6 +1005,7 @@ retry_timer:;
     }
 
     ESP_LOGI(TAG, "rx task exiting");
+    tl_wdt_unsubscribe();
     vTaskDelete(NULL);
 }
 
@@ -1015,7 +1015,9 @@ retry_timer:;
 static void tx_task_fn(void *arg)
 {
     (void)arg;
+    tl_wdt_subscribe();
     while (!g.stop_requested) {
+        tl_wdt_feed();
         /* 500 ms wakeup so stop_requested is observed even when no
          * outbound traffic is flowing. xQueueReceive memcpys the
          * dequeued item directly into our BSS scratch — keeping it
@@ -1083,6 +1085,7 @@ static void tx_task_fn(void *arg)
     if (g.tx_done_sem != NULL) {
         xSemaphoreGive(g.tx_done_sem);
     }
+    tl_wdt_unsubscribe();
     vTaskDelete(NULL);
 }
 

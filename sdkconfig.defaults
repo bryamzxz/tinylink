@@ -47,6 +47,10 @@ CONFIG_ESP_WIFI_MGMT_SBUF_NUM=8
 # DTIM management on AP side, AP-side WPS handshake, AP-side WPA
 # supplicant fragment.
 # CONFIG_ESP_WIFI_SOFTAP_SUPPORT is not set
+# WPA2-Enterprise (EAP) is not used — the sensor joins a WPA2-PSK AP
+# (app_wifi.c sets WIFI_AUTH_WPA2_PSK). Dropping it removes the EAP
+# state machines from wpa_supplicant (~20 KiB flash). 2026-09.
+# CONFIG_ESP_WIFI_ENTERPRISE_SUPPORT is not set
 # WPA3-Personal (SAE) handshake codepath: not needed; the production
 # AP (INTELCOM-CARDONA) is WPA2-PSK-SHA256 + PMF, not WPA3-Personal.
 # Removes SAE-PWE Dragonfly + SAE-H2E variants.
@@ -139,6 +143,14 @@ CONFIG_MBEDTLS_SSL_MAX_CONTENT_LEN=4096
 # wg_tx task writes relayed frames through the same SSL context. Also
 # drops the renegotiation state machine from the image.
 # CONFIG_MBEDTLS_SSL_RENEGOTIATION is not set
+# Client-only TLS (2026-09): the firmware never accepts a TLS connection
+# (esp_https_server / esp_http_server are excluded in CMakeLists.txt), so
+# the server-side handshake state machine is dead weight. Plain-RSA key
+# exchange (no forward secrecy; every Tailscale / DERP endpoint negotiates
+# ECDHE) and PEM *writing* go with it.
+CONFIG_MBEDTLS_TLS_CLIENT_ONLY=y
+# CONFIG_MBEDTLS_KEY_EXCHANGE_RSA is not set
+# CONFIG_MBEDTLS_PEM_WRITE_C is not set
 CONFIG_MBEDTLS_ASYMMETRIC_CONTENT_LEN=y
 CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=16384
 CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=2048
@@ -532,3 +544,20 @@ CONFIG_COMPILER_OPTIMIZATION_CHECKS_SILENT=y
 # Drops the ~7 KiB esp_err_msg_table[] rodata; esp_err_to_name() returns
 # "UNKNOWN ERROR" plus the hex code. Operationally readable, just lookup-free.
 # CONFIG_ESP_ERR_TO_NAME_LOOKUP is not set
+
+# ---- Task watchdog (2026-09) --------------------------------------------------
+# Application tasks subscribe to the task WDT (CONFIG_TINYLINK_APP_TASK_WDT,
+# tinylink core menu). 60 s — the Kconfig maximum (range 1..60; a larger
+# value is silently dropped and the 5-s default comes back, which the
+# telemetry task's 5-s period cannot satisfy — seen on hardware
+# 2026-09-04) — covers the longest blocking primitive in the firmware:
+# one 30-s SO_RCVTIMEO TLS poll plus reconnect work, with the tls_io poll
+# hook feeding on every iteration. PANIC=y turns a wedged
+# task into a reboot into the known-good boot path — the purpose of the
+# subscription. Idle tasks stay subscribed (CPU-starvation detection).
+CONFIG_ESP_TASK_WDT_EN=y
+CONFIG_ESP_TASK_WDT_INIT=y
+CONFIG_ESP_TASK_WDT_PANIC=y
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=60
+CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0=y
+CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU1=y

@@ -3,6 +3,19 @@
 
 menu "tinylink core"
 
+    config TINYLINK_APP_TASK_WDT
+        bool "Subscribe application tasks to the task watchdog"
+        default y
+        help
+            wg_rx, wg_tx, telemetry, the DERP supervisor and the map
+            long-poll subscribe to the ESP task WDT and feed it once per
+            loop iteration (blocking TLS reads feed through the tls_io
+            poll hook). With CONFIG_ESP_TASK_WDT_PANIC=y a task that
+            stops iterating for CONFIG_ESP_TASK_WDT_TIMEOUT_S reboots
+            the device into the known-good boot path. Disable for bench
+            debugging with a debugger attached (breakpoints would trip
+            it).
+
     config TINYLINK_BENCH_AEAD
         bool "Run ChaCha20-Poly1305 AEAD micro-benchmark on boot"
         default n

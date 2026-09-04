@@ -40,13 +40,6 @@ extern "C" {
 #endif
 
 #ifdef ESP_PLATFORM
-/* POST /machine/map with `Stream:false`, parse the single MapResponse the
- * server returns, and fill `out`. The HTTP/2 stream is closed by the
- * server after the single message in non-stream mode. */
-esp_err_t mapreq_fetch_once(ts2021_conn_t *conn,
-                            const tinylink_keys_t *keys,
-                            tl_netmap_t *out);
-
 /* Lite endpoint update: POST /machine/map with `Stream:false` AND
  * `OmitPeers:true`. Per upstream
  * tailscale/control/controlclient/auto.go:249-251, this is the only

@@ -7,6 +7,172 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Road-to-100 round (2026-09-04, part 2, branch `feat/road-to-100`)
+
+Works down the prioritized list in `docs/ROADMAP.md` § "Improvement list
+(2026-09-04)". Host suite **566 strict OK, 0 FAIL** (+40: `test_jsmn_split`,
+`test_tai64n`, `test_nacl_box`), clean under ASan + UBSan. Δ flash
+946 293 → **938 421 B** (−7.7 KiB). Δ static DRAM 136 656 → **106 880 B**
+(75.6 % → 59.1 %; BSS 122 024 → 92 248 B). Firmware version 1.0.0 →
+**1.2.0** (`IPNVersion 1.2.0-tinylink` in the admin panel — 1.1.0 was
+flashed first and the panel flipped `tsReleaseTrack` to *unstable*:
+Tailscale treats odd minor versions as unstable builds, the same rule
+PR #87 leaned on to reach *stable* with 1.0.0; even minors only from
+now on). Compiler
+warnings: 0. Hardware validation at the end of this entry.
+
+#### 1 — MapResponse parsed one value at a time (−30 KiB BSS, no tailnet-size ceiling)
+
+`mapresp_parse` used to tokenize the whole document into a 2 500-entry
+jsmn table (40 KiB BSS) — and any tailnet whose MapResponse exceeded
+that (≈ 30 peers with Hostinfo) failed to parse outright. New
+`jsmn_split.h` (header-only, host-tested) iterates an object's members
+/ an array's elements by byte range without tokenizing; `mapresp_parse`
+now splits the top level, then hands jsmn one value at a time — the
+self `Node`, each `Peers[i]` / `PeersChanged[i]`, each
+`DERPMap.Regions[id]`; `PeersChangedPatch` entries are scanned for
+`Key`/`DiscoKey` straight off the split with no tokens at all. The table
+is 640 tokens (10 KiB); an oversized element is skipped with a log
+instead of failing the map. Every other top-level key (DNSConfig,
+PacketFilter, UserProfiles, …) is skipped by range. `test_mapresp`'s real
+MapResponse stubs pass unchanged; `mapresp peak` now logs the largest
+single sub-parse.
+
+#### 2 — Task WDT for the application tasks (ROADMAP execution-queue item 2)
+
+`wg_rx`, `wg_tx`, telemetry, the DERP supervisor and the map long-poll
+subscribe to the ESP task WDT (`tl_wdt.h`, `CONFIG_TINYLINK_APP_TASK_WDT`,
+default y) and feed once per loop iteration. Blocking TLS reads feed
+through a new `tls_io` poll hook on every WANT_READ/WRITE poll (one 30-s
+SO_RCVTIMEO each) and after every partial transfer; long sleeps
+(Retry-After up to 5 min, reconnect ladders, the DERP dataplane wait)
+go through `tl_wdt_sleep_ms` in 10-s slices. `sdkconfig.defaults` pins
+`ESP_TASK_WDT_TIMEOUT_S=60` — the Kconfig maximum; the first flash of
+this round set 90, which Kconfig silently dropped back to the 5-s
+default, and the long-poll (which feeds once per 30-s TLS poll) tripped
+the watchdog 24 s after boot in a reboot loop — caught by the smoke,
+fixed by staying inside the range — and `ESP_TASK_WDT_PANIC=y`: a task
+that stops iterating reboots the device into the known-good boot path,
+the same stance as the control-path wedge restart. `wg_rx`/`wg_tx`
+unsubscribe before `vTaskDelete`. Validation: boot smoke + stream soak
+below; the multi-hour soak the roadmap asks for is still owed.
+
+#### 3 — CapabilityVersion 138 → 142 (hardware A/B against tailscale.com)
+
+142 = Tailscale v1.102, the newest version headscale's capver table
+maps; buys ~4 more headscale releases before the floor (115 today,
+"latest 10 minors") reaches us. 139–142 gate only client-side node
+attributes and the c2n localapi proxy; 143–145 are deliberately not
+claimed (144 would promise the TSMP disco-key adverts tinylink does not
+send). Changes the Noise prologue (`Tailscale Control Protocol v142`),
+`RegisterRequest.Version`, `MapRequest.Version` and `/key?v=` at once.
+
+#### 4 — ts2021 connect-path buffer diet (−8 KiB of long-poll stack)
+
+`ts2021_connect`'s frame was 9 888 B: a 4 KiB `resp_buf` for the HTTP
+101 response plus the 4 077-B record scratch of the inlined
+`consume_early_payload`. Both now borrow the conn's `h2_rx` ring, which
+is idle until `h2_session_init` runs at the end of the connect and is
+exactly one record long. Nothing in the Noise/record layer changed. The
+24 KiB `tinylink_lp` stack stays for now — the measured margin grows;
+trimming it needs the multi-hour soak the M10 lesson requires.
+
+#### 5 — DERP: live relay switch, parsed port, fallback in the preferred region
+
+A netmap that moves the preferred region's node only took effect at
+the next reconnect, which on a healthy relay never came. The supervisor
+now captures a host generation at connect; `update_derp_host_from_netmap`
+bumps it (host or port change) and the event callback stops the stream
+within one server keepalive, reconnecting immediately (no backoff) to
+the new node. The parsed `DERPPort` is dialed (was hardcoded 443).
+`CONFIG_TINYLINK_DERP_SMOKE_HOST` — the host used until the first netmap
+arrives — defaults to `derp16b.tailscale.com`, in the same region as
+`TINYLINK_PREFERRED_DERP=16`, instead of derp1 (region 1): a fallback in
+another region leaves relayed DISCO/CallMeMaybe unreachable while it is
+in use.
+
+#### 6 — IP change recycles both TLS conns; WiFi reconnect backoff; storage order
+
+`IP_EVENT_STA_GOT_IP` with `ip_changed` now aborts the control read
+(`ts2021_abort_reads`) and the DERP read (new `abort_reads` flag on
+`derp_client_t`), so both conns reconnect from the new address within
+one poll instead of sitting half-open for the 120-s idle budget.
+`app_wifi.c` paces `esp_wifi_connect()` after `STA_DISCONNECTED` through
+a one-shot `esp_timer` on the shared jittered ladder (500 ms → 30 s,
+reset on GOT_IP; `backoff.h` moved to the component's public include
+dir) instead of reconnecting synchronously in a tight loop, and calls
+`esp_wifi_set_storage(RAM)` BEFORE `set_config` — the old order wrote a
+second copy of the SSID/passphrase into the driver's `nvs.net80211`
+namespace (visible in the deployed sensor's NVS).
+
+#### 7 — Control conn kept after register; Noise connect counts as alive
+
+`tinylink_register` no longer drops `s_conn` on success — the rationale
+("one nghttp2 session per request") has been obsolete since M5-2c. Saves
+one TLS + Noise IK handshake (~5 s, ~12 KiB heap transient) per boot and
+per in-place re-register. A failed register still drops the conn.
+`ensure_control_conn` feeds the wedge clock on a completed handshake
+(ROADMAP item 11): a node the server keeps rejecting with 4xx retries via
+the re-register ladder instead of rebooting every hour for nothing.
+
+#### 8 — Flash trims and dead code
+
+`CONFIG_MBEDTLS_TLS_CLIENT_ONLY=y` (no TLS server anywhere in the image),
+plain-RSA key exchange and PEM writing off, `ESP_WIFI_ENTERPRISE_SUPPORT`
+off (WPA2-PSK only). Removed: `mapreq_fetch_once` (34 KiB malloc path, no
+callers), `stun_probe_run` (ephemeral-socket probe, no callers), the
+`tinylink_telemetry_start` stub and its `main.c` call, the unreachable
+`WG_NETIF_FAILED` state.
+
+#### 9 — Per-packet INFO logs → DEBUG
+
+Direct DISCO ping/pong/CMM handling, prepunch and CMM punch pings, and
+every relayed DERP packet no longer print at INFO (UART at 115200 blocks
+the RX/DERP tasks for milliseconds per line). Telemetry `tx seq` and the
+smoke/soak grep targets are unchanged.
+
+#### 10 — Tests
+
+`test_jsmn_split` (13 cases incl. tricky strings, depth bound, a
+MapResponse-shaped split), `test_tai64n` (11: floor clamp, monotonicity,
+reservation extend, persist failure, wire layout — `wg_proto.c`'s
+cross-reboot logic had no host coverage), `test_nacl_box` (16: seal/open/
+precomputed-shared/tamper against **libsodium** vectors generated with
+PyNaCl — until now the NaCl box was only round-trip tested against
+itself, so a shared bug in `salsa20.c` would have passed). CI floor
+raised to 566.
+
+#### Hardware (deployed sensor, app partition only; the M14 image was read back to `~/tinylink-backups/` first)
+
+First flash of this round hit the WDT-range mistake described in item 2:
+`tinylink_lp` tripped the 5-s watchdog 24 s after boot, panic, reboot
+loop — everything before it (register with capver 142, the split parser
+`mapresp peak: tokens=177/640 body=25838`, DERP login, WG session) was
+already green. Reflashed with the 60-s budget: 180-s boot smoke `boots:1
+wdt:0 panics:0 initial:1 wg_up:1 stun_ok:1 stream_ended:0
+tls_read_failed:0 stream_silent:0`, register 200 at +7.5 s, initial
+netmap at +19.8 s (4 peers, 28 regions), DERP login at +23.3 s, WG
+session up at +25.0 s, telemetry every 5 000 ms from +29.9 s, 0 warnings.
+Heap after the netmap: `heap_free=63 104 largest=49 152` (M14: 33 328 /
+21 504; M13 and before: largest 9–11 KiB). `tinylink_lp hwm=13 496 B
+free` — unchanged from M14, i.e. the long-poll's steady-state peak is the
+streaming path, not the connect path the diet shortened; the trim of its
+24 KiB stack still waits for the multi-hour soak.
+
+20-min stream-stability run on the same image (1 200 s from +130 s of
+uptime): `boots:0 wdt:0 panics:0 stream_ended:0 tls_read_failed:0
+stream_silent:0`, 22 server KeepAlives, 244 telemetry datagrams at the
+exact 5 000 ms cadence, 0 WiFi disconnects, 0 DERP reconnects, 0
+warnings or errors, 21 stack-diag dumps with `heap_free` 62 664–63 396 B
+and `largest` pinned at 49 152 B; task high-water marks unchanged from
+the first dump to the last (`tinylink_lp` 13 496 B free, `tinylink_derp`
+5 140 B, `wg_rx` 2 120 B). The task WDT stayed silent for the whole run
+with every application task subscribed. The 1.2.0 image (version bump
+only, same code) was then flashed: 120-s smoke `boots:1 wdt:0 panics:0
+initial:1 wg_up:1 stun_ok:1 stream_ended:0`, register 200 at +8.4 s,
+netmap +12.7 s, DERP +15.4 s, WG session +18.9 s, `largest=51 200` at
++68 s; the admin panel shows `1.2.0-tinylink` on the stable track.
+
 ### Audit + optimization round (2026-09-04)
 
 Four inputs: a fresh two-sided upstream audit (tailscale

@@ -5,6 +5,18 @@
 
 #include "mbedtls/ssl.h"
 
+static tls_io_poll_hook_t s_poll_hook;
+
+void tls_io_set_poll_hook(tls_io_poll_hook_t hook)
+{
+    s_poll_hook = hook;
+}
+
+static inline void poll_hook(void)
+{
+    if (s_poll_hook != NULL) s_poll_hook();
+}
+
 int tls_io_read_full(tls_io_read_fn rd, void *ctx,
                      uint8_t *buf, size_t need, uint32_t max_idle)
 {
@@ -13,6 +25,7 @@ int tls_io_read_full(tls_io_read_fn rd, void *ctx,
     uint32_t idle = 0;
     while (got < need) {
         ssize_t r = rd(ctx, buf + got, need - got);
+        poll_hook();
         if (r == MBEDTLS_ERR_SSL_WANT_READ ||
             r == MBEDTLS_ERR_SSL_WANT_WRITE) {
             /* SO_RCVTIMEO fired with no data on the wire (or the TLS
@@ -45,6 +58,7 @@ int tls_io_write_full(tls_io_write_fn wr, void *ctx,
     uint32_t idle = 0;
     while (sent < len) {
         ssize_t w = wr(ctx, buf + sent, len - sent);
+        poll_hook();
         if (w == MBEDTLS_ERR_SSL_WANT_READ ||
             w == MBEDTLS_ERR_SSL_WANT_WRITE) {
             idle++;

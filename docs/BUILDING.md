@@ -99,17 +99,18 @@ is not set`); the bench code drops out of the binary entirely.
 Reference `idf.py size` numbers for the ESP32-WROOM-32E (no PSRAM)
 target on ESP-IDF v5.5.4:
 
-| Region        | Post-η baseline (`4bd5b0f`) | Post-DERP-round (`7a45269`) | M13 (`c383e49`)     | **2026-09 round**             |
-|---------------|----------------------------:|----------------------------:|--------------------:|------------------------------:|
-| Flash app     | 1 173 717 B (74.6 %)        | 1 015 533 B (64.5 %)        | 948 624 B (60.2 %)  | **946 293 B (60.1 %)**        |
-| DRAM static   | 151 412 B (83.78 %)         | 148 516 B (82.17 %)         | 149 312 B (82.6 %)  | **136 656 B (75.6 %)**        |
-| IRAM          | 104 383 B (79.64 %)         | 75 079 B (57.28 %)          | 75 079 B (57.28 %)  | **75 079 B (57.28 %)**        |
-| Bootloader    | 27 808 B                    | 18 176 B                    | 18 176 B            | 18 176 B                      |
-| RTC SLOW      | 56 B                        | 56 B                        | 56 B                | 56 B                          |
+| Region        | Post-η baseline (`4bd5b0f`) | M13 (`c383e49`)     | M14 (`8f353c5`)       | **M15**                       |
+|---------------|----------------------------:|--------------------:|----------------------:|------------------------------:|
+| Flash app     | 1 173 717 B (74.6 %)        | 948 624 B (60.2 %)  | 946 293 B (60.1 %)    | **938 421 B (59.6 %)**        |
+| DRAM static   | 151 412 B (83.78 %)         | 149 312 B (82.6 %)  | 136 656 B (75.6 %)    | **106 880 B (59.1 %)**        |
+| IRAM          | 104 383 B (79.64 %)         | 75 079 B (57.28 %)  | 75 079 B (57.28 %)    | **75 079 B (57.28 %)**        |
+| Bootloader    | 27 808 B                    | 18 176 B            | 18 176 B              | 18 176 B                      |
+| RTC SLOW      | 56 B                        | 56 B                | 56 B                  | 56 B                          |
 
-The 2026-09 DRAM drop is the removal of the endpoint-push task's 12 KiB
-static stack (see `CHANGELOG.md`). Largest contiguous heap block 60 s
-after boot: 21 504 B (was 9–11 KiB).
+M14's DRAM drop is the removal of the endpoint-push task's 12 KiB static
+stack; M15's is the MapResponse token table (40 → 10 KiB) — see
+`CHANGELOG.md`. Largest contiguous heap block 60 s after boot: 21 504 B
+after M14 (was 9–11 KiB); M15 numbers in the CHANGELOG hardware notes.
 
 Headline of the cumulative work from baseline to post-DERP-round:
 **flash −154.6 KiB, DRAM −2.9 KiB, IRAM −29.3 KiB (80 % → 57 %),

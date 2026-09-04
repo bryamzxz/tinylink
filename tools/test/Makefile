@@ -22,19 +22,21 @@ RUNNER  ?=
 CRYPTO  := ../../components/tinylink/src/crypto
 
 TL_SRC  := ../../components/tinylink/src
+TL_INC  := ../../components/tinylink/include
 
 TARGETS := test_blake2s test_curve25519 test_mapresp \
            test_chacha20 test_poly1305 test_chacha20poly1305 \
            test_hkdf_noise test_wg_handshake test_wg_transport \
            test_wg_demux test_disco test_stun test_tls_io test_derp \
            test_disco_handler test_disco_prober test_retry_after \
-           test_backoff test_keys_regen test_skip_value
+           test_backoff test_keys_regen test_skip_value test_jsmn_split \
+           test_tai64n test_nacl_box
 
 all: $(TARGETS)
 
 # Pure exponential-backoff-with-jitter helper (RC-2). Header-only.
-test_backoff: test_backoff.c $(TL_SRC)/backoff.h
-	$(CC) $(CFLAGS) -I$(TL_SRC) -o $@ test_backoff.c
+test_backoff: test_backoff.c $(TL_INC)/backoff.h
+	$(CC) $(CFLAGS) -I$(TL_INC) -o $@ test_backoff.c
 
 # Pure identity-regeneration policy (headscale 1:1 NodeKey/MachineKey). Header-only.
 test_keys_regen: test_keys_regen.c $(TL_SRC)/keys_regen.h
@@ -43,6 +45,22 @@ test_keys_regen: test_keys_regen.c $(TL_SRC)/keys_regen.h
 # Depth-bounded JSON value skipper (MapResponse stack-overflow guard). Header-only.
 test_skip_value: test_skip_value.c $(TL_SRC)/jsmn_skip.h $(TL_SRC)/jsmn.h
 	$(CC) $(CFLAGS) -I$(TL_SRC) -o $@ test_skip_value.c
+
+# Shallow JSON splitter feeding jsmn one MapResponse value at a time. Header-only.
+test_jsmn_split: test_jsmn_split.c $(TL_SRC)/jsmn_split.h
+	$(CC) $(CFLAGS) -I$(TL_SRC) -o $@ test_jsmn_split.c
+
+# TAI64N floor / reservation logic (cross-reboot handshake monotonicity).
+test_tai64n: test_tai64n.c $(TL_SRC)/wg_proto.c $(TL_SRC)/wg_proto.h
+	$(CC) $(CFLAGS) -I$(TL_SRC) -I$(CRYPTO) -o $@ test_tai64n.c $(TL_SRC)/wg_proto.c \
+	    $(CRYPTO)/blake2s.c $(CRYPTO)/hkdf_blake2s.c
+
+# libsodium reference vectors for the NaCl box (DISCO sealing).
+test_nacl_box: test_nacl_box.c $(CRYPTO)/nacl_box.c $(CRYPTO)/salsa20.c $(CRYPTO)/poly1305_donna.c \
+               $(CRYPTO)/curve25519.c $(CRYPTO)/curve25519_donna.c host_mbedtls_shim.c
+	$(CC) $(CFLAGS) -Ihost_include -I$(CRYPTO) -o $@ test_nacl_box.c $(CRYPTO)/nacl_box.c \
+	    $(CRYPTO)/salsa20.c $(CRYPTO)/poly1305_donna.c $(CRYPTO)/curve25519.c \
+	    $(CRYPTO)/curve25519_donna.c host_mbedtls_shim.c
 
 test_blake2s: test_blake2s.c $(CRYPTO)/blake2s.c $(CRYPTO)/blake2s.h
 	$(CC) $(CFLAGS) -I$(CRYPTO) -o $@ test_blake2s.c $(CRYPTO)/blake2s.c
@@ -53,7 +71,7 @@ test_curve25519: test_curve25519.c $(CRYPTO)/curve25519.c $(CRYPTO)/curve25519_d
 # mapreq.c builds on host because its ESP-IDF-specific code is guarded
 # by #ifdef ESP_PLATFORM; the mapresp_parse() entry point we test here
 # is platform-independent and depends only on the vendored jsmn.h.
-test_mapresp: test_mapresp.c $(TL_SRC)/mapreq.c $(TL_SRC)/netmap.h $(TL_SRC)/jsmn.h
+test_mapresp: test_mapresp.c $(TL_SRC)/mapreq.c $(TL_SRC)/netmap.h $(TL_SRC)/jsmn.h $(TL_SRC)/jsmn_split.h
 	$(CC) $(CFLAGS) -I$(TL_SRC) -o $@ test_mapresp.c $(TL_SRC)/mapreq.c
 
 # RFC 8439 §2.4.2 — ChaCha20 keystream KAT.
@@ -214,7 +232,8 @@ test: test_blake2s.run test_curve25519.run test_mapresp.run \
       test_wg_demux.run test_disco.run test_stun.run test_tls_io.run \
       test_derp.run test_disco_handler.run test_disco_prober.run \
       test_retry_after.run test_backoff.run test_keys_regen.run \
-      test_skip_value.run
+      test_skip_value.run test_jsmn_split.run test_tai64n.run \
+      test_nacl_box.run
 
 test_blake2s.run: test_blake2s
 	$(RUNNER) ./test_blake2s
@@ -236,6 +255,15 @@ test_keys_regen.run: test_keys_regen
 
 test_skip_value.run: test_skip_value
 	$(RUNNER) ./test_skip_value
+
+test_jsmn_split.run: test_jsmn_split
+	$(RUNNER) ./test_jsmn_split
+
+test_tai64n.run: test_tai64n
+	$(RUNNER) ./test_tai64n
+
+test_nacl_box.run: test_nacl_box
+	$(RUNNER) ./test_nacl_box
 
 test_poly1305.run: test_poly1305
 	$(RUNNER) ./test_poly1305

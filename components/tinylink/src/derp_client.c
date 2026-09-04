@@ -54,6 +54,7 @@ static ssize_t derp_tls_write_raw(void *ctx, const uint8_t *buf, size_t len) {
 }
 static ssize_t derp_tls_read(void *ctx, uint8_t *buf, size_t len) {
     derp_client_t *c = (derp_client_t *)ctx;
+    if (c->abort_reads) return DERP_ERR_READ_ABORTED;
     return esp_tls_conn_read(c->tls, buf, len);
 }
 

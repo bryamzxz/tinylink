@@ -20,6 +20,7 @@
 #define JSMN_STATIC
 #include "jsmn.h"
 #include "jsmn_skip.h"
+#include "jsmn_split.h"
 
 #ifdef ESP_PLATFORM
 static const char *TAG = "mapreq";
@@ -32,17 +33,16 @@ static const char *TAG = "mapreq";
  * boot 2026-05-02. 48 KiB gives us headroom for a handful of peers
  * before we'd need streaming. */
 #define RESPONSE_BUF_SZ  32768
-/* MapResponse JSON token budget. Empirically measured 2026-05-06
- * post-#25 (28 DERP regions, 2 peers, full DERPMap): 1884 tokens for
- * a 19248-byte first netmap. Token count is bounded by the in-tree
- * caps (TL_MAX_PEERS=4 with 4 endpoints each ≈ 80 tokens, plus
- * TL_MAX_DERP_REGIONS=28 × TL_MAX_DERP_NODES=3 × ≈6 fields ≈ 500
- * tokens), so growth from the measured peak is structurally limited.
- * 2500 = 1884 × 1.33 (33% margin over observed peak) + headroom for
- * the bounded growth surface. Saves ~23 KiB BSS vs the prior 3920
- * size (which was an over-estimate from the pre-#25 era when only
- * 4 DERP regions were parsed). 2500 × 16 = 40 KiB BSS table. */
-#define MAX_TOKENS       2500
+/* jsmn token budget for ONE sub-document. Since 2026-09 the MapResponse
+ * is not tokenized as a whole: jsmn_split.h cuts it into its top-level
+ * values and this table only ever holds the self Node object, one peer
+ * object, one DERP region object or one patch entry at a time. The
+ * largest of those in the wild is a peer with a full Hostinfo (a few
+ * hundred tokens); 640 leaves ~2× headroom, and an oversized element is
+ * skipped with a log instead of failing the whole map. Was 2 500 tokens
+ * (40 KiB BSS) for the whole document — which also capped the tailnet
+ * size the parser could handle at all. 640 × 16 = 10 KiB BSS. */
+#define SUB_MAX_TOKENS   640
 
 /* ------------------------------ helpers ----------------------------------- */
 
@@ -282,21 +282,41 @@ static esp_err_t parse_one_peer(const char *js, const jsmntok_t *toks,
     return ESP_OK;
 }
 
-static esp_err_t parse_peers_arr(const char *js, const jsmntok_t *toks,
-                                 int arr_idx, tl_netmap_t *out)
+/* One jsmn token table for every sub-parse (BSS, see SUB_MAX_TOKENS). */
+static jsmntok_t s_toks[SUB_MAX_TOKENS];
+
+/* Tokenize one extracted value. Returns the jsmn token count (≥ 1) or a
+ * negative jsmn error; updates *peak for the soak log. */
+static int sub_parse(const char *js, size_t len, int *peak)
 {
-    if (!tok_is_arr(&toks[arr_idx])) return ESP_ERR_INVALID_ARG;
-    int n = toks[arr_idx].size;
-    int next = arr_idx + 1;
-    out->n_peers = 0;
-    for (int k = 0; k < n; k++) {
-        if (tok_is_obj(&toks[next]) && out->n_peers < TL_MAX_PEERS) {
-            parse_one_peer(js, toks, next, &out->peers[out->n_peers]);
-            out->n_peers++;
-        }
-        next = skip_value(toks, next);
+    jsmn_parser p;
+    jsmn_init(&p);
+    int n = jsmn_parse(&p, js, len, s_toks, SUB_MAX_TOKENS);
+    if (n > *peak) *peak = n;
+#ifdef ESP_PLATFORM
+    if (n == JSMN_ERROR_NOMEM) {
+        ESP_LOGW(TAG, "sub-document exceeds %d tokens (%u bytes) — skipped",
+                 SUB_MAX_TOKENS, (unsigned)len);
     }
-    return ESP_OK;
+#endif
+    return n;
+}
+
+/* Peers / PeersChanged: array of Node objects, one sub-parse each. */
+static esp_err_t parse_peers_split(const char *js, size_t len,
+                                   tl_netmap_t *out, int *peak)
+{
+    size_t pos = 0;
+    const char *v; size_t vlen; int rc;
+    out->n_peers = 0;
+    while ((rc = tl_jsplit_arr_next(js, len, &pos, &v, &vlen)) == 1) {
+        if (out->n_peers >= TL_MAX_PEERS) continue;   /* keep draining; cap like before */
+        int n = sub_parse(v, vlen, peak);
+        if (n < 1 || !tok_is_obj(&s_toks[0])) continue;
+        parse_one_peer(v, s_toks, 0, &out->peers[out->n_peers]);
+        out->n_peers++;
+    }
+    return (rc < 0) ? ESP_ERR_INVALID_RESPONSE : ESP_OK;
 }
 
 static esp_err_t parse_one_derp_region(const char *js, const jsmntok_t *toks,
@@ -357,36 +377,52 @@ static esp_err_t parse_one_derp_region(const char *js, const jsmntok_t *toks,
     return ESP_OK;
 }
 
-static esp_err_t parse_derp_map(const char *js, const jsmntok_t *toks,
-                                int obj_idx, tl_netmap_t *out)
+/* DERPMap: {"Regions": {"<id>": {...region...}, ...}} — one sub-parse per
+ * region object. The key (region id as string) is ignored: RegionID is
+ * inside the value too. */
+static esp_err_t parse_derp_map_split(const char *js, size_t len,
+                                      tl_netmap_t *out, int *peak)
 {
-    if (!tok_is_obj(&toks[obj_idx])) return ESP_ERR_INVALID_ARG;
-    int n = toks[obj_idx].size;
-    int next = obj_idx + 1;
+    size_t pos = 0;
+    tl_jsplit_kv_t kv; int rc;
     out->n_derp_regions = 0;
-    for (int k = 0; k < n; k++) {
-        const jsmntok_t *key = &toks[next];
-        int val_idx = next + 1;
-        if (tok_eq(js, key, "Regions") && tok_is_obj(&toks[val_idx])) {
-            int rn = toks[val_idx].size;
-            int rx = val_idx + 1;
-            for (int r = 0; r < rn; r++) {
-                /* key is region-id-as-string; we ignore it (RegionID is
-                 * also inside the value object). */
-                int region_obj = rx + 1;
-                if (tok_is_obj(&toks[region_obj]) &&
-                    out->n_derp_regions < TL_MAX_DERP_REGIONS) {
-                    parse_one_derp_region(js, toks, region_obj,
-                                          &out->derp_regions[out->n_derp_regions]);
-                    out->n_derp_regions++;
-                }
-                rx = skip_value(toks, region_obj);
-            }
-            out->have_derp_map = true;
+    while ((rc = tl_jsplit_obj_next(js, len, &pos, &kv)) == 1) {
+        if (!tl_jsplit_key_is(&kv, "Regions") || kv.val[0] != '{') continue;
+        size_t rp = 0;
+        tl_jsplit_kv_t rkv; int rrc;
+        while ((rrc = tl_jsplit_obj_next(kv.val, kv.val_len, &rp, &rkv)) == 1) {
+            if (out->n_derp_regions >= TL_MAX_DERP_REGIONS) continue;
+            int n = sub_parse(rkv.val, rkv.val_len, peak);
+            if (n < 1 || !tok_is_obj(&s_toks[0])) continue;
+            parse_one_derp_region(rkv.val, s_toks, 0,
+                                  &out->derp_regions[out->n_derp_regions]);
+            out->n_derp_regions++;
         }
-        next = skip_value(toks, val_idx);
+        if (rrc < 0) return ESP_ERR_INVALID_RESPONSE;
+        out->have_derp_map = true;
     }
-    return ESP_OK;
+    return (rc < 0) ? ESP_ERR_INVALID_RESPONSE : ESP_OK;
+}
+
+/* PeersChangedPatch: array of tailcfg.PeerChange objects. Only the
+ * presence of "Key" / "DiscoKey" matters (see netmap.h) — read straight
+ * off the split, no tokens needed. */
+static esp_err_t parse_patch_split(const char *js, size_t len, tl_netmap_t *out)
+{
+    size_t pos = 0;
+    const char *v; size_t vlen; int rc;
+    while ((rc = tl_jsplit_arr_next(js, len, &pos, &v, &vlen)) == 1) {
+        if (v[0] != '{') continue;
+        size_t ep = 0;
+        tl_jsplit_kv_t ekv; int erc;
+        while ((erc = tl_jsplit_obj_next(v, vlen, &ep, &ekv)) == 1) {
+            if (tl_jsplit_key_is(&ekv, "Key") || tl_jsplit_key_is(&ekv, "DiscoKey")) {
+                out->patch_identity_changed = true;
+            }
+        }
+        if (erc < 0) return ESP_ERR_INVALID_RESPONSE;
+    }
+    return (rc < 0) ? ESP_ERR_INVALID_RESPONSE : ESP_OK;
 }
 
 esp_err_t mapresp_parse(const char *json, size_t json_len, tl_netmap_t *out)
@@ -394,95 +430,53 @@ esp_err_t mapresp_parse(const char *json, size_t json_len, tl_netmap_t *out)
     if (json == NULL || out == NULL) return ESP_ERR_INVALID_ARG;
     tl_netmap_clear(out);
 
-    /* Token budget in BSS. MAX_TOKENS * sizeof(jsmntok_t) = 4500 * 16
-     * = 72 KiB. Putting this in BSS instead of malloc'ing per parse:
-     * (a) avoids heap fragmentation — after two TLS handshakes (register
-     * + long-poll) the heap's largest_free_block dropped to ~68 KiB,
-     * smaller than the alloc, and mapresp_parse started failing with
-     * ESP_ERR_NO_MEM; (b) makes the cost a constant we can budget for
-     * at link time instead of a runtime mystery. We have ~110 KiB of
-     * free DRAM at boot before WiFi/TLS bring-up, so 72 KiB resident
-     * fits cleanly. */
-    static jsmntok_t toks[MAX_TOKENS];
-    jsmn_parser p;
-    jsmn_init(&p);
-    int n = jsmn_parse(&p, json, json_len, toks, MAX_TOKENS);
-    if (n == JSMN_ERROR_NOMEM) {
-        /* Token table too small. A real Tailscale netmap saturating
-         * this budget means the in-tree TL_MAX_* caps are also out
-         * of step with the live tailnet. Distinct error code so the
-         * caller can log + raise MAX_TOKENS. */
-#ifdef ESP_PLATFORM
-        ESP_LOGE(TAG, "jsmn token budget exhausted (%d tokens, %u bytes) — "
-                      "raise MAX_TOKENS",
-                 MAX_TOKENS, (unsigned)json_len);
-#endif
-        return ESP_ERR_INVALID_RESPONSE;
-    }
-    if (n < 1 || !tok_is_obj(&toks[0])) {
-        return ESP_ERR_INVALID_RESPONSE;
-    }
-
-    /* Soak observability: per-parse jsmn token usage. Grep `mapresp peak`
-     * across a multi-hour log and take the max to size MAX_TOKENS down
-     * to (peak + 20 % margin). Currently MAX_TOKENS=2500 → 40 KiB BSS;
-     * 4-peer netmaps almost certainly use a small fraction of that. */
-#ifdef ESP_PLATFORM
-    ESP_LOGI(TAG, "mapresp peak: tokens=%d/%d body=%u",
-             n, MAX_TOKENS, (unsigned)json_len);
-#endif
-
-    int fields = toks[0].size;
-    int next = 1;
-    for (int k = 0; k < fields; k++) {
-        const jsmntok_t *key = &toks[next];
-        int val_idx = next + 1;
-        if (tok_eq(json, key, "Node") && tok_is_obj(&toks[val_idx])) {
-            parse_node_obj(json, toks, val_idx, out);
-        } else if (tok_eq(json, key, "Peers") && tok_is_arr(&toks[val_idx])) {
-            parse_peers_arr(json, toks, val_idx, out);
-        } else if (tok_eq(json, key, "PeersChanged") && tok_is_arr(&toks[val_idx])) {
+    /* Shallow split of the top-level object (jsmn_split.h), then one
+     * bounded jsmn parse per value we care about. Every other key
+     * (DNSConfig, PacketFilter, UserProfiles, ...) is skipped by byte
+     * range without being tokenized at all. */
+    int peak = 0;
+    size_t pos = 0;
+    tl_jsplit_kv_t kv;
+    int rc;
+    esp_err_t err = ESP_OK;
+    while ((rc = tl_jsplit_obj_next(json, json_len, &pos, &kv)) == 1) {
+        if (tl_jsplit_key_is(&kv, "Node") && kv.val[0] == '{') {
+            int n = sub_parse(kv.val, kv.val_len, &peak);
+            if (n >= 1 && tok_is_obj(&s_toks[0])) {
+                parse_node_obj(kv.val, s_toks, 0, out);
+            }
+        } else if ((tl_jsplit_key_is(&kv, "Peers") ||
+                    tl_jsplit_key_is(&kv, "PeersChanged")) && kv.val[0] == '[') {
             /* Stream-mode delta-add. The control plane sends the full peer
              * list in PeersChanged on the first MapResponse instead of
-             * Peers (verified on-device 2026-05-02 via field-substring
-             * scan: first frame has PeersChanged=1, Peers=0). Subsequent
-             * updates carry only the changed peers. For our M2 first cut
-             * we treat PeersChanged identically to Peers — replace the
-             * full peer list. PeersRemoved is not yet honored. */
-            parse_peers_arr(json, toks, val_idx, out);
-        } else if (tok_eq(json, key, "PeersChangedPatch") &&
-                   tok_is_arr(&toks[val_idx])) {
-            /* Minimal patch handling (upstream-audit 2026-07-16): scan
-             * each tailcfg.PeerChange entry for the two fields the data
-             * plane cannot afford to miss — "Key" (NodeKey rotation) and
-             * "DiscoKey". Presence of either flags the netmap so the
-             * streaming caller recycles the stream and refetches a full
-             * map instead of running WG/DISCO against dead peer keys.
-             * All other patch content (Endpoints, DERPRegion, Online...)
-             * is deliberately not merged — see netmap.h. */
-            int pn = toks[val_idx].size;
-            int px = val_idx + 1;
-            for (int pk = 0; pk < pn; pk++) {
-                if (tok_is_obj(&toks[px])) {
-                    int nfields = toks[px].size;
-                    int fx = px + 1;
-                    for (int q = 0; q < nfields; q++) {
-                        const jsmntok_t *fkey = &toks[fx];
-                        if (tok_eq(json, fkey, "Key") ||
-                            tok_eq(json, fkey, "DiscoKey")) {
-                            out->patch_identity_changed = true;
-                        }
-                        fx = skip_value(toks, fx + 1);
-                    }
-                }
-                px = skip_value(toks, px);
-            }
-        } else if (tok_eq(json, key, "DERPMap") &&
-                   tok_is_obj(&toks[val_idx])) {
-            parse_derp_map(json, toks, val_idx, out);
+             * Peers; subsequent updates carry only the changed peers. We
+             * treat PeersChanged identically to Peers — replace the full
+             * peer list. PeersRemoved is not honored (see ROADMAP). */
+            err = parse_peers_split(kv.val, kv.val_len, out, &peak);
+        } else if (tl_jsplit_key_is(&kv, "PeersChangedPatch") && kv.val[0] == '[') {
+            /* Minimal patch handling (upstream-audit 2026-07-16): a patch
+             * touching a peer's "Key" (NodeKey rotation) or "DiscoKey"
+             * flags the netmap so the streaming caller recycles the
+             * stream and refetches a full map. Nothing is merged. */
+            err = parse_patch_split(kv.val, kv.val_len, out);
+        } else if (tl_jsplit_key_is(&kv, "DERPMap") && kv.val[0] == '{') {
+            err = parse_derp_map_split(kv.val, kv.val_len, out, &peak);
         }
-        next = skip_value(toks, val_idx);
+        if (err != ESP_OK) break;
     }
+    if (rc < 0 || err != ESP_OK) {
+#ifdef ESP_PLATFORM
+        ESP_LOGE(TAG, "MapResponse malformed at byte %u of %u",
+                 (unsigned)pos, (unsigned)json_len);
+#endif
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    /* Soak observability: largest single sub-parse this message. */
+#ifdef ESP_PLATFORM
+    ESP_LOGI(TAG, "mapresp peak: tokens=%d/%d body=%u",
+             peak, SUB_MAX_TOKENS, (unsigned)json_len);
+#endif
     return ESP_OK;
 }
 
@@ -670,92 +664,6 @@ esp_err_t mapreq_push_endpoints(ts2021_conn_t *conn,
     return ESP_OK;
 }
 
-esp_err_t mapreq_fetch_once(ts2021_conn_t *conn,
-                            const tinylink_keys_t *keys,
-                            tl_netmap_t *out)
-{
-    if (conn == NULL || keys == NULL || out == NULL) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    /* Buffers heap-allocated: response can be ~32 KiB + tokens table
-     * is sizeof(jsmntok_t) * MAX_TOKENS = 64 KiB. Keeping these in BSS
-     * overflows the 168 KiB DRAM segment once esp_main_task and the
-     * WiFi/lwIP/mbedtls stacks have taken their share. */
-    char    *body = malloc(REQUEST_BUF_SZ);
-    uint8_t *resp = malloc(RESPONSE_BUF_SZ);
-    if (body == NULL || resp == NULL) {
-        free(body); free(resp);
-        return ESP_ERR_NO_MEM;
-    }
-
-    int body_len = build_request_body(keys, false, false, body, REQUEST_BUF_SZ);
-    if (body_len < 0) {
-        free(body); free(resp);
-        return ESP_ERR_INVALID_SIZE;
-    }
-
-    size_t  resp_len = 0;
-    int     status = 0;
-    esp_err_t err = h2_post_json(conn, "/machine/map",
-                                 CONFIG_TINYLINK_CONTROL_HOST,
-                                 (const uint8_t *)body, (size_t)body_len,
-                                 &status, resp, RESPONSE_BUF_SZ - 1, &resp_len);
-    free(body);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "h2_post_json failed: 0x%x", err);
-        free(resp);
-        return err;
-    }
-    resp[resp_len] = '\0';
-    ESP_LOGI(TAG, "/machine/map status=%d body=%u bytes",
-             status, (unsigned)resp_len);
-    if (status != 200) {
-        if (status == 429 || status == 503) {
-            ESP_LOGW(TAG, "/machine/map throttled: HTTP %d "
-                          "(Retry-After=%d s)",
-                     status, conn->h2_retry_after_s);
-        } else {
-            ESP_LOGE(TAG, "control plane returned HTTP %d: %.*s",
-                     status, (int)(resp_len > 200 ? 200 : resp_len),
-                     (const char *)resp);
-        }
-        free(resp);
-        return ESP_FAIL;
-    }
-
-    /* Even for non-streaming MapResponse, the control plane frames the
-     * body as `LE32 length || JSON`. Verified on real HW 2026-05-02:
-     * first 4 bytes were `51 4b 00 00` = 19281, matching the JSON
-     * length right after. Strip the prefix before parsing. (Upstream
-     * Go reads it in controlclient/direct.go as part of its standard
-     * stream framing whether Stream is true or not.) */
-    if (resp_len < 4) {
-        ESP_LOGE(TAG, "MapResponse too short: %u bytes", (unsigned)resp_len);
-        free(resp);
-        return ESP_ERR_INVALID_RESPONSE;
-    }
-    uint32_t framed_len = (uint32_t)resp[0]
-                        | ((uint32_t)resp[1] <<  8)
-                        | ((uint32_t)resp[2] << 16)
-                        | ((uint32_t)resp[3] << 24);
-    if (framed_len + 4 > resp_len) {
-        ESP_LOGE(TAG, "MapResponse framing: declared %u + 4 > received %u",
-                 (unsigned)framed_len, (unsigned)resp_len);
-        free(resp);
-        return ESP_ERR_INVALID_RESPONSE;
-    }
-    /* Shrink down to actual JSON size before parsing — mapresp_parse
-     * allocates a ~72 KiB token table; keeping the full 32 KiB
-     * response alongside risks DRAM exhaustion. */
-    memmove(resp, resp + 4, framed_len);
-    resp[framed_len] = '\0';
-    uint8_t *trimmed = realloc(resp, framed_len + 1);
-    if (trimmed != NULL) resp = trimmed;
-    err = mapresp_parse((const char *)resp, framed_len, out);
-    free(resp);
-    return err;
-}
 
 /* ---- streaming reader ----------------------------------------------------
  *

@@ -21,6 +21,7 @@
 #include "sdkconfig.h"
 
 #include "backoff.h"
+#include "tl_wdt.h"
 #include "control_key.h"
 #include "derp_client.h"
 #include "disco.h"
@@ -70,7 +71,17 @@ static esp_err_t ensure_control_conn(void)
     if (s_conn_open) return ESP_OK;
     esp_err_t err = ts2021_connect(&s_conn, s_keys.machine_priv,
                                    s_keys.machine_pub, s_control_pub);
-    if (err == ESP_OK) s_conn_open = true;
+    if (err == ESP_OK) {
+        s_conn_open = true;
+        /* A completed TLS + Noise IK handshake proves the control plane
+         * is reachable and our local stack is not wedged — exactly what
+         * the wedge-restart last resort exists to detect. Feed it here
+         * too (not only from stream bytes), so a node the server keeps
+         * rejecting with 4xx (deleted / expired) retries via the
+         * re-register ladder instead of rebooting every
+         * CONFIG_TINYLINK_CONTROL_WEDGE_RESTART_S, which cannot help. */
+        tinylink_control_mark_alive();
+    }
     return err;
 }
 
@@ -133,6 +144,8 @@ void tinylink_diag_dump_stacks(void)
 
 esp_err_t tinylink_init(void)
 {
+    /* Task-WDT feed for every blocking TLS poll (see tl_wdt.h). */
+    tls_io_set_poll_hook(tl_wdt_feed);
     esp_err_t err = keys_load_or_generate(&s_keys);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "keys_load_or_generate failed: 0x%x", err);
@@ -290,18 +303,16 @@ esp_err_t tinylink_register(void)
      * way a plain memset on a no-longer-read buffer can). */
     mbedtls_platform_zeroize(auth_key, sizeof(auth_key));
 
-    /* Drop the conn after register. Reusing the same ts2021 channel for
-     * /machine/map fails because our h2_drive_request creates+destroys
-     * a fresh nghttp2 session per request, and the GOAWAY emitted on
-     * the first session_del causes the SECOND submit to land on a
-     * half-closed transport (server returns HTTP 0).
-     *
-     * Until h2_client is refactored to keep ONE persistent nghttp2
-     * session per ts2021 conn (matching upstream's go-http2 behavior),
-     * the safe pattern is one ts2021 conn per request. The 24 KiB
-     * long-poll stack now absorbs the second handshake without
-     * blowing — see tinylink_long_poll_start. */
-    drop_control_conn();
+    /* Keep the conn on success: since M5-2c the nghttp2 session is
+     * persistent per ts2021 conn, so the next request (the boot-time
+     * endpoint push, then the map stream — or, on the in-place
+     * re-register path, the push the long-poll runs right after) rides
+     * the same channel. The old "one conn per request" teardown here
+     * dated from the per-request session_new/del era and cost one full
+     * TLS + Noise IK handshake (~5 s, ~12 KiB heap transient) per boot
+     * and per re-register. A failed register still drops the conn so a
+     * half-broken channel is never reused. */
+    if (err != ESP_OK) drop_control_conn();
     return err;
 }
 
@@ -450,6 +461,15 @@ static derp_client_t s_derp_sup;
  * (which races against the long-poll's first netmap) doesn't see an
  * empty string. Updated in-place from long_poll_handler each frame. */
 static char s_derp_host[TL_DERP_HOSTNAME_LEN] = CONFIG_TINYLINK_DERP_SMOKE_HOST;
+/* Bumped by update_derp_host_from_netmap on every host/port change; the
+ * supervisor captures it at connect and its event callback stops the
+ * stream when it moves, so a control-plane reroute reaches a LIVE
+ * connection within one server keepalive instead of waiting for the
+ * stream to die on its own (2026-09). */
+static volatile uint32_t s_derp_host_gen;
+static uint32_t          s_derp_conn_gen;
+static uint16_t          s_derp_port;      /* 0 → DERP default 443 */
+
 
 typedef struct {
     uint64_t recv_packets;
@@ -588,7 +608,7 @@ static void prepunch_pings_to_peers(const tl_peer_t *peers, size_t n_peers)
                                 esp_timer_get_time());
 #endif
             total_sent++;
-            ESP_LOGI(TAG, "prepunch ping → %s txid=%02x%02x%02x%02x..",
+            ESP_LOGD(TAG, "prepunch ping → %s txid=%02x%02x%02x%02x..",
                      ep, ping.txid[0], ping.txid[1],
                      ping.txid[2], ping.txid[3]);
         }
@@ -673,7 +693,7 @@ static void send_disco_pings_to_cmm_endpoints(const derp_event_t *e)
                             esp_timer_get_time());
 #endif
         sent++;
-        ESP_LOGI(TAG, "cmm punch ping → %u.%u.%u.%u:%u txid=%02x%02x%02x%02x..",
+        ESP_LOGD(TAG, "cmm punch ping → %u.%u.%u.%u:%u txid=%02x%02x%02x%02x..",
                  ep->addr[12], ep->addr[13], ep->addr[14], ep->addr[15],
                  (unsigned)ep->port,
                  ping.txid[0], ping.txid[1], ping.txid[2], ping.txid[3]);
@@ -777,7 +797,7 @@ static int derp_sup_event_cb(const derp_event_t *e, void *ctx)
     switch (e->kind) {
     case DERP_EVT_RECV_PACKET:
         st->recv_packets++;
-        ESP_LOGI(TAG, "derp recv: src=%02x%02x..%02x%02x len=%u (total=%lu)",
+        ESP_LOGD(TAG, "derp recv: src=%02x%02x..%02x%02x len=%u (total=%lu)",
                  e->src_pub[0], e->src_pub[1],
                  e->src_pub[DERP_KEY_LEN - 2], e->src_pub[DERP_KEY_LEN - 1],
                  (unsigned)e->data_len,
@@ -812,6 +832,11 @@ static int derp_sup_event_cb(const derp_event_t *e, void *ctx)
                  (unsigned)e->restart_reconnect_ms,
                  (unsigned)e->restart_total_ms);
         break;
+    }
+    if (s_derp_host_gen != s_derp_conn_gen) {
+        ESP_LOGI(TAG, "derp supervisor: preferred relay changed — leaving %s",
+                 s_derp_host);
+        return 1;   /* derp_client_run returns ESP_OK; supervisor reconnects */
     }
     return 0;
 }
@@ -851,6 +876,7 @@ static void derp_supervised_task(void *arg)
      * 30 s is generous: register + first MapRequest typically lands
      * in 5-10 s on this hardware. On timeout we still proceed to the
      * connect loop — best-effort with the fallback host. */
+    tl_wdt_subscribe();
     esp_err_t wait_err = tinylink_wait_dataplane_ms(30000);
     if (wait_err != ESP_OK) {
         ESP_LOGW(TAG, "derp supervisor: dataplane wait timeout (0x%x) — "
@@ -894,7 +920,9 @@ static void derp_supervised_task(void *arg)
                      attempt, host,
                      (unsigned)esp_get_free_heap_size(),
                      (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
-            esp_err_t cerr = derp_client_connect_login(&s_derp_sup, host, 443,
+            s_derp_conn_gen = s_derp_host_gen;
+            esp_err_t cerr = derp_client_connect_login(&s_derp_sup, host,
+                                                       s_derp_port,
                                                        s_keys.node_priv,
                                                        s_keys.node_pub);
             if (cerr == ESP_OK) {
@@ -911,7 +939,7 @@ static void derp_supervised_task(void *arg)
                           "backoff %u ms",
                      attempt, cerr, (unsigned)delay_ms);
             derp_client_close(&s_derp_sup);
-            vTaskDelay(pdMS_TO_TICKS(delay_ms));
+            tl_wdt_sleep_ms(delay_ms);
         }
 
         ESP_LOGI(TAG, "derp supervisor: entering recv loop server-v=%d",
@@ -936,6 +964,9 @@ static void derp_supervised_task(void *arg)
                      (unsigned long)wg_netif_get_tx_drops());
         }
         derp_client_close(&s_derp_sup);
+        if (s_derp_host_gen != s_derp_conn_gen) {
+            continue;   /* deliberate relay switch: reconnect right away */
+        }
         /* A stream that served for a while was a healthy relay — recover
          * from the base; a stream that died young climbs the ladder. */
         const int64_t up_us = esp_timer_get_time() - t0;
@@ -947,7 +978,7 @@ static void derp_supervised_task(void *arg)
         const uint32_t delay_ms = tl_backoff_ms(fail, base_ms, cap_ms,
                                                 esp_random());
         ESP_LOGI(TAG, "derp supervisor: reconnecting in %u ms", (unsigned)delay_ms);
-        vTaskDelay(pdMS_TO_TICKS(delay_ms));
+        tl_wdt_sleep_ms(delay_ms);
     }
 }
 
@@ -1057,10 +1088,14 @@ static void update_derp_host_from_netmap(const tl_netmap_t *nm)
         if (r->region_id != want || r->n_nodes == 0) continue;
         const char *h = r->nodes[0].hostname;
         if (h[0] == '\0') continue;
-        if (strcmp(s_derp_host, h) == 0) return;  /* unchanged */
+        const uint16_t port = r->nodes[0].port;
+        if (strcmp(s_derp_host, h) == 0 && s_derp_port == port) return;  /* unchanged */
         snprintf(s_derp_host, sizeof(s_derp_host), "%s", h);
-        ESP_LOGI(TAG, "derp host updated to region %d node: %s",
-                 want, s_derp_host);
+        s_derp_port = port;
+        s_derp_host_gen++;
+        ESP_LOGI(TAG, "derp host updated to region %d node: %s:%u (gen %u)",
+                 want, s_derp_host, port ? port : 443u,
+                 (unsigned)s_derp_host_gen);
         return;
     }
 }
@@ -1196,7 +1231,9 @@ static void long_poll_task(void *arg)
      * is an in-place re-register (the exact path every boot exercises). */
     uint32_t consec_4xx = 0;
     tinylink_control_mark_alive();  /* arm the wedge clock from task start */
+    tl_wdt_subscribe();
     for (;;) {
+        tl_wdt_feed();
         int retry_after_s = 0;
         int http_status   = 0;
         esp_err_t err = ensure_control_conn();
@@ -1315,7 +1352,7 @@ static void long_poll_task(void *arg)
                                      LP_BACKOFF_CAP_MS, esp_random());
             if (fail_attempt < 1000u) fail_attempt++;  /* saturate the counter */
         }
-        vTaskDelay(pdMS_TO_TICKS(delay_ms));
+        tl_wdt_sleep_ms(delay_ms);   /* Retry-After may be minutes; keep feeding */
     }
 }
 
@@ -1375,18 +1412,9 @@ esp_err_t tinylink_wait_dataplane_ms(uint32_t timeout_ms)
     while (!s_dataplane_started) {
         if (waited >= timeout_ms) return ESP_ERR_TIMEOUT;
         vTaskDelay(pdMS_TO_TICKS(step_ms));
+        tl_wdt_feed();
         waited += step_ms;
     }
-    return ESP_OK;
-}
-
-esp_err_t tinylink_telemetry_start(void)
-{
-    /* Telemetry now starts implicitly from the long-poll handler the
-     * first time the control plane delivers a netmap (so we don't
-     * sendto a 100.64.x.y destination before the WG netif exists).
-     * This entry point is a no-op kept for boot-sequence backward
-     * compatibility with main.c. */
     return ESP_OK;
 }
 
@@ -1747,11 +1775,25 @@ static SemaphoreHandle_t s_stun_reprobe_wake;
 static void stun_reprobe_on_got_ip(void *arg, esp_event_base_t base,
                                    int32_t id, void *data)
 {
-    (void)arg; (void)base; (void)id; (void)data;
+    (void)arg; (void)base; (void)id;
     /* Binary give coalesces: several GOT_IP events before the task runs
      * collapse to a single immediate reprobe. */
     if (s_stun_reprobe_wake != NULL) {
         xSemaphoreGive(s_stun_reprobe_wake);
+    }
+    /* A new L3 identity (DHCP handed us a different address after a
+     * re-association) leaves the control and DERP TCP conns half-open:
+     * their packets now leave from an address the servers never saw, so
+     * nothing comes back and they only die on the 120-s idle budget.
+     * Recycle both right away (2026-09); the endpoint push that the
+     * re-probe queues rides the same reconnect. */
+    const ip_event_got_ip_t *ev = (const ip_event_got_ip_t *)data;
+    if (ev != NULL && ev->ip_changed) {
+        ESP_LOGI(TAG, "ip changed — recycling control + DERP conns");
+        ts2021_abort_reads();
+#if CONFIG_TINYLINK_DERP_SUPERVISED
+        s_derp_sup.abort_reads = true;
+#endif
     }
 }
 

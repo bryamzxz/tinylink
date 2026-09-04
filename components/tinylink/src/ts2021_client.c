@@ -20,7 +20,6 @@ static const char *TAG = "ts2021";
 #define HANDSHAKE_HDR  "X-Tailscale-Handshake"
 
 #define TLS_TIMEOUT_MS 30000
-#define HTTP_RESPONSE_BUF 4096
 
 /* Liveness budget for every blocking read/write on the control conn:
  * consecutive WANT_READ/WANT_WRITE polls (one SO_RCVTIMEO period =
@@ -229,7 +228,14 @@ static esp_err_t recv_record_plaintext(ts2021_conn_t *c,
  * HTTP/2 residual replayed to nghttp2. */
 static esp_err_t consume_early_payload(ts2021_conn_t *c)
 {
-    uint8_t rec[TS2021_RECORD_PLAINTEXT_MAX];
+    /* Record scratch: borrow the conn's h2_rx ring. It is unused until
+     * h2_session_init runs at the very end of ts2021_connect, and it is
+     * exactly one record long. Saves 4 077 B of stack on the connect
+     * path (this function is inlined into ts2021_connect, whose frame
+     * was 9 888 B). rx_residual is a different buffer, so the copies
+     * below never overlap. */
+    uint8_t *rec = c->h2_rx;
+    const size_t rec_cap = sizeof(c->h2_rx);
     size_t  rec_len = 0, rec_off = 0;
 
     /* 1) Read up to the 9-byte early-payload header from the record stream.
@@ -241,7 +247,7 @@ static esp_err_t consume_early_payload(ts2021_conn_t *c)
 
     while (hdr_have < TS2021_EARLY_PAYLOAD_HDR_LEN) {
         if (rec_off == rec_len) {
-            if (recv_record_plaintext(c, rec, sizeof(rec), &rec_len) != ESP_OK)
+            if (recv_record_plaintext(c, rec, rec_cap, &rec_len) != ESP_OK)
                 return ESP_FAIL;
             rec_off = 0;
             if (rec_len == 0) continue;  /* empty record: pull the next one */
@@ -292,7 +298,7 @@ static esp_err_t consume_early_payload(ts2021_conn_t *c)
     size_t to_skip = ep_len;
     while (to_skip > 0) {
         if (rec_off == rec_len) {
-            if (recv_record_plaintext(c, rec, sizeof(rec), &rec_len) != ESP_OK)
+            if (recv_record_plaintext(c, rec, rec_cap, &rec_len) != ESP_OK)
                 return ESP_FAIL;
             rec_off = 0;
             if (rec_len == 0) continue;
@@ -409,9 +415,12 @@ esp_err_t ts2021_connect(ts2021_conn_t *out,
     ESP_LOGI(TAG, "ts2021: sent init in X-Tailscale-Handshake (%u bytes), waiting for 101",
              (unsigned)sizeof(init));
 
-    /* Read 101 + headers. */
-    uint8_t resp_buf[HTTP_RESPONSE_BUF];
-    if (read_upgrade_response(out->tls, resp_buf, sizeof(resp_buf)) != ESP_OK) {
+    /* Read 101 + headers into the (still idle) h2_rx ring instead of a
+     * 4 KiB stack buffer — the response is a few hundred bytes and the
+     * ring is one full record (4 077 B). Another 4 KiB off the connect
+     * path frame; consume_early_payload reuses the same ring after us. */
+    _Static_assert(sizeof(out->h2_rx) >= 1024, "h2_rx must hold the 101 response");
+    if (read_upgrade_response(out->tls, out->h2_rx, sizeof(out->h2_rx)) != ESP_OK) {
         ts2021_close(out);
         return ESP_FAIL;
     }
