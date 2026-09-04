@@ -46,19 +46,22 @@ extern "C" {
  *      the /ts2021 upgrade outright.
  *   2. RegisterRequest.Version  (register.c)
  *   3. MapRequest.Version       (mapreq.c)
- * NOTE: control_key.c's "/key?v=" floor is a deliberately separate,
- * lower value (only needs >= NoiseCapabilityVersion) and is NOT tied
- * to this macro.
+ *   4. GET /key?v=<n>            (control_key.c) — since 2026-09; headscale
+ *      5b6e1e17 gates /key on the same floor as the Noise handshake, so
+ *      the old fixed "v=100" now gets a 400 there.
  *
  * Floor check (verify on every upstream-audit round): headscale main
- * enforces MinSupportedCapabilityVersion = 113 (= Tailscale v1.80);
- * unchanged through 0.30.0-dev (audit 2026-07-16, capver_generated.go:89).
- * Upstream tailcfg.CurrentCapabilityVersion is 142 as of 2026-07
- * (141→142 gates only the c2n localapi proxy — no wire impact for a
- * register+map+disco+derp client). 138 (= v1.98) remains >= the
- * headscale floor with wide headroom. Bumping the value changes the
- * Noise prologue hash, so it requires a hardware A/B smoke against the
- * live control plane per the repo's verify-regression rule. */
+ * enforces MinSupportedCapabilityVersion = 115 (= Tailscale v1.82) as of
+ * 89fa72e0 (audit 2026-09-03; was 113 in 2026-07 — the floor is "latest
+ * 10 minor versions" and moves with every capver regen, so 138 (= v1.98)
+ * falls below it in roughly four more headscale releases; plan the bump
+ * then). Upstream tailcfg.CurrentCapabilityVersion is 145 as of
+ * 2026-09-03 (139–145 gate client-side node attrs, a c2n proxy and the
+ * TSMP disco-key advert — none changes what control sends a 138 client;
+ * the advert is a peer-side effect handled in wg_lwip.c). Bumping the
+ * value changes the Noise prologue hash, so it requires a hardware A/B
+ * smoke against the live control plane per the repo's verify-regression
+ * rule. */
 #define TINYLINK_CAPVER 138
 
 #define TINYLINK_KEY_LEN 32
@@ -275,22 +278,12 @@ esp_err_t tinylink_stun_probe(void);
  * the task itself; callers get ESP_OK if the task spawned. */
 esp_err_t tinylink_stun_reprobe_start(void);
 
-/* Spawn the persistent endpoint-updater task. The task sleeps on a
- * semaphore signaled internally from the STUN re-probe path whenever
- * the public AddrPort changes; on wake it pushes the new endpoint to
- * the control plane via a Stream=false MapRequest.
- *
- * Must be called BEFORE tinylink_stun_reprobe_start (the re-probe
- * signals this task; if the task isn't up the signal is dropped with a
- * warning). Idempotent — second call returns ESP_OK without re-spawning.
- *
- * Stack: TINYLINK_EP_PUSH_TASK_STACK (12 KiB, BSS-static) — sized by the
- * 30-min stress soak of 2026-05-13 (see the block comment over the
- * #define in tinylink.c). Allocated once at boot to avoid the
- * heap-fragmentation failure that took out the legacy one-shot-task
- * design (see endpoint_updater_task comment in tinylink.c for the
- * failure capture). */
-esp_err_t tinylink_endpoint_updater_start(void);
+/* Endpoint changes found by the STUN re-probe are pushed to the control
+ * plane by the long-poll task itself (Stream=false lite MapRequest on the
+ * control conn right after its next reconnect, which the re-probe path
+ * triggers). No separate task since 2026-09 — the previous dedicated
+ * `tinylink_ep_up` task overflowed its 12 KiB stack on every push; see
+ * the "Endpoint push" section in tinylink.c. */
 
 /* Read-only accessor for the cached STUN result. Returns true and
  * fills *addr_v4 / *port if a successful probe has run; returns false

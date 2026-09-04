@@ -9,7 +9,7 @@
 # incompatible with the IDF v5.5 DHCP-client callback wiring).
 # Replaced by the native tinylink_wg stack (components/tinylink/src/
 # wg_netif.c + wg_lwip.c + wg_proto.c + wg_handshake.c + wg_transport.c
-# + the host-KAT'd ChaCha20-Poly1305 crypto). 110 host KATs across the
+# + the host-KAT'd ChaCha20-Poly1305 crypto). 546 host KATs (tools/test) across the
 # vendored crypto + protocol layers.
 
 dependencies:

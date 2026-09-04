@@ -802,39 +802,14 @@ static int stream_dispatch(stream_state_t *s)
      * handler. Partial/incremental updates beyond KeepAlive are logged
      * and skipped — the upstream server only sends incrementals to
      * clients that opt in via capability flags we don't advertise. */
-    /* DIAGNÓSTICO 2026-05-02 (per upstream investigation): inspect the
-     * first 16 bytes + key field substrings to distinguish:
-     *   - 0x7B '{'             → JSON plain
-     *   - 0x28 0xB5 0x2F 0xFD  → zstd magic (server compressed despite our
-     *                            Compress="" — cliente Go siempre manda
-     *                            "zstd", server puede ignorar Compress="")
-     *   - other                → unknown framing */
-    {
-        const uint8_t *b = s->body_buf;
-        size_t n = s->body_have;
-        size_t hn = n < 16 ? n : 16;
-        char hex[16*3 + 1] = {0};
-        for (size_t i = 0; i < hn; i++) {
-            snprintf(hex + i*3, 4, "%02x ", b[i]);
-        }
-        bool has_peers       = false, has_peers_changed = false;
-        bool has_keepalive   = false, has_node          = false;
-        bool has_peers_patch = false, has_peers_removed = false;
-        if (n >= 9) {
-            for (size_t i = 0; i + 7 < n; i++) {
-                if (!has_peers       && memcmp(b+i, "\"Peers\"", 7) == 0)             has_peers = true;
-                if (!has_keepalive   && i + 11 < n && memcmp(b+i, "\"KeepAlive\"", 11) == 0) has_keepalive = true;
-                if (!has_node        && memcmp(b+i, "\"Node\"", 6) == 0)              has_node = true;
-                if (!has_peers_changed && i + 14 < n && memcmp(b+i, "\"PeersChanged\"", 14) == 0) has_peers_changed = true;
-                if (!has_peers_patch   && i + 19 < n && memcmp(b+i, "\"PeersChangedPatch\"", 19) == 0) has_peers_patch = true;
-                if (!has_peers_removed && i + 14 < n && memcmp(b+i, "\"PeersRemoved\"", 14) == 0) has_peers_removed = true;
-            }
-        }
-        ESP_LOGI(TAG, "frame[%u] hex: %s", (unsigned)n, hex);
-        ESP_LOGI(TAG, "frame fields: Node=%d Peers=%d PeersChanged=%d PeersChangedPatch=%d PeersRemoved=%d KeepAlive=%d",
-                 has_node, has_peers, has_peers_changed,
-                 has_peers_patch, has_peers_removed, has_keepalive);
-    }
+    /* The 2026-05-02 framing diagnostic (hex dump of the first 16 bytes
+     * + six memcmp-per-byte substring scans over the whole body, three
+     * INFO lines per frame) was removed 2026-09: the framing question it
+     * answered (plain JSON vs zstd) has been settled since M2, and it
+     * cost up to 6 × 32 KiB comparisons plus ~250 B of UART output on
+     * every frame of the long-poll hot path. mapresp_parse below reports
+     * the same field presence (n_peers, keepalive, patch flags) from the
+     * real parse. */
 
     /* Soak observability: per-dispatch assembled body size. Grep
      * `stream peak: body` over a multi-hour log and take the max to

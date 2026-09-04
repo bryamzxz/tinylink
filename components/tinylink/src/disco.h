@@ -5,7 +5,7 @@
 // discovery between magicsock peers (Ping/Pong) and DERP-mediated
 // path-up requests (CallMeMaybe).
 //
-// Wire format per /home/bryam/dev/tailscale/disco/disco.go:
+// Wire format per tailscale/tailscale: disco/disco.go:
 //
 //   cleartext header:
 //     magic[6]              "TS💬" = 54 53 f0 9f 92 ac

@@ -545,8 +545,10 @@ static void handle_transport(const uint8_t *buf, size_t len)
     if (g.state != WG_NETIF_UP) return;
 
     /* Decrypt straight into a stack buffer; max payload bounded by
-     * WG_RX_BUF_LEN - WG_TRANSPORT_OVERHEAD. */
-    uint8_t  plaintext[WG_RX_BUF_LEN];
+     * WG_RX_BUF_LEN - WG_TRANSPORT_OVERHEAD. Word-aligned so the AEAD's
+     * XOR loop takes its l32i/s32i fast path (chacha20.c) — GCC gives a
+     * uint8_t[] on the Xtensa stack no alignment guarantee otherwise. */
+    uint8_t __attribute__((aligned(4))) plaintext[WG_RX_BUF_LEN];
     size_t   plen = 0;
 
     xSemaphoreTake(g.lock, portMAX_DELAY);
@@ -756,7 +758,10 @@ static void handle_disco_direct(const uint8_t *buf, size_t len,
 static void rx_task(void *arg)
 {
     (void)arg;
-    uint8_t buf[WG_RX_BUF_LEN];
+    /* Word-aligned: the WG transport ciphertext starts at offset 16, so
+     * an aligned packet buffer means an aligned AEAD input (fast path in
+     * chacha20.c / poly1305_donna_32.h). */
+    uint8_t __attribute__((aligned(4))) buf[WG_RX_BUF_LEN];
     /* Short receive timeout so we can periodically check
      * stop_requested and the handshake retry timer. */
     struct timeval tv = {.tv_sec = 1, .tv_usec = 0};

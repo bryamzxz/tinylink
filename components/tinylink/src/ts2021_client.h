@@ -47,6 +47,10 @@
 
 /* maxMessageSize in upstream controlbase. Plaintext max = wire - 3 - 16. */
 #define TS2021_MAX_MESSAGE      4096
+/* Returned by the TLS read adapter (through tls_io_read_full) when
+ * ts2021_abort_reads() was requested. Outside the 16-bit mbedtls error
+ * space and distinct from TLS_IO_ERR_IDLE_TIMEOUT (-0x10000). */
+#define TS2021_ERR_READ_ABORTED (-0x10001)
 #define TS2021_RECORD_PLAINTEXT_MAX (TS2021_MAX_MESSAGE - TS2021_HEADER_LEN - NOISE_TAGLEN)
 
 /* EarlyPayload sentinel sent (optionally) by the server before HTTP/2
@@ -168,6 +172,13 @@ esp_err_t ts2021_recv(ts2021_conn_t *c,
                       uint8_t *out, size_t out_max, size_t *out_len);
 
 void ts2021_close(ts2021_conn_t *c);
+
+/* Ask the task blocked in a ts2021 record read (the long-poll) to give
+ * up at its next socket poll (≤ one SO_RCVTIMEO, 30 s) with
+ * TS2021_ERR_READ_ABORTED, so it drops the conn and reconnects. Safe to
+ * call from any task; idempotent; automatically cleared by the next
+ * ts2021_connect. Used by the endpoint push to recycle the map stream. */
+void ts2021_abort_reads(void);
 
 #ifdef __cplusplus
 }

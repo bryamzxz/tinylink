@@ -36,7 +36,10 @@ typedef struct {
     int               server_version;     /* parsed from FrameServerInfo JSON */
     /* Serializes writes between the recv-loop's auto-pongs and any
      * external sender (e.g. magicsock relay). Held across one full
-     * frame write so DERP framing on the wire stays intact. */
+     * frame write so DERP framing on the wire stays intact. Created on
+     * the first connect and never deleted (derp_client_close takes it
+     * while destroying the TLS context, so a cross-task sender can never
+     * touch a freed conn) — zero-initialise the struct before first use. */
     SemaphoreHandle_t write_lock;
 } derp_client_t;
 

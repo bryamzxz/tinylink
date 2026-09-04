@@ -2,7 +2,7 @@
 # Copyright (c) 2026 Bryam (bryamzxz)
 
 description: "tinylink core: ts2021, Noise IK, vendored crypto, H2 over Noise."
-version: "0.1.0"
+version: "1.0.0"
 url: "https://github.com/bryamzxz/tinylink"
 license: "MIT"
 

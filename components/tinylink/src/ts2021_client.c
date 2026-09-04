@@ -12,6 +12,7 @@
 
 #include "h2_client.h"
 #include "tls_io.h"
+#include "crypto/secure_zero.h"
 
 static const char *TAG = "ts2021";
 
@@ -63,10 +64,25 @@ static int b64_encode(const uint8_t *in, size_t in_len,
     return 0;
 }
 
+/* Cooperative stream abort. Set from ANY task (tinylink.c's endpoint
+ * push) to make the long-poll's blocking record read fail at its next
+ * poll — esp_tls_conn_read returns WANT_READ every SO_RCVTIMEO (30 s),
+ * so the abort lands within one poll without touching the socket from
+ * a foreign task. Cleared by ts2021_connect, i.e. it only ever kills
+ * the conn that was open when it was raised. One flag for the single
+ * control conn this firmware keeps. */
+static volatile bool s_abort_reads;
+
+void ts2021_abort_reads(void)
+{
+    s_abort_reads = true;
+}
+
 /* Adapter shims so tls_io_* can call esp_tls_conn_{read,write}. The
  * cast on the write side hides esp_tls_conn_write's `void *` (non-const)
  * second parameter — we never mutate it. */
 static ssize_t ts2021_tls_read(void *ctx, uint8_t *buf, size_t len) {
+    if (s_abort_reads) return TS2021_ERR_READ_ABORTED;
     return esp_tls_conn_read((esp_tls_t *)ctx, buf, len);
 }
 static ssize_t ts2021_tls_write(void *ctx, const uint8_t *buf, size_t len) {
@@ -81,6 +97,8 @@ static esp_err_t tls_read_full(esp_tls_t *tls, uint8_t *buf, size_t need)
         if (rc == TLS_IO_ERR_IDLE_TIMEOUT) {
             ESP_LOGW(TAG, "control stream silent past %d s — declaring dead",
                      CONFIG_TINYLINK_STREAM_IDLE_TIMEOUT_S);
+        } else if (rc == TS2021_ERR_READ_ABORTED) {
+            ESP_LOGI(TAG, "control stream read aborted on request (recycle)");
         } else {
             ESP_LOGE(TAG, "tls_read_full failed: %d", rc);
         }
@@ -309,6 +327,7 @@ esp_err_t ts2021_connect(ts2021_conn_t *out,
 {
     if (out == NULL) return ESP_ERR_INVALID_ARG;
     memset(out, 0, sizeof(*out));
+    s_abort_reads = false;   /* a pending abort targets the OLD conn only */
 
     char host_with_port[160];
     snprintf(host_with_port, sizeof(host_with_port), "https://%s:%d",
@@ -507,4 +526,11 @@ void ts2021_close(ts2021_conn_t *c)
         c->tls = NULL;
     }
     c->connected = false;
+    /* The Noise state keeps a copy of the machine private key (s_priv),
+     * the ephemeral private key and both transport keys. The 2026-06
+     * secure_zero sweep (df7b6bd) scrubbed the WG side but left this
+     * struct live in BSS between control-plane reconnects; scrub it the
+     * moment the conn is gone so a later memory disclosure (coredump,
+     * heap-overread elsewhere) cannot recover a session key. */
+    tl_secure_zero(&c->noise, sizeof(c->noise));
 }
