@@ -41,12 +41,15 @@ In scope:
 
 Out of scope:
 
-- Bugs in upstream dependencies (`droscy/esp_wireguard`, `mbedtls`, `nghttp2`,
+- Bugs in upstream dependencies (`espressif/nghttp` (nghttp2), `mbedtls`,
   ESP-IDF). Please report those upstream; we will track and pull in fixes.
 - Side-channel attacks requiring physical access beyond what the threat model
   in [`docs/SECURITY-MODEL.md`](docs/SECURITY-MODEL.md) covers.
-- Findings that depend on the user disabling NVS encryption or flash
-  encryption.
+- Recovery of key material by reading the flash: NVS is stored in
+  **plaintext by decision** (no flash/NVS encryption — eFuse burns are
+  irreversible and were declined, see `docs/ROADMAP.md` § Execution queue);
+  physical-access attackers are outside the threat model in
+  [`docs/SECURITY-MODEL.md`](docs/SECURITY-MODEL.md).
 
 ## Cryptographic primitives
 

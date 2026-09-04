@@ -14,6 +14,7 @@
 #include "cJSON.h"
 
 #include "json_helpers.h"
+#include "tinylink.h"        /* TINYLINK_CAPVER / TINYLINK_STR */
 
 static const char *TAG = "ctrl_key";
 
@@ -27,7 +28,16 @@ static const char *TAG = "ctrl_key";
  * (5+64), not 70 (6+64), so the parser rejected it. */
 #define KEY_PREFIX "mkey:"
 #define KEY_HEX_LEN 64
-#define KEY_PATH   "/key?v=100"
+/* /key?v=<n> advertises our CapabilityVersion, exactly like the upstream
+ * client (control/controlclient/direct.go: `/key?v=%d` with
+ * CurrentCapabilityVersion). This used to be a fixed, deliberately lower
+ * `v=100`; headscale 5b6e1e17 (2026-07) now gates /key on the same
+ * capver.MinSupportedCapabilityVersion floor as the /ts2021 handshake
+ * (115 as of 0.29.3/0.30-dev, and it climbs with every release), so a
+ * fixed low value gets a 400 "unsupported client version" and the TOFU
+ * bootstrap fails. Derive from TINYLINK_CAPVER so the three wire sites
+ * (Noise prologue, register/map JSON, /key) can never diverge. */
+#define KEY_PATH   "/key?v=" TINYLINK_STR(TINYLINK_CAPVER)
 
 /* Production-profile guard: when the operator opted into the
  * "official" control-pub bootstrap profile (TOFU window closed at
@@ -43,7 +53,7 @@ _Static_assert(sizeof(CONFIG_TINYLINK_CONTROL_PUB_FALLBACK_HEX) == 65,
                "CONFIG_TINYLINK_CONTROL_PROFILE_OFFICIAL requires "
                "CONFIG_TINYLINK_CONTROL_PUB_FALLBACK_HEX to be exactly "
                "64 hex chars. See sdkconfig.defaults.prod.example for "
-               "how to populate it from a curl of /key?v=100.");
+               "how to populate it from a curl of /key?v=<capver>.");
 #endif
 #define BODY_MAX   512
 
@@ -193,7 +203,7 @@ static esp_err_t parse_fallback(uint8_t out[CONTROL_KEY_LEN])
  *      provisioning). NVS wins regardless of fallback config.
  *   2. NVS empty + fallback set → install fallback as the pin without
  *      contacting the network. This eliminates the TOFU window where
- *      a MITM during the initial GET /key?v=100 could substitute the
+ *      a MITM during the initial GET /key?v=<capver> could substitute the
  *      pin. Production deployments should always reach this branch on
  *      first boot.
  *   3. NVS empty + no fallback → legacy TOFU via GET /key. Logs a

@@ -169,7 +169,15 @@ esp_err_t derp_client_connect_login(derp_client_t *out,
      * tl_derp_node_t.port, leaving it 0 when absent. Treat 0 as "use the
      * DERP default" so callers can pass dn->port unchanged. */
     if (port == 0) port = 443;
+    /* The write lock outlives individual connections: it is created on
+     * the first connect of a (zero-initialised) derp_client_t and never
+     * deleted (see derp_client_close), so a concurrent sender blocked on
+     * it can never wake up on a freed semaphore. Preserve it across the
+     * per-connect reset. Callers must zero the struct before the first
+     * connect (static storage or `= {0}`). */
+    SemaphoreHandle_t lock = out->write_lock;
     memset(out, 0, sizeof(*out));
+    out->write_lock = lock;
 
     char url[160];
     snprintf(url, sizeof(url), "https://%s:%u", server_host, (unsigned)port);
@@ -179,7 +187,9 @@ esp_err_t derp_client_connect_login(derp_client_t *out,
         .timeout_ms        = DERP_TLS_TIMEOUT_MS,
     };
 
-    out->write_lock = xSemaphoreCreateMutex();
+    if (out->write_lock == NULL) {
+        out->write_lock = xSemaphoreCreateMutex();
+    }
     if (out->write_lock == NULL) {
         ESP_LOGE(TAG, "write_lock create failed");
         return ESP_ERR_NO_MEM;
@@ -294,15 +304,30 @@ esp_err_t derp_client_connect_login(derp_client_t *out,
 void derp_client_close(derp_client_t *c)
 {
     if (c == NULL) return;
+    /* Teardown ordering vs the wg_tx relay (tinylink_relay_via_derp →
+     * derp_client_send_packet), which runs on ANOTHER task and used to
+     * race this function: the old code destroyed the TLS context and
+     * deleted the mutex while a sender could be inside
+     * esp_tls_conn_write or blocked on xSemaphoreTake — a use-after-free
+     * of c->tls and a wait on a deleted semaphore. Now:
+     *   1. drop `connected` first, so the relay's unlocked fast-path
+     *      check stops admitting new sends;
+     *   2. take the write lock, so a sender already past its check
+     *      finishes (or fails) its frame before the TLS context goes;
+     *   3. destroy TLS under the lock and NULL it, so a sender that
+     *      wins the lock afterwards sees c->tls == NULL and bails;
+     *   4. never delete the lock — it is created once per client. */
+    c->connected = false;
+    if (c->write_lock != NULL) {
+        xSemaphoreTake(c->write_lock, portMAX_DELAY);
+    }
     if (c->tls != NULL) {
         esp_tls_conn_destroy(c->tls);
         c->tls = NULL;
     }
     if (c->write_lock != NULL) {
-        vSemaphoreDelete(c->write_lock);
-        c->write_lock = NULL;
+        xSemaphoreGive(c->write_lock);
     }
-    c->connected = false;
 }
 
 /* Atomic-frame writer used both by the recv loop's pongs (via
@@ -320,6 +345,10 @@ static int derp_send_frame_locked(void *ctx, derp_frame_type_t type,
     derp_write_frame_header(hdr, type, (uint32_t)plen);
 
     xSemaphoreTake(c->write_lock, portMAX_DELAY);
+    if (c->tls == NULL) {           /* closed while we waited for the lock */
+        xSemaphoreGive(c->write_lock);
+        return -1;
+    }
     int rc = tls_io_write_full(derp_tls_write_raw, c->tls, hdr, sizeof(hdr),
                                DERP_MAX_IDLE_POLLS);
     if (rc == 0 && plen > 0) {
@@ -368,6 +397,12 @@ esp_err_t derp_client_send_packet(derp_client_t *c,
                             (uint32_t)total_payload);
 
     xSemaphoreTake(c->write_lock, portMAX_DELAY);
+    /* Re-validate under the lock: derp_client_close may have torn the
+     * connection down between the unlocked pre-check above and here. */
+    if (c->tls == NULL || !c->connected) {
+        xSemaphoreGive(c->write_lock);
+        return ESP_ERR_INVALID_STATE;
+    }
     int rc = tls_io_write_full(derp_tls_write_raw, c->tls, hdr, sizeof(hdr),
                                DERP_MAX_IDLE_POLLS);
     if (rc == 0) {

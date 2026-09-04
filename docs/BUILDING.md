@@ -2,7 +2,8 @@
 
 ## Prerequisites
 
-- ESP-IDF **v5.5.x** installed (e.g. `~/esp/esp-idf-v5.5.4`).
+- ESP-IDF **v5.5.4** installed (the project is frozen on this exact
+  release — see "CI" below). `$IDF_PATH` below is its checkout.
 - A Python virtualenv with the project tooling installed (the helper scripts
   in `tools/` use `pyserial` and the IDF Python deps).
 - A Freenove ESP32-WROOM-32E DevKit on `/dev/ttyUSB0` (CH340).
@@ -10,14 +11,14 @@
 ## One-time setup
 
 ```bash
-# Activate your project Python venv.
-source ~/entorno_investigación/bin/activate
+# Activate the Python venv ESP-IDF's install.sh populated.
+source "$VENV/bin/activate"
 
-# Source ESP-IDF.
-. ~/esp/esp-idf-v5.5.4/export.sh
+# Source ESP-IDF (export.sh sets IDF_PATH and the toolchain PATH).
+. "$IDF_PATH/export.sh"
 
 # Set the target. Only required once; rerun if you change targets.
-cd ~/dev/tinylink
+cd /path/to/tinylink
 idf.py set-target esp32
 ```
 
@@ -32,23 +33,26 @@ panics with `LoadProhibited` at `dhcp_state.c:52` from the lwIP task
 the first time `wg_lwip_attach()` calls `netif_set_addr()`.**
 
 ```bash
-cd ~/esp/esp-idf-v5.5.4   # or wherever your IDF checkout lives
-git apply --check ~/dev/tinylink/idf-patches/0001-*.patch ~/dev/tinylink/idf-patches/0002-*.patch
-git am          ~/dev/tinylink/idf-patches/0001-*.patch ~/dev/tinylink/idf-patches/0002-*.patch
+cd "$IDF_PATH"
+git apply --check /path/to/tinylink/idf-patches/0001-*.patch /path/to/tinylink/idf-patches/0002-*.patch
+git am          /path/to/tinylink/idf-patches/0001-*.patch /path/to/tinylink/idf-patches/0002-*.patch
 ```
+
+(CI runs the same `git apply --check` against the pinned release on
+every push, so a patch that stops applying is caught early.)
 
 If `git am` fails on whitespace, fall back to:
 
 ```bash
-cd ~/esp/esp-idf-v5.5.4
-git apply ~/dev/tinylink/idf-patches/0001-*.patch ~/dev/tinylink/idf-patches/0002-*.patch
+cd "$IDF_PATH"
+git apply /path/to/tinylink/idf-patches/0001-*.patch /path/to/tinylink/idf-patches/0002-*.patch
 git add -A && git commit -m "tinylink: apply DHCP_CLIENT whitelist patches"
 ```
 
 To revert (e.g. to test against stock IDF — expect the panic):
 
 ```bash
-cd ~/esp/esp-idf-v5.5.4
+cd "$IDF_PATH"
 git reset --hard v5.5.4
 ```
 
@@ -95,13 +99,17 @@ is not set`); the bench code drops out of the binary entirely.
 Reference `idf.py size` numbers for the ESP32-WROOM-32E (no PSRAM)
 target on ESP-IDF v5.5.4:
 
-| Region        | Post-η baseline (`4bd5b0f`) | Post-perf-trim merged | Post-DERP-round merged (`7a45269`) |
-|---------------|----------------------------:|----------------------:|------------------------------------:|
-| Flash app     | 1 173 717 B (74.6 %)        | 1 015 145 B (64.5 %)  | **1 015 533 B (64.5 %)**           |
-| DRAM static   | 151 412 B (83.78 %)         | 148 484 B (82.16 %)   | **148 516 B (82.17 %)**            |
-| IRAM          | 104 383 B (79.64 %)         | 75 079 B (57.28 %)    | **75 079 B (57.28 %)**             |
-| Bootloader    | 27 808 B                    | 18 176 B              | 18 176 B                            |
-| RTC SLOW      | 56 B                        | 56 B                  | 56 B                                |
+| Region        | Post-η baseline (`4bd5b0f`) | Post-DERP-round (`7a45269`) | M13 (`c383e49`)     | **2026-09 round**             |
+|---------------|----------------------------:|----------------------------:|--------------------:|------------------------------:|
+| Flash app     | 1 173 717 B (74.6 %)        | 1 015 533 B (64.5 %)        | 948 624 B (60.2 %)  | **946 293 B (60.1 %)**        |
+| DRAM static   | 151 412 B (83.78 %)         | 148 516 B (82.17 %)         | 149 312 B (82.6 %)  | **136 656 B (75.6 %)**        |
+| IRAM          | 104 383 B (79.64 %)         | 75 079 B (57.28 %)          | 75 079 B (57.28 %)  | **75 079 B (57.28 %)**        |
+| Bootloader    | 27 808 B                    | 18 176 B                    | 18 176 B            | 18 176 B                      |
+| RTC SLOW      | 56 B                        | 56 B                        | 56 B                | 56 B                          |
+
+The 2026-09 DRAM drop is the removal of the endpoint-push task's 12 KiB
+static stack (see `CHANGELOG.md`). Largest contiguous heap block 60 s
+after boot: 21 504 B (was 9–11 KiB).
 
 Headline of the cumulative work from baseline to post-DERP-round:
 **flash −154.6 KiB, DRAM −2.9 KiB, IRAM −29.3 KiB (80 % → 57 %),
@@ -164,12 +172,22 @@ sizeof(dst))` will break the build. Use `memcpy + strnlen` (see
 
 ## Provisioning credentials
 
-Before the firmware can do anything useful you need an `nvs_creds` partition
-populated with WiFi + WireGuard data. See [`PROVISIONING.md`](PROVISIONING.md).
+Before the firmware can do anything useful you need the WiFi credentials
+and a Tailscale auth key in NVS (namespace `tl_creds`, either in the
+dedicated `nvs_creds` partition or the default `nvs` one). See
+[`PROVISIONING.md`](PROVISIONING.md).
 
 ## CI
 
-GitHub Actions (`.github/workflows/build.yml`) runs `idf.py build` against
-`esp32` with ESP-IDF v5.5 on every push and PR. CI artefacts include the
-ELF, BIN, MAP and partition table — useful for diffing flash size between
-PRs.
+GitHub Actions (`.github/workflows/build.yml`) runs, on every push and PR:
+
+1. the host KAT suite (`make -C tools/test test`, with a floor on the
+   number of `OK` cases) and the same suite under ASan + UBSan;
+2. a dry-run of the two `idf-patches/` against the pinned ESP-IDF, so a
+   patch that stops applying is caught before a device panics;
+3. `idf.py build` for `esp32` against the pinned ESP-IDF **v5.5.4**, plus
+   `idf.py size` / `size-components` (posted to the run summary) and a
+   check that `dependencies.lock` was not rewritten.
+
+Artefacts include the ELF, BIN, MAP, size reports and partition table —
+useful for diffing flash/DRAM between PRs.

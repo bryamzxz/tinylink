@@ -15,7 +15,7 @@
 
 /* DISCO v1 magic prefix per Tailscale's disco/disco.go (const Magic =
  * "TS💬", 6 bytes: 0x54 0x53 0xf0 0x9f 0x92 0xac). Cited from
- * /home/bryam/dev/tailscale/disco/disco.go line 35. */
+ * tailscale/tailscale: disco/disco.go line 35. */
 static const uint8_t DISCO_V1_MAGIC[6] = {
     0x54, 0x53, 0xf0, 0x9f, 0x92, 0xac
 };

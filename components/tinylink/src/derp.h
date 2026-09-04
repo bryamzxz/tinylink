@@ -9,7 +9,7 @@
 // frames travel before any direct path exists.
 //
 // This module implements only the stateless wire codec (port of
-// /home/bryam/dev/tailscale/derp/derp.go):
+// tailscale/tailscale: derp/derp.go):
 //   - frame header read/write
 //   - per-frame-type encoders/decoders for the subset a leaf client
 //     needs (login handshake, packet relay, ping/pong, KeepAlive,
@@ -41,7 +41,7 @@ extern "C" {
 #define DERP_MAX_PACKET         (64 * 1024)
 
 /* Magic bytes at the start of FrameServerKey: "DERP🔑" UTF-8.
- * Verified against /home/bryam/dev/tailscale/derp/derp.go:32. */
+ * Verified against tailscale/tailscale: derp/derp.go:32. */
 extern const uint8_t DERP_MAGIC[DERP_MAGIC_LEN];
 
 /* The subset of frame types this codec covers. Numeric values match

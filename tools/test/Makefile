@@ -10,8 +10,15 @@
 #   make test_blake2s.run / test_curve25519.run
 
 CC      ?= gcc
-CFLAGS  ?= -O2 -Wall -Wextra -Wno-unused-parameter -Wno-sign-compare \
-           -std=c11 -D_DEFAULT_SOURCE
+# EXTRA_CFLAGS is appended (sanitizers, -g, coverage) without restating
+# the base flags; RUNNER wraps every test invocation (valgrind, qemu…).
+#   make test                                   # plain
+#   make asan                                   # ASan+UBSan, clean rebuild
+#   make test RUNNER='valgrind -q --error-exitcode=9'
+CFLAGS  ?= -O2 -Wall -Wextra -Werror -Wno-unused-parameter -Wno-sign-compare \
+           -Wno-unterminated-string-initialization \
+           -std=c11 -D_DEFAULT_SOURCE $(EXTRA_CFLAGS)
+RUNNER  ?=
 CRYPTO  := ../../components/tinylink/src/crypto
 
 TL_SRC  := ../../components/tinylink/src
@@ -186,12 +193,20 @@ test_wg_transport: test_wg_transport.c \
 	    $(CRYPTO)/chacha20.c $(CRYPTO)/poly1305_donna.c \
 	    $(CRYPTO)/chacha20poly1305.c
 
-.PHONY: test test_blake2s.run test_curve25519.run test_mapresp.run \
-        test_chacha20.run test_poly1305.run test_chacha20poly1305.run \
-        test_hkdf_noise.run test_wg_handshake.run test_wg_transport.run \
-        test_wg_demux.run test_disco.run test_stun.run test_tls_io.run \
-        test_derp.run test_disco_handler.run test_disco_prober.run \
-        test_retry_after.run test_backoff.run clean
+.PHONY: all test asan clean $(addsuffix .run,$(TARGETS))
+
+# Sanitized run: AddressSanitizer + UndefinedBehaviorSanitizer (incl.
+# alignment checks — the crypto fast paths depend on the
+# aligned/unaligned dispatch being right). `shift-base` is excluded on
+# purpose: the vendored curve25519-donna does `limb << n` on negative
+# 64-bit limbs (curve25519_donna.c:226 and friends), which C11 calls
+# undefined but GCC documents as two's-complement (and every KAT
+# confirms); flagging it would only hide real findings. Always rebuilds
+# from clean so stale unsanitized binaries can't slip through.
+asan:
+	$(MAKE) clean
+	$(MAKE) EXTRA_CFLAGS='-g -O1 -fno-omit-frame-pointer -fsanitize=address,undefined -fno-sanitize=shift-base -fno-sanitize-recover=all' test
+	$(MAKE) clean
 
 test: test_blake2s.run test_curve25519.run test_mapresp.run \
       test_chacha20.run test_poly1305.run test_chacha20poly1305.run \
@@ -202,64 +217,64 @@ test: test_blake2s.run test_curve25519.run test_mapresp.run \
       test_skip_value.run
 
 test_blake2s.run: test_blake2s
-	./test_blake2s
+	$(RUNNER) ./test_blake2s
 
 test_curve25519.run: test_curve25519
-	./test_curve25519
+	$(RUNNER) ./test_curve25519
 
 test_mapresp.run: test_mapresp
-	./test_mapresp
+	$(RUNNER) ./test_mapresp
 
 test_chacha20.run: test_chacha20
-	./test_chacha20
+	$(RUNNER) ./test_chacha20
 
 test_backoff.run: test_backoff
-	./test_backoff
+	$(RUNNER) ./test_backoff
 
 test_keys_regen.run: test_keys_regen
-	./test_keys_regen
+	$(RUNNER) ./test_keys_regen
 
 test_skip_value.run: test_skip_value
-	./test_skip_value
+	$(RUNNER) ./test_skip_value
 
 test_poly1305.run: test_poly1305
-	./test_poly1305
+	$(RUNNER) ./test_poly1305
 
 test_chacha20poly1305.run: test_chacha20poly1305
-	./test_chacha20poly1305
+	$(RUNNER) ./test_chacha20poly1305
 
 test_hkdf_noise.run: test_hkdf_noise
-	./test_hkdf_noise
+	$(RUNNER) ./test_hkdf_noise
 
 test_wg_handshake.run: test_wg_handshake
-	./test_wg_handshake
+	$(RUNNER) ./test_wg_handshake
 
 test_wg_transport.run: test_wg_transport
-	./test_wg_transport
+	$(RUNNER) ./test_wg_transport
 
 test_wg_demux.run: test_wg_demux
-	./test_wg_demux
+	$(RUNNER) ./test_wg_demux
 
 test_disco.run: test_disco
-	./test_disco
+	$(RUNNER) ./test_disco
 
 test_stun.run: test_stun
-	./test_stun
+	$(RUNNER) ./test_stun
 
 test_tls_io.run: test_tls_io
-	./test_tls_io
+	$(RUNNER) ./test_tls_io
 
 test_derp.run: test_derp
-	./test_derp
+	$(RUNNER) ./test_derp
 
 test_disco_handler.run: test_disco_handler
-	./test_disco_handler
+	$(RUNNER) ./test_disco_handler
 
 test_disco_prober.run: test_disco_prober
-	./test_disco_prober
+	$(RUNNER) ./test_disco_prober
 
 test_retry_after.run: test_retry_after
-	./test_retry_after
+	$(RUNNER) ./test_retry_after
 
 clean:
 	rm -f $(TARGETS)

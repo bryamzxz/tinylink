@@ -62,7 +62,7 @@ static err_t wg_lwip_linkoutput(struct netif *netif, struct pbuf *p)
                                                 p->len);
         return (err == ESP_OK) ? ERR_OK : ERR_IF;
     }
-    uint8_t scratch[1536];
+    uint8_t __attribute__((aligned(4))) scratch[1536];
     if (p->tot_len > sizeof(scratch)) return ERR_BUF;
     if (pbuf_copy_partial(p, scratch, p->tot_len, 0) != p->tot_len) {
         return ERR_BUF;
@@ -96,6 +96,22 @@ static void wg_rx_inject(const uint8_t *plaintext, size_t len, void *user)
 {
     (void)user;
     if (s_lwn == NULL || len == 0) return;
+
+    /* TSMP (IP protocol 99) is Tailscale's in-tunnel side channel. Since
+     * CapVer 144 (tailscale b87203b83 / 3799eaf26, 2026-07) tailscaled
+     * sends a TSMPDiscoKeyAdvertisement — a 20-byte IPv4 header with
+     * proto 99 and a 33-byte payload ('a' + 32-byte disco key) — into
+     * the tunnel right after EVERY WireGuard handshake and rekey, to any
+     * disco-speaking peer, with no receiver-side capver gate. lwIP has
+     * no handler for proto 99: ip4_input's default branch answers each
+     * one with an ICMP "protocol unreachable" (ip4.c: icmp_dest_unreach
+     * ICMP_DUR_PROTO) — one wasted encrypt + TX per handshake/rekey and
+     * a pbuf churn on the RX task for nothing. tinylink learns peer disco
+     * keys from the netmap, exactly like a pre-144 client, so the advert
+     * carries nothing we need. Drop it here, before it costs a pbuf.
+     * Also drop anything shorter than an IPv4 header. */
+    if (len < 20 || (plaintext[0] >> 4) != 4) return;
+    if (plaintext[9] == 99) return;
 
     struct pbuf *p = pbuf_alloc(PBUF_RAW, (u16_t)len, PBUF_RAM);
     if (p == NULL) {

@@ -53,8 +53,8 @@ NodeKey, DiscoKey) on first boot and persists them in NVS namespace
 ## Step 3 — generate `nvs_creds.bin`
 
 ```bash
-source ~/entorno_investigación/bin/activate
-. ~/esp/esp-idf-v5.5.4/export.sh
+source "$VENV/bin/activate"
+. "$IDF_PATH/export.sh"
 
 python tools/nvs_provision.py \
     --input tools/credentials.csv \
@@ -68,7 +68,7 @@ idf.py set-target esp32       # one-time per checkout
 idf.py build
 idf.py -p /dev/ttyUSB0 flash
 esptool.py --chip esp32 -p /dev/ttyUSB0 \
-    write_flash --encrypt 0x320000 build/nvs_creds.bin
+    write_flash 0x320000 build/nvs_creds.bin
 idf.py -p /dev/ttyUSB0 monitor
 ```
 

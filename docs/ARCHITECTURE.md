@@ -38,9 +38,8 @@ primitives we did, see [`SECURITY-MODEL.md`](SECURITY-MODEL.md).
 |     tinylink_long_poll_start  ← stream=true read-only poll    |
 |     tinylink_derp_supervised_start                            |
 |     tinylink_telemetry_start                                  |
-|     tinylink_endpoint_updater_start ← persistent task, BSS    |
-|                                       stack; signaled by STUN |
-|                                       reprobe on NAT rebind   |
+|     (endpoint push: no task — flagged by the STUN reprobe,    |
+|      executed by the long-poll on its next reconnect)         |
 |     tinylink_stun_reprobe_start                               |
 +---------------------------------------------------------------+
         │
@@ -259,24 +258,28 @@ anyone bisecting an unrelated regression to before the netstack switch.
    independently of rekey state — both `UP` + `HANDSHAKE_PENDING`
    benefit, so a long outage that's already fallen to cold-handshake
    retries also gets the probe.
-9. **Endpoint-push updater task** (`tinylink.c::endpoint_updater_task`)
-   — persistent worker spawned at boot via `xTaskCreateStatic` with
-   stack + TCB in BSS (12 KiB, sized to the ts2021_connect mbedtls
-   peak). Signaled via semaphore + monotonic generation counter from
-   `tinylink_endpoint_push_async`, which the STUN re-probe path calls
-   on detected NAT rebind. When the worker wakes it opens its own
-   ts2021 channel (h2_client is single-stream-per-conn, so it cannot
-   multiplex over `s_conn`), runs `mapreq_push_endpoints`, closes,
-   sleeps again. When `s_conn_open` is false (long-poll has not yet
-   established the channel, or is in backoff after a network error),
-   the worker re-enqueues itself with a short delay rather than
-   opening a redundant TLS handshake — the path will likely fail with
-   the same error long-poll keeps hitting. Mirrors upstream tailscale
-   `controlclient.Auto.updateRoutine` (`auto.go:55-99`): one
-   long-lived goroutine, signal channel, generation counter
-   coalesces concurrent triggers. Replaces the legacy one-shot
-   `xTaskCreate` per re-probe that started failing on a fragmented
-   heap after hours of operation.
+9. **Endpoint push on the long-poll task** (`tinylink.c`, "Endpoint
+   push" section) — when the STUN re-probe finds a new public AddrPort
+   it calls `tinylink_endpoint_push_async()`, which sets
+   `s_ep_push_pending` and `ts2021_abort_reads()`: the long-poll's
+   blocking record read returns `TS2021_ERR_READ_ABORTED` at its next
+   30 s socket poll, the stream is dropped (logged as "recycled for
+   endpoint push", healthy-stream backoff ≈ 1 s), and right after the
+   reconnect — before the read-only Stream=true cycle claims `s_conn` —
+   `long_poll_task` runs `mapreq_push_endpoints(&s_conn)`: the same
+   sequence bringup runs at boot. The in-place re-register path (M13)
+   sets the same flag. History: until 2026-09 this was a dedicated
+   persistent task (`tinylink_ep_up`, 12 KiB static stack) that opened
+   its own ts2021 conn from a stack-local `ts2021_conn_t` (8 648 B)
+   and then ran `ts2021_connect` (9 888 B frame) + the TLS handshake —
+   ≈ 28 KiB on a 12 KiB stack, overflowing into the BSS below it on
+   every real push (NAT rebind, WiFi re-association, re-register). The
+   PR #102 soak panic ("InstructionFetchError at a DRAM PC" under a
+   forced NAT rebind) was this overflow. Verified from the compiled
+   `entry` frame sizes; removing the task freed 12.6 KiB of BSS.
+   Upstream sends its lite update over the shared HTTP/2 client
+   (`controlclient.Auto.updateRoutine`); tinylink's h2_client is one
+   stream per conn, so the recycle is the equivalent.
 10. **Outbound DISCO prober + tx-id binding** (`disco_prober.{c,h}`,
    replaces the deleted `disco_replay.{c,h}` — commit `31de72d`) — NaCl
    box (XSalsa20-Poly1305) is a stateless AEAD: `nacl_box_open` is
@@ -546,8 +549,9 @@ The original M1-only layout, kept for historical reference:
      NodeKey, DiscoKey). On first boot these are written back to
      `tl_keys` and `"generated new node identity"` is logged.
    - Reads the pinned control plane public key from `tl_pin`. On first
-     boot this is missing; we HTTPS-GET `/key?v=100`, parse
-     `{"publicKey":"nlpub:<64-hex>"}`, and persist.
+     boot this is missing; we HTTPS-GET `/key?v=<TINYLINK_CAPVER>`
+     (was a fixed `v=100` until M14; headscale now gates `/key` on its
+     capver floor), parse `{"publicKey":"mkey:<64-hex>"}`, and persist.
 4. `tinylink_register()` runs in a loop until success:
    - `ts2021_connect()` opens TLS to `controlplane.tailscale.com:443`,
      sends a `POST /ts2021` HTTP Upgrade request whose body carries Noise
@@ -597,26 +601,28 @@ Fits a 1 MB OTA slot in 4 MB flash with dual-OTA partitions.
 
 Leaves ~390 KB free on the 520 KB SRAM chip. No PSRAM is required.
 
-## FreeRTOS task layout (target, end-state)
+## FreeRTOS task layout (as built, 2026-09)
 
-| Task            | Stack | Prio   | Role                                               |
-|-----------------|-------|--------|----------------------------------------------------|
-| `net_io_task`   | 6 KB  | high   | single UDP recv, demux first byte → DISCO/WG/STUN  |
-| `control_task`  | 8 KB  | medium | TLS+ts2021+HTTP/2+MapRequest long-poll             |
-| `derp_task`     | 10 KB | medium | TLS to home DERP; only alive when direct path down |
-| `wg_task`       | 4 KB  | high   | WireGuard encrypt/decrypt (esp_wireguard timer)    |
-| `app_task`      | 3 KB  | low    | TMP117 poll → JSON → UDP send                      |
+Generated from the `xTaskCreate*` call sites; keep in sync when a task
+or a stack size changes.
 
-Total task stacks: ~31 KB SRAM. The M1 implementation uses only `main`
-(8 KB) for bringup + register; the others land progressively in M2–M5.
+| Task               | Stack    | Prio    | Where                              | Role                                                       |
+|--------------------|----------|---------|------------------------------------|------------------------------------------------------------|
+| `main`             | 24 KiB   | 1       | `CONFIG_ESP_MAIN_TASK_STACK_SIZE`  | bringup: WiFi, keys, register, STUN, dataplane, spawns; exits |
+| `tinylink_lp`      | 24 KiB   | IDLE+4  | `tinylink.c::tinylink_long_poll_start` | control conn: ts2021 connect, endpoint push, map long-poll, re-register, wedge restart |
+| `tinylink_derp`    | 10 KiB   | IDLE+3  | `tinylink.c::tinylink_derp_supervised_start` | DERP TLS session: relayed DISCO / WG inject, CMM punch |
+| `wg_rx`            | 8 KiB    | IDLE+3  | `wg_netif.c::wg_netif_start`       | UDP recv, demux (WG/DISCO/STUN), handshake, decrypt → lwIP  |
+| `wg_tx`            | 7 KiB    | IDLE+2  | `wg_netif.c::wg_netif_start`       | encrypted-frame queue → `sendto` (direct) or DERP relay     |
+| `tinylink_tlm`     | 4 KiB    | IDLE+2  | `telemetry.c`                      | TMP117 sample → JSON → UDP over the tunnel; 60 s stack diag |
+| `tinylink_stun_re` | 3 KiB    | IDLE+1  | `tinylink.c::tinylink_stun_reprobe_start` | periodic / GOT_IP-triggered STUN re-probe, flags endpoint push |
+| `tiT` (lwIP)       | 4.5 KiB  | 18      | `CONFIG_LWIP_TCPIP_TASK_STACK_SIZE`| TCP/IP thread (raised 3 → 4.5 KiB in #104)                 |
 
-## Threading model (M1)
+Application task stacks total ≈ 56.5 KiB (the 24 KiB `main` stack is
+returned to the heap when `app_main` returns). The long-poll's 24 KiB is
+the one to watch: its measured lifetime peak is 20 KiB, dominated by
+`ts2021_connect` (9 888 B frame) → `recv_record_plaintext` (4 176 B) →
+mbedTLS handshake; see `docs/ROADMAP.md` § "Buffer diet" for the
+planned trim.
 
-| Task            | Stack | Prio | Owner                  |
-|-----------------|-------|------|------------------------|
-| `main`          | 8 KiB | 1    | bringup + register     |
-| WiFi internals  | —     | —    | esp_wifi               |
-| TLS internals   | —     | —    | esp_tls / mbedtls      |
-
-The register state machine runs synchronously inside `main`; there are no
-worker tasks in M1. M2 will introduce a long-lived `mapstream` task.
+There is no dedicated endpoint-push task any more (2026-09): the push
+runs on `tinylink_lp` — see item 9 below.

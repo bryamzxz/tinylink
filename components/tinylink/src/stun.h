@@ -5,7 +5,7 @@
 // own public-side AddrPort so it can advertise it to peers (HostInfo
 // endpoints + DISCO CallMeMaybe).
 //
-// Wire format mirrors /home/bryam/dev/tailscale/net/stun/stun.go:
+// Wire format mirrors tailscale/tailscale: net/stun/stun.go:
 //   - Request: header(20) + SOFTWARE("tailnode", 12) + FINGERPRINT(8) = 40
 //   - Response parsing prefers XOR-MAPPED-ADDRESS (RFC 5389) and falls
 //     back to MAPPED-ADDRESS (RFC 3489) for legacy servers.

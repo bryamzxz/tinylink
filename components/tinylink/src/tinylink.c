@@ -235,20 +235,27 @@ esp_err_t tinylink_tai64n_floor_init(void)
     return ESP_OK;
 }
 
+/* Same lookup order as main/app_nvs.c (keep in sync): the dedicated
+ * `nvs_creds` partition first (docs/PROVISIONING.md flashes it there),
+ * then the default `nvs` partition, both under namespace "tl_creds". The
+ * partition is mounted by app_nvs_init(); if it was not (absent / not
+ * provisioned) nvs_open_from_partition fails and we fall through. */
 static esp_err_t read_auth_key(char *out, size_t out_size)
 {
-    nvs_handle_t h;
-    esp_err_t err = nvs_open("tl_creds", NVS_READONLY, &h);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "nvs_open(tl_creds) failed: 0x%x", err);
-        return err;
+    esp_err_t err = ESP_ERR_NVS_NOT_FOUND;
+    for (int tier = 0; tier < 2; tier++) {
+        nvs_handle_t h;
+        err = (tier == 0)
+            ? nvs_open_from_partition("nvs_creds", "tl_creds", NVS_READONLY, &h)
+            : nvs_open("tl_creds", NVS_READONLY, &h);
+        if (err != ESP_OK) continue;
+        size_t len = out_size;
+        err = nvs_get_str(h, "auth_key", out, &len);
+        nvs_close(h);
+        if (err == ESP_OK) return ESP_OK;
     }
-    size_t len = out_size;
-    err = nvs_get_str(h, "auth_key", out, &len);
-    nvs_close(h);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "auth_key missing from NVS: 0x%x", err);
-    }
+    ESP_LOGE(TAG, "auth_key missing from NVS (nvs_creds:tl_creds, nvs:tl_creds): 0x%x",
+             err);
     return err;
 }
 
@@ -809,6 +816,10 @@ static int derp_sup_event_cb(const derp_event_t *e, void *ctx)
     return 0;
 }
 
+/* A DERP stream that lived at least this long counts as healthy for the
+ * reconnect ladder (mirrors LP_HEALTHY_MS for the control stream). */
+#define DERP_SUP_HEALTHY_MS 10000
+
 /* Task entry: own the connect + recv-loop + close + backoff cycle
  * end-to-end. Initial connect lives here (not in the start() caller)
  * so a transient heap shortage at bringup time doesn't tear the
@@ -853,10 +864,18 @@ static void derp_supervised_task(void *arg)
      * snappy). Reset to base on a successful login so the *next*
      * outage starts fresh instead of inheriting hours of accumulated
      * doubling. */
-    const TickType_t base_backoff =
-        pdMS_TO_TICKS(CONFIG_TINYLINK_DERP_SUPERVISED_BACKOFF_MS);
-    const TickType_t max_backoff = pdMS_TO_TICKS(30000);
-    TickType_t backoff = base_backoff;
+    /* Backoff ladder shared with the long-poll (backoff.h): capped
+     * exponential with ±25 % jitter, counted in consecutive FAILURES —
+     * connect failures, or streams that died before DERP_SUP_HEALTHY_MS
+     * of service. A healthy stream resets the ladder so the next blip
+     * recovers from the base, not the cap. Replaces the unjittered
+     * TickType_t doubling (15 s → 30 s, effectively one step) that
+     * synchronised a fleet into a thundering herd on every relay blip.
+     * Envelope unchanged: base = CONFIG_TINYLINK_DERP_SUPERVISED_BACKOFF_MS,
+     * cap = 30 s. */
+    const uint32_t base_ms = CONFIG_TINYLINK_DERP_SUPERVISED_BACKOFF_MS;
+    const uint32_t cap_ms  = 30000u;
+    uint32_t fail = 0;
 
     derp_sup_stats_t stats = {0};
     static uint8_t frame_buf[DERP_SUP_FRAME_CAP];
@@ -883,25 +902,21 @@ static void derp_supervised_task(void *arg)
                               "(after %u attempts)",
                          s_derp_sup.server_version, attempt);
                 attempt = 0;
-                backoff = base_backoff;
                 break;
             }
+            const uint32_t delay_ms = tl_backoff_ms(fail, base_ms, cap_ms,
+                                                    esp_random());
+            if (fail < 1000u) fail++;              /* saturate the counter */
             ESP_LOGW(TAG, "derp supervisor: connect attempt #%u failed 0x%x — "
                           "backoff %u ms",
-                     attempt, cerr,
-                     (unsigned)pdTICKS_TO_MS(backoff));
+                     attempt, cerr, (unsigned)delay_ms);
             derp_client_close(&s_derp_sup);
-            vTaskDelay(backoff);
-            /* Double for the next attempt, cap at max. The wrap guard
-             * (next < backoff) is paranoia — at 100 Hz tick rate the
-             * cap kicks in after 13 doublings, far below uint32 wrap. */
-            TickType_t next = backoff * 2;
-            backoff = (next > max_backoff || next < backoff)
-                      ? max_backoff : next;
+            vTaskDelay(pdMS_TO_TICKS(delay_ms));
         }
 
         ESP_LOGI(TAG, "derp supervisor: entering recv loop server-v=%d",
                  s_derp_sup.server_version);
+        const int64_t t0 = esp_timer_get_time();
         esp_err_t err = derp_client_run(&s_derp_sup, frame_buf, sizeof(frame_buf),
                                         derp_sup_event_cb, &stats);
         if (err == ESP_ERR_INVALID_RESPONSE) {
@@ -921,7 +936,18 @@ static void derp_supervised_task(void *arg)
                      (unsigned long)wg_netif_get_tx_drops());
         }
         derp_client_close(&s_derp_sup);
-        vTaskDelay(backoff);
+        /* A stream that served for a while was a healthy relay — recover
+         * from the base; a stream that died young climbs the ladder. */
+        const int64_t up_us = esp_timer_get_time() - t0;
+        if (up_us >= (int64_t)DERP_SUP_HEALTHY_MS * 1000LL) {
+            fail = 0;
+        } else if (fail < 1000u) {
+            fail++;
+        }
+        const uint32_t delay_ms = tl_backoff_ms(fail, base_ms, cap_ms,
+                                                esp_random());
+        ESP_LOGI(TAG, "derp supervisor: reconnecting in %u ms", (unsigned)delay_ms);
+        vTaskDelay(pdMS_TO_TICKS(delay_ms));
     }
 }
 
@@ -1137,10 +1163,11 @@ static esp_err_t long_poll_handler(const tl_netmap_t *nm, void *ctx)
 #define LP_BACKOFF_CAP_MS  ((uint32_t)CONFIG_TINYLINK_REGISTER_RETRY_MS)
 #define LP_HEALTHY_MS      10000LL
 
-/* Defined in the endpoint-updater section below; the long-poll task
- * signals it after a successful in-place re-register so the fresh node
- * record learns our current public endpoint (Stream=true is read-only
- * server-side). */
+/* Endpoint-push request flag, consumed by long_poll_task right after
+ * each control (re)connect. Set from the STUN re-probe path (any task)
+ * and from the in-place re-register path below; single consumer. See
+ * the "Endpoint push" section further down for the design + history. */
+static volatile bool s_ep_push_pending;
 static void tinylink_endpoint_push_async(void);
 
 /* Last time any control-plane byte reached us on the map stream. Set
@@ -1173,6 +1200,35 @@ static void long_poll_task(void *arg)
         int retry_after_s = 0;
         int http_status   = 0;
         esp_err_t err = ensure_control_conn();
+        if (err == ESP_OK && s_ep_push_pending) {
+            /* Endpoint push (Stream=false lite MapRequest) on the freshly
+             * connected s_conn, BEFORE the read-only Stream=true cycle
+             * claims it — the same sequence bringup runs at boot. This
+             * task has the stack the ts2021 path needs; the old dedicated
+             * ep_up task did not (see the "Endpoint push" section). */
+            s_ep_push_pending = false;
+            esp_err_t perr = mapreq_push_endpoints(&s_conn, &s_keys);
+            if (perr == ESP_OK) {
+                uint8_t  ep_addr[4];
+                uint16_t ep_port = 0;
+                if (tinylink_get_public_endpoint(ep_addr, &ep_port)) {
+                    ESP_LOGI(TAG, "endpoint push: pushed %u.%u.%u.%u:%u",
+                             ep_addr[0], ep_addr[1], ep_addr[2], ep_addr[3],
+                             (unsigned)ep_port);
+                }
+            } else {
+                /* Retry on the next connect; the loop's backoff below
+                 * paces it and a server Retry-After is honored like any
+                 * other map failure. */
+                s_ep_push_pending = true;
+                retry_after_s = s_conn.h2_retry_after_s;
+                http_status   = s_conn.h2_status;
+                ESP_LOGW(TAG, "endpoint push failed: 0x%x — retrying after "
+                              "reconnect", perr);
+                drop_control_conn();
+                err = perr;
+            }
+        }
         if (err == ESP_OK) {
             const int64_t t0 = esp_timer_get_time();
             err = mapreq_run_stream(&s_conn, &s_keys, long_poll_handler, NULL);
@@ -1184,7 +1240,12 @@ static void long_poll_task(void *arg)
             retry_after_s = s_conn.h2_retry_after_s;
             http_status   = s_conn.h2_status;
             const int64_t up_us = esp_timer_get_time() - t0;
-            ESP_LOGW(TAG, "long-poll stream ended: 0x%x — reconnecting", err);
+            if (s_ep_push_pending) {
+                ESP_LOGI(TAG, "long-poll stream recycled for endpoint push "
+                              "(0x%x) — reconnecting", err);
+            } else {
+                ESP_LOGW(TAG, "long-poll stream ended: 0x%x — reconnecting", err);
+            }
             drop_control_conn();
             /* The stream was a healthy working connection — recover fast. */
             if (up_us >= LP_HEALTHY_MS * 1000LL) fail_attempt = 0;
@@ -1209,8 +1270,10 @@ static void long_poll_task(void *arg)
                 if (rr == ESP_OK) {
                     ESP_LOGI(TAG, "re-register OK — refreshing endpoints");
                     /* Stream=true is read-only server-side; make sure the
-                     * fresh node record gets our current endpoint. */
-                    tinylink_endpoint_push_async();
+                     * fresh node record gets our current endpoint. We ARE
+                     * the long-poll task, so just flag it: the next
+                     * ensure_control_conn below runs the push. */
+                    s_ep_push_pending = true;
                     consec_4xx = 0;
                 } else {
                     ESP_LOGW(TAG, "re-register failed: 0x%x — map retry "
@@ -1363,244 +1426,56 @@ esp_err_t tinylink_wg_socket_init(void)
     return ESP_OK;
 }
 
-/* --- Persistent endpoint-updater task ---------------------------------
+/* --- Endpoint push (post-boot endpoint changes) ----------------------
  *
- * After a STUN re-probe finds a new public AddrPort, we need to tell
- * the control plane via a Stream=false MapRequest. The long-poll's
- * Stream=true cycle is read-only (tailcfg.go:1408+1436), and we can't
- * multiplex our lite request over s_conn because the h2_client tracks
- * a single stream_id per ts2021_conn (see h2_client.c, conn->h2_stream_id).
+ * After a STUN re-probe finds a new public AddrPort we must tell the
+ * control plane via a Stream=false MapRequest — the long-poll's
+ * Stream=true cycle is read-only server-side (tailcfg.go:1408+1436).
  *
- * Pattern mirrors upstream tailscale `controlclient.Auto.updateRoutine`
- * (control/controlclient/auto.go:55-99): one persistent worker that
- * sleeps on a signal, with a monotonic generation counter that coalesces
- * rapid changes — only the latest state is pushed.
+ * History. The 2026-05 design ran the push on a dedicated persistent
+ * task ("tinylink_ep_up", 12 KiB static stack in BSS) that opened its
+ * OWN ts2021 conn: `ts2021_conn_t conn` as a stack local (8 648 B) and
+ * then ts2021_connect (9 888 B frame) → recv_record_plaintext (4 176 B)
+ * → the mbedTLS handshake (~5 KiB). That chain needs ~28 KiB; the
+ * long-poll task, which runs the SAME chain without the local conn,
+ * measured a 20 KiB lifetime peak (PR #103). The 12 KiB task therefore
+ * overflowed its static stack by ~16 KiB on every real push, straight
+ * into the BSS neighbours below it (the DERP frame buffer, FreeRTOS
+ * ready lists, WiFi driver tables). It only appeared to work because
+ * the path runs solely on NAT rebind / WiFi re-association /
+ * re-register — and the one soak that forced a rebind (PR #102,
+ * 2026-05-13) panicked with an InstructionFetchError at a DRAM PC, the
+ * signature of exactly this overflow, attributed at the time to a 1 KiB
+ * stack trim. Verified 2026-09 from the compiled `entry` frame sizes
+ * (objdump of the release objects) and -fstack-usage.
  *
- * Why persistent: the legacy `endpoint_push_task` was spawned per
- * re-probe with a 24 KiB stack. After hours of operation with mbedtls +
- * nghttp2 + long-poll churn, heap fragmentation prevented
- * `xTaskCreate` from finding a contiguous 24 KiB block. The push then
- * never fired, the control plane kept the stale endpoint, the peer kept
- * sending WG to a dead NAT mapping, and the device entered an indefinite
- * handshake-retry loop. Reproduced in serial capture
- * /tmp/tinylink_capture_2026-05-11_0233_longrun.log around uptime 2716 s.
- *
- * The persistent task allocates its stack ONCE at boot (when heap is
- * plenty), so the spawn-failure path is eliminated.
- *
- * --- HOW WE HANDLE s_conn NOT-YET-ESTABLISHED ---
- *
- * When this task wakes and `s_conn_open == false` (the long-poll task
- * has not yet established the control-plane TLS+Noise channel, either
- * at cold boot or during a long-poll backoff after a network error),
- * we DO NOT open our own ts2021 connection. Two reasons:
- *
- *   1. If long-poll can't bring s_conn up, the network path to the
- *      control plane is probably also unreachable from here. Opening
- *      our own TLS handshake would just burn ~12 KiB of heap peak and
- *      ~5 s of wall time only to fail with the same error long-poll
- *      keeps hitting.
- *
- *   2. Once long-poll comes back up, the next STUN re-probe (or a
- *      manually-bumped gen) will signal us and we'll push then —
- *      cheaper and more likely to succeed.
- *
- * So in that case we re-enqueue: brief vTaskDelay, give the semaphore
- * back to ourselves, and loop. The wait is bounded by long-poll's own
- * reconnect backoff (CONFIG_TINYLINK_REGISTER_RETRY_MS, default 30 s).
- *
- * When `s_conn_open == true` we still open our own ts2021 conn for the
- * push (cannot share s_conn — single-stream h2_client; see above). The
- * difference vs the legacy code is reliability: we're running in a
- * persistent task, so the stack is already there. */
+ * Now: the push runs on the long-poll task, on s_conn, right after the
+ * (re)connect and before the stream starts — the exact sequence bringup
+ * runs at boot (tinylink_dataplane_start). tinylink_endpoint_push_async()
+ * records the request and kicks the long-poll out of its blocking
+ * stream read (ts2021_abort_reads); the reconnect then follows the
+ * normal healthy-stream backoff (~1 s), so a push lands within one 30 s
+ * socket poll + one Noise handshake. That latency is fine: the direct
+ * path recovers via DISCO regardless (RX-stale probe + roaming); the
+ * control-plane endpoint refresh is what lets PEERS initiate towards
+ * us. Cost vs the old design: one extra control reconnect per endpoint
+ * change (rare), in exchange for −12.6 KiB of BSS (stack + TCB), no
+ * second Noise/TLS conn (−8.6 KiB peak stack, ~−12 KiB TLS heap
+ * transient) and no overflow. Upstream sends its lite update over the
+ * shared HTTP/2 client (controlclient.Auto.updateRoutine); tinylink's
+ * h2_client is one stream per conn, so the recycle is the equivalent. */
 
-/* Stack: 12 KiB. Reverted from a 11 KiB trim attempt (PR #102) that was
- * sized off a 100 s post-boot smoke measuring the lifetime peak at
- * 9 264 B used.
- *
- * 30-min soak 2026-05-13 caught the actual overflow scenario the
- * commit body of PR #102 had explicitly flagged as un-validated:
- * a stun_probe-detected NAT rebind (ESP32-side WAN port shift) fires
- * `endpoint_push_bump_gen()`, the ep_up task wakes and starts the
- * ts2021_connect TLS handshake to controlplane — but under heap
- * fragmentation from a preceding cascade (Servidor1's WG responder
- * unreachable for ~minutes, handshake retries piling up, lwIP UDP
- * ENOMEM from sendto pressure), mbedtls's allocation pattern shifts
- * deeper than the 9 264 B baseline. The 11 KiB ceiling overflowed.
- * Panic: Guru Meditation InstructionFetchError, PC=0x3ffb2a60 (DRAM
- * region — classic stack-corruption-driven jump to bogus address),
- * Backtrace CORRUPTED.
- *
- * Original 12 KiB had 3 024 B margin over the steady-state 9 264 B
- * peak — that 33 % cushion absorbs the deeper allocation pattern
- * under stress and survives. The 11 KiB attempt's 2 000 B (22 %)
- * margin was insufficient.
- *
- * Indirect heap caveat: this stack lives in BSS (s_endpoint_push_stack
- * is StaticTask_t-backed via xTaskCreateStatic, see below). Per the
- * author's prior comment, "every KiB we lock in BSS comes directly out
- * of the DRAM heap arena WiFi init draws from — verified
- * 2026-05-11_validate_optB_v2 where 16 KiB tipped DRAM under the WiFi
- * driver's contiguous-block requirement and the boot CPU asserted in
- * esp_startup_start_app". 12 KiB has been validated safe; going to
- * 16 KiB would not be. */
-#define TINYLINK_EP_PUSH_TASK_STACK    12288
-#define TINYLINK_EP_PUSH_WAIT_MS        2000
-
-/* Exponential capped backoff for endpoint-push retries. Pre-PR the
- * task slept a fixed 3 s on every failure, so a server unreachable
- * for 10 minutes meant 200 connect attempts in that window. Mirrors
- * upstream tailscale `controlclient.Auto.updateRoutine` which uses
- * `backoff.NewBackoff("updateRoutine", c.logf, 30*time.Second)`
- * (auto.go:57): start at 1 s, double on each consecutive failure
- * until capped at 30 s, reset to the base on first success. */
-#define TINYLINK_EP_PUSH_ERR_BACKOFF_BASE_MS  1000
-#define TINYLINK_EP_PUSH_ERR_BACKOFF_MAX_MS   30000
-
-/* Stack + TCB in BSS — keeps the 12 KiB out of the heap arena that
- * long-poll's nghttp2 + mbedtls session init competes for. The only
- * post-boot heap cost is the semaphore (~80 B). xTaskCreateStatic can
- * never return NULL on memory grounds — predictable boot. */
-static StaticTask_t s_endpoint_push_tcb;
-static StackType_t  s_endpoint_push_stack[TINYLINK_EP_PUSH_TASK_STACK / sizeof(StackType_t)];
-
-static SemaphoreHandle_t s_endpoint_push_sem;
-static volatile uint32_t s_endpoint_push_gen;
-static uint32_t          s_endpoint_push_last_informed;
-static int               s_endpoint_push_backoff_ms =
-                            TINYLINK_EP_PUSH_ERR_BACKOFF_BASE_MS;
-
-/* Bump the backoff after a failure: double, cap at MAX_MS. */
-static void endpoint_push_bump_backoff(void)
-{
-    s_endpoint_push_backoff_ms *= 2;
-    if (s_endpoint_push_backoff_ms > TINYLINK_EP_PUSH_ERR_BACKOFF_MAX_MS) {
-        s_endpoint_push_backoff_ms = TINYLINK_EP_PUSH_ERR_BACKOFF_MAX_MS;
-    }
-}
-
-static void endpoint_updater_task(void *arg)
-{
-    (void)arg;
-    for (;;) {
-        xSemaphoreTake(s_endpoint_push_sem, portMAX_DELAY);
-
-        const uint32_t gen = s_endpoint_push_gen;
-        if (gen == s_endpoint_push_last_informed) {
-            /* Stale signal: latest gen already pushed (coalesce). */
-            continue;
-        }
-
-        if (!s_conn_open) {
-            ESP_LOGI(TAG, "endpoint_push: s_conn not yet established — "
-                          "re-enqueueing (waiting for long_poll, gen=%u)",
-                     (unsigned)gen);
-            vTaskDelay(pdMS_TO_TICKS(TINYLINK_EP_PUSH_WAIT_MS));
-            xSemaphoreGive(s_endpoint_push_sem);
-            continue;
-        }
-
-        /* s_conn is up but owned by long_poll_task in a blocking stream
-         * read; open our own ts2021 conn for the lite request. */
-        ts2021_conn_t conn;
-        esp_err_t err = ts2021_connect(&conn, s_keys.machine_priv,
-                                       s_keys.machine_pub, s_control_pub);
-        if (err != ESP_OK) {
-            ESP_LOGW(TAG, "endpoint_push: ts2021_connect failed: 0x%x "
-                          "— retrying gen=%u in %d ms",
-                     err, (unsigned)gen, s_endpoint_push_backoff_ms);
-            vTaskDelay(pdMS_TO_TICKS(s_endpoint_push_backoff_ms));
-            endpoint_push_bump_backoff();
-            xSemaphoreGive(s_endpoint_push_sem);
-            continue;
-        }
-
-        err = mapreq_push_endpoints(&conn, &s_keys);
-        /* Capture Retry-After (set by mapreq.c on 429/503) before
-         * ts2021_close, since the conn's per-stream state is gone after
-         * close. Only meaningful when err != ESP_OK with status 429/503;
-         * for all other paths mapreq_push_endpoints either leaves the
-         * field at the h2_request_reset baseline of 0, or sets it from
-         * a header that we'll only act on when err signals failure. */
-        int retry_after_s = conn.h2_retry_after_s;
-        ts2021_close(&conn);
-
-        if (err != ESP_OK) {
-            uint32_t delay_ms = (retry_after_s > 0)
-                                  ? (uint32_t)retry_after_s * 1000U
-                                  : (uint32_t)s_endpoint_push_backoff_ms;
-            ESP_LOGW(TAG, "endpoint_push: mapreq_push_endpoints failed: "
-                          "0x%x — retrying gen=%u in %u ms%s",
-                     err, (unsigned)gen, (unsigned)delay_ms,
-                     retry_after_s > 0 ? " (server Retry-After)" : "");
-            vTaskDelay(pdMS_TO_TICKS(delay_ms));
-            /* When the server gave us a specific Retry-After, don't ramp
-             * the exponential backoff on top of it — the server told us
-             * exactly how long to wait, and our internal escalation
-             * would double-count and likely overshoot on the next round. */
-            if (retry_after_s == 0) {
-                endpoint_push_bump_backoff();
-            }
-            xSemaphoreGive(s_endpoint_push_sem);
-            continue;
-        }
-
-        s_endpoint_push_last_informed = gen;
-        /* Reset backoff on first success after a failure run — fresh
-         * outage gets the full 1→30 s ramp again, matches upstream
-         * auto.go:91-94 `bo.Reset()` after a successful SendUpdate. */
-        s_endpoint_push_backoff_ms = TINYLINK_EP_PUSH_ERR_BACKOFF_BASE_MS;
-        uint8_t  ep_addr[4];
-        uint16_t ep_port = 0;
-        if (tinylink_get_public_endpoint(ep_addr, &ep_port)) {
-            ESP_LOGI(TAG, "endpoint_push: pushed %u.%u.%u.%u:%u (gen=%u)",
-                     ep_addr[0], ep_addr[1], ep_addr[2], ep_addr[3],
-                     (unsigned)ep_port, (unsigned)gen);
-        }
-    }
-}
-
-esp_err_t tinylink_endpoint_updater_start(void)
-{
-    if (s_endpoint_push_sem != NULL) return ESP_OK;  /* idempotent */
-
-    s_endpoint_push_sem = xSemaphoreCreateBinary();
-    if (s_endpoint_push_sem == NULL) {
-        ESP_LOGE(TAG, "endpoint_updater: xSemaphoreCreateBinary failed");
-        return ESP_ERR_NO_MEM;
-    }
-
-    /* Static allocation: stack/TCB live in BSS, NOT in the heap arena
-     * that long-poll's TLS+nghttp2 init draws from. Can never fail
-     * (no allocator involved). */
-    TaskHandle_t h = xTaskCreateStatic(endpoint_updater_task,
-                                       "tinylink_ep_up",
-                                       sizeof(s_endpoint_push_stack) / sizeof(StackType_t),
-                                       NULL,
-                                       tskIDLE_PRIORITY + 2,
-                                       s_endpoint_push_stack,
-                                       &s_endpoint_push_tcb);
-    if (h == NULL) {
-        ESP_LOGE(TAG, "endpoint_updater: xTaskCreateStatic returned NULL");
-        vSemaphoreDelete(s_endpoint_push_sem);
-        s_endpoint_push_sem = NULL;
-        return ESP_ERR_NO_MEM;
-    }
-    return ESP_OK;
-}
-
-/* Signal the updater that the public endpoint has changed. Coalesces
- * rapid concurrent calls via the gen counter (non-blocking semaphore
- * give; if the updater is already pending the second give is a no-op). */
+/* Signal that the public endpoint changed. Idempotent; callable from
+ * any task (STUN re-probe task, event handlers). */
 static void tinylink_endpoint_push_async(void)
 {
-    if (s_endpoint_push_sem == NULL) {
-        ESP_LOGW(TAG, "endpoint_push: updater task not started — "
-                      "endpoint change ignored");
-        return;
+    s_ep_push_pending = true;
+    if (s_conn_open) {
+        ESP_LOGI(TAG, "endpoint push: queued — recycling the map stream");
+        ts2021_abort_reads();
+    } else {
+        ESP_LOGI(TAG, "endpoint push: queued — runs on the next control connect");
     }
-    s_endpoint_push_gen++;
-    xSemaphoreGive(s_endpoint_push_sem);
 }
 
 /* --- STUN reprobe via the live WG socket -------------------------------

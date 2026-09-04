@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: MIT
+# Keep the GitHub Actions pins (checkout, upload-artifact, esp-idf-ci-action)
+# current. ESP-IDF itself is deliberately frozen at v5.5.4 (see
+# docs/BUILDING.md) and is NOT managed here.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly

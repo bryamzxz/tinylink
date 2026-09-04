@@ -10,7 +10,7 @@ These two patches must be applied to ESP-IDF v5.5.4 (and current master at time 
 ## Applying
 
 ```sh
-cd ~/esp/esp-idf-v5.5.4   # or wherever your IDF checkout lives
+cd "$IDF_PATH"            # your ESP-IDF v5.5.4 checkout
 git apply --check /path/to/tinylink/idf-patches/0001-*.patch /path/to/tinylink/idf-patches/0002-*.patch
 git am /path/to/tinylink/idf-patches/0001-*.patch /path/to/tinylink/idf-patches/0002-*.patch
 ```
@@ -20,7 +20,7 @@ If `git am` complains about whitespace, `git apply` followed by a manual commit 
 ## Reverting (to test against stock IDF)
 
 ```sh
-cd ~/esp/esp-idf-v5.5.4
+cd "$IDF_PATH"
 git reset --hard v5.5.4
 ```
 

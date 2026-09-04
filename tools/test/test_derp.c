@@ -3,7 +3,7 @@
  *
  * Host KAT for the DERP wire codec (derp.c). Covers:
  *   - Frame header read/write roundtrip + golden vectors lifted from
- *     /home/bryam/dev/tailscale/derp/derp_test.go::TestWriteFrameHeader.
+ *     tailscale/tailscale @ 632293de7: derp/derp_test.go::TestWriteFrameHeader.
  *   - FrameServerKey: magic verification, key extraction, magic tamper
  *     rejection, short-input rejection, forward-compat tail tolerance.
  *   - FrameClientInfo: build with two real Curve25519 keypairs, then
@@ -92,7 +92,7 @@ static void make_keypair(const char *seed_label,
 /* ------------------------------------------------------------------ */
 
 static void test_frame_header_roundtrip(void) {
-    /* Lifted from /home/bryam/dev/tailscale/derp/derp_test.go
+    /* Lifted from tailscale/tailscale @ 632293de7: derp/derp_test.go
      * TestWriteFrameHeader: FrameSendPacket + length 0x400 → bytes
      * {0x04, 0x00, 0x00, 0x04, 0x00}. */
     uint8_t hdr[DERP_FRAME_HDR_LEN];

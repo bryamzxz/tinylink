@@ -36,17 +36,28 @@ typedef struct poly1305_state_internal_t {
 
 /* interpret four 8 bit unsigned integers as a 32 bit unsigned integer in little endian.
  *
- * tinylink change: use __builtin_memcpy instead of byte-by-byte
- * assembly. On Xtensa little-endian (ESP32 LX6) this compiles to
- *   - 1× l32i  when GCC can prove p is 4-byte aligned (offsets 0 and 12
- *              in poly1305_blocks IF the call site passes an aligned m,
- *              e.g. the leftover path which always uses st->buffer);
- *   - 4× l8ui + reassembly otherwise (same as the original macro).
- * Never UB, never traps — strict-aliasing-safe by construction. */
-static unsigned long
+ * tinylink change (2026-09): register-only byte assembly for pointers of
+ * unknown alignment. The previous `__builtin_memcpy(&v, p, 4)` form
+ * compiled on Xtensa LX6 (no unaligned access, no byte-insert) to
+ * 4× l8ui + 4× s8i to the stack + 1× l32i — a store→load round trip
+ * per word, five of them per 16-byte block. This form is 4× l8ui +
+ * 3× slli + 3× or with no memory traffic; x86-64/AArch64 fold it to a
+ * single load. Never UB, never traps. */
+static uint32_t
 U8TO32(const unsigned char *p) {
+    return (uint32_t)p[0]
+         | ((uint32_t)p[1] << 8)
+         | ((uint32_t)p[2] << 16)
+         | ((uint32_t)p[3] << 24);
+}
+
+/* Same, for a pointer the CALLER has checked is 4-byte aligned:
+ * __builtin_assume_aligned lets GCC emit a single l32i. */
+static inline uint32_t
+U8TO32_ALIGNED(const unsigned char *p) {
+    const unsigned char *ap = __builtin_assume_aligned(p, 4);
     uint32_t v;
-    __builtin_memcpy(&v, p, sizeof(v));
+    __builtin_memcpy(&v, ap, sizeof(v));
     return v;
 }
 
@@ -63,12 +74,25 @@ void
 poly1305_init(poly1305_context *ctx, const unsigned char key[32]) {
     poly1305_state_internal_t *st = (poly1305_state_internal_t *)ctx;
 
-    /* r &= 0xffffffc0ffffffc0ffffffc0fffffff */
-    st->r[0] = (U8TO32(&key[ 0])     ) & 0x3ffffff;
-    st->r[1] = (U8TO32(&key[ 3]) >> 2) & 0x3ffff03;
-    st->r[2] = (U8TO32(&key[ 6]) >> 4) & 0x3ffc0ff;
-    st->r[3] = (U8TO32(&key[ 9]) >> 6) & 0x3f03fff;
-    st->r[4] = (U8TO32(&key[12]) >> 8) & 0x00fffff;
+    /* r &= 0xffffffc0ffffffc0ffffffc0fffffff
+     *
+     * tinylink change: the 26-bit limbs are carved out of FOUR
+     * word-aligned loads with funnel shifts (Xtensa `ssr`+`src`)
+     * instead of five loads at byte offsets 0/3/6/9/12 — three of which
+     * can never be aligned no matter what the caller does. Bit-identical
+     * to the upstream donna form: U8TO32(key+3) >> 2 == (t0 >> 26) |
+     * (t1 << 6) on the low 26 bits, etc. */
+    {
+        const uint32_t t0 = U8TO32(&key[ 0]);
+        const uint32_t t1 = U8TO32(&key[ 4]);
+        const uint32_t t2 = U8TO32(&key[ 8]);
+        const uint32_t t3 = U8TO32(&key[12]);
+        st->r[0] = ( t0                      ) & 0x3ffffff;
+        st->r[1] = ((t0 >> 26) | (t1 <<  6)) & 0x3ffff03;
+        st->r[2] = ((t1 >> 20) | (t2 << 12)) & 0x3ffc0ff;
+        st->r[3] = ((t2 >> 14) | (t3 << 18)) & 0x3f03fff;
+        st->r[4] = ( t3 >>  8                ) & 0x00fffff;
+    }
 
     /* h = 0 */
     st->h[0] = 0;
@@ -113,13 +137,37 @@ poly1305_blocks(poly1305_state_internal_t *st, const unsigned char *m, size_t by
     h3 = st->h[3];
     h4 = st->h[4];
 
+    /* tinylink change: load each 16-byte block as four LE words and
+     * carve the 26-bit limbs with funnel shifts, instead of five loads
+     * at byte offsets 0/3/6/9/12 (three of them inherently unaligned →
+     * on Xtensa each was 4× l8ui + a stack bounce). The alignment of m
+     * is invariant across the loop (16-byte stride), so it is decided
+     * once, on the buffer ADDRESS — never on data — and the aligned
+     * case (every WG packet: ciphertext at offset 16 of a word-aligned
+     * packet buffer; st->buffer in poly1305_finish) is 4× l32i. */
+    const int m_aligned = (((uintptr_t)m) & 3u) == 0;
+
     while (bytes >= poly1305_block_size) {
-        /* h += m[i] */
-        h0 += (U8TO32(m+ 0)     ) & 0x3ffffff;
-        h1 += (U8TO32(m+ 3) >> 2) & 0x3ffffff;
-        h2 += (U8TO32(m+ 6) >> 4) & 0x3ffffff;
-        h3 += (U8TO32(m+ 9) >> 6) & 0x3ffffff;
-        h4 += (U8TO32(m+12) >> 8) | hibit;
+        uint32_t t0, t1, t2, t3;
+        if (m_aligned) {
+            t0 = U8TO32_ALIGNED(m +  0);
+            t1 = U8TO32_ALIGNED(m +  4);
+            t2 = U8TO32_ALIGNED(m +  8);
+            t3 = U8TO32_ALIGNED(m + 12);
+        } else {
+            t0 = U8TO32(m +  0);
+            t1 = U8TO32(m +  4);
+            t2 = U8TO32(m +  8);
+            t3 = U8TO32(m + 12);
+        }
+        /* h += m[i]  (bit-identical to the upstream byte-offset form:
+         * U8TO32(m+3) >> 2 == (t0 >> 26) | (t1 << 6) on the low 26 bits,
+         * and so on) */
+        h0 += ( t0                      ) & 0x3ffffff;
+        h1 += ((t0 >> 26) | (t1 <<  6)) & 0x3ffffff;
+        h2 += ((t1 >> 20) | (t2 << 12)) & 0x3ffffff;
+        h3 += ((t2 >> 14) | (t3 << 18)) & 0x3ffffff;
+        h4 += ( t3 >>  8                ) | hibit;
 
         /* h *= r */
         d0 = ((unsigned long long)h0 * r0) + ((unsigned long long)h1 * s4) + ((unsigned long long)h2 * s3) + ((unsigned long long)h3 * s2) + ((unsigned long long)h4 * s1);

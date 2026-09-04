@@ -86,14 +86,16 @@ static void init_ctx_with_nonce12(struct chacha20_ctx *ctx,
  * 1, ready for plaintext encryption to start at counter=1 (per §2.8). */
 static void poly1305_keygen(uint8_t otk[32], struct chacha20_ctx *ctx)
 {
-    static const uint8_t zeros[32] = {0};
+    /* Word-aligned so chacha20()'s XOR takes its l32i/s32i fast path
+     * (the caller's otk[] is declared aligned too). */
+    static const uint8_t __attribute__((aligned(4))) zeros[32] = {0};
     chacha20(ctx, otk, zeros, 32);
 }
 
 /* Pad Poly1305 input to a 16-byte boundary by feeding zero bytes. */
 static void poly1305_pad16(poly1305_context *p, size_t already_in_len)
 {
-    static const uint8_t zeros[16] = {0};
+    static const uint8_t __attribute__((aligned(4))) zeros[16] = {0};
     size_t pad = (16 - (already_in_len % 16)) % 16;
     if (pad) {
         poly1305_update(p, zeros, pad);
@@ -108,7 +110,7 @@ static void aead_tag(uint8_t tag[TAG_LEN],
                      const uint8_t *ct,  size_t ct_len)
 {
     poly1305_context p;
-    uint8_t lengths[16];
+    uint8_t __attribute__((aligned(4))) lengths[16];
 
     poly1305_init(&p, otk);
     if (aad_len) poly1305_update(&p, aad, aad_len);
@@ -131,7 +133,7 @@ void chacha20poly1305_encrypt(uint8_t *out,
                               const uint8_t nonce[CHACHA20POLY1305_NONCE_LEN])
 {
     struct chacha20_ctx ctx;
-    uint8_t otk[32];
+    uint8_t __attribute__((aligned(4))) otk[32];
 
     init_ctx_with_nonce12(&ctx, key, nonce);
     poly1305_keygen(otk, &ctx);
@@ -159,7 +161,7 @@ int chacha20poly1305_decrypt(uint8_t *out,
     size_t mlen = clen - TAG_LEN;
 
     struct chacha20_ctx ctx;
-    uint8_t otk[32];
+    uint8_t __attribute__((aligned(4))) otk[32];
     uint8_t expected_tag[TAG_LEN];
 
     init_ctx_with_nonce12(&ctx, key, nonce);
