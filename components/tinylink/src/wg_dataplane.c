@@ -366,30 +366,36 @@ esp_err_t wg_dataplane_update_peer(const tinylink_keys_t *keys,
 {
     if (keys == NULL || nm == NULL) return ESP_ERR_INVALID_ARG;
     if (nm->n_peers == 0) return ESP_OK;
-
     /* Not started yet — go through the full bring-up (which runs
      * select_target_peer itself). */
     if (!s_started) return wg_dataplane_start(keys, nm);
+    return wg_dataplane_update_peers(keys, nm->peers, nm->n_peers);
+}
 
-    /* Already started: lock onto the peer we handshook with by
-     * matching s_peer_node_pub. Re-running select_target_peer here
-     * could pick a different peer mid-session, which would point
-     * encrypted traffic at a peer that holds different keys.
-     * Roaming the *endpoint* of the same peer is fine; switching
-     * peers is not — leave the live session alone in that case. */
+esp_err_t wg_dataplane_update_peers(const tinylink_keys_t *keys,
+                                    const tl_peer_t *peers, size_t n_peers)
+{
+    if (keys == NULL || peers == NULL) return ESP_ERR_INVALID_ARG;
+    if (!s_started || n_peers == 0) return ESP_OK;
+
+    /* Lock onto the peer we handshook with by matching s_peer_node_pub.
+     * Re-running select_target_peer here could pick a different peer
+     * mid-session, which would point encrypted traffic at a peer that
+     * holds different keys. Roaming the *endpoint* of the same peer is
+     * fine; switching peers is not — leave the live session alone. */
     const tl_peer_t *peer = NULL;
-    for (size_t i = 0; i < nm->n_peers; i++) {
-        if (memcmp(nm->peers[i].node_pub, s_peer_node_pub,
+    for (size_t i = 0; i < n_peers; i++) {
+        if (memcmp(peers[i].node_pub, s_peer_node_pub,
                    sizeof(s_peer_node_pub)) == 0) {
-            peer = &nm->peers[i];
+            peer = &peers[i];
             break;
         }
     }
     if (peer == NULL || peer->n_endpoints == 0) {
-        /* Peer dropped from the netmap or lost endpoints. We don't
-         * tear down here — the WG handshake retry budget will surface
-         * the dead path eventually, and a future netmap may re-add
-         * the peer. */
+        /* Peer dropped from the table or lost endpoints. We don't tear
+         * down here — the WG handshake retry budget will surface the
+         * dead path eventually, and a future netmap may re-add the
+         * peer. */
         return ESP_OK;
     }
 

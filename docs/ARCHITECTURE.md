@@ -123,6 +123,38 @@ primitives we did, see [`SECURITY-MODEL.md`](SECURITY-MODEL.md).
 +---------------------------------------------------------------+
 ```
 
+## Wall clock and certificate dates (M16, 2026-09)
+
+`tl_time.c`: at boot the clock is floored to max(build epoch, last NTP
+time persisted in `tl_state:time_floor`); SNTP starts on GOT_IP. The
+three TLS clients attach the IDF certificate bundle through
+`tl_crt_bundle_attach()`, whose verify callback clears
+`BADCERT_FUTURE`/`EXPIRED` only while the clock is not yet synced and
+then defers to the bundle's own callback. Result: offline boots and the
+first handshakes of a boot behave as before (no date check); every
+handshake after the first sync validates `notBefore`/`notAfter`. The
+telemetry task persists the synced time hourly.
+
+## WireGuard roaming and the handshake lock (M16, 2026-09)
+
+`wg_rx` authenticates TRANSPORT and handshake RESPONSE datagrams from an
+unexpected source first (AEAD + RFC 6479 window / Noise response
+verification) and, on success, moves the peer endpoint to that source
+(`roam_to`, under `g.lock` like every other endpoint write) — the
+whitepaper's roaming rule. INIT/COOKIE from unknown sources are dropped
+unauthenticated. The handshake state machine (`g.handshake`, `g.state`,
+rekey flags) is serialized by `g.hs_lock` between the RX task's timer
+blocks, the DISCO-pong fast-INIT and the DERP-relayed response path.
+
+## `/stats` (M16, 2026-09)
+
+The telemetry task's UDP socket also listens on
+`CONFIG_TINYLINK_STATS_PORT` (27822) and answers any datagram from a
+100.64.0.0/10 source with one JSON line built from
+`tinylink_get_stats()` (uptime, heap, NTP, control/DERP state, public
+endpoint, WG counters: rekeys, cold handshakes, RX-stale events, roams,
+TX drops, relay). `echo | nc -u -w1 <tailnet-ip> 27822`.
+
 ## MapResponse parsing (M15, 2026-09)
 
 `mapresp_parse` no longer tokenizes the whole document. `jsmn_split.h`
@@ -136,7 +168,10 @@ element larger than the table is skipped with a log instead of failing
 the map, so there is no document-size ceiling any more (the previous
 2 500-token table failed outright above ≈ 30 peers). The 32 KiB body
 buffer (`RESPONSE_BUF_SZ`) remains: each stream frame is still
-assembled whole before the split runs.
+assembled whole before the split runs. Since M16 the parser also
+reports `peers_is_delta` and `PeersRemoved` ids, and `tinylink.c` keeps
+a canonical peer table (replace / upsert / delete) that the data plane
+is updated from.
 
 ## WG netif as raw-IP carrier
 

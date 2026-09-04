@@ -90,6 +90,46 @@ typedef struct {
  */
 esp_err_t tinylink_init(void);
 
+/* Floor the wall clock (build time / last NTP sync persisted in NVS)
+ * and start SNTP. Call once WiFi has an address and BEFORE
+ * tinylink_init(): the TLS clients enforce certificate validity dates
+ * as soon as the first sync lands, and tolerate them until then. */
+esp_err_t tinylink_time_start(void);
+
+/* Read-only runtime snapshot, served as JSON by the telemetry task's
+ * /stats responder (CONFIG_TINYLINK_STATS_PORT) and usable from any
+ * task. All counters are since boot. */
+typedef struct {
+    uint32_t uptime_s;
+    uint32_t heap_free;
+    uint32_t heap_largest;
+    bool     ntp_synced;
+    /* control plane */
+    bool     control_open;
+    uint32_t control_alive_age_s;
+    uint32_t control_reconnects;
+    uint32_t endpoint_pushes;
+    /* DERP */
+    bool     derp_connected;
+    char     derp_host[64];
+    /* public endpoint (STUN) */
+    uint8_t  public_v4[4];
+    uint16_t public_port;
+    bool     public_valid;
+    /* WireGuard (wg_netif) */
+    int      wg_state;               /* 0 idle, 1 handshake pending, 2 up */
+    uint32_t wg_rekeys;
+    uint32_t wg_cold_handshakes;
+    uint32_t wg_rx_stale_events;
+    uint32_t wg_roams;
+    uint32_t wg_tx_drops;
+    uint32_t wg_relayed_stale;
+    uint32_t wg_relay_errors;
+    uint32_t wg_last_rx_age_s;
+} tinylink_stats_t;
+
+void tinylink_get_stats(tinylink_stats_t *out);
+
 /* Load the persisted TAI64N floor from NVS namespace "tl_state" key
  * "tai_floor" (default 0 on first ever boot), pre-reserve a 1-day
  * chunk forward, persist that, and install it into wg_proto.c so the

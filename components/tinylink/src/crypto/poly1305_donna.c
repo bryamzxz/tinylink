@@ -6,9 +6,10 @@
 // Validated by host KAT against RFC 8439 §2.5.2.
 
 #include "poly1305_donna.h"
+#include "tl_hot.h"
 #include "poly1305_donna_32.h"
 
-void
+TL_HOT_ATTR void
 poly1305_update(poly1305_context *ctx, const unsigned char *m, size_t bytes) {
     poly1305_state_internal_t *st = (poly1305_state_internal_t *)ctx;
     size_t i;

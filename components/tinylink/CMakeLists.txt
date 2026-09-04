@@ -39,6 +39,7 @@ idf_component_register(
         "src/crypto/poly1305_donna.c"
         "src/crypto/chacha20poly1305.c"
         "src/tinylink_bench.c"
+        "src/tl_time.c"
     INCLUDE_DIRS
         "include"
     PRIV_INCLUDE_DIRS
@@ -65,3 +66,10 @@ idf_component_register(
 # override here scopes -O2 to our own code only, so the documented
 # toolchain hangs on certain lwIP files at -O2 are not in scope.
 target_compile_options(${COMPONENT_LIB} PRIVATE -O2)
+
+# Build epoch for tl_time.c's clock floor (see tl_time.h). Evaluated at
+# configure time, so a reconfigure moves it; that is the intent — the
+# floor only has to be <= real time and >= the newest cert's notBefore
+# the firmware will meet before its first NTP sync.
+string(TIMESTAMP TL_BUILD_EPOCH "%s" UTC)
+target_compile_definitions(${COMPONENT_LIB} PRIVATE TL_BUILD_EPOCH=${TL_BUILD_EPOCH}ULL)

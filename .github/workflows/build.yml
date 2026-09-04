@@ -25,7 +25,7 @@ concurrency:
 env:
   # Strict per-case count of `[name] OK` lines the suite must reach.
   # Bump when tests are added (see CHANGELOG for the running number).
-  HOST_TESTS_MIN_OK: 566
+  HOST_TESTS_MIN_OK: 570
 
 jobs:
   host-tests:

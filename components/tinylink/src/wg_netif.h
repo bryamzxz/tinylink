@@ -231,6 +231,22 @@ bool wg_netif_rx_running(void);
  * handler in tinylink.c can apply the same knownPeerDiscoKey gate the
  * direct UDP path applies in handle_disco_direct, instead of acting on
  * a PING/CallMeMaybe sealed by any tailnet node's DiscoKey. */
+/* /stats snapshot (M16). */
+typedef struct {
+    int      state;                  /* wg_netif_state_t */
+    uint32_t rekeys;
+    uint32_t cold_handshakes;
+    uint32_t rx_stale_events;
+    uint32_t roams;
+    uint64_t tx_drops;
+    uint64_t relayed_stale;
+    uint64_t relay_errors;
+    int64_t  last_transport_recv_us;
+    int64_t  last_handshake_completed_us;
+} wg_netif_stats_t;
+
+void wg_netif_get_stats(wg_netif_stats_t *out);
+
 bool wg_netif_get_peer_disco_pub(uint8_t out[WG_KEY_LEN]);
 
 #ifdef __cplusplus

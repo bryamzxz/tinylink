@@ -82,6 +82,14 @@ static esp_err_t bringup(void)
         ESP_LOGI(TAG, "pm: light-sleep enabled, DFS 240/80 MHz");
     }
 
+    /* Clock floor + SNTP before the first TLS handshake (tinylink_init
+     * may fetch /key over TLS). Certificate dates are enforced once the
+     * first sync lands; until then they are tolerated. See tl_time.h. */
+    err = tinylink_time_start();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "time start failed: 0x%x — certificate dates unchecked", err);
+    }
+
     err = tinylink_init();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "tinylink_init failed: 0x%x", err);

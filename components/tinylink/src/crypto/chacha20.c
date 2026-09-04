@@ -46,6 +46,8 @@
 #include <stdint.h>
 #include <string.h>
 
+#include "tl_hot.h"
+
 /* Endian/clamp macros — inlined from trombik/esp_wireguard's crypto.h
  * so this file is self-contained. */
 #define U8C(v)  (v##U)
@@ -119,7 +121,7 @@ static inline __attribute__((always_inline)) void INNER_BLOCK(uint32_t *block) {
  * writer below and the XOR reader both touch it with plain l32i/s32i,
  * and reading a uint32_t[] through a uint8_t* (for the tail bytes) is
  * always legal, whereas the reverse is not. */
-static void chacha20_block(struct chacha20_ctx *ctx, uint32_t stream[16]) {
+static TL_HOT_ATTR void chacha20_block(struct chacha20_ctx *ctx, uint32_t stream[16]) {
     uint32_t working_state[16];
     int i;
 
@@ -206,7 +208,7 @@ static inline void xor_block_u32(uint8_t *out, const uint8_t *in,
     }
 }
 
-void chacha20(struct chacha20_ctx *ctx, uint8_t *out, const uint8_t *in, uint32_t len) {
+TL_HOT_ATTR void chacha20(struct chacha20_ctx *ctx, uint8_t *out, const uint8_t *in, uint32_t len) {
     /* Keystream block; word-typed so it is 4-byte aligned by
      * construction (Xtensa requires it for l32i/s32i). */
     uint32_t output[CHACHA20_BLOCK_SIZE / 4];

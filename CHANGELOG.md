@@ -7,6 +7,128 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### To-95 round (2026-09-04, part 3, branch `feat/to-95`)
+
+Closes every improvement-list item that needs neither router/admin
+access nor an owner decision (`docs/ROADMAP.md` § "Improvement list");
+the remaining 5 % is written down as the next owner's checklist in
+§ "The last 5 %". Host suite **570 strict OK, 0 FAIL**, ASan/UBSan clean.
+Hardware numbers at the end of the entry.
+
+#### 1 — TLS certificate dates are validated once the clock is NTP-synced (item 6)
+
+`CONFIG_MBEDTLS_HAVE_TIME_DATE=y` at last. New `tl_time.c`: at boot the
+system clock is floored to max(build epoch — injected by CMake —, last
+NTP time persisted in `tl_state:time_floor`), both ≤ real time by
+construction; SNTP (lwIP, `CONFIG_TINYLINK_SNTP_SERVER`, default
+pool.ntp.org) starts once WiFi has an address. All three TLS clients
+(control plane, DERP, `/key`) go through `tl_crt_bundle_attach()`, which
+installs a verify callback in front of the IDF bundle's: while the clock
+is not yet synced it clears `BADCERT_FUTURE`/`BADCERT_EXPIRED` — exactly
+the pre-existing "no date check" behaviour, now limited to the first
+handshakes of a boot — and once synced dates are enforced. (The IDF
+bundle callback only acts on a bare `NOT_TRUSTED` flag, so without the
+wrapper an unsynced clock would have failed every handshake; verified
+against `esp_crt_bundle.c`.) The telemetry task persists the synced
+time hourly so the floor advances across reboots; an offline boot keeps
+working with the last floor.
+
+#### 2 — `PeersRemoved` and delta merge (item 10)
+
+`mapresp_parse` now distinguishes `Peers` (full list) from
+`PeersChanged` (delta) via `peers_is_delta` and parses `PeersRemoved`
+NodeIDs. `long_poll_handler` keeps the canonical peer table
+(`s_last_peers`): replace on `Peers`, upsert by NodeKey on
+`PeersChanged`, delete by NodeID on `PeersRemoved`; KeepAlive and
+patch-only frames leave it alone — before this every frame overwrote the
+table and a KeepAlive *emptied* it, so the RX-stale probe had no
+endpoints to try for most of the stream's life, and a delta carrying
+another peer wiped the WG peer's endpoints. The data plane is updated
+from the merged table (`wg_dataplane_update_peers`). Four new
+`test_mapresp` cases incl. an oversized element that is skipped without
+losing the rest of the map.
+
+#### 3 — WireGuard handshake state under a lock; roam on any authenticated packet (items 8, 9)
+
+`g.hs_lock` serializes the handshake state machine between `wg_rx`'s
+timer blocks, the DISCO-pong fast-INIT and the DERP-relayed response
+path (`wg_netif_inject_packet`, another task); every peer-endpoint
+write (`update_peer_endpoint`, pong roam, the new `roam_to`) runs under
+`g.lock`, which the TX worker already holds when it snapshots the
+sockaddr, so a torn `0.0.0.0:0` destination is no longer possible. And
+the pre-authentication source filter is gone for TRANSPORT and handshake
+RESPONSE datagrams: they are authenticated first (AEAD + replay window /
+Noise response verification) and, if genuine, the peer endpoint follows
+the source — the WireGuard whitepaper's roaming rule. A peer NAT rebind
+used to blackhole inbound until the 30-s RX-stale probe elicited a pong;
+now the first authenticated packet from the new mapping re-routes us.
+Replayed packets fail the window and cannot roam; INIT/COOKIE from
+unknown sources are still dropped unauthenticated.
+
+#### 4 — `/stats` over UDP on the tunnel (item 18)
+
+The telemetry socket binds `CONFIG_TINYLINK_STATS_PORT` (27822); any
+datagram from a 100.64.0.0/10 source is answered with one JSON line:
+uptime, heap free/largest, NTP state, control conn (open, alive age,
+reconnects, endpoint pushes), DERP (connected, host), public endpoint,
+WG (state, rekeys, cold handshakes, RX-stale events, roams, TX drops,
+relayed/relay errors, last-RX age), telemetry seq. Waiting is
+`select()`-based on a fixed deadline, so the 5-s cadence is unchanged.
+`tinylink_get_stats()` is the public snapshot API; wg_netif grew the
+four counters. No httpd, no heap.
+
+```
+$ echo | nc -u -w1 100.67.60.92 27822
+```
+
+#### 5 — AEAD hot path placement decided by measurement (item 16)
+
+`crypto/tl_hot.h` + `CONFIG_TINYLINK_CRYPTO_IN_IRAM` mark
+`chacha20()`, the Poly1305 block/update/finish functions and the AEAD
+glue `IRAM_ATTR`. The bench (`CONFIG_TINYLINK_BENCH_AEAD`) gained a
+**cold** variant that evicts the 32 KiB flash cache (reads 64 KiB of
+mapped text) before each timed call — the per-packet situation after
+TLS/WiFi code has run, which the hot loop cannot show. Measured on the
+sensor (ESP32-WROOM-32E, 240 MHz, QIO@80, two bench images flashed back
+to back):
+
+| ChaCha20-Poly1305 | crypto in flash | crypto in IRAM |
+|---|---:|---:|
+| hot loop, 1500 B enc / dec | 374.7 / 375.0 µs (250 ns/B) | 374.5 / 375.2 µs |
+| hot loop, 64 B enc / dec | 31.7 / 32.2 µs | 31.8 / 32.3 µs |
+| **cold**, 1500 B enc / dec | 545 / 527 µs | **451 / 452 µs** (−17 %) |
+| **cold**, 64 B enc / dec | 157 / 162 µs | **112 / 113 µs** (−29 %) |
+| IRAM used | 75 079 B | 76 787 B (+1 708 B) |
+
+Hot numbers are identical, as predicted — and 1.76× better than the
+660 µs/1500 B recorded before the M8/M14 optimizations. The cold case
+is what a WG packet actually costs after TLS/WiFi code ran in between;
+1.7 KiB of the 56 KiB unused IRAM buys 90 µs per MTU packet there, so
+`CONFIG_TINYLINK_CRYPTO_IN_IRAM` defaults to **y**.
+
+#### 6 — Tests
+
+`test_mapresp` +4 (full vs delta, PeersRemoved ids, oversized element
+skipped). CI floor 570.
+
+#### Hardware (deployed sensor, app partition only; the M15 image read back to `~/tinylink-backups/` first)
+
+Build: 0 warnings; flash 938 421 → 946 209 B (+7.8 KiB: SNTP, `/stats`,
+IRAM copies of the AEAD); static DRAM 106 880 → 107 696 B (59.6 %);
+IRAM 75 079 → 76 787 B. 180-s boot smoke: `boots:1 wdt:0 panics:0
+initial:1 wg_up:1 stun_ok:1 stream_ended:0`, clock floored to the build
+time at +1.9 s, **NTP sync at +2.5 s — before the first TLS handshake at
++4.7 s, so every certificate of this boot was date-validated**,
+register 200 at +7.0 s, `/stats` responder up at +9.3 s, DERP login at
++11.7 s, WG session up at +14.6 s, 33 telemetry datagrams at the 5 000 ms
+cadence, `heap_free=61 976 largest=49 152` at +125 s, no warnings beyond
+the expected ones (legacy-namespace credentials, the pre-session
+`sendto`, one boot handshake retry). The two bench images that preceded
+it (crypto in flash / in IRAM, with all of this round's code) also
+registered, parsed the netmap and brought the WG session up with the
+task WDT silent. A multi-hour soak of this image is running as this
+entry is written; its result belongs to owner-checklist item D.
+
 ### Road-to-100 round (2026-09-04, part 2, branch `feat/road-to-100`)
 
 Works down the prioritized list in `docs/ROADMAP.md` § "Improvement list

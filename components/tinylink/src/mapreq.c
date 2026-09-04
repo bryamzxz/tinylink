@@ -404,6 +404,22 @@ static esp_err_t parse_derp_map_split(const char *js, size_t len,
     return (rc < 0) ? ESP_ERR_INVALID_RESPONSE : ESP_OK;
 }
 
+/* PeersRemoved: array of NodeIDs (JSON numbers). */
+static esp_err_t parse_removed_split(const char *js, size_t len, tl_netmap_t *out)
+{
+    size_t pos = 0;
+    const char *v; size_t vlen; int rc;
+    while ((rc = tl_jsplit_arr_next(js, len, &pos, &v, &vlen)) == 1) {
+        if (out->n_removed >= TL_MAX_PEERS_REMOVED) continue;
+        char buf[24];
+        if (vlen == 0 || vlen >= sizeof(buf) || v[0] < '0' || v[0] > '9') continue;
+        memcpy(buf, v, vlen);
+        buf[vlen] = '\0';
+        out->removed_ids[out->n_removed++] = strtoull(buf, NULL, 10);
+    }
+    return (rc < 0) ? ESP_ERR_INVALID_RESPONSE : ESP_OK;
+}
+
 /* PeersChangedPatch: array of tailcfg.PeerChange objects. Only the
  * presence of "Key" / "DiscoKey" matters (see netmap.h) — read straight
  * off the split, no tokens needed. */
@@ -445,14 +461,19 @@ esp_err_t mapresp_parse(const char *json, size_t json_len, tl_netmap_t *out)
             if (n >= 1 && tok_is_obj(&s_toks[0])) {
                 parse_node_obj(kv.val, s_toks, 0, out);
             }
-        } else if ((tl_jsplit_key_is(&kv, "Peers") ||
-                    tl_jsplit_key_is(&kv, "PeersChanged")) && kv.val[0] == '[') {
-            /* Stream-mode delta-add. The control plane sends the full peer
-             * list in PeersChanged on the first MapResponse instead of
-             * Peers; subsequent updates carry only the changed peers. We
-             * treat PeersChanged identically to Peers — replace the full
-             * peer list. PeersRemoved is not honored (see ROADMAP). */
+        } else if (tl_jsplit_key_is(&kv, "Peers") && kv.val[0] == '[') {
+            /* Full peer list: the caller replaces its table. */
             err = parse_peers_split(kv.val, kv.val_len, out, &peak);
+            out->peers_is_delta = false;
+        } else if (tl_jsplit_key_is(&kv, "PeersChanged") && kv.val[0] == '[') {
+            /* Stream-mode delta: upsert into the caller's table. The
+             * control plane sends the whole list this way on the first
+             * MapResponse (observed 2026-05-02), which merges into an
+             * empty table identically to a full list. */
+            err = parse_peers_split(kv.val, kv.val_len, out, &peak);
+            out->peers_is_delta = true;
+        } else if (tl_jsplit_key_is(&kv, "PeersRemoved") && kv.val[0] == '[') {
+            err = parse_removed_split(kv.val, kv.val_len, out);
         } else if (tl_jsplit_key_is(&kv, "PeersChangedPatch") && kv.val[0] == '[') {
             /* Minimal patch handling (upstream-audit 2026-07-16): a patch
              * touching a peer's "Key" (NodeKey rotation) or "DiscoKey"

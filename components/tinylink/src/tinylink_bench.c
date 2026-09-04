@@ -78,6 +78,47 @@ static void bench_one(const char *label, size_t mlen, uint32_t iters)
              rc);
 }
 
+/* Cold-cache variant (2026-09): between timed calls, read 64 KiB of the
+ * app's flash-mapped text through the cache (the ESP32 has a 32 KiB
+ * flash cache per core, so this evicts everything), then time ONE
+ * encrypt / decrypt. This is what a WG packet costs after TLS / WiFi
+ * code has run in between — the case CONFIG_TINYLINK_CRYPTO_IN_IRAM
+ * targets; the hot loop above cannot show it. */
+#define BENCH_EVICT_BYTES (64 * 1024)
+static uint32_t evict_flash_cache(void)
+{
+    /* 0x400D0000 is the IROM (flash text) mapping base on the ESP32;
+     * the app text is ≥ 600 KiB, so 64 KiB from the base is always
+     * mapped. Volatile so the reads are not folded away. */
+    const volatile uint32_t *p = (const volatile uint32_t *)0x400D0000;
+    uint32_t sink = 0;
+    for (size_t i = 0; i < BENCH_EVICT_BYTES / 4; i += 8) {   /* one word per 32-B line */
+        sink += p[i];
+    }
+    return sink;
+}
+
+static void bench_cold(const char *label, size_t mlen, uint32_t iters)
+{
+    int64_t enc_us = 0, dec_us = 0;
+    uint32_t sink = 0;
+    int rc = 0;
+    for (uint32_t i = 0; i < iters; ++i) {
+        sink += evict_flash_cache();
+        int64_t t0 = esp_timer_get_time();
+        chacha20poly1305_encrypt(s_ct, s_pt, mlen, s_aad, sizeof(s_aad), s_key, s_nonce);
+        enc_us += esp_timer_get_time() - t0;
+        sink += evict_flash_cache();
+        t0 = esp_timer_get_time();
+        rc |= chacha20poly1305_decrypt(s_dec, s_ct, mlen + CHACHA20POLY1305_TAG_LEN,
+                                       s_aad, sizeof(s_aad), s_key, s_nonce);
+        dec_us += esp_timer_get_time() - t0;
+    }
+    ESP_LOGI(TAG, "%-7s mlen=%4u iters=%4u COLD | enc %u us/call | dec %u us/call | dec_rc=%d sink=%u",
+             label, (unsigned)mlen, (unsigned)iters,
+             (unsigned)(enc_us / iters), (unsigned)(dec_us / iters), rc, (unsigned)sink);
+}
+
 esp_err_t tinylink_bench_aead(void)
 {
     /* Fixed inputs: we want bit-identical work across builds so two
@@ -108,6 +149,8 @@ esp_err_t tinylink_bench_aead(void)
      * outside that band. */
     bench_one("small",   64,  4000);
     bench_one("mtu",   1500,   500);
+    bench_cold("cold", 64, 50);
+    bench_cold("cold", 1500, 50);
 
     return ESP_OK;
 }

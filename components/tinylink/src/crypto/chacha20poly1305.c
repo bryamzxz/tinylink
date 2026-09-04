@@ -22,6 +22,7 @@
 #include "chacha20.h"
 #include "poly1305_donna.h"
 #include "secure_zero.h"
+#include "tl_hot.h"
 
 #define TAG_LEN CHACHA20POLY1305_TAG_LEN
 
@@ -104,7 +105,7 @@ static void poly1305_pad16(poly1305_context *p, size_t already_in_len)
 
 /* Compute the AEAD tag over (aad || pad16 || ct || pad16 || u64 LE
  * aad_len || u64 LE ct_len). Used by both encrypt and decrypt. */
-static void aead_tag(uint8_t tag[TAG_LEN],
+static TL_HOT_ATTR void aead_tag(uint8_t tag[TAG_LEN],
                      const uint8_t otk[32],
                      const uint8_t *aad, size_t aad_len,
                      const uint8_t *ct,  size_t ct_len)
@@ -126,7 +127,7 @@ static void aead_tag(uint8_t tag[TAG_LEN],
 
 /* --- public API ----------------------------------------------------- */
 
-void chacha20poly1305_encrypt(uint8_t *out,
+TL_HOT_ATTR void chacha20poly1305_encrypt(uint8_t *out,
                               const uint8_t *m, size_t mlen,
                               const uint8_t *aad, size_t aad_len,
                               const uint8_t key[CHACHA20POLY1305_KEY_LEN],
@@ -151,7 +152,7 @@ void chacha20poly1305_encrypt(uint8_t *out,
     tl_secure_zero(&ctx, sizeof(ctx));
 }
 
-int chacha20poly1305_decrypt(uint8_t *out,
+TL_HOT_ATTR int chacha20poly1305_decrypt(uint8_t *out,
                              const uint8_t *c, size_t clen,
                              const uint8_t *aad, size_t aad_len,
                              const uint8_t key[CHACHA20POLY1305_KEY_LEN],

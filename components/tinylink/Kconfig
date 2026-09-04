@@ -16,6 +16,19 @@ menu "tinylink core"
             debugging with a debugger attached (breakpoints would trip
             it).
 
+    config TINYLINK_CRYPTO_IN_IRAM
+        bool "Place the ChaCha20-Poly1305 hot path in IRAM"
+        default y
+        help
+            Marks chacha20(), poly1305 blocks/update/finish and the AEAD
+            glue IRAM_ATTR (1.7 KiB of the ~56 KiB free IRAM). Removes the
+            flash-cache refill cost (~225 CPU cycles per 32-byte line)
+            when TLS/WiFi code has evicted the crypto between packets.
+            Measured 2026-09-04 with TINYLINK_BENCH_AEAD's cold variant
+            on the ESP32-WROOM-32E: MTU packet 545 → 451 us (−17 %),
+            64-byte packet 157 → 112 us (−29 %); hot-loop numbers are
+            identical (375 us / 31.7 us). Off only if IRAM runs short.
+
     config TINYLINK_BENCH_AEAD
         bool "Run ChaCha20-Poly1305 AEAD micro-benchmark on boot"
         default n

@@ -187,6 +187,48 @@ int main(void)
     }
     printf("[patch/mixed-frame] OK\n");
 
+    /* --- Peers vs PeersChanged vs PeersRemoved (M16 merge contract) --- */
+    static const char *kFull = "{\"Peers\":[{\"ID\":1},{\"ID\":2}]}";
+    if (mapresp_parse(kFull, strlen(kFull), &nm) != ESP_OK ||
+        nm.n_peers != 2 || nm.peers_is_delta || nm.n_removed != 0) {
+        printf("[peers/full-not-delta] FAIL\n");
+        return 1;
+    }
+    printf("[peers/full-not-delta] OK\n");
+
+    static const char *kDelta = "{\"PeersChanged\":[{\"ID\":3}]}";
+    if (mapresp_parse(kDelta, strlen(kDelta), &nm) != ESP_OK ||
+        nm.n_peers != 1 || !nm.peers_is_delta || nm.peers[0].id != 3) {
+        printf("[peers/changed-is-delta] FAIL\n");
+        return 1;
+    }
+    printf("[peers/changed-is-delta] OK\n");
+
+    static const char *kRemoved =
+        "{\"PeersRemoved\":[7,123456789012,\"x\",42],\"KeepAlive\":false}";
+    if (mapresp_parse(kRemoved, strlen(kRemoved), &nm) != ESP_OK ||
+        nm.n_removed != 3 || nm.removed_ids[0] != 7 ||
+        nm.removed_ids[1] != 123456789012ULL || nm.removed_ids[2] != 42 ||
+        nm.n_peers != 0) {
+        printf("[peers/removed-ids] FAIL n=%zu\n", nm.n_removed);
+        return 1;
+    }
+    printf("[peers/removed-ids] OK\n");
+
+    /* Oversized element is skipped, the rest of the map still parses. */
+    {
+        static char big[9000];
+        size_t o = 0;
+        o += (size_t)snprintf(big + o, sizeof(big) - o, "{\"Peers\":[{\"ID\":1,\"Tags\":[");
+        for (int i = 0; i < 700; i++) o += (size_t)snprintf(big + o, sizeof(big) - o, "\"t\",");
+        o += (size_t)snprintf(big + o, sizeof(big) - o, "\"t\"]},{\"ID\":2}]}");
+        if (mapresp_parse(big, o, &nm) != ESP_OK || nm.n_peers != 1 || nm.peers[0].id != 2) {
+            printf("[peers/oversized-element-skipped] FAIL n=%zu\n", nm.n_peers);
+            return 1;
+        }
+        printf("[peers/oversized-element-skipped] OK\n");
+    }
+
     printf("ALL OK\n");
     return 0;
 }

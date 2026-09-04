@@ -72,12 +72,15 @@ cutting scope to a single peer.
 
 **Production-ready — stable within the single-peer scope.** The
 firmware runs 24/7 in its intended sensor-→-collector deployment;
-milestones **M1–M15** are done (the two 2026-09 rounds also gave M13
-its first hardware runs: boot smokes and a 20-min stream check clean on
-the deployed sensor; the forced half-open / wedge / node-delete items of
-the M13 checklist remain to be exercised). Static DRAM is at 59 %, the
-application tasks are under the task watchdog, and the firmware reports
-`1.2.0-tinylink`. Per-milestone breakdown in
+milestones **M1–M16** are done — about **95 % of the declared scope**
+by the maintainer's estimate (`docs/ROADMAP.md` § "Completion
+estimate"); the remaining 5 % is an owner checklist (router-side drop
+tests, a multi-hour soak, two authorizations) that no code change can
+substitute. The three 2026-09 rounds also gave M13 its first hardware
+runs. Static DRAM is at 59 %, every application task is under the task
+watchdog, certificate dates are validated once NTP syncs, `/stats` is a
+UDP query away, and the firmware reports `1.2.0-tinylink`. Per-milestone
+breakdown in
 [`docs/ROADMAP.md`](docs/ROADMAP.md), per-PR history in
 [`CHANGELOG.md`](CHANGELOG.md).
 
@@ -109,6 +112,7 @@ What works today, verified on real hardware:
 | 13 | Control-plane reconnect hardening (2026-07-16, #109) | done — stream idle budget (mirrors upstream `watchdogTimeout`), `PeersChangedPatch` identity refetch, in-place re-register on map 4xx, wedge `esp_restart` last resort. Boot smoke + 20-min stream check passed 2026-09-04 |
 | 14 | Audit + optimization round (2026-09-04) | done — endpoint-push stack overflow fixed (task removed, −12.6 KiB BSS), headscale `/key` capver gate, TSMP proto-99 drop, DERP close race, Xtensa-tuned ChaCha20/Poly1305 (XOR 19 → 7 instr/word), backoff consolidation, provisioning contract fixed, ASan CI |
 | 15 | Road-to-100 round (2026-09-04, part 2) | done — netmap parsed one value at a time (−30 KiB BSS, no tailnet-size ceiling), task WDT for app tasks, capver 142, connect-path stack diet, DERP live relay switch, IP-change recycle + WiFi backoff, conn kept after register, flash trims, 3 new KAT suites, firmware 1.2.0 (even minor = Tailscale "stable" track) |
+| 16 | To-95 round (2026-09-04, part 3) | done — NTP-synced certificate date validation, `PeersRemoved` + delta merge, WG handshake lock + roam on authenticated packets, `/stats` over UDP, AEAD placement measured cold. Declared scope ≈ 95 %; the last 5 % is the owner checklist in `docs/ROADMAP.md` |
 
 Two further 2026-05-12 rounds — sdkconfig perf-trim (#76–#80) and DERP
 outbound (#82–#83: supervisor spawn + lossless relay fallback during
@@ -309,8 +313,10 @@ None of these block the current sensor-→-collector path:
   control plane are a worse failure mode than the out-of-scope
   physical-access risk; rationale in
   [`docs/ROADMAP.md` § Execution queue](docs/ROADMAP.md)).
-- **No SNTP / wall-clock** — `MBEDTLS_HAVE_TIME_DATE` is off, so the
-  three TLS clients never validate cert `notBefore`/`notAfter`.
+- **Certificate dates are enforced only after the first NTP sync** —
+  until then (the first handshakes of a boot, or an offline boot) they
+  are tolerated, with the clock floored to the build / last-synced
+  time. See `tl_time.h`.
 - **CapabilityVersion has a shelf life against headscale** — its
   `MinSupportedCapabilityVersion` tracks the latest ten minor releases
   (113 in 2026-07, 115 in 2026-09) and rejects both `/key` and `/ts2021`
@@ -323,7 +329,8 @@ None of these block the current sensor-→-collector path:
   parser to go the same way.
 - **DERP relay TX path validated only dormant** — the PR-D1 relay
   fallback is in place but has not yet fired under a real forced flap;
-  that soak needs peer-side (Servidor1) access.
+  that soak needs peer-side (Servidor1) access. (`/stats` reports
+  `relayed_stale` so the next flap will be visible without a cable.)
 
 ## Possible future directions
 

@@ -7,6 +7,7 @@
 #include <string.h>
 
 #include "esp_crt_bundle.h"
+#include "tl_time.h"
 #include "esp_log.h"
 #include "mbedtls/ssl.h"
 
@@ -340,7 +341,7 @@ esp_err_t ts2021_connect(ts2021_conn_t *out,
              CONFIG_TINYLINK_CONTROL_HOST, CONFIG_TINYLINK_CONTROL_PORT);
 
     esp_tls_cfg_t tls_cfg = {
-        .crt_bundle_attach = esp_crt_bundle_attach,
+        .crt_bundle_attach = tl_crt_bundle_attach,
         .timeout_ms = TLS_TIMEOUT_MS,
     };
 

@@ -57,6 +57,11 @@ void wg_dataplane_stop(void);
 esp_err_t wg_dataplane_update_peer(const tinylink_keys_t *keys,
                                    const tl_netmap_t *nm);
 
+/* Same, from the caller's merged peer table (tinylink.c keeps the
+ * canonical table across Peers / PeersChanged / PeersRemoved frames). */
+esp_err_t wg_dataplane_update_peers(const tinylink_keys_t *keys,
+                                    const tl_peer_t *peers, size_t n_peers);
+
 #ifdef __cplusplus
 }
 #endif

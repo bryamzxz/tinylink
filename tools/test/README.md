@@ -46,7 +46,7 @@ coverage without restating the base flags.
 | `test_derp`              | `derp.c` frame codec, ServerInfo/ClientInfo           | upstream `derp_test.go` |
 | `test_tls_io`            | `tls_io.c` WANT_READ retry + idle budget (M13)        | fake reader |
 | `test_retry_after`       | `h2_retry_after.h` 429/503 parsing                    | synthetic |
-| `test_mapresp`           | `mapreq.c::mapresp_parse` (netmap, DERPMap, patches)  | real one-peer MapResponse stub |
+| `test_mapresp`           | `mapreq.c::mapresp_parse` (netmap, DERPMap, patches, Peers vs PeersChanged vs PeersRemoved, oversized element) | real one-peer MapResponse stub + synthetic |
 | `test_skip_value`        | `jsmn_skip.h` depth bound                             | synthetic |
 | `test_backoff`           | `backoff.h` ladder + jitter                           | synthetic |
 | `test_keys_regen`        | `keys_regen.h` identity regeneration policy           | 8 combinations |
