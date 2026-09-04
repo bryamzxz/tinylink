@@ -2,7 +2,7 @@
 
 ## Supported versions
 
-tinylink versions as `1.1.x` (`TINYLINK_IPN_VERSION` in
+tinylink versions as `1.2.x` (`TINYLINK_IPN_VERSION` in
 `components/tinylink/include/tinylink.h`), but there are no release tags or
 branches yet: development happens on `main` and only `main` receives fixes.
 

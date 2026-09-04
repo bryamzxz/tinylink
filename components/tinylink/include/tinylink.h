@@ -14,7 +14,7 @@ extern "C" {
 #endif
 
 #define TINYLINK_VERSION_MAJOR 1
-#define TINYLINK_VERSION_MINOR 1
+#define TINYLINK_VERSION_MINOR 2
 #define TINYLINK_VERSION_PATCH 0
 
 /* String forms derived from the integer components above so a future

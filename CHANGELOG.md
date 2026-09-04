@@ -14,7 +14,11 @@ Works down the prioritized list in `docs/ROADMAP.md` § "Improvement list
 `test_tai64n`, `test_nacl_box`), clean under ASan + UBSan. Δ flash
 946 293 → **938 421 B** (−7.7 KiB). Δ static DRAM 136 656 → **106 880 B**
 (75.6 % → 59.1 %; BSS 122 024 → 92 248 B). Firmware version 1.0.0 →
-**1.1.0** (`IPNVersion 1.1.0-tinylink` in the admin panel). Compiler
+**1.2.0** (`IPNVersion 1.2.0-tinylink` in the admin panel — 1.1.0 was
+flashed first and the panel flipped `tsReleaseTrack` to *unstable*:
+Tailscale treats odd minor versions as unstable builds, the same rule
+PR #87 leaned on to reach *stable* with 1.0.0; even minors only from
+now on). Compiler
 warnings: 0. Hardware validation at the end of this entry.
 
 #### 1 — MapResponse parsed one value at a time (−30 KiB BSS, no tailnet-size ceiling)
@@ -153,8 +157,21 @@ Heap after the netmap: `heap_free=63 104 largest=49 152` (M14: 33 328 /
 21 504; M13 and before: largest 9–11 KiB). `tinylink_lp hwm=13 496 B
 free` — unchanged from M14, i.e. the long-poll's steady-state peak is the
 streaming path, not the connect path the diet shortened; the trim of its
-24 KiB stack still waits for the multi-hour soak. 20-min stream
-stability run recorded below.
+24 KiB stack still waits for the multi-hour soak.
+
+20-min stream-stability run on the same image (1 200 s from +130 s of
+uptime): `boots:0 wdt:0 panics:0 stream_ended:0 tls_read_failed:0
+stream_silent:0`, 22 server KeepAlives, 244 telemetry datagrams at the
+exact 5 000 ms cadence, 0 WiFi disconnects, 0 DERP reconnects, 0
+warnings or errors, 21 stack-diag dumps with `heap_free` 62 664–63 396 B
+and `largest` pinned at 49 152 B; task high-water marks unchanged from
+the first dump to the last (`tinylink_lp` 13 496 B free, `tinylink_derp`
+5 140 B, `wg_rx` 2 120 B). The task WDT stayed silent for the whole run
+with every application task subscribed. The 1.2.0 image (version bump
+only, same code) was then flashed: 120-s smoke `boots:1 wdt:0 panics:0
+initial:1 wg_up:1 stun_ok:1 stream_ended:0`, register 200 at +8.4 s,
+netmap +12.7 s, DERP +15.4 s, WG session +18.9 s, `largest=51 200` at
++68 s; the admin panel shows `1.2.0-tinylink` on the stable track.
 
 ### Audit + optimization round (2026-09-04)
 

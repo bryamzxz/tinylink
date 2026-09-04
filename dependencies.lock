@@ -16,6 +16,6 @@ dependencies:
 direct_dependencies:
 - espressif/nghttp
 - idf
-manifest_hash: 121a4e381f91ba29039642cc8534df1f9da71d1d8e0da5bdc9f01c4fcb6f8b07
+manifest_hash: b67347429aac5da5ab85319880a350a09599e952245bd35c884eb9bf0ae30d53
 target: esp32
 version: 2.0.0

@@ -5,7 +5,7 @@
 **A clean-room, single-peer Tailscale-compatible node for the bare ESP32 — no PSRAM, ~916 KiB of flash, pure C.**
 
 [![CI](https://github.com/bryamzxz/tinylink/actions/workflows/build.yml/badge.svg)](https://github.com/bryamzxz/tinylink/actions/workflows/build.yml)
-[![Firmware](https://img.shields.io/badge/firmware-1.1.0-brightgreen)](CHANGELOG.md)
+[![Firmware](https://img.shields.io/badge/firmware-1.2.0-brightgreen)](CHANGELOG.md)
 [![Target](https://img.shields.io/badge/target-ESP32--WROOM%20(no%20PSRAM)-orange)](#hardware)
 [![Framework](https://img.shields.io/badge/ESP--IDF-v5.5-e7352c)](docs/BUILDING.md)
 [![Host tests](https://img.shields.io/badge/host%20KATs-546%20%C2%B7%200%20fail-brightgreen)](#testing)
@@ -77,7 +77,7 @@ its first hardware runs: boot smokes and a 20-min stream check clean on
 the deployed sensor; the forced half-open / wedge / node-delete items of
 the M13 checklist remain to be exercised). Static DRAM is at 59 %, the
 application tasks are under the task watchdog, and the firmware reports
-`1.1.0-tinylink`. Per-milestone breakdown in
+`1.2.0-tinylink`. Per-milestone breakdown in
 [`docs/ROADMAP.md`](docs/ROADMAP.md), per-PR history in
 [`CHANGELOG.md`](CHANGELOG.md).
 
@@ -108,7 +108,7 @@ What works today, verified on real hardware:
 | 12 | Audit-fix round (2026-06-10, #106)             | done — capver 138 at the Noise layer, WG rx-path lock + relayed-DISCO peer gate, atomic key regen, depth-bounded MapResponse skip, secure_zero sweep |
 | 13 | Control-plane reconnect hardening (2026-07-16, #109) | done — stream idle budget (mirrors upstream `watchdogTimeout`), `PeersChangedPatch` identity refetch, in-place re-register on map 4xx, wedge `esp_restart` last resort. Boot smoke + 20-min stream check passed 2026-09-04 |
 | 14 | Audit + optimization round (2026-09-04) | done — endpoint-push stack overflow fixed (task removed, −12.6 KiB BSS), headscale `/key` capver gate, TSMP proto-99 drop, DERP close race, Xtensa-tuned ChaCha20/Poly1305 (XOR 19 → 7 instr/word), backoff consolidation, provisioning contract fixed, ASan CI |
-| 15 | Road-to-100 round (2026-09-04, part 2) | done — netmap parsed one value at a time (−30 KiB BSS, no tailnet-size ceiling), task WDT for app tasks, capver 142, connect-path stack diet, DERP live relay switch, IP-change recycle + WiFi backoff, conn kept after register, flash trims, 3 new KAT suites, firmware 1.1.0 |
+| 15 | Road-to-100 round (2026-09-04, part 2) | done — netmap parsed one value at a time (−30 KiB BSS, no tailnet-size ceiling), task WDT for app tasks, capver 142, connect-path stack diet, DERP live relay switch, IP-change recycle + WiFi backoff, conn kept after register, flash trims, 3 new KAT suites, firmware 1.2.0 (even minor = Tailscale "stable" track) |
 
 Two further 2026-05-12 rounds — sdkconfig perf-trim (#76–#80) and DERP
 outbound (#82–#83: supervisor spawn + lossless relay fallback during

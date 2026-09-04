@@ -29,7 +29,7 @@ implementation, which is the authoritative reference for wire format.
 | M12| Audit-fix round (2026-06-10)                  | done — 6 fixes, HW-validated vs tailscale.com | v0.7   | landed   |
 | M13| Control-plane reconnect hardening (2026-07-16)| done — stream idle budget, patch-driven refetch, in-place re-register, wedge restart. Boot smoke + 20-min stream check passed on the deployed sensor 2026-09-04 (checklist items 3–5 still open) | v0.8   | landed   |
 | M14| Audit + optimization round (2026-09-04)       | done — endpoint-push stack overflow fixed (task removed, −12.6 KiB BSS), headscale `/key` capver gate, TSMP drop, DERP close race, Xtensa-tuned AEAD, backoff consolidation, provisioning contract, ASan CI. See "M14" + "Improvement list" below | v0.8   | landed   |
-| M15| Road-to-100 round (2026-09-04, part 2)        | done — netmap parsed one value at a time (−30 KiB BSS, no tailnet-size ceiling), task WDT for app tasks, capver 142, connect-path stack diet, DERP live relay switch, IP-change recycle + WiFi backoff, conn kept after register, flash trims, 3 new KAT suites, firmware 1.1.0 | v1.1   | landed   |
+| M15| Road-to-100 round (2026-09-04, part 2)        | done — netmap parsed one value at a time (−30 KiB BSS, no tailnet-size ceiling), task WDT for app tasks, capver 142, connect-path stack diet, DERP live relay switch, IP-change recycle + WiFi backoff, conn kept after register, flash trims, 3 new KAT suites, firmware 1.2.0 | v1.2   | landed   |
 | —  | Next rounds                                   | queued — see "Execution queue" below (M13 checklist 3–5 → task WDT → SNTP → buffer diet → /stats → OTA; eFuse encryption explicitly out) | —      | queued   |
 
 End-to-end verification on hardware (sensor-cali next to router,
@@ -980,7 +980,7 @@ connected sensor. Per-item detail in `CHANGELOG.md`.
   WPA-Enterprise (−8.2 KiB); the cert-bundle trim stays a CA-risk
   decision.
 - [x] **#19 conn kept after register.**  [x] **#20 dead code.**
-- Firmware version **1.1.0**.
+- Firmware version **1.2.0** (even minor: Tailscale shows odd minors as the *unstable* release track).
 
 ### Improvement list (2026-09-04) — what remains, in priority order
 
