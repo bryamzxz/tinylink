@@ -11,7 +11,7 @@ dispatched on buffer alignment, which UBSan checks on the host).
 
 ```bash
 cd tools/test
-make test                    # build + run all 20 binaries
+make test                    # build + run all 23 binaries
 make asan                    # same, under ASan + UBSan (clean rebuild)
 make test RUNNER='valgrind -q --error-exitcode=9'
 make test_stun.run           # one binary
@@ -50,6 +50,9 @@ coverage without restating the base flags.
 | `test_skip_value`        | `jsmn_skip.h` depth bound                             | synthetic |
 | `test_backoff`           | `backoff.h` ladder + jitter                           | synthetic |
 | `test_keys_regen`        | `keys_regen.h` identity regeneration policy           | 8 combinations |
+| `test_jsmn_split`        | `jsmn_split.h` shallow object/array splitter (MapResponse) | synthetic incl. depth bound |
+| `test_tai64n`            | `wg_proto.c` TAI64N floor / reservation / persist     | synthetic |
+| `test_nacl_box`          | `nacl_box.c` seal/open/precomputed-shared/tamper      | **libsodium** vectors (PyNaCl, `gen_nacl_vectors.py`) |
 
 ## Not covered on the host (needs a seam or a fixture)
 
@@ -57,7 +60,5 @@ coverage without restating the base flags.
   chachapoly shim over `chacha20poly1305.c`; `host_mbedtls_shim.c` shows
   the pattern).
 - `register.c` RegisterResponse parsing (cJSON-based), `control_key.c`
-  `/key` parsing, `stun_probe.c`, `telemetry.c` JSON formatting,
-  `wg_proto.c` TAI64N floor/reservation logic — all platform-bound today.
-- Salsa20 / NaCl-box have only round-trip consistency, not independent
-  vectors (DJB / libsodium KATs would close that).
+  `/key` parsing, `stun_probe.c`, `telemetry.c` JSON formatting — all
+  platform-bound today.

@@ -123,6 +123,21 @@ primitives we did, see [`SECURITY-MODEL.md`](SECURITY-MODEL.md).
 +---------------------------------------------------------------+
 ```
 
+## MapResponse parsing (M15, 2026-09)
+
+`mapresp_parse` no longer tokenizes the whole document. `jsmn_split.h`
+iterates the top-level object by byte range (string-aware, depth-bounded)
+and jsmn tokenizes ONE value at a time into a 640-entry table (10 KiB
+BSS): the self `Node`, each `Peers[i]` / `PeersChanged[i]`, each
+`DERPMap.Regions[id]`; `PeersChangedPatch` entries are scanned for
+`Key`/`DiscoKey` off the split with no tokens. Everything else
+(DNSConfig, PacketFilter, UserProfiles, …) is skipped by range. An
+element larger than the table is skipped with a log instead of failing
+the map, so there is no document-size ceiling any more (the previous
+2 500-token table failed outright above ≈ 30 peers). The 32 KiB body
+buffer (`RESPONSE_BUF_SZ`) remains: each stream frame is still
+assembled whole before the split runs.
+
 ## WG netif as raw-IP carrier
 
 The WG netif uses `ESP_NETIF_FLAG_AUTOUP` and a custom no-op netstack
@@ -626,3 +641,20 @@ planned trim.
 
 There is no dedicated endpoint-push task any more (2026-09): the push
 runs on `tinylink_lp` — see item 9 below.
+
+### Task watchdog (M15, 2026-09)
+
+Every task in the table except `tinylink_stun_re` subscribes to the ESP
+task WDT at entry (`tl_wdt.h`, `CONFIG_TINYLINK_APP_TASK_WDT`, default
+y) and feeds once per loop iteration. Blocking TLS reads feed through
+the `tls_io` poll hook on every WANT_READ/WRITE poll — one 30-s
+`SO_RCVTIMEO` period — so the long-poll and the DERP supervisor feed
+at least every 30 s while idle; long sleeps (Retry-After, reconnect
+ladders, the DERP dataplane wait) go through `tl_wdt_sleep_ms` in 10-s
+slices. Budget: `CONFIG_ESP_TASK_WDT_TIMEOUT_S=60`, the Kconfig maximum
+(a larger value is silently dropped back to the 5-s default — that
+exact mistake tripped the long-poll on the first M15 flash, since its
+30-s poll cannot feed a 5-s budget). `CONFIG_ESP_TASK_WDT_PANIC=y`: a
+task that stops iterating reboots the device into the known-good boot
+path, the same stance as the control-path wedge restart. `wg_rx` /
+`wg_tx` unsubscribe before `vTaskDelete`.

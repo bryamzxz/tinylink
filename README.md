@@ -2,10 +2,10 @@
 
 # tinylink
 
-**A clean-room, single-peer Tailscale-compatible node for the bare ESP32 — no PSRAM, ~924 KiB of flash, pure C.**
+**A clean-room, single-peer Tailscale-compatible node for the bare ESP32 — no PSRAM, ~916 KiB of flash, pure C.**
 
 [![CI](https://github.com/bryamzxz/tinylink/actions/workflows/build.yml/badge.svg)](https://github.com/bryamzxz/tinylink/actions/workflows/build.yml)
-[![Firmware](https://img.shields.io/badge/firmware-1.0.0-brightgreen)](CHANGELOG.md)
+[![Firmware](https://img.shields.io/badge/firmware-1.1.0-brightgreen)](CHANGELOG.md)
 [![Target](https://img.shields.io/badge/target-ESP32--WROOM%20(no%20PSRAM)-orange)](#hardware)
 [![Framework](https://img.shields.io/badge/ESP--IDF-v5.5-e7352c)](docs/BUILDING.md)
 [![Host tests](https://img.shields.io/badge/host%20KATs-546%20%C2%B7%200%20fail-brightgreen)](#testing)
@@ -49,7 +49,7 @@ the tunnel — 24/7, on a 4 MB module with 520 KiB of SRAM.
   546 host known-answer tests (golden vectors lifted from upstream),
   multi-hour hardware soaks behind every riskier change, per-PR
   CHANGELOG with flash/RAM deltas.
-- **Tiny footprint** — ~924 KiB app image (40 % of the partition free),
+- **Tiny footprint** — ~916 KiB app image (40 % of the partition free),
   static-first memory design tuned for a PSRAM-less ESP32.
 
 ## Why
@@ -63,7 +63,7 @@ cutting scope to a single peer.
 
 |                    | `tailscaled`            | MicroLink            | **tinylink**             |
 |--------------------|-------------------------|----------------------|--------------------------|
-| Footprint          | ~23 MB (~4.5 MB small)  | ~950 KiB             | **~924 KiB**             |
+| Footprint          | ~23 MB (~4.5 MB small)  | ~950 KiB             | **~916 KiB**             |
 | RAM requirement    | tens of MB              | PSRAM                | **no PSRAM (520 KiB SRAM)** |
 | Language / runtime | Go                      | —                    | **pure C, ESP-IDF v5.5** |
 | Scope              | full Tailscale          | reduced              | **single-peer sensor node** |
@@ -72,11 +72,12 @@ cutting scope to a single peer.
 
 **Production-ready — stable within the single-peer scope.** The
 firmware runs 24/7 in its intended sensor-→-collector deployment;
-milestones **M1–M14** are done (M14, the 2026-09 audit + optimization
-round, also gave M13 its first hardware run: boot smoke and stream
-stability clean on the deployed sensor; the forced half-open / wedge /
-node-delete items of the M13 checklist remain to be exercised). Per-milestone
-breakdown in
+milestones **M1–M15** are done (the two 2026-09 rounds also gave M13
+its first hardware runs: boot smokes and a 20-min stream check clean on
+the deployed sensor; the forced half-open / wedge / node-delete items of
+the M13 checklist remain to be exercised). Static DRAM is at 59 %, the
+application tasks are under the task watchdog, and the firmware reports
+`1.1.0-tinylink`. Per-milestone breakdown in
 [`docs/ROADMAP.md`](docs/ROADMAP.md), per-PR history in
 [`CHANGELOG.md`](CHANGELOG.md).
 
@@ -107,6 +108,7 @@ What works today, verified on real hardware:
 | 12 | Audit-fix round (2026-06-10, #106)             | done — capver 138 at the Noise layer, WG rx-path lock + relayed-DISCO peer gate, atomic key regen, depth-bounded MapResponse skip, secure_zero sweep |
 | 13 | Control-plane reconnect hardening (2026-07-16, #109) | done — stream idle budget (mirrors upstream `watchdogTimeout`), `PeersChangedPatch` identity refetch, in-place re-register on map 4xx, wedge `esp_restart` last resort. Boot smoke + 20-min stream check passed 2026-09-04 |
 | 14 | Audit + optimization round (2026-09-04) | done — endpoint-push stack overflow fixed (task removed, −12.6 KiB BSS), headscale `/key` capver gate, TSMP proto-99 drop, DERP close race, Xtensa-tuned ChaCha20/Poly1305 (XOR 19 → 7 instr/word), backoff consolidation, provisioning contract fixed, ASan CI |
+| 15 | Road-to-100 round (2026-09-04, part 2) | done — netmap parsed one value at a time (−30 KiB BSS, no tailnet-size ceiling), task WDT for app tasks, capver 142, connect-path stack diet, DERP live relay switch, IP-change recycle + WiFi backoff, conn kept after register, flash trims, 3 new KAT suites, firmware 1.1.0 |
 
 Two further 2026-05-12 rounds — sdkconfig perf-trim (#76–#80) and DERP
 outbound (#82–#83: supervisor spawn + lossless relay fallback during
@@ -178,7 +180,7 @@ Three properties that are non-obvious from a casual read of the code:
    OmitPeers=true), the only shape modern Tailscale.com persists at
    CapVer ≥ 68. The long-poll Stream=true is read-only — it streams
    netmap updates but ignores any Hostinfo/Endpoints in the request.
-   The advertised CapabilityVersion is `TINYLINK_CAPVER = 138`
+   The advertised CapabilityVersion is `TINYLINK_CAPVER = 142`
    (= Tailscale v1.98), set once in `components/tinylink/include/
    tinylink.h` and derived into the Noise prologue, RegisterRequest,
    and MapRequest. It clears headscale's earlyNoise
@@ -186,7 +188,7 @@ Three properties that are non-obvious from a casual read of the code:
    2026-09; it tracks the latest ten minor releases), which the server
    enforces before any JSON is read — and, since headscale `5b6e1e17`,
    on the legacy `GET /key?v=` TOFU fetch as well, so `control_key.c`
-   sends the same macro.
+   sends the same macro. The value is 142 (= v1.102) since round 15.
 
 ## Quick start
 
@@ -296,11 +298,10 @@ None of these block the current sensor-→-collector path:
   against. Since round 13, `PeersChangedPatch` frames carrying a peer
   `Key`/`DiscoKey` rotation force a full-netmap refetch, so the gap is
   efficiency, not correctness, for single-peer.
-- **No general task watchdog** — round 13 added control-path
-  self-recovery (stream idle timeout + wedge `esp_restart` after
-  `CONFIG_TINYLINK_CONTROL_WEDGE_RESTART_S` of control silence, plus
-  restart-on-failed-bringup), but application tasks (`wg_rx`,
-  telemetry, DERP supervisor) are still not subscribed to the task WDT.
+- **Task watchdog validated only on short runs** — since round 15 every
+  application task (`wg_rx`, `wg_tx`, telemetry, DERP supervisor,
+  long-poll) is subscribed to the task WDT (90 s, panic → reboot); the
+  multi-hour soak the stack-trim lesson calls for has not been run yet.
 - **NVS private keys are stored in PLAINTEXT** — there is no
   `CONFIG_SECURE_FLASH_ENC_ENABLED` and `keys.c` uses the default plain
   partition. At-rest/eFuse key encryption is **deliberately declined**
@@ -310,16 +311,16 @@ None of these block the current sensor-→-collector path:
   [`docs/ROADMAP.md` § Execution queue](docs/ROADMAP.md)).
 - **No SNTP / wall-clock** — `MBEDTLS_HAVE_TIME_DATE` is off, so the
   three TLS clients never validate cert `notBefore`/`notAfter`.
-- **CapabilityVersion 138 has a shelf life against headscale** — its
+- **CapabilityVersion has a shelf life against headscale** — its
   `MinSupportedCapabilityVersion` tracks the latest ten minor releases
   (113 in 2026-07, 115 in 2026-09) and rejects both `/key` and `/ts2021`
-  below it. 138 (= v1.98) falls under the floor in roughly four more
-  headscale releases; the bump needs a hardware A/B smoke (it changes
-  the Noise prologue). Upstream is at 145.
-- **Static DRAM is at 75.6 %** (136.7 KiB) — dominated by the 40 KiB
-  jsmn token table and the 32 KiB MapResponse body buffer; the
-  streaming/shallow parser in `docs/ROADMAP.md` § "Future directions"
-  is what lifts that.
+  below it. tinylink advertises 142 (= v1.102) since round 15, ~8
+  headscale releases of headroom; each bump needs a hardware A/B smoke
+  (it changes the Noise prologue). Upstream is at 145.
+- **The 32 KiB MapResponse body buffer is the last big static object**
+  (static DRAM 59 %). The token table went 40 → 10 KiB in round 15 by
+  parsing one value at a time; the body buffer needs a streaming
+  parser to go the same way.
 - **DERP relay TX path validated only dormant** — the PR-D1 relay
   fallback is in place but has not yet fired under a real forced flap;
   that soak needs peer-side (Servidor1) access.

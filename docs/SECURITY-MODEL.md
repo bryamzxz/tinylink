@@ -145,10 +145,11 @@ solved. None is fixed in the current firmware.
   (2026-07-16) — irreversible eFuse burns paired with recovery that
   depends on a third-party control plane are a worse failure mode than
   the (out-of-scope) physical-access risk they mitigate.
-- **No general task-WDT coverage for application tasks.** The task WDT
-  is compiled in (`CONFIG_ESP_TASK_WDT_EN=y`) but `CONFIG_..._WDT_PANIC`
-  is unset and it only subscribes the two idle tasks — no application
-  task (`wg_rx`, DERP supervisor, telemetry) calls `esp_task_wdt_add`.
+- ~~**No general task-WDT coverage for application tasks.**~~ *Closed in
+  M15 (2026-09-04)*: every application task subscribes (`tl_wdt.h`),
+  `CONFIG_ESP_TASK_WDT_PANIC=y`, 90-s budget. What remains is the
+  multi-hour validation soak. Historical note kept below for context:
+  before M15 the task WDT only subscribed the two idle tasks.
   *Narrowed in the 2026-07 round:* the control path now has a dedicated
   self-recovery ladder (bounded stream silence → reconnect → in-place
   re-register → `esp_restart` after
@@ -201,6 +202,15 @@ view here.
 - **Provisioning.** NVS is confirmed plaintext (the inert
   `CONFIG_NVS_ENCRYPTION=y` was removed so nobody believes otherwise);
   the credential lookup order is documented in `docs/PROVISIONING.md`.
+- **Part 2 (M15), same day.** Application tasks are under the task WDT
+  (90 s, panic → reboot) — closes the "wedge in a data-plane task
+  bricks its function" gap below for good, pending the multi-hour
+  soak. The MapResponse is parsed one value at a time, so an oversized
+  or adversarially large element is skipped rather than failing the
+  map (and the 40 KiB token table is 10 KiB). The NaCl box now has
+  independent libsodium vectors; the TAI64N floor has host coverage.
+  CapVer 142 claims only client-side node attributes tinylink ignores.
+  TLS is compiled client-only.
 
 ## Reconnect-hardening round (2026-07) — control-path availability
 
