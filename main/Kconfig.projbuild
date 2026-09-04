@@ -143,13 +143,18 @@ menu "tinylink application"
         range 1 65535
 
     config TINYLINK_DERP_SMOKE_HOST
-        string "DERP smoke-test hostname (M5 step 2a)"
-        default "derp1.tailscale.com"
+        string "DERP fallback hostname (before the first netmap)"
+        default "derp16b.tailscale.com"
         help
-            Hostname used for the boot-time DERP connect+login smoke
-            test. derp1 is region 1 (US East) — adjust if you want a
-            closer relay for boot-latency reasons. Set to empty to
-            skip the smoke test entirely.
+            Relay the DERP supervisor dials if the first netmap has not
+            arrived within its 30-s wait (and the host used by the
+            SUPERVISED=n boot smoke). Keep it in the same region as
+            TINYLINK_PREFERRED_DERP — the netmap-driven host replaces
+            it as soon as the DERPMap is parsed, but until then peers
+            relay to us through the preferred region, so a fallback in
+            another region (the old default was derp1, region 1) leaves
+            relayed DISCO/CallMeMaybe unreachable. Set to empty to skip
+            the SUPERVISED=n smoke entirely.
 
     config TINYLINK_PREFERRED_DERP
         int "Preferred DERP region ID advertised in MapRequest"

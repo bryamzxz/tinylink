@@ -33,18 +33,9 @@ typedef struct {
     uint16_t port;         /* host byte order */
 } stun_probe_result_t;
 
-/* Run a single STUN binding probe. Resolves server_host, sends one
- * binding request, waits up to timeout_ms for a matching response,
- * parses it into out. Caller-owned out is set to {valid=false} on
- * any failure path (DNS, socket, send, recv timeout, txid mismatch,
- * malformed response).
- *
- * Returns ESP_OK only when out->valid is true. */
-esp_err_t stun_probe_run(const char *server_host, uint16_t server_port,
-                         uint32_t timeout_ms, stun_probe_result_t *out);
 
-/* Same as stun_probe_run but uses an externally-managed UDP socket
- * instead of opening an ephemeral one. The socket MUST be AF_INET
+/* Run a single RFC 5389 binding probe over an externally-managed UDP
+ * socket. The socket MUST be AF_INET
  * SOCK_DGRAM, already bound. The caller retains ownership — this
  * function does not close it. The recv timeout is set on the socket
  * for the duration of the call (and left set; callers that need a

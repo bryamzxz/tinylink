@@ -41,7 +41,16 @@ typedef struct {
      * while destroying the TLS context, so a cross-task sender can never
      * touch a freed conn) — zero-initialise the struct before first use. */
     SemaphoreHandle_t write_lock;
+    /* Set from any task to make the recv loop's next TLS poll fail with
+     * DERP_ERR_READ_ABORTED (≤ one SO_RCVTIMEO), so the supervisor drops
+     * and reconnects — used when the device's IP changes. Cleared by
+     * derp_client_connect_login. */
+    volatile bool     abort_reads;
 } derp_client_t;
+
+/* Returned through tls_io by the read adapter when abort_reads is set.
+ * Outside the mbedtls error space; distinct from TLS_IO_ERR_IDLE_TIMEOUT. */
+#define DERP_ERR_READ_ABORTED (-0x10002)
 
 /* Open a TLS connection to server_host:port, complete the HTTP
  * Upgrade dance, and run the DERP login handshake against the server.

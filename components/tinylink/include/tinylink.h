@@ -14,7 +14,7 @@ extern "C" {
 #endif
 
 #define TINYLINK_VERSION_MAJOR 1
-#define TINYLINK_VERSION_MINOR 0
+#define TINYLINK_VERSION_MINOR 1
 #define TINYLINK_VERSION_PATCH 0
 
 /* String forms derived from the integer components above so a future
@@ -53,16 +53,20 @@ extern "C" {
  * Floor check (verify on every upstream-audit round): headscale main
  * enforces MinSupportedCapabilityVersion = 115 (= Tailscale v1.82) as of
  * 89fa72e0 (audit 2026-09-03; was 113 in 2026-07 — the floor is "latest
- * 10 minor versions" and moves with every capver regen, so 138 (= v1.98)
- * falls below it in roughly four more headscale releases; plan the bump
- * then). Upstream tailcfg.CurrentCapabilityVersion is 145 as of
- * 2026-09-03 (139–145 gate client-side node attrs, a c2n proxy and the
- * TSMP disco-key advert — none changes what control sends a 138 client;
- * the advert is a peer-side effect handled in wg_lwip.c). Bumping the
- * value changes the Noise prologue hash, so it requires a hardware A/B
- * smoke against the live control plane per the repo's verify-regression
- * rule. */
-#define TINYLINK_CAPVER 138
+ * 10 minor versions" and moves with every capver regen). Bumped 138 → 142
+ * (= Tailscale v1.102, the newest version headscale's capver table maps)
+ * on 2026-09-04 with a hardware A/B smoke against tailscale.com: 139–142
+ * gate only client-side node attributes (runtime metrics, GRO/GSO
+ * toggles) and the c2n localapi proxy, none of which changes what
+ * control sends or expects from a register+map+disco+derp client; 143
+ * (conn25 attrs), 144 (client SENDS TSMP disco-key adverts) and 145
+ * (macOS quad-100 scoping) are deliberately not claimed — 144 would
+ * promise a behaviour tinylink does not implement. Upstream
+ * CurrentCapabilityVersion is 145 as of 2026-09-03. Bumping the value
+ * changes the Noise prologue hash, so every bump requires a hardware
+ * A/B smoke against the live control plane per the repo's
+ * verify-regression rule. */
+#define TINYLINK_CAPVER 142
 
 #define TINYLINK_KEY_LEN 32
 
@@ -168,18 +172,6 @@ esp_err_t tinylink_long_poll_start(void);
  * Returns ESP_OK if dataplane came up within timeout, ESP_ERR_TIMEOUT
  * otherwise. */
 esp_err_t tinylink_wait_dataplane_ms(uint32_t timeout_ms);
-
-/* M3 first cut — spawn the TMP117 telemetry task. The task initializes
- * the I²C bus + sensor, then sends one JSON datagram per
- * `CONFIG_TINYLINK_TELEMETRY_PERIOD_MS` to the configured destination
- * over UDP. The destination is expected to be reachable through the
- * WireGuard netif (usually a `100.x.y.z` tailnet address on the home
- * peer).
- *
- * If `CONFIG_TINYLINK_TELEMETRY_ENABLE=n` the call is a no-op so
- * boards that ship without a TMP117 still build and run.
- */
-esp_err_t tinylink_telemetry_start(void);
 
 /* M5 step 2a — best-effort DERP smoke test. Opens a TLS connection
  * to CONFIG_TINYLINK_DERP_SMOKE_HOST:443, runs the HTTP Upgrade dance,

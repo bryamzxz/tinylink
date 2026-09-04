@@ -20,6 +20,7 @@
 #include "lwip/netdb.h"
 
 #include "tmp117.h"
+#include "tl_wdt.h"
 
 #if CONFIG_TINYLINK_TELEMETRY_ENABLE
 
@@ -106,7 +107,9 @@ static void telemetry_task(void *arg)
      * (~65 s post-boot) when all bringup tasks have stabilized. */
     enum { TL_DIAG_TX_PERIOD = 12 };
 
+    tl_wdt_subscribe();
     for (;;) {
+        tl_wdt_feed();
         int32_t milli_c = 0;
         err = tmp117_read_milli_c(&milli_c);
         if (err != ESP_OK) {

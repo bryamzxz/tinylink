@@ -120,31 +120,6 @@ static esp_err_t resolve_server(const char *host, uint16_t port,
     return ESP_OK;
 }
 
-esp_err_t stun_probe_run(const char *server_host, uint16_t server_port,
-                         uint32_t timeout_ms, stun_probe_result_t *out)
-{
-    if (server_host == NULL || out == NULL || server_port == 0) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    out->valid = false;
-
-    struct sockaddr_in server;
-    if (resolve_server(server_host, server_port, &server) != ESP_OK) {
-        return ESP_FAIL;
-    }
-
-    int sock = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sock < 0) {
-        ESP_LOGE(TAG, "socket() failed: errno=%d", errno);
-        return ESP_FAIL;
-    }
-
-    esp_err_t err = do_probe(sock,
-                             (struct sockaddr *)&server, sizeof(server),
-                             timeout_ms, out);
-    close(sock);
-    return err;
-}
 
 esp_err_t stun_probe_run_on_socket(int sock,
                                    const char *server_host,
