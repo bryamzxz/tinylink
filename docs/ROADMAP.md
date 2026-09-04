@@ -1036,7 +1036,7 @@ Owner-facing inventory. "Gate" is what each item waits on.
 | 13 | ✅ (M15) **Per-packet INFO logs → DEBUG** (DISCO ping/pong, relayed DERP packets, telemetry samples) | UART at 115200 blocks the RX/DERP tasks for ms per line | trivial | owner's grep-based smoke recipes |
 | 14 | ⏳ **Coredump to flash** (`ESP_COREDUMP_ENABLE_TO_FLASH`, partition in the free tail) | panics currently leave no post-mortem | small | partition-table reflash |
 | 15 | ◐ (M15: TAI64N + NaCl box done) **Host KATs for `noise_ik.c`, `register.c` parsing, `wg_proto.c` TAI64N, Salsa20/NaCl vectors** | highest-value untested modules | small each | none |
-| 16 | ✅ (M16: cold −17 % MTU, −29 % small; default y) **IRAM placement of the AEAD hot path** (~4 KiB of the 56 KiB free IRAM) | a flash-cache miss costs ≈ 225 CPU cycles per 32-B line; after eviction by TLS/WiFi code a packet re-fetches ~4 KiB | small | on-device AEAD bench |
+| 16 | ✅ (M16: cold −28 % MTU, −70 % small with all crypto in IRAM; default y) **IRAM placement of the AEAD hot path** (~4 KiB of the 56 KiB free IRAM) | a flash-cache miss costs ≈ 225 CPU cycles per 32-B line; after eviction by TLS/WiFi code a packet re-fetches ~4 KiB | small | on-device AEAD bench |
 | 17 | ◐ (M15: client-only TLS, no RSA kx/PEM write/EAP) **Flash trims for the production profile**: custom cert bundle (−~50 KiB), `MBEDTLS_TLS_CLIENT_ONLY`, `ESP_WIFI_ENTERPRISE_SUPPORT=n`, `esp_http_client` only when TOFU is compiled in | 40 % free today; matters for OTA slot headroom | small | CA-change risk assessment |
 | 18 | ✅ (M16: `/stats`; OTA stays in the last-5 % list) **`/stats` over UDP on the tunnel** (reuse the telemetry socket) and **OTA over the tunnel** (plain HTTP over WG + detached ECDSA signature) | observability / remote update | small / medium | per the Execution queue |
 | 19 | ✅ (M15) Drop the `s_conn` teardown after register (stale rationale; costs one extra Noise+TLS handshake per boot) | ~5 s boot, one heap peak | trivial | smoke |
@@ -1054,7 +1054,7 @@ state after each round of 2026-09-04.
 | Data plane (WG / DISCO / DERP / STUN) | 90 % | 92 % | 96 % | forced-flap relay soak (E) |
 | Self-healing / robustness | 85 % | 93 % | 95 % | M13 checklist A–C, WDT soak (D) |
 | Static + dynamic memory (DRAM) | 70 % | 88 % | 90 % | LP stack trim after D; body_buf needs a streaming parser (out of scope) |
-| CPU / ISA hot path | 80 % | 80 % | 95 % | measured; nothing left worth the risk |
+| CPU / ISA hot path | 80 % | 80 % | 97 % | Poly1305 constant-time + SAR-once rotates from the ISA manual pass; nothing left worth the risk |
 | Flash footprint | 85 % | 90 % | 90 % | cert-bundle trim (G) |
 | Power | 80 % | 80 % | 80 % | deep-sleep with WG state is a future direction, not declared scope |
 | Security within the threat model | 90 % | 94 % | 97 % | coredump (F); plaintext NVS accepted by decision |

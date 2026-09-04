@@ -197,6 +197,14 @@ view here.
 - **Provisioning.** NVS is confirmed plaintext (the inert
   `CONFIG_NVS_ENCRYPTION=y` was removed so nobody believes otherwise);
   the credential lookup order is documented in `docs/PROVISIONING.md`.
+- **Poly1305 block loop made constant-time (M16 ISA pass).** The Xtensa
+  ISA manual's preferred 64-bit-add idiom is a branch (`bgeu`), and GCC
+  used it 24 times per Poly1305 block — data-dependent branches on the
+  MAC accumulator that the M7-6 / PR #86 review had only caught in
+  `poly1305_finish`. The accumulation is now radix-2^26 split with
+  32-bit-only arithmetic: 2 branches per block, both loop control.
+  Rotates/funnel shifts use explicit `ssai`/`src`; neither depends on
+  data. Re-verified from the disassembly of the release objects.
 - **Part 2 (M15), same day.** Application tasks are under the task WDT
   (90 s, panic → reboot) — closes the "wedge in a data-plane task
   bricks its function" gap below for good, pending the multi-hour

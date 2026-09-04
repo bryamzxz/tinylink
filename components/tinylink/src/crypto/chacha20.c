@@ -96,15 +96,62 @@ static const uint32_t CHACHA20_CONSTANT_4 = 0x6b206574;
  * potential window-overflow exception on the deep wg_rx → transport →
  * AEAD call chain. With a single inlined body inside a counted loop the
  * rounds run under one Xtensa zero-overhead `loop` with no calls. */
+/* Xtensa note (ISA RM §8.3.2, table 8-246): a constant rotate is the
+ * two-instruction idiom `ssai n; src ax, ay, ay` — the amount lives in
+ * the special register SAR. Running the four quarter-rounds of a half
+ * round in LOCKSTEP (step 1 of all four columns, then step 2 of all
+ * four, …) puts four rotates by the same amount back to back, so the
+ * compiler can set SAR once per step instead of once per rotate: 8
+ * `ssai` per double round instead of 32. Same arithmetic, same order
+ * of operations within each quarter-round. */
+/* Rotation primitive. GCC emits `ssai n; src d, d, d` for every constant
+ * rotate and — verified on the 2026-09 objects — never merges the SAR
+ * writes of four consecutive rotates by the same amount (64 `ssai` per
+ * double round, one per `src`). On Xtensa we therefore set SAR by hand
+ * once per lockstep step (ISA RM: rotl(v, n) = SRC v,v with SAR = 32-n;
+ * "left funnel shifts are done by swapping the operands and setting SAR
+ * to 32 minus the shift amount") and issue bare `src` per rotate: 8
+ * `ssai` per double round instead of 32. Both asm statements are
+ * volatile, so their relative order is preserved; nothing else in this
+ * translation unit touches SAR (no variable shifts). Hosts / other
+ * targets keep the plain C rotate. */
+#if defined(__XTENSA__)
+#define SET_SAR_ROTL(n)  __asm__ volatile ("ssai %0" : : "i"(32 - (n)))
+#define ROTL_SAR(v)      ({ uint32_t _r; \
+                            __asm__ volatile ("src %0, %1, %1" : "=a"(_r) : "a"(v)); \
+                            _r; })
+#else
+#define SET_SAR_ROTL(n)  do { } while (0)
+#define ROTL_SAR_N(v, n) ROTL32((v), (n))
+#endif
+
+#if defined(__XTENSA__)
+#define QR_STEP(a, b, c, d, n)  a += b;  d ^= a;  d = ROTL_SAR(d)
+#define QR_STEP2(a, b, c, d, n) c += d;  b ^= c;  b = ROTL_SAR(b)
+#else
+#define QR_STEP(a, b, c, d, n)  a += b;  d ^= a;  d = ROTL_SAR_N(d, n)
+#define QR_STEP2(a, b, c, d, n) c += d;  b ^= c;  b = ROTL_SAR_N(b, n)
+#endif
+
+#define HALF_ROUND(x, a0,b0,c0,d0, a1,b1,c1,d1, a2,b2,c2,d2, a3,b3,c3,d3)      \
+    SET_SAR_ROTL(16);                                                           \
+    QR_STEP (x[a0],x[b0],x[c0],x[d0],16); QR_STEP (x[a1],x[b1],x[c1],x[d1],16); \
+    QR_STEP (x[a2],x[b2],x[c2],x[d2],16); QR_STEP (x[a3],x[b3],x[c3],x[d3],16); \
+    SET_SAR_ROTL(12);                                                           \
+    QR_STEP2(x[a0],x[b0],x[c0],x[d0],12); QR_STEP2(x[a1],x[b1],x[c1],x[d1],12); \
+    QR_STEP2(x[a2],x[b2],x[c2],x[d2],12); QR_STEP2(x[a3],x[b3],x[c3],x[d3],12); \
+    SET_SAR_ROTL(8);                                                            \
+    QR_STEP (x[a0],x[b0],x[c0],x[d0], 8); QR_STEP (x[a1],x[b1],x[c1],x[d1], 8); \
+    QR_STEP (x[a2],x[b2],x[c2],x[d2], 8); QR_STEP (x[a3],x[b3],x[c3],x[d3], 8); \
+    SET_SAR_ROTL(7);                                                            \
+    QR_STEP2(x[a0],x[b0],x[c0],x[d0], 7); QR_STEP2(x[a1],x[b1],x[c1],x[d1], 7); \
+    QR_STEP2(x[a2],x[b2],x[c2],x[d2], 7); QR_STEP2(x[a3],x[b3],x[c3],x[d3], 7)
+
 static inline __attribute__((always_inline)) void INNER_BLOCK(uint32_t *block) {
-    QUARTERROUND(block[0], block[4], block[ 8], block[12]); /* column 0 */
-    QUARTERROUND(block[1], block[5], block[ 9], block[13]); /* column 1 */
-    QUARTERROUND(block[2], block[6], block[10], block[14]); /* column 2 */
-    QUARTERROUND(block[3], block[7], block[11], block[15]); /* column 3 */
-    QUARTERROUND(block[0], block[5], block[10], block[15]); /* diagonal 1 */
-    QUARTERROUND(block[1], block[6], block[11], block[12]); /* diagonal 2 */
-    QUARTERROUND(block[2], block[7], block[ 8], block[13]); /* diagonal 3 */
-    QUARTERROUND(block[3], block[4], block[ 9], block[14]); /* diagonal 4 */
+    /* columns */
+    HALF_ROUND(block, 0,4,8,12,  1,5,9,13,  2,6,10,14,  3,7,11,15);
+    /* diagonals */
+    HALF_ROUND(block, 0,5,10,15, 1,6,11,12, 2,7,8,13,   3,4,9,14);
 }
 
 /* 20 rounds = 10 double rounds. A counted loop rather than 10 textual

@@ -101,16 +101,17 @@ target on ESP-IDF v5.5.4:
 
 | Region        | Post-η baseline (`4bd5b0f`) | M13 (`c383e49`)     | M14 (`8f353c5`)       | M15 (`8a18425`)       | **M16**                       |
 |---------------|----------------------------:|--------------------:|----------------------:|----------------------:|------------------------------:|
-| Flash app     | 1 173 717 B (74.6 %)        | 948 624 B (60.2 %)  | 946 293 B (60.1 %)    | 938 421 B (59.6 %)    | **946 209 B (60.1 %)**        |
+| Flash app     | 1 173 717 B (74.6 %)        | 948 624 B (60.2 %)  | 946 293 B (60.1 %)    | 938 421 B (59.6 %)    | **946 069 B (60.1 %)**        |
 | DRAM static   | 151 412 B (83.78 %)         | 149 312 B (82.6 %)  | 136 656 B (75.6 %)    | 106 880 B (59.1 %)    | **107 696 B (59.6 %)**        |
-| IRAM          | 104 383 B (79.64 %)         | 75 079 B (57.28 %)  | 75 079 B (57.28 %)    | 75 079 B (57.28 %)    | **76 787 B (58.6 %)**         |
+| IRAM          | 104 383 B (79.64 %)         | 75 079 B (57.28 %)  | 75 079 B (57.28 %)    | 75 079 B (57.28 %)    | **78 667 B (60.0 %)**         |
 | Bootloader    | 27 808 B                    | 18 176 B            | 18 176 B              | 18 176 B              | 18 176 B                      |
 | RTC SLOW      | 56 B                        | 56 B                | 56 B                  | 56 B                  | 56 B                          |
 
 M14's DRAM drop is the removal of the endpoint-push task's 12 KiB static
 stack; M15's is the MapResponse token table (40 → 10 KiB); M16 adds SNTP
-+ the `/stats` responder (+7.8 KiB flash, +0.8 KiB BSS) and moves the
-AEAD hot path into IRAM (+1.7 KiB, measured −17 % cold per MTU packet).
++ the `/stats` responder (+7.6 KiB flash, +0.8 KiB BSS) and moves the
+whole ChaCha20-Poly1305 hot path into IRAM (+3.6 KiB, measured −28 %
+cold per MTU packet, −70 % per 64-B packet).
 Largest contiguous heap block 60 s after boot: 9–11 KiB before M14,
 21 504 B after M14, 49–51 KiB after M15/M16 — see `CHANGELOG.md`.
 
