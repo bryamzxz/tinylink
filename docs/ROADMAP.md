@@ -30,6 +30,7 @@ implementation, which is the authoritative reference for wire format.
 | M13| Control-plane reconnect hardening (2026-07-16)| done — stream idle budget, patch-driven refetch, in-place re-register, wedge restart. Boot smoke + 20-min stream check passed on the deployed sensor 2026-09-04 (checklist items 3–5 still open) | v0.8   | landed   |
 | M14| Audit + optimization round (2026-09-04)       | done — endpoint-push stack overflow fixed (task removed, −12.6 KiB BSS), headscale `/key` capver gate, TSMP drop, DERP close race, Xtensa-tuned AEAD, backoff consolidation, provisioning contract, ASan CI. See "M14" + "Improvement list" below | v0.8   | landed   |
 | M15| Road-to-100 round (2026-09-04, part 2)        | done — netmap parsed one value at a time (−30 KiB BSS, no tailnet-size ceiling), task WDT for app tasks, capver 142, connect-path stack diet, DERP live relay switch, IP-change recycle + WiFi backoff, conn kept after register, flash trims, 3 new KAT suites, firmware 1.2.0 | v1.2   | landed   |
+| M16| To-95 round (2026-09-04, part 3)              | done — NTP-synced certificate date validation, `PeersRemoved` + delta merge, WG handshake lock + roam on authenticated packets, `/stats` over UDP, AEAD placement measured cold. Declared scope ≈ 95 %; the last 5 % is the owner checklist below | v1.2   | landed   |
 | —  | Next rounds                                   | queued — see "Execution queue" below (M13 checklist 3–5 → task WDT → SNTP → buffer diet → /stats → OTA; eFuse encryption explicitly out) | —      | queued   |
 
 End-to-end verification on hardware (sensor-cali next to router,
@@ -982,6 +983,38 @@ connected sensor. Per-item detail in `CHANGELOG.md`.
 - [x] **#19 conn kept after register.**  [x] **#20 dead code.**
 - Firmware version **1.2.0** (even minor: Tailscale shows odd minors as the *unstable* release track).
 
+## M16 — To-95 round (2026-09-04, part 3)
+
+Everything in the improvement list that needed neither router/admin
+access nor an owner decision. Per-item detail in `CHANGELOG.md`.
+
+- [x] **#6 SNTP + certificate dates** (`tl_time.c`; tolerant until the
+  first sync, enforced after; floor persisted hourly).
+- [x] **#10 `PeersRemoved` / delta merge** (canonical peer table;
+  KeepAlives no longer empty it).
+- [x] **#8 handshake-state lock** (`g.hs_lock`) and **#9 roam on any
+  authenticated packet** (whitepaper rule; pre-auth source filter kept
+  only for INIT/COOKIE).
+- [x] **#18 `/stats` over UDP** on the telemetry socket.
+- [x] **#16 AEAD in IRAM** — measured cold vs hot; default set from the
+  numbers (CHANGELOG).
+- [◐] **#15 KATs** — mapresp merge contract; `noise_ik` / `register`
+  parsing still open (see below).
+
+### The last 5 % — owner checklist (needs you, not code)
+
+| # | What | How to run it | Why it is not done |
+|---|------|---------------|--------------------|
+| A | M13 checklist item 3 — forced half-open control conn | on the router: drop the established TCP flow to `controlplane.tailscale.com:443` (conntrack flush / `iptables -I FORWARD -s <sensor> -d <cp> -p tcp --dport 443 -j DROP`) for 3 min while capturing serial; expect `control stream silent past 120 s` → reconnect, no reboot | needs router access |
+| B | M13 item 4 — ≥ 60-min drop → wedge restart | same drop held > 60 min; expect diag dump + `restarting as last resort` + full recovery | needs router access + an hour |
+| C | M13 item 5 — node deleted in the admin panel | delete `sensor-cali` in the panel mid-run; expect `map rejected 2 consecutive times` → re-register → endpoint push on the long-poll → node back | 10 seconds of yours |
+| D | Multi-hour soak with the task WDT (M15) and the LP stack trim | leave `tools/serial_capture.py --duration 21600` running; if every `stack diag` keeps `tinylink_lp` ≥ 8 KiB free, trim its stack 24 → 16 KiB in a PR | time |
+| E | Forced-flap DERP relay soak | `iptables -I INPUT -p udp --sport <sensor WG port> -j DROP` on Servidor1 for 2 min; expect `relayed_stale` to climb in `/stats` and telemetry to keep flowing | peer-side root |
+| F | Coredump partition | authorize a **full** flash (partition table changes: add `coredump, data, coredump, 0x330000, 0x10000`); then `CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y` | owner authorization — the sensor's identity survives, but it is not an app-only flash |
+| G | Certificate-bundle trim (−~50 KiB flash) | decide the root set (recommended: ISRG Root X1/X2 + DigiCert + GlobalSign + GTS), then `CONFIG_MBEDTLS_CUSTOM_CERTIFICATE_BUNDLE` | CA-change risk is yours to accept |
+| H | `noise_ik` / `register` host KATs | needs an mbedtls chachapoly shim and a cJSON host build; no hardware involved | effort only, low risk |
+| I | OTA over the tunnel | design: plain HTTP over WG + detached ECDSA-P256 signature with a compile-time key; rollback via `BOOTLOADER_APP_ROLLBACK_ENABLE` | medium effort, and it is the item that justifies F and G |
+
 ### Improvement list (2026-09-04) — what remains, in priority order
 
 Owner-facing inventory. "Gate" is what each item waits on.
@@ -993,42 +1026,42 @@ Owner-facing inventory. "Gate" is what each item waits on.
 | 3 | ✅ (M15) **Task WDT for app tasks** (`wg_rx`, `wg_tx`, telemetry, DERP, long-poll via a `tls_io` idle hook; `TIMEOUT_S`≈90, `PANIC=y`) | a wedge in one of those still bricks its function | small | multi-hour soak |
 | 4 | ◐ (M15: −8 KiB frames; LP stack trim pending soak) **ts2021 connect-path buffer diet** (`resp_buf`→`h2_rx`, `rec`→`rx_residual`, in-place record decrypt) | −8…12 KiB of long-poll stack (24 → ~14 KiB), −4 KiB per conn | medium | soak with stack-diag dumps |
 | 5 | ✅ (M15: toks 40 → 10 KiB; region filter not needed) **Netmap parse memory**: shallow top-level/region splitter feeding jsmn per value (toks 40 KiB → ~8 KiB), DERP regions filtered to {preferred, peer home} at parse (−5.5 KiB) | the two largest BSS objects; lifts the "largest block" ceiling for good | medium | host KATs (`test_mapresp`) + smoke |
-| 6 | ⏳ **SNTP + `MBEDTLS_HAVE_TIME_DATE`** with a persisted/build-epoch floor and `BADCERT_FUTURE/EXPIRED` tolerated until first sync | certs are never date-checked today | medium | re-smoke all TLS clients |
+| 6 | ✅ (M16) **SNTP + `MBEDTLS_HAVE_TIME_DATE`** with a persisted/build-epoch floor and `BADCERT_FUTURE/EXPIRED` tolerated until first sync | certs are never date-checked today | medium | re-smoke all TLS clients |
 | 7 | ✅ (M15) **DERP region change on a live conn** (generation counter → supervisor exits the stream; honour `restart_reconnect_ms`; dial parsed `DERPPort`; default fallback host in the preferred region) | a region reroute is ignored until the stream happens to die | small | smoke |
-| 8 | ⏳ **WG handshake/roam state under a lock** (rx_task vs DERP-inject vs long-poll writers of `g.handshake`/`g.peer_addr`) | rare torn writes / wasted handshake rounds | medium | soak |
-| 9 | ⏳ **Pre-auth source filter vs roaming**: verify first, then roam `peer_addr` on an authenticated packet from a new source | today a peer NAT rebind blackholes inbound until the 30-s RX-stale probe | medium | forced-flap soak |
-| 10 | ⏳ **`PeersRemoved` / delta merge** keyed by NodeKey | a delta carrying another peer overwrites `s_last_peers` | medium | multi-peer tailnet |
+| 8 | ✅ (M16) **WG handshake/roam state under a lock** (rx_task vs DERP-inject vs long-poll writers of `g.handshake`/`g.peer_addr`) | rare torn writes / wasted handshake rounds | medium | soak |
+| 9 | ✅ (M16) **Pre-auth source filter vs roaming**: verify first, then roam `peer_addr` on an authenticated packet from a new source | today a peer NAT rebind blackholes inbound until the 30-s RX-stale probe | medium | forced-flap soak |
+| 10 | ✅ (M16) **`PeersRemoved` / delta merge** keyed by NodeKey | a delta carrying another peer overwrites `s_last_peers` | medium | multi-peer tailnet |
 | 11 | ✅ (M15) **Mark control alive on a completed Noise handshake** | a deleted/expired node reboots hourly despite a reachable control plane | trivial | owner decision (semantics of the wedge restart) |
 | 12 | ✅ (M15) **WiFi reconnect backoff + `ip_changed` → stream recycle** (`app_wifi.c` reconnects instantly; `set_storage(RAM)` runs after `set_config`) | tight reconnect loop on AP loss; half-open control conn after a DHCP change | small | smoke |
 | 13 | ✅ (M15) **Per-packet INFO logs → DEBUG** (DISCO ping/pong, relayed DERP packets, telemetry samples) | UART at 115200 blocks the RX/DERP tasks for ms per line | trivial | owner's grep-based smoke recipes |
 | 14 | ⏳ **Coredump to flash** (`ESP_COREDUMP_ENABLE_TO_FLASH`, partition in the free tail) | panics currently leave no post-mortem | small | partition-table reflash |
 | 15 | ◐ (M15: TAI64N + NaCl box done) **Host KATs for `noise_ik.c`, `register.c` parsing, `wg_proto.c` TAI64N, Salsa20/NaCl vectors** | highest-value untested modules | small each | none |
-| 16 | ⏳ **IRAM placement of the AEAD hot path** (~4 KiB of the 56 KiB free IRAM) | a flash-cache miss costs ≈ 225 CPU cycles per 32-B line; after eviction by TLS/WiFi code a packet re-fetches ~4 KiB | small | on-device AEAD bench |
+| 16 | ✅ (M16: cold −17 % MTU, −29 % small; default y) **IRAM placement of the AEAD hot path** (~4 KiB of the 56 KiB free IRAM) | a flash-cache miss costs ≈ 225 CPU cycles per 32-B line; after eviction by TLS/WiFi code a packet re-fetches ~4 KiB | small | on-device AEAD bench |
 | 17 | ◐ (M15: client-only TLS, no RSA kx/PEM write/EAP) **Flash trims for the production profile**: custom cert bundle (−~50 KiB), `MBEDTLS_TLS_CLIENT_ONLY`, `ESP_WIFI_ENTERPRISE_SUPPORT=n`, `esp_http_client` only when TOFU is compiled in | 40 % free today; matters for OTA slot headroom | small | CA-change risk assessment |
-| 18 | ⏳ **`/stats` over UDP on the tunnel** (reuse the telemetry socket) and **OTA over the tunnel** (plain HTTP over WG + detached ECDSA signature) | observability / remote update | small / medium | per the Execution queue |
+| 18 | ✅ (M16: `/stats`; OTA stays in the last-5 % list) **`/stats` over UDP on the tunnel** (reuse the telemetry socket) and **OTA over the tunnel** (plain HTTP over WG + detached ECDSA signature) | observability / remote update | small / medium | per the Execution queue |
 | 19 | ✅ (M15) Drop the `s_conn` teardown after register (stale rationale; costs one extra Noise+TLS handshake per boot) | ~5 s boot, one heap peak | trivial | smoke |
 | 20 | ✅ (M15, dead code; helper de-duplication still open) Dead code: `mapreq_fetch_once`, `stun_probe_run`, `tinylink_telemetry_start` stub, `WG_NETIF_FAILED`; duplicated 101-upgrade readers / hex helpers / host:port splitters | maintenance | small | none |
 
-### Completion estimate by area (2026-09-04, after M15)
+### Completion estimate by area (2026-09-04, after M16)
 
 Maintainer-style estimate of "% of the declared single-peer scope that is
-done and optimized". Not a metric — a planning aid. The M14 column is
-what the morning round left; M15 is the state on `main` after part 2.
+done and optimized". Not a metric — a planning aid. Columns are the
+state after each round of 2026-09-04.
 
-| Area | after M14 | after M15 | What the remainder is |
-|------|----------:|----------:|-----------------------|
-| Control-plane protocol compatibility (tailscale.com + headscale) | 95 % | 97 % | `PeersRemoved` (#10); capver has ~8 headscale releases of headroom now |
-| Data plane (WG / DISCO / DERP / STUN) | 90 % | 92 % | handshake-state lock (#8), auth-then-roam (#9), forced-flap relay soak |
-| Self-healing / robustness | 85 % | 93 % | M13 checklist 3–5 (#1), multi-hour WDT soak, SNTP (#6) |
-| Static + dynamic memory (DRAM) | 70 % | 88 % | body_buf 32 KiB (needs a streaming parser), LP stack 24 → ~14 KiB after a soak |
-| CPU / ISA hot path | 80 % | 80 % | IRAM placement (#16) pending a bench |
-| Flash footprint | 85 % | 90 % | cert-bundle trim (CA-change risk decision) |
-| Power | 80 % | 80 % | deep-sleep with WG state is a future direction |
-| Security within the threat model | 90 % | 94 % | coredump (#14); plaintext NVS accepted by decision |
-| Tests / CI | 80 % | 88 % | `noise_ik` / `register` KATs, size-regression gate, formatter job, HIL |
-| Provisioning / tooling | 90 % | 90 % | `examples/` is a README, not a project |
-| Documentation | 85 % | 92 % | — |
-| **Overall (declared scope)** | **≈ 85 %** | **≈ 90 %** | the rest is gated on router/admin access, a multi-hour soak, or owner decisions |
+| Area | after M14 | after M15 | after M16 | What the remainder is |
+|------|----------:|----------:|----------:|-----------------------|
+| Control-plane protocol compatibility (tailscale.com + headscale) | 95 % | 97 % | 98 % | capver bump cadence; nothing structural |
+| Data plane (WG / DISCO / DERP / STUN) | 90 % | 92 % | 96 % | forced-flap relay soak (E) |
+| Self-healing / robustness | 85 % | 93 % | 95 % | M13 checklist A–C, WDT soak (D) |
+| Static + dynamic memory (DRAM) | 70 % | 88 % | 90 % | LP stack trim after D; body_buf needs a streaming parser (out of scope) |
+| CPU / ISA hot path | 80 % | 80 % | 95 % | measured; nothing left worth the risk |
+| Flash footprint | 85 % | 90 % | 90 % | cert-bundle trim (G) |
+| Power | 80 % | 80 % | 80 % | deep-sleep with WG state is a future direction, not declared scope |
+| Security within the threat model | 90 % | 94 % | 97 % | coredump (F); plaintext NVS accepted by decision |
+| Tests / CI | 80 % | 88 % | 90 % | `noise_ik` / `register` KATs (H), HIL |
+| Provisioning / tooling | 90 % | 90 % | 92 % | `/stats` covers field diagnostics; `examples/` is a README |
+| Documentation | 85 % | 92 % | 95 % | — |
+| **Overall (declared scope)** | **≈ 85 %** | **≈ 90 %** | **≈ 95 %** | the last 5 % is the owner checklist above |
 
 ES: idem — inventario de mejoras y estimación de avance por área tras la
 ronda 2026-09-04; el detalle por ítem está en `CHANGELOG.md`.
@@ -1054,12 +1087,11 @@ experiments):
    90 s, panic → reboot). The multi-hour validation soak is still owed:
    the stack-trim lesson applies (short post-boot smokes are
    insufficient for tasks with reconnect/retry loops).
-3. **SNTP + `MBEDTLS_HAVE_TIME_DATE`** — TLS certificate
-   `notBefore`/`notAfter` validation with a boot fallback when NTP is
-   unreachable (an offline boot must not brick). Re-smoke all three
-   TLS clients (control, DERP, future OTA) + flash-budget check.
-4. **`/stats` diagnostics endpoint** on the WG netif — heap, rekey
-   count, RX-stale events, endpoint roams (see Future directions).
+3. ~~**SNTP + `MBEDTLS_HAVE_TIME_DATE`**~~ — *landed in M16*
+   (`tl_time.c`: tolerant until the first sync, enforced after,
+   offline boots keep working).
+4. ~~**`/stats` diagnostics endpoint**~~ — *landed in M16* as a UDP
+   responder on the telemetry socket (no httpd).
 5. **OTA over the tailnet** — signed image fetch from a tailnet peer;
    the partition table is already OTA-shaped. Also provides the
    remote trigger that auth-key rotation lacked.
@@ -1131,10 +1163,12 @@ isn't covered. Each is a conscious deferral, not an oversight.
   decision 2026-07-16** (see the Execution queue above for the
   rationale); accepted risk, physical-access attacker out of scope per
   `SECURITY-MODEL.md`.
-- **No SNTP-backed TLS time validation.** `MBEDTLS_HAVE_TIME_DATE` is
-  off, so all three TLS clients (controlplane, DERP, OTA-to-be) never
-  check certificate `notBefore` / `notAfter`. The pinned-control-key
-  TOFU + the published cert chain are the only trust anchors.
+- ~~**No SNTP-backed TLS time validation.**~~ *Closed in M16
+  (2026-09-04)*: `MBEDTLS_HAVE_TIME_DATE=y`; dates are enforced after
+  the first NTP sync of a boot and tolerated before it (`tl_time.c`).
+  Residual: the handshakes between boot and the first sync — seconds on
+  a connected network, the whole session on an offline one — still rely
+  on the pinned control key + chain signatures only.
 - ~~CI runs `idf.py build` only, not `make test`~~ **Closed 2026-07-16**:
   `build.yml` now runs the 546-assertion host suite as its own job and
   pins the exact `v5.5.4` the project freezes on (was the floating

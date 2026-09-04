@@ -31,6 +31,7 @@ extern "C" {
 #endif
 
 #define TL_MAX_PEERS            4
+#define TL_MAX_PEERS_REMOVED    8
 #define TL_MAX_PEER_ENDPOINTS   4
 #define TL_MAX_PEER_ADDRESSES   2
 /* Tailscale ships 28 DERP regions today (mia/region 16 is the closest
@@ -91,9 +92,17 @@ typedef struct {
     size_t    n_self_addresses;
     tl_cidr_t self_addresses[TL_MAX_PEER_ADDRESSES];
 
-    /* Peers */
+    /* Peers. `peers_is_delta` = the array came from PeersChanged (an
+     * upsert into the caller's peer table) rather than Peers (a full
+     * replacement). `removed_ids` = PeersRemoved NodeIDs to delete from
+     * that table. Merge semantics live in tinylink.c (M16, 2026-09);
+     * before that every frame replaced the table and a delta carrying
+     * only another peer wiped the WG peer's cached endpoints. */
     size_t    n_peers;
     tl_peer_t peers[TL_MAX_PEERS];
+    bool      peers_is_delta;
+    size_t    n_removed;
+    uint64_t  removed_ids[TL_MAX_PEERS_REMOVED];
 
     /* DERP map (M5) */
     size_t           n_derp_regions;

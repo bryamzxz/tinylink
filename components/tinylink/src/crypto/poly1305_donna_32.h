@@ -10,6 +10,8 @@
 
 #include <stdint.h>
 
+#include "tl_hot.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -70,7 +72,7 @@ U32TO8(unsigned char *p, unsigned long v) {
     p[3] = (v >> 24) & 0xff;
 }
 
-void
+TL_HOT_ATTR void
 poly1305_init(poly1305_context *ctx, const unsigned char key[32]) {
     poly1305_state_internal_t *st = (poly1305_state_internal_t *)ctx;
 
@@ -111,7 +113,7 @@ poly1305_init(poly1305_context *ctx, const unsigned char key[32]) {
     st->final = 0;
 }
 
-static void
+static TL_HOT_ATTR void
 poly1305_blocks(poly1305_state_internal_t *st, const unsigned char *m, size_t bytes) {
     const unsigned long hibit = (st->final) ? 0 : (1UL << 24); /* 1 << 128 */
     unsigned long r0,r1,r2,r3,r4;
@@ -196,7 +198,7 @@ poly1305_blocks(poly1305_state_internal_t *st, const unsigned char *m, size_t by
     st->h[4] = h4;
 }
 
-POLY1305_NOINLINE void
+POLY1305_NOINLINE TL_HOT_ATTR void
 poly1305_finish(poly1305_context *ctx, unsigned char mac[16]) {
     poly1305_state_internal_t *st = (poly1305_state_internal_t *)ctx;
     unsigned long h0,h1,h2,h3,h4,c;

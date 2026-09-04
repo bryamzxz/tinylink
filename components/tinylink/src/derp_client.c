@@ -9,6 +9,7 @@
 #include <stdio.h>
 
 #include "esp_crt_bundle.h"
+#include "tl_time.h"
 #include "esp_log.h"
 #include "esp_random.h"
 #include "mbedtls/ssl.h"
@@ -184,7 +185,7 @@ esp_err_t derp_client_connect_login(derp_client_t *out,
     snprintf(url, sizeof(url), "https://%s:%u", server_host, (unsigned)port);
 
     esp_tls_cfg_t cfg = {
-        .crt_bundle_attach = esp_crt_bundle_attach,
+        .crt_bundle_attach = tl_crt_bundle_attach,
         .timeout_ms        = DERP_TLS_TIMEOUT_MS,
     };
 

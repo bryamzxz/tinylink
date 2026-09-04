@@ -561,3 +561,11 @@ CONFIG_ESP_TASK_WDT_PANIC=y
 CONFIG_ESP_TASK_WDT_TIMEOUT_S=60
 CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0=y
 CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU1=y
+
+# ---- Wall clock for certificate validation (2026-09, tl_time.c) ------------
+# SNTP is compiled anyway (lwIP); with HAVE_TIME_DATE the three TLS
+# clients check notBefore/notAfter once the clock is NTP-synced. Until
+# then tl_crt_bundle_attach() tolerates date flags (offline boots keep
+# working) and the clock is floored to the build / last-synced time.
+CONFIG_MBEDTLS_HAVE_TIME=y
+CONFIG_MBEDTLS_HAVE_TIME_DATE=y

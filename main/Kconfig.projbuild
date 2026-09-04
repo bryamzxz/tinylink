@@ -127,6 +127,26 @@ menu "tinylink application"
             mode forever. Set to 0 to disable both behaviors and keep
             the stay-up-for-diagnostics semantics.
 
+    config TINYLINK_SNTP_SERVER
+        string "NTP server for TLS certificate date validation"
+        default "pool.ntp.org"
+        help
+            SNTP (lwIP) starts once WiFi has an address. Until the first
+            sync the TLS clients skip certificate notBefore/notAfter
+            (the clock is floored to the build time / last synced time);
+            after it they enforce them. See tl_time.h.
+
+    config TINYLINK_STATS_PORT
+        int "UDP port answering /stats queries on the tailnet (0 = off)"
+        default 27822
+        range 0 65535
+        help
+            Any datagram from a 100.64.0.0/10 source to this port on the
+            telemetry socket is answered with a one-line JSON snapshot
+            (uptime, heap, WG rekeys / roams / RX-stale events, control
+            and DERP state, public endpoint). Read-only; reachable only
+            through the tunnel (non-tailnet sources are ignored).
+
     config TINYLINK_STUN_HOST
         string "STUN server hostname (M4)"
         default "stun.l.google.com"

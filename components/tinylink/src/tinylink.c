@@ -22,6 +22,7 @@
 
 #include "backoff.h"
 #include "tl_wdt.h"
+#include "tl_time.h"
 #include "control_key.h"
 #include "derp_client.h"
 #include "disco.h"
@@ -1129,16 +1130,63 @@ static void on_wg_path_stale(void *user)
     prepunch_pings_to_peers(s_last_peers, s_last_peers_count);
 }
 
+/* Merge one frame into the canonical peer table (M16, 2026-09):
+ *   Peers          → replace;
+ *   PeersChanged   → upsert by NodeKey (append while there is room);
+ *   PeersRemoved   → delete by NodeID.
+ * Returns true when the table changed. KeepAlive / patch-only frames
+ * leave it alone — before this, every frame overwrote the table and a
+ * KeepAlive emptied it, so the path-stale probe had no endpoints to
+ * try for most of the stream's life. */
+static bool merge_peers(const tl_netmap_t *nm)
+{
+    bool changed = false;
+    if (nm->n_peers > 0 && !nm->peers_is_delta) {
+        size_t n = nm->n_peers > TL_MAX_PEERS ? TL_MAX_PEERS : nm->n_peers;
+        memcpy(s_last_peers, nm->peers, n * sizeof(tl_peer_t));
+        s_last_peers_count = n;
+        changed = true;
+    } else if (nm->n_peers > 0) {
+        for (size_t i = 0; i < nm->n_peers; i++) {
+            const tl_peer_t *p = &nm->peers[i];
+            size_t j;
+            for (j = 0; j < s_last_peers_count; j++) {
+                if (memcmp(s_last_peers[j].node_pub, p->node_pub,
+                           TINYLINK_KEY_LEN) == 0) break;
+            }
+            if (j == s_last_peers_count) {
+                if (s_last_peers_count >= TL_MAX_PEERS) {
+                    ESP_LOGW(TAG, "peer table full (%d) — delta peer dropped",
+                             TL_MAX_PEERS);
+                    continue;
+                }
+                s_last_peers_count++;
+            }
+            s_last_peers[j] = *p;
+            changed = true;
+        }
+    }
+    for (size_t r = 0; r < nm->n_removed; r++) {
+        for (size_t j = 0; j < s_last_peers_count; j++) {
+            if (s_last_peers[j].id != nm->removed_ids[r]) continue;
+            ESP_LOGI(TAG, "peer removed from netmap: id=0x%08lx%08lx",
+                     (unsigned long)(s_last_peers[j].id >> 32),
+                     (unsigned long)(s_last_peers[j].id & 0xFFFFFFFFul));
+            for (size_t k = j + 1; k < s_last_peers_count; k++) {
+                s_last_peers[k - 1] = s_last_peers[k];
+            }
+            s_last_peers_count--;
+            changed = true;
+            break;
+        }
+    }
+    return changed;
+}
+
 static esp_err_t long_poll_handler(const tl_netmap_t *nm, void *ctx)
 {
     (void)ctx;
-    /* Snapshot just the peer array for the path-stale probe. */
-    size_t n = nm->n_peers;
-    if (n > TL_MAX_PEERS) n = TL_MAX_PEERS;
-    if (n > 0) {
-        memcpy(s_last_peers, nm->peers, n * sizeof(tl_peer_t));
-    }
-    s_last_peers_count = n;
+    const bool peers_changed = merge_peers(nm);
 #if CONFIG_TINYLINK_DERP_SUPERVISED
     update_derp_host_from_netmap(nm);
 #endif
@@ -1172,11 +1220,16 @@ static esp_err_t long_poll_handler(const tl_netmap_t *nm, void *ctx)
         prepunch_pings_to_peer_endpoints(nm);
         return ESP_OK;
     }
-    ESP_LOGI(TAG, "netmap (update): peers=%u derp_regions=%u",
-             (unsigned)nm->n_peers, (unsigned)nm->n_derp_regions);
-    /* wg_dataplane_update_peer already guards on n_peers==0 (rare server
-     * push during a tailnet reconfigure). */
-    esp_err_t err = wg_dataplane_update_peer(&s_keys, nm);
+    ESP_LOGI(TAG, "netmap (update): peers=%u%s removed=%u derp_regions=%u table=%u",
+             (unsigned)nm->n_peers, nm->peers_is_delta ? " (delta)" : "",
+             (unsigned)nm->n_removed, (unsigned)nm->n_derp_regions,
+             (unsigned)s_last_peers_count);
+    /* Apply the merged table to the data plane (endpoint roam of the
+     * WG peer; a removed WG peer leaves the live session alone). */
+    esp_err_t err = ESP_OK;
+    if (peers_changed) {
+        err = wg_dataplane_update_peers(&s_keys, s_last_peers, s_last_peers_count);
+    }
     /* Refresh NAT mappings on every netmap update too. Idle ages out
      * mappings (typical UDP timeout 30-120 s); without a periodic punch
      * the peer's first packet after silence finds a closed path and
@@ -1216,6 +1269,10 @@ void tinylink_control_mark_alive(void)
     s_control_last_rx_us = esp_timer_get_time();
 }
 
+/* Counters for the /stats snapshot. */
+static uint32_t s_stat_lp_reconnects;
+static uint32_t s_stat_ep_pushes;
+
 static void long_poll_task(void *arg)
 {
     (void)arg;
@@ -1246,6 +1303,7 @@ static void long_poll_task(void *arg)
             s_ep_push_pending = false;
             esp_err_t perr = mapreq_push_endpoints(&s_conn, &s_keys);
             if (perr == ESP_OK) {
+                s_stat_ep_pushes++;
                 uint8_t  ep_addr[4];
                 uint16_t ep_port = 0;
                 if (tinylink_get_public_endpoint(ep_addr, &ep_port)) {
@@ -1284,6 +1342,7 @@ static void long_poll_task(void *arg)
                 ESP_LOGW(TAG, "long-poll stream ended: 0x%x — reconnecting", err);
             }
             drop_control_conn();
+            s_stat_lp_reconnects++;
             /* The stream was a healthy working connection — recover fast. */
             if (up_us >= LP_HEALTHY_MS * 1000LL) fail_attempt = 0;
         } else {
@@ -1416,6 +1475,46 @@ esp_err_t tinylink_wait_dataplane_ms(uint32_t timeout_ms)
         waited += step_ms;
     }
     return ESP_OK;
+}
+
+esp_err_t tinylink_time_start(void)
+{
+    esp_err_t err = tl_time_init();
+    esp_err_t serr = tl_time_start_sntp();
+    return (err != ESP_OK) ? err : serr;
+}
+
+void tinylink_get_stats(tinylink_stats_t *out)
+{
+    if (out == NULL) return;
+    memset(out, 0, sizeof(*out));
+    const int64_t now = esp_timer_get_time();
+    out->uptime_s     = (uint32_t)(now / 1000000LL);
+    out->heap_free    = (uint32_t)esp_get_free_heap_size();
+    out->heap_largest = (uint32_t)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT);
+    out->ntp_synced   = tl_time_synced();
+    out->control_open = s_conn_open;
+    out->control_alive_age_s =
+        (uint32_t)((now - s_control_last_rx_us) / 1000000LL);
+    out->control_reconnects = s_stat_lp_reconnects;
+    out->endpoint_pushes    = s_stat_ep_pushes;
+#if CONFIG_TINYLINK_DERP_SUPERVISED
+    out->derp_connected = s_derp_sup.connected;
+    snprintf(out->derp_host, sizeof(out->derp_host), "%s", s_derp_host);
+#endif
+    out->public_valid = tinylink_get_public_endpoint(out->public_v4, &out->public_port);
+    wg_netif_stats_t ws;
+    wg_netif_get_stats(&ws);
+    out->wg_state           = ws.state;
+    out->wg_rekeys          = ws.rekeys;
+    out->wg_cold_handshakes = ws.cold_handshakes;
+    out->wg_rx_stale_events = ws.rx_stale_events;
+    out->wg_roams           = ws.roams;
+    out->wg_tx_drops        = (uint32_t)ws.tx_drops;
+    out->wg_relayed_stale   = (uint32_t)ws.relayed_stale;
+    out->wg_relay_errors    = (uint32_t)ws.relay_errors;
+    out->wg_last_rx_age_s   = ws.last_transport_recv_us > 0
+        ? (uint32_t)((now - ws.last_transport_recv_us) / 1000000LL) : 0u;
 }
 
 esp_err_t tinylink_wg_socket_init(void)

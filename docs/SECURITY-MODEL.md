@@ -127,18 +127,13 @@ cheaper than dragging in another dependency.
 - **MagicDNS resolution.** We use raw `100.x.y.z` peer IPs.
 - **Tailnet Lock.** tinylink does not verify the tailnet-lock signature
   on `NodeKey` updates. If you need this, do not use tinylink.
-- **TLS certificate validity windows.** `MBEDTLS_HAVE_TIME_DATE` is unset
-  and there is no SNTP wall-clock sync feeding mbedTLS, so the three TLS
-  clients (control-plane `/key` bootstrap, ts2021, DERP) verify the cert
-  chain and pin but **never** check `notBefore` / `notAfter`. An expired
-  or not-yet-valid leaf is accepted. Chain validity still rests on the
-  TOFU/compile-in control-pub pin, not on time.
-
-## Accepted risks / hardening roadmap (not yet addressed)
-
-These are known gaps, surfaced honestly so nobody mistakes them for
-solved. None is fixed in the current firmware.
-
+- **TLS certificate validity windows.** Since M16 (2026-09-04)
+  `MBEDTLS_HAVE_TIME_DATE=y` and `tl_time.c` floors the clock at boot
+  and runs SNTP: `notBefore`/`notAfter` are enforced on every handshake
+  after the first NTP sync, and tolerated before it (the first seconds
+  of a connected boot; the whole session of an offline one). During
+  that window the pinned control key + chain signatures are the trust
+  anchors, as they were for every handshake before M16.
 - **NVS private keys are plaintext at rest.** See "Long-term keys":
   flash encryption is off, so the Curve25519 identities are recoverable
   from a raw flash dump. Accepted permanently by owner decision

@@ -281,6 +281,17 @@ static struct {
 
     TaskHandle_t            rx_task;
     SemaphoreHandle_t       lock;
+    /* Serializes the handshake state machine (g.handshake, state,
+     * rekey flags, attempt counters): rx_task's timer blocks, the DISCO
+     * pong fast-INIT and the DERP-relayed response path
+     * (wg_netif_inject_packet, another task) all mutate it. Never held
+     * while g.lock is taken, and never across rx_cb. (M16, 2026-09) */
+    SemaphoreHandle_t       hs_lock;
+    /* /stats counters (since boot). */
+    uint32_t                stat_rekeys;
+    uint32_t                stat_cold_handshakes;
+    uint32_t                stat_rx_stale;
+    uint32_t                stat_roams;
 
     /* Outbound TX queue + worker. The worker drains in non-TCPIP
      * context so sendto can re-enter lwIP safely. tx_done_sem is
@@ -467,15 +478,15 @@ static int start_rekey(void)
  * send_key, emitting (new_key, old_counter) — a counter the fresh session
  * re-uses as it climbs from 0, i.e. catastrophic ChaCha20-Poly1305 nonce
  * reuse. So we take the SAME g.lock send_plaintext uses around the swap. */
-static void handle_handshake_response(const uint8_t *buf, size_t len)
+static bool handle_handshake_response_locked(const uint8_t *buf, size_t len)
 {
-    if (len != sizeof(struct wg_msg_response)) return;
+    if (len != sizeof(struct wg_msg_response)) return false;
     const bool cold_path  = (g.state == WG_NETIF_HANDSHAKE_PENDING);
     const bool rekey_path = (g.state == WG_NETIF_UP && g.rekey_in_flight);
     if (!cold_path && !rekey_path) {
         ESP_LOGD(TAG, "handshake response in state=%d rekey=%d ignored",
                  g.state, (int)g.rekey_in_flight);
-        return;
+        return false;
     }
     const struct wg_msg_response *resp = (const struct wg_msg_response *)buf;
 
@@ -487,7 +498,7 @@ static void handle_handshake_response(const uint8_t *buf, size_t len)
                  cold_path ? "cold" : "rekey");
         tl_secure_zero(send_key, sizeof(send_key));
         tl_secure_zero(recv_key, sizeof(recv_key));
-        return;
+        return false;
     }
 
     xSemaphoreTake(g.lock, portMAX_DELAY);
@@ -511,12 +522,25 @@ static void handle_handshake_response(const uint8_t *buf, size_t len)
     if (cold_path) {
         g.state = WG_NETIF_UP;
         g.handshake_attempt = 0;
+        g.stat_cold_handshakes++;
         ESP_LOGI(TAG, "session up: remote_idx=0x%08x", (unsigned)remote_index);
     } else {
         g.rekey_in_flight = false;
         g.rekey_attempt = 0;
+        g.stat_rekeys++;
         ESP_LOGI(TAG, "session rekeyed: remote_idx=0x%08x", (unsigned)remote_index);
     }
+    return true;
+}
+
+/* Serialized entry point — see g.hs_lock. Returns true when the response
+ * was accepted (session up / rekeyed). */
+static bool handle_handshake_response(const uint8_t *buf, size_t len)
+{
+    xSemaphoreTake(g.hs_lock, portMAX_DELAY);
+    const bool ok = handle_handshake_response_locked(buf, len);
+    xSemaphoreGive(g.hs_lock);
+    return ok;
 }
 
 /* Process a MessageTransport from the peer.
@@ -537,9 +561,9 @@ static void handle_handshake_response(const uint8_t *buf, size_t len)
  * the decrypt + watchdog-clock update ONLY: g.rx_cb re-enters lwIP, which
  * calls back into wg_netif_send_plaintext (takes g.lock), so holding the
  * lock across it would deadlock. */
-static void handle_transport(const uint8_t *buf, size_t len)
+static bool handle_transport(const uint8_t *buf, size_t len)
 {
-    if (g.state != WG_NETIF_UP) return;
+    if (g.state != WG_NETIF_UP) return false;
 
     /* Decrypt straight into a stack buffer; max payload bounded by
      * WG_RX_BUF_LEN - WG_TRANSPORT_OVERHEAD. Word-aligned so the AEAD's
@@ -562,12 +586,12 @@ static void handle_transport(const uint8_t *buf, size_t len)
     xSemaphoreGive(g.lock);
 
     if (drc != 0) {
-        return;  /* Replay / tamper / wrong index — silent drop. */
+        return false;  /* Replay / tamper / wrong index — silent drop. */
     }
     if (plen == 0) {
         /* WG keepalive (zero plaintext) — peer is alive, nothing to
          * deliver upstream. */
-        return;
+        return true;
     }
     if (g.rx_cb) {
         g.rx_cb(plaintext, plen, g.rx_cb_user);
@@ -575,6 +599,7 @@ static void handle_transport(const uint8_t *buf, size_t len)
     /* Best-effort scrub — plaintext might be sensitive (passwords,
      * tokens) and the buffer is on the stack of a long-lived task. */
     memset(plaintext, 0, plen);
+    return true;
 }
 
 /* Handle a DISCO datagram that arrived on the shared UDP socket. The
@@ -708,9 +733,12 @@ static void handle_disco_direct(const uint8_t *buf, size_t len,
                 src_port  != g.peer.peer_endpoint_port) {
                 ESP_LOGI(TAG, "WG endpoint roam (via pong) → %s:%u",
                          src_ip, (unsigned)src_port);
+                xSemaphoreTake(g.lock, portMAX_DELAY);
                 g.peer.peer_endpoint_v4_be = src_v4_be;
                 g.peer.peer_endpoint_port  = src_port;
                 rebuild_peer_sockaddr();
+                g.stat_roams++;
+                xSemaphoreGive(g.lock);
 
                 /* Fast-INIT fast path. We just learned a working
                  * AddrPort via the pong; if a handshake/rekey was
@@ -726,6 +754,7 @@ static void handle_disco_direct(const uint8_t *buf, size_t len,
                  * back-to-back FAST INITs from multiple-endpoint roam
                  * bursts get coalesced. */
                 const int64_t now = now_us();
+                xSemaphoreTake(g.hs_lock, portMAX_DELAY);
                 if ((now - g.last_fast_init_us) >
                         WG_DISCO_FAST_INIT_MIN_MS * 1000LL) {
                     if (g.state == WG_NETIF_HANDSHAKE_PENDING) {
@@ -741,6 +770,7 @@ static void handle_disco_direct(const uint8_t *buf, size_t len,
                         start_rekey();
                     }
                 }
+                xSemaphoreGive(g.hs_lock);
             }
         }
         return;
@@ -749,6 +779,23 @@ static void handle_disco_direct(const uint8_t *buf, size_t len,
         ESP_LOGD(TAG, "disco call-me-maybe (direct path)");
         return;
     }
+}
+
+/* Move the WG peer endpoint to `src` under g.lock (the TX worker
+ * snapshots g.peer_addr under the same lock, so it never sees a torn
+ * sockaddr). Counted for /stats. */
+static void roam_to(const struct sockaddr_in *src, const char *why)
+{
+    char ip[16];
+    inet_ntoa_r(src->sin_addr, ip, sizeof(ip));
+    xSemaphoreTake(g.lock, portMAX_DELAY);
+    g.peer.peer_endpoint_v4_be = (uint32_t)src->sin_addr.s_addr;
+    g.peer.peer_endpoint_port  = ntohs(src->sin_port);
+    rebuild_peer_sockaddr();
+    g.stat_roams++;
+    xSemaphoreGive(g.lock);
+    ESP_LOGI(TAG, "WG endpoint roam (%s) → %s:%u", why, ip,
+             (unsigned)ntohs(src->sin_port));
 }
 
 /* RX task: blocks on recvfrom, classifies, dispatches. */
@@ -790,19 +837,33 @@ static void rx_task(void *arg)
                  kind == WG_DEMUX_HANDSHAKE_RESP ||
                  kind == WG_DEMUX_HANDSHAKE_COOKIE ||
                  kind == WG_DEMUX_TRANSPORT);
-            if (is_wg_proto &&
-                (src.sin_addr.s_addr != g.peer_addr.sin_addr.s_addr ||
-                 src.sin_port        != g.peer_addr.sin_port)) {
+            const bool from_peer =
+                (src.sin_addr.s_addr == g.peer_addr.sin_addr.s_addr &&
+                 src.sin_port        == g.peer_addr.sin_port);
+            /* WireGuard roaming (M16, 2026-09): a TRANSPORT or handshake
+             * RESPONSE from an unexpected source is authenticated FIRST
+             * (AEAD + replay window / Noise response verification) and,
+             * if genuine, the peer endpoint follows it — the whitepaper's
+             * "update endpoint on any authenticated packet". Before this,
+             * a peer NAT rebind blackholed every inbound datagram until
+             * the 30-s RX-stale probe elicited a pong. INIT / COOKIE from a
+             * non-peer source are still dropped unauthenticated. */
+            if (is_wg_proto && !from_peer &&
+                kind != WG_DEMUX_TRANSPORT && kind != WG_DEMUX_HANDSHAKE_RESP) {
                 ESP_LOGD(TAG, "drop WG datagram from non-peer src");
                 goto retry_timer;
             }
 
             switch (kind) {
             case WG_DEMUX_HANDSHAKE_RESP:
-                handle_handshake_response(buf, (size_t)n);
+                if (handle_handshake_response(buf, (size_t)n) && !from_peer) {
+                    roam_to(&src, "authenticated handshake response");
+                }
                 break;
             case WG_DEMUX_TRANSPORT:
-                handle_transport(buf, (size_t)n);
+                if (handle_transport(buf, (size_t)n) && !from_peer) {
+                    roam_to(&src, "authenticated transport");
+                }
                 break;
             case WG_DEMUX_DISCO:
                 handle_disco_direct(buf, (size_t)n, &src);
@@ -827,6 +888,11 @@ static void rx_task(void *arg)
             }
         }
 retry_timer:;
+
+        /* The four handshake-state blocks below run under g.hs_lock
+         * (see the struct field): the DERP-relayed response path mutates
+         * the same state from another task. */
+        xSemaphoreTake(g.hs_lock, portMAX_DELAY);
 
         /* Handshake retry timer. Fires regardless of whether recvfrom
          * timed out.
@@ -943,6 +1009,7 @@ retry_timer:;
             ESP_LOGW(TAG, "RX stale >%ds (no transport decrypt since) — "
                           "forcing rekey (suspected peer restart)",
                      WG_RX_STALE_THRESHOLD_MS / 1000);
+            g.stat_rx_stale++;
             g.rekey_attempt = 0;
             if (start_rekey() == 0) {
                 g.rekey_in_flight = true;
@@ -978,6 +1045,7 @@ retry_timer:;
                 start_rekey();
             }
         }
+        xSemaphoreGive(g.hs_lock);
 
         /* Persistent-keepalive trigger. WG NAT mappings on the
          * outbound path decay after ~30-60 s of idle (CGNAT being the
@@ -1106,6 +1174,8 @@ esp_err_t wg_netif_init(const struct wg_netif_local_config *local)
 
     g.lock = xSemaphoreCreateMutex();
     if (g.lock == NULL) return ESP_ERR_NO_MEM;
+    g.hs_lock = xSemaphoreCreateMutex();
+    if (g.hs_lock == NULL) return ESP_ERR_NO_MEM;
 
     g.sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (g.sock < 0) {
@@ -1207,9 +1277,11 @@ esp_err_t wg_netif_start(const struct wg_netif_peer_config *peer)
 esp_err_t wg_netif_update_peer_endpoint(uint32_t v4_be, uint16_t port)
 {
     if (!g.initialized) return ESP_ERR_INVALID_STATE;
+    xSemaphoreTake(g.lock, portMAX_DELAY);
     g.peer.peer_endpoint_v4_be = v4_be;
     g.peer.peer_endpoint_port  = port;
     rebuild_peer_sockaddr();
+    xSemaphoreGive(g.lock);
     /* Existing transport session keys remain valid — endpoint roaming
      * doesn't invalidate keys (per WG roaming spec). Subsequent
      * outgoing packets land at the new endpoint. */
@@ -1235,10 +1307,10 @@ esp_err_t wg_netif_inject_packet(const uint8_t *src_node_pub,
     wg_demux_kind_t kind = wg_demux_classify(buf, len);
     switch (kind) {
     case WG_DEMUX_HANDSHAKE_RESP:
-        handle_handshake_response(buf, len);
+        (void)handle_handshake_response(buf, len);
         return ESP_OK;
     case WG_DEMUX_TRANSPORT:
-        handle_transport(buf, len);
+        (void)handle_transport(buf, len);
         return ESP_OK;
     case WG_DEMUX_HANDSHAKE_INIT:
     case WG_DEMUX_HANDSHAKE_COOKIE:
@@ -1405,6 +1477,22 @@ int wg_netif_get_socket(void)
 bool wg_netif_rx_running(void)
 {
     return g.rx_task != NULL;
+}
+
+void wg_netif_get_stats(wg_netif_stats_t *out)
+{
+    if (out == NULL) return;
+    memset(out, 0, sizeof(*out));
+    out->state                 = (int)g.state;
+    out->rekeys                = g.stat_rekeys;
+    out->cold_handshakes       = g.stat_cold_handshakes;
+    out->rx_stale_events       = g.stat_rx_stale;
+    out->roams                 = g.stat_roams;
+    out->tx_drops              = g.tx_drops;
+    out->relayed_stale         = g.relayed_stale;
+    out->relay_errors          = g.relay_errors;
+    out->last_transport_recv_us = g.last_transport_recv_us;
+    out->last_handshake_completed_us = g.last_handshake_completed_us;
 }
 
 bool wg_netif_get_peer_disco_pub(uint8_t out[WG_KEY_LEN])
