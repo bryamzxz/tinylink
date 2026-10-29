@@ -131,14 +131,15 @@ static esp_err_t bringup(void)
     }
 
 #if CONFIG_TINYLINK_BENCH_AEAD
-    /* AEAD baseline. Runs before register/dataplane so the heap is
-     * still pristine and the timer numbers aren't confounded by
-     * background TLS/long-poll work. The 8 s delay is purely so the
+    /* AEAD + X25519 baseline. Runs before register/dataplane so the
+     * heap is still pristine and the timer numbers aren't confounded
+     * by background TLS/long-poll work. The 8 s delay is purely so the
      * host serial capture can attach after `idf.py flash` releases the
      * port — without it the bench fires before capture is listening
      * and the numbers are lost. */
     vTaskDelay(pdMS_TO_TICKS(8000));
     (void)tinylink_bench_aead();
+    (void)tinylink_bench_x25519();
 #endif
 
     /* Bring up the WG UDP socket EARLY (bind only — no handshake yet)

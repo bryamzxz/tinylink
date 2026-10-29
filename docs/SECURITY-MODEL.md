@@ -78,29 +78,60 @@ the first registration and when control refuses the known node (deleted,
 expired, needs approval) — so a revoked or expired key costs nothing
 until then.
 
-## X25519 — constant-time donna (landed in PR #61)
+## X25519 — constant-time fiat-crypto field (round 1.3.3)
 
-`components/tinylink/src/crypto/curve25519.c` is now a thin shim over
-`agl/curve25519-donna` (BSD-3, Google, see `curve25519_donna.c`). Donna
-is the canonical constant-time 32-bit X25519 implementation. The
-MachineKey and NodeKey private keys are exercised on every Noise IK
-handshake and every WG `handshake_init` (DH e/s, s/s); under donna the
-scalar multiplication has data-independent timing in both the ladder
-and the limb arithmetic, eliminating the timing-channel that the
-previous TweetNaCl-derived reference left open.
+`components/tinylink/src/crypto/curve25519.c` is a thin shim over
+`curve25519_fiat32.c`: fiat-crypto's formally verified 32-bit Curve25519
+as carried by Linux (`lib/crypto/curve25519-fiat32.c`, "GPL-2.0 OR MIT",
+used here under MIT), with the field multiplication, squaring and
+×121666 rewritten for the Xtensa LX6. The MachineKey and NodeKey private
+keys are exercised on every Noise IK handshake and every WG
+`handshake_init` (DH e/s, s/s), the DISCO key on every uncached ping.
 
-API unchanged: `curve25519_scalarmult`, `curve25519_keypair`,
-`curve25519_dh`, `curve25519_derive_pub` all behave identically modulo
-internal timing. RFC 7748 §5.2 (two single-scalarmult vectors) + §6.1
-(DH round-trip Alice↔Bob) are verified in
-`tools/test/test_curve25519.c`; the full host KAT battery stays
-green (452 OK / 0 FAIL).
+From PR #61 to 1.3.2 the primitive was `agl/curve25519-donna`. Donna's
+C is constant-time, but on the LX6 — no carry flag — GCC compiles its
+int64 limb sums to `add; add; bgeu; addi`, a branch on the carry of
+secret-dependent data (finding S3 of the 2026-10 optimization list).
+Measured on the 1.3.2 firmware's compiled code (instruction-level
+simulation of the Xtensa objects): 162 `bgeu` sites executing 342 266
+times per scalarmult, and the instruction count varies with the scalar
+(by up to ~2 000 across seven random ones). fiat32's own u64 column
+sums would compile the same way. The rewrite never adds 64-bit values:
+each 32×32→64 product is split at bit 28 into two 32-bit column
+accumulators (`mull`, `muluh`, `src` with SAR = 28, `and`, `add`,
+`add`), and carries move between columns with 32-bit shifts; the bound
+analysis is in the file header.
 
-### Why donna, not mbedTLS
+Evidence, on the 1.3.3 firmware ELF:
+- static: the field functions (`fe_mul_impl`, `fe_sqr_impl`,
+  `fe_mul121666_impl`, `fe_add_impl`, `fe_sub_impl`, `fe_cswap`) contain
+  no conditional branch; the only branches left in the ladder and the
+  inversion are their fixed loop counters (9 sites), and `fe_mul_impl` /
+  `fe_sqr_impl` write SAR exactly once, before every `src`;
+- dynamic: run in the simulator over random and edge-case scalars and
+  points (zero, all-ones, u = 9, p − 1, non-canonical u), the X25519
+  executes the identical instruction sequence, the same memory addresses
+  and the same branch outcomes — 2 430 825 instructions every time.
+- not covered: MULL / MULUH latency is not documented as
+  operand-independent (`docs/esp32/REFERENCE.md`, "Multiplier timing is
+  unspecified"); `CONFIG_TINYLINK_BENCH_AEAD`'s X25519 timing probe
+  reports the cycle spread over eight inputs on the device.
+
+3.51 M → 2.43 M instructions per scalarmult, frame 2.7 → 0.85 KiB, and
+the stack temporaries are scrubbed with `tl_secure_zero` (donna left
+them). API unchanged: `curve25519_scalarmult`, `curve25519_keypair`,
+`curve25519_dh`, `curve25519_derive_pub`. RFC 7748 §5.2 (two vectors,
+iterated 1 / 1 000 times; 1 000 000 on demand) and §6.1, 4 000 random
+cross-checks against donna (kept as the test oracle,
+`tools/test/ref/curve25519_donna.c`) and the field operations against
+an independent mod-p reference at their input bounds are in
+`tools/test/test_curve25519.c` / `test_x25519.c`.
+
+### Why vendored, not mbedTLS
 
 The same argument applies even more strongly to mbedTLS's curve25519
 path: it has not historically been written with the same constant-time
-discipline as donna, and on ESP32 the HW assistance is weaker than the
+discipline, and on ESP32 the HW assistance is weaker than the
 generic "mbedTLS uses HW MPI" narrative suggests. IDF source review
 (v5.5.4, re-checked unchanged in v5.5.6):
 
@@ -114,9 +145,9 @@ generic "mbedTLS uses HW MPI" narrative suggests. IDF source review
   ESP32 RSA peripheral as "slow for public key operations". So `exp_mod`
   doesn't even hit hardware on ESP32.
 
-Net: mbedTLS X25519 on ESP32 would not be measurably faster than donna
-pure-C, and would cost `MBEDTLS_ECP_C` + `MBEDTLS_ECDH_C` flash + a
-non-constant-time risk profile. ChaCha20-Poly1305 stays on the
+Net: mbedTLS X25519 on ESP32 would not be measurably faster than the
+vendored pure C, and would cost `MBEDTLS_ECP_C` + `MBEDTLS_ECDH_C`
+flash + a non-constant-time risk profile. ChaCha20-Poly1305 stays on the
 in-tree vendored implementations because the ESP32's hardware AES
 accelerator is irrelevant to ChaCha and the implementations are
 already constant-time. BLAKE2s is small enough that vendoring is
@@ -466,3 +497,12 @@ the optimizer, particularly after the AEAD perf sprint that added
   unchanged: 493 OK, 0 FAIL.
 
   Cost: +48 B flash on the ESP32 build; zero DRAM/IRAM change.
+
+**Round 1.3.3 re-check.** The review above read the X25519 of its time
+(TweetNaCl's `sel25519`); the donna that followed it reintroduced carry
+branches through int64 arithmetic (S3), closed by the fiat32 field —
+see [X25519](#x25519--constant-time-fiat-crypto-field-round-133). The
+ChaCha20 rewrite of the same round (C4) keeps the branch set listed
+above (lengths and buffer alignment only); its compiled AEAD over 1 500
+B executes the same instruction sequence and addresses for any key and
+plaintext (instruction-level simulation of the firmware ELF).

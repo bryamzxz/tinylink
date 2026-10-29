@@ -8,11 +8,13 @@
 #include <stdint.h>
 #include <string.h>
 
+#include "esp_cpu.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 
 #include "crypto/chacha20.h"
 #include "crypto/chacha20poly1305.h"
+#include "crypto/curve25519.h"
 
 static const char *TAG = "bench-aead";
 
@@ -204,6 +206,69 @@ esp_err_t tinylink_bench_aead(void)
     bench_cold("cold", 1500, 50);
     bench_chacha20(1500, 500);
 
+    return ESP_OK;
+}
+
+/* X25519 (round 1.3.3, C6). RFC 7748 §5.2 vector 1 through the shim
+ * first: on the device it is the only oracle for the Xtensa asm in the
+ * field multiplication (mull / muluh / src with SAR = 28), which the host
+ * KATs never compile. Then the time per scalarmult, and a timing probe:
+ * CCOUNT cycles for a spread of scalars and points, the minimum of 3 runs
+ * each (filters interrupts; the code runs from flash, so the first call
+ * also pays the cache fill). The field code has no secret-dependent
+ * branch or address (round 1.3.3 notes); what this measures is the rest
+ * — the multiplier's latency is not documented as constant (REFERENCE.md,
+ * "Multiplier timing is unspecified"). Expect a spread of a few cycles. */
+esp_err_t tinylink_bench_x25519(void)
+{
+    static const char *TAG_X = "bench-x25519";
+    static const uint8_t k[32] = {
+        0xa5,0x46,0xe3,0x6b,0xf0,0x52,0x7c,0x9d,0x3b,0x16,0x15,0x4b,0x82,0x46,0x5e,0xdd,
+        0x62,0x14,0x4c,0x0a,0xc1,0xfc,0x5a,0x18,0x50,0x6a,0x22,0x44,0xba,0x44,0x9a,0xc4 };
+    static const uint8_t u[32] = {
+        0xe6,0xdb,0x68,0x67,0x58,0x30,0x30,0xdb,0x35,0x94,0xc1,0xa4,0x24,0xb1,0x5f,0x7c,
+        0x72,0x66,0x24,0xec,0x26,0xb3,0x35,0x3b,0x10,0xa9,0x03,0xa6,0xd0,0xab,0x1c,0x4c };
+    static const uint8_t want[32] = {
+        0xc3,0xda,0x55,0x37,0x9d,0xe9,0xc6,0x90,0x8e,0x94,0xea,0x4d,0xf2,0x8d,0x08,0x4f,
+        0x32,0xec,0xcf,0x03,0x49,0x1c,0x71,0xf7,0x54,0xb4,0x07,0x55,0x77,0xa2,0x85,0x52 };
+    uint8_t q[32], sk[32], pt[32];
+
+    int rc = curve25519_scalarmult(q, k, u);
+    const bool ok = rc == 0 && memcmp(q, want, 32) == 0;
+    ESP_LOGI(TAG_X, "RFC 7748 5.2 KAT: %s", ok ? "OK" : "MISMATCH");
+    if (!ok) return ESP_FAIL;
+
+    const uint32_t iters = 10;
+    int64_t t0 = esp_timer_get_time();
+    for (uint32_t i = 0; i < iters; ++i) {
+        rc |= curve25519_scalarmult(q, k, u);
+    }
+    const int64_t us = esp_timer_get_time() - t0;
+    ESP_LOGI(TAG_X, "scalarmult iters=%u | %u us/call rc=%d",
+             (unsigned)iters, (unsigned)(us / iters), rc);
+
+    /* Inputs: zero / all-ones / alternating scalars (clamped inside),
+     * the base point, the RFC point, an all-ones (non-canonical) u. */
+    uint32_t cmin = UINT32_MAX, cmax = 0;
+    for (int v = 0; v < 8; ++v) {
+        for (int i = 0; i < 32; ++i) {
+            sk[i] = v == 0 ? 0x00 : v == 1 ? 0xff : v == 2 ? 0x55 : (uint8_t)(k[i] * (v + 1) + i);
+            pt[i] = v == 3 ? (i == 0 ? 9 : 0) : v == 4 ? 0xff : (uint8_t)(u[i] ^ (uint8_t)(v * 37));
+        }
+        pt[31] &= v == 4 ? 0xff : 0x7f;
+        uint32_t best = UINT32_MAX;
+        for (int r = 0; r < 3; ++r) {
+            const uint32_t c0 = esp_cpu_get_cycle_count();
+            (void)curve25519_scalarmult(q, sk, pt);
+            const uint32_t c = esp_cpu_get_cycle_count() - c0;
+            if (c < best) best = c;
+        }
+        if (best < cmin) cmin = best;
+        if (best > cmax) cmax = best;
+        ESP_LOGI(TAG_X, "input %d: %u cycles", v, (unsigned)best);
+    }
+    ESP_LOGI(TAG_X, "timing probe: min %u max %u spread %u cycles over 8 inputs",
+             (unsigned)cmin, (unsigned)cmax, (unsigned)(cmax - cmin));
     return ESP_OK;
 }
 

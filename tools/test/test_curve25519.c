@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Bryam (bryamzxz)
 //
-// Host-side known-answer test for the placeholder TweetNaCl-derived
-// X25519. Run with:
+// Host-side known-answer test for the X25519 shim (crypto/curve25519.c
+// over curve25519_fiat32.c since round 1.3.3). Run with:
 //   make -C tools/test test_curve25519
 //
 // Vectors: RFC 7748 §5.2 (single scalarmult) and §6.1 (DH round-trip).
+// The iterated §5.2 vector and the cross-checks against donna are in
+// test_x25519.c.
 //
 // Note: the host build replaces esp_fill_random() with a fake symbol so
 // curve25519_keypair() compiles; we only exercise curve25519_scalarmult

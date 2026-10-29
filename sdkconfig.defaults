@@ -259,7 +259,7 @@ CONFIG_MBEDTLS_CLIENT_SSL_SESSION_TICKETS=n
 # first in supported_groups and both controlplane and DERP pick it, so
 # every TLS 1.2 handshake's ECDHE is mbedTLS X25519 (openssl s_client
 # "Peer Temp Key: X25519", 2026-10-28); without it the ECDHE falls back
-# to P-256. Noise IK + WireGuard use the vendored donna X25519 in
+# to P-256. Noise IK + WireGuard use the vendored X25519 in
 # crypto/curve25519*.c independently of this Kconfig.
 #
 # Dropped curves (8): SECP192R1, SECP224R1, SECP521R1, the three Koblitz

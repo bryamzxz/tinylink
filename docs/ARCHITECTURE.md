@@ -618,8 +618,9 @@ The original M1-only layout, kept for historical reference:
 |  Vendored crypto (src/crypto/)                                 |
 |     blake2s.c        — RFC 7693 reference                      |
 |     hkdf_blake2s.c   — HMAC + Noise HKDF + RFC 5869 HKDF       |
-|     curve25519.c     — shim over donna (constant-time)         |
-|     curve25519_donna.c — agl curve25519-donna 1:1 (BSD-3)      |
+|     curve25519.c     — X25519 shim (clamp, low-order reject)   |
+|     curve25519_fiat32.c — fiat-crypto 32-bit field, carry-free |
+|                        mul/sqr for the LX6 (MIT; was donna)    |
 |     salsa20.c        — Salsa20 / HSalsa20 / XSalsa20           |
 |     nacl_box.c       — crypto_box / crypto_box_open            |
 |     secure_zero.h    — tl_secure_zero scrubs ALL secret key    |

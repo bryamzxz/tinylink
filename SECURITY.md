@@ -54,5 +54,6 @@ Out of scope:
 ## Cryptographic primitives
 
 See [`docs/SECURITY-MODEL.md`](docs/SECURITY-MODEL.md) for the rationale behind
-the primitive choices, including why Curve25519 is vendored from constant-time
-"donna" rather than taken from mbedTLS.
+the primitive choices, including why Curve25519 is vendored (fiat-crypto's
+verified 32-bit field, made branch-free on the ESP32 in round 1.3.3) rather
+than taken from mbedTLS.
