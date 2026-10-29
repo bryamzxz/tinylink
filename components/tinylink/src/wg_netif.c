@@ -21,6 +21,7 @@
 #include "esp_timer.h"
 
 #include "lwip/inet.h"
+#include "lwip/pbuf.h"
 #include "lwip/sockets.h"
 
 #include "crypto/nacl_box.h"
@@ -275,6 +276,11 @@ static const char *TAG = "wg_netif";
  * UART doesn't spam if the worker is stuck for an extended window. */
 #define WG_TX_DROP_LOG_EVERY   64
 
+/* Same for inbound packets dropped because no pbuf could be allocated
+ * (C1-S): the pbuf is allocated before the tag check, so under heap
+ * pressure every forged packet would otherwise print a line. */
+#define WG_RX_DROP_LOG_EVERY   64
+
 /* Largest WG datagram we accept on the wire. WG transport packets are
  * usually MTU-bounded; with our 1.5 KiB upper bound we have plenty of
  * headroom for IPv4 over WG. */
@@ -391,6 +397,7 @@ static struct {
      * first. */
     uint32_t                stat_rx_keypair_race;
     uint32_t                stat_rx_dup_race;
+    uint32_t                stat_rx_pbuf_fail;     /* C1-S, unlocked like tx_drops */
 
     /* Outbound TX ring + worker (see WG_TX_SLOTS). The worker drains in
      * non-TCPIP context so sendto can re-enter lwIP safely. tx_done_sem
@@ -879,6 +886,8 @@ static bool handle_handshake_response(const uint8_t *buf, size_t len,
     return ok;
 }
 
+static void roam_to(const struct sockaddr_in *src, const char *why);
+
 /* Process a MessageTransport from the peer.
  *
  * WGN-1 (rx side): handle_transport is reachable from TWO unpinned FreeRTOS
@@ -908,26 +917,58 @@ static bool handle_handshake_response(const uint8_t *buf, size_t len,
  * Each locked step is a few hundred cycles; the window update is
  * byte-wise. g.rx_cb re-enters lwIP, which calls back into
  * wg_netif_send_plaintext (takes g.lock), so it runs after step 3 with no
- * lock held. */
-static bool handle_transport(const uint8_t *buf, size_t len)
+ * lock held.
+ *
+ * The plaintext goes straight into the pbuf lwIP will own (C1-S, 1.3.3).
+ * Until 1.3.2 it was decrypted into a 1 536-B stack buffer, copied into a
+ * fresh pbuf by wg_lwip and the stack copy scrubbed: two passes over every
+ * packet and 1.5 KiB on the wg_rx / tinylink_derp frames. The pbuf is
+ * allocated before the AEAD (after the cheap rejects), so a forgery costs
+ * one heap alloc + free on top of its tag check; a PBUF_RAM payload is
+ * word-aligned, which keeps the AEAD's l32i/s32i fast path.
+ *
+ * `src` is the UDP source (NULL for a DERP-relayed packet) and `from_peer`
+ * whether it is the current endpoint: an authenticated direct packet
+ * confirms the direct path and roams the endpoint to its source — here,
+ * before delivery, because lwIP now runs on this task and may answer at
+ * once (ICMP echo, TCP ACK) with a frame whose destination is taken from
+ * g.peer_addr (C1-S; while tiT built replies, the roam merely raced
+ * them). */
+static bool handle_transport(const uint8_t *buf, size_t len,
+                             const struct sockaddr_in *src, bool from_peer,
+                             int64_t now)
 {
     if (g.state != WG_NETIF_UP) return false;
 
-    /* Decrypt straight into a stack buffer; max payload bounded by
-     * WG_RX_BUF_LEN. Word-aligned so the AEAD's XOR loop takes its
-     * l32i/s32i fast path (chacha20.c) — GCC gives a uint8_t[] on the
-     * Xtensa stack no alignment guarantee otherwise. */
-    uint8_t __attribute__((aligned(4))) plaintext[WG_RX_BUF_LEN];
     struct wg_rx_ticket t;
-
     xSemaphoreTake(g.lock, portMAX_DELAY);
     int rc = wg_transport_rx_begin(&g.transport, buf, len,
-                                   sizeof(plaintext), &t);
+                                   WG_RX_BUF_LEN, &t);
     xSemaphoreGive(g.lock);
     if (rc != 0) {
         return false;  /* Replay / wrong index / malformed — silent drop. */
     }
-    if (wg_transport_rx_open(&t, buf, len, plaintext) != 0) {
+
+    /* Keepalives (plen 0) open into nothing. pbuf_alloc of a PBUF_RAM is
+     * one malloc (MEM_LIBC_MALLOC), safe without the core lock — until
+     * 1.3.2 wg_rx_inject did the same on these two tasks. */
+    struct pbuf *p = NULL;
+    if (t.plen > 0) {
+        p = pbuf_alloc(PBUF_RAW, (u16_t)t.plen, PBUF_RAM);
+        if (p == NULL) {
+            wg_transport_ticket_scrub(&t, sizeof(t));
+            const uint32_t prev = g.stat_rx_pbuf_fail++;
+            if ((prev % WG_RX_DROP_LOG_EVERY) == 0) {
+                ESP_LOGW(TAG, "pbuf_alloc(%u) failed — dropping inbound "
+                              "(total=%lu)", (unsigned)t.plen,
+                         (unsigned long)(prev + 1));
+            }
+            return false;
+        }
+    }
+    if (wg_transport_rx_open(&t, buf, len,
+                             p ? (uint8_t *)p->payload : NULL) != 0) {
+        if (p) pbuf_free(p);   /* the tag failed before any decrypt */
         return false;  /* Tamper / wrong key — silent drop. */
     }
 
@@ -959,21 +1000,33 @@ static bool handle_transport(const uint8_t *buf, size_t len)
             ESP_LOGD(TAG, "transport rx: duplicate committed first — "
                           "dropped (total %lu)", (unsigned long)races);
         }
-        tl_secure_zero(plaintext, t.plen);
+        if (p) {
+            tl_secure_zero(p->payload, p->len);
+            pbuf_free(p);
+        }
         return false;
     }
-    const size_t plen = t.plen;
-    if (plen == 0) {
+    if (src != NULL) {
+        note_direct_rx(now, "transport");
+        if (!from_peer) {
+            roam_to(src, "authenticated transport");
+        }
+    }
+    if (p == NULL) {
         /* WG keepalive (zero plaintext) — peer is alive, nothing to
          * deliver upstream. */
         return true;
     }
-    if (g.rx_cb) {
-        g.rx_cb(plaintext, plen, g.rx_cb_user);
+    /* Ownership moves to the callback (lwIP frees the pbuf like any
+     * received packet; the old stack copy, the one that was scrubbed,
+     * no longer exists). No netif attached yet: drop. */
+    wg_netif_rx_cb_t cb = g.rx_cb;
+    if (cb != NULL) {
+        cb(p, g.rx_cb_user);
+    } else {
+        tl_secure_zero(p->payload, p->len);
+        pbuf_free(p);
     }
-    /* Best-effort scrub — plaintext might be sensitive (passwords,
-     * tokens) and the buffer is on the stack of a long-lived task. */
-    tl_secure_zero(plaintext, plen);
     return true;
 }
 
@@ -1362,12 +1415,9 @@ static void rx_task(void *arg)
                 }
                 break;
             case WG_DEMUX_TRANSPORT:
-                if (handle_transport(buf, (size_t)n)) {
-                    note_direct_rx(now, "transport");
-                    if (!from_peer) {
-                        roam_to(&src, "authenticated transport");
-                    }
-                }
+                /* Authenticated = direct path noted and endpoint roamed
+                 * inside, before the packet reaches lwIP. */
+                (void)handle_transport(buf, (size_t)n, &src, from_peer, now);
                 break;
             case WG_DEMUX_DISCO:
                 handle_disco_direct(buf, (size_t)n, &src);
@@ -1955,7 +2005,7 @@ esp_err_t wg_netif_inject_packet(const uint8_t *src_node_pub,
         if (handle_handshake_response(buf, len, true)) send_disco_advert();
         return ESP_OK;
     case WG_DEMUX_TRANSPORT:
-        (void)handle_transport(buf, len);
+        (void)handle_transport(buf, len, NULL, false, 0);
         return ESP_OK;
     case WG_DEMUX_HANDSHAKE_INIT:
     case WG_DEMUX_HANDSHAKE_COOKIE:

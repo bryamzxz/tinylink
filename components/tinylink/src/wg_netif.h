@@ -28,12 +28,15 @@
 extern "C" {
 #endif
 
-/* Callback invoked from the RX task once a WG transport packet has
- * been authenticated and decrypted. The plaintext is the inner IP
- * datagram; the callee owns nothing — must copy if it needs to retain
- * the bytes past callback return. */
-typedef void (*wg_netif_rx_cb_t)(const uint8_t *plaintext, size_t len,
-                                 void *user);
+struct pbuf;
+
+/* Callback invoked once a WG transport packet has been authenticated and
+ * decrypted, from the RX task or (DERP-relayed) the DERP task, with no
+ * wg lock and no lwIP core lock held. `p` is a single PBUF_RAM pbuf
+ * (p->len == p->tot_len, word-aligned payload) holding the inner IP
+ * datagram — the AEAD wrote it there directly (round 1.3.3, C1-S). The
+ * callee takes ownership: it hands `p` to lwIP or frees it. */
+typedef void (*wg_netif_rx_cb_t)(struct pbuf *p, void *user);
 
 struct wg_netif_peer_config {
     uint8_t  peer_static_pub[WG_KEY_LEN];   /* WG static public of the peer */

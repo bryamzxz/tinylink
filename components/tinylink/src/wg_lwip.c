@@ -14,10 +14,12 @@
 #include "esp_netif_net_stack.h"        /* esp_netif_get_netif_impl */
 #include "lwip/esp_netif_net_stack.h"   /* struct esp_netif_netstack_config */
 #include "lwip/def.h"     /* lwip_htonl */
+#include "lwip/ip.h"      /* ip_input */
 #include "lwip/netif.h"
 #include "lwip/pbuf.h"
 #include "lwip/tcpip.h"
 
+#include "crypto/secure_zero.h"
 #include "wg_netif.h"
 
 static const char *TAG = "wg_lwip";
@@ -30,7 +32,7 @@ typedef struct {
 
 static esp_netif_t *s_netif;
 static wg_driver_t *s_driver;
-static struct netif *s_lwn;   /* underlying lwIP netif (cached for tcpip_input bypass) */
+static struct netif *s_lwn;   /* underlying lwIP netif (wg_rx_inject's ip_input target) */
 
 /* lwIP → WG: called by lwIP when it has an IP packet to send out the
  * tunnel netif. We pass the buffer to wg_netif which encrypts and
@@ -48,7 +50,7 @@ static esp_err_t wg_transmit(void *h, void *buffer, size_t len)
  * 0x00 0x21 PPP protocol = IP, payload, FCS, 0x7e). We encrypt those
  * framed bytes and send them, but the peer's WG decrypts them and
  * sees garbage instead of an IP packet — silently dropped. Mirror of
- * the ingress fix: just like `wg_rx_inject` calls `tcpip_input` to
+ * the ingress fix: just like `wg_rx_inject` calls `ip_input` to
  * skip the PPP `input_fn`, here we override `linkoutput` to ship the
  * raw IP payload straight to wg_netif. */
 /* Chained pbuf (rare: LWIP_NETIF_TX_SINGLE_PBUF=1 makes TCP and socket
@@ -100,20 +102,39 @@ static err_t wg_lwip_ip4_output(struct netif *netif, struct pbuf *p,
 }
 
 /* WG → lwIP: invoked from wg_netif's RX path after a transport
- * record has been authenticated and decrypted. Injects the plaintext
- * IP packet directly into lwIP's tcpip_input bypassing
- * esp_netif_receive — the PPP-flagged netif's `input_fn` is
- * `esp_netif_lwip_ppp_input` which calls `pppos_input_tcpip_as_ram_pbuf`,
- * a HDLC-framed-PPP-bytes parser. Feeding raw IP through that layer
- * silently drops every packet at the PPP framing stage (it sees
- * `0x45` as a corrupt non-flag byte, not the `0x7e` HDLC flag).
- * `tcpip_input` is the lwIP-native receive entry point any netif
- * driver uses to hand packets to the IP stack — we go straight
- * there with a pbuf wrapping the plaintext bytes. */
-static void wg_rx_inject(const uint8_t *plaintext, size_t len, void *user)
+ * record has been authenticated and decrypted — into `p` itself (round
+ * 1.3.3, C1-S; until 1.3.2 into a stack buffer that this function copied
+ * into a fresh pbuf). Injects the plaintext IP packet directly into lwIP's
+ * IPv4 input, bypassing esp_netif_receive — the PPP-flagged netif's
+ * `input_fn` is `esp_netif_lwip_ppp_input` which calls
+ * `pppos_input_tcpip_as_ram_pbuf`, a HDLC-framed-PPP-bytes parser. Feeding
+ * raw IP through that layer silently drops every packet at the PPP framing
+ * stage (it sees `0x45` as a corrupt non-flag byte, not the `0x7e` HDLC
+ * flag).
+ *
+ * Under the lwIP core lock, in the caller's task (C1-S): until 1.3.2 this
+ * was `tcpip_input`, which (CONFIG_LWIP_TCPIP_CORE_LOCKING_INPUT is off)
+ * allocates a TCPIP_MSG_INPKT, posts it to tiT's mbox and leaves the rest
+ * to tiT — one more task hop per inbound packet (memp alloc, mbox post,
+ * a context switch to tiT and back), and an input that fails with ERR_MEM
+ * when the 32-deep mbox is full. With core locking on (sdkconfig.defaults)
+ * any task may run the stack while holding the lock; ip_input is what
+ * tcpip_input would dispatch to for a netif without ETHARP (ip4_input:
+ * IPv6 is off). The same lock is what lets an ICMP echo reply or any
+ * other output this input triggers run linkoutput → wg_netif_send_plaintext
+ * right here — exactly the chain tiT used to run, now on wg_rx's 8 KiB or
+ * the DERP task's 10 KiB stack instead of tiT's 4.5 KiB. Lock order is
+ * hs_lock → core lock → g.lock: sendto takes the core lock under hs_lock
+ * (INIT sends), linkoutput takes g.lock under it (send_plaintext's
+ * reserve, as on tiT), nothing takes the core lock under g.lock and
+ * nothing under the core lock takes hs_lock; the callers hold none of
+ * the three. Core-locked input from a low-priority task is safe: the core
+ * lock is a FreeRTOS mutex, so tiT blocking on it lends its priority to
+ * this task. */
+static void wg_rx_inject(struct pbuf *p, void *user)
 {
     (void)user;
-    if (s_lwn == NULL || len == 0) return;
+    const uint8_t *ip = (const uint8_t *)p->payload;
 
     /* TSMP (IP protocol 99) is Tailscale's in-tunnel side channel. Since
      * CapVer 144 (tailscale b87203b83 / 3799eaf26, 2026-07) tailscaled
@@ -123,25 +144,29 @@ static void wg_rx_inject(const uint8_t *plaintext, size_t len, void *user)
      * disco-speaking peer, with no receiver-side capver gate. lwIP has
      * no handler for proto 99: ip4_input's default branch answers each
      * one with an ICMP "protocol unreachable" (ip4.c: icmp_dest_unreach
-     * ICMP_DUR_PROTO) — one wasted encrypt + TX per handshake/rekey and
-     * a pbuf churn on the RX task for nothing. tinylink learns peer disco
-     * keys from the netmap, exactly like a pre-144 client, so the advert
-     * carries nothing we need. Drop it here, before it costs a pbuf.
-     * Also drop anything shorter than an IPv4 header. */
-    if (len < 20 || (plaintext[0] >> 4) != 4) return;
-    if (plaintext[9] == 99) return;
-
-    struct pbuf *p = pbuf_alloc(PBUF_RAW, (u16_t)len, PBUF_RAM);
-    if (p == NULL) {
-        ESP_LOGW(TAG, "pbuf_alloc(%u) failed — dropping inbound", (unsigned)len);
+     * ICMP_DUR_PROTO) — one wasted encrypt + TX per handshake/rekey for
+     * nothing. tinylink learns peer disco keys from the netmap, exactly
+     * like a pre-144 client, so the advert carries nothing we need. Drop
+     * it here, before lwIP sees it. Also drop anything shorter than an
+     * IPv4 header. The dropped plaintext is wiped, as the stack copy was
+     * until 1.3.2 (what lwIP takes it frees unwiped, as before). */
+    if (s_lwn == NULL || p->len < 20 || (ip[0] >> 4) != 4 || ip[9] == 99) {
+        tl_secure_zero(p->payload, p->len);
+        pbuf_free(p);
         return;
     }
-    memcpy(p->payload, plaintext, len);
 
-    err_t e = tcpip_input(p, s_lwn);
+#if LWIP_TCPIP_CORE_LOCKING
+    LOCK_TCPIP_CORE();
+    const err_t e = ip_input(p, s_lwn);   /* consumes p (returns ERR_OK) */
+    UNLOCK_TCPIP_CORE();
+#else
+    const err_t e = tcpip_input(p, s_lwn);
+#endif
     if (e != ERR_OK) {
+        const unsigned len = p->tot_len;
         pbuf_free(p);
-        ESP_LOGW(TAG, "tcpip_input err=%d (len=%u)", (int)e, (unsigned)len);
+        ESP_LOGW(TAG, "IP input err=%d (len=%u)", (int)e, len);
     }
 }
 
@@ -175,10 +200,11 @@ static uint16_t s_pending_mtu;
  *   - installs the WG-aware output and linkoutput (so ip4_output's
  *     send chain reaches wg_netif_send_plaintext, not netif_null_output)
  *   - brings the netif up at admin and link level so ip4_input_accept
- *     accepts inbound pbufs delivered via tcpip_input from wg_rx_inject
- *   - leaves NETIF_FLAG_ETHARP/ETHERNET unset so tcpip_input() dispatches
+ *     accepts inbound pbufs delivered by wg_rx_inject
+ *   - leaves NETIF_FLAG_ETHARP/ETHERNET unset so tcpip_input() (the
+ *     !LWIP_TCPIP_CORE_LOCKING fallback in wg_rx_inject) dispatches
  *     inbound to ip_input rather than ethernet_input
- *   - caches the lwIP netif pointer for wg_rx_inject's tcpip_input call */
+ *   - caches the lwIP netif pointer for wg_rx_inject's ip_input call */
 static err_t wg_lwip_netif_init(struct netif *netif)
 {
     netif->name[0] = 'w';
@@ -198,10 +224,11 @@ static err_t wg_lwip_netif_init(struct netif *netif)
 }
 
 /* Stub input_fn. RX never goes through esp_netif_receive — wg_rx_inject
- * calls tcpip_input(p, s_lwn) directly. But esp_netif_start_api runs
- * esp_netif_config_sanity_check (esp_netif_lwip.c:1171) which rejects
- * a NULL lwip_input_fn with ESP_ERR_INVALID_STATE, so provide a stub
- * that returns failure if anything ever does call it. */
+ * calls ip_input(p, s_lwn) directly, under the core lock. But
+ * esp_netif_start_api runs esp_netif_config_sanity_check
+ * (esp_netif_lwip.c:1171) which rejects a NULL lwip_input_fn with
+ * ESP_ERR_INVALID_STATE, so provide a stub that returns failure if
+ * anything ever does call it. */
 static esp_netif_recv_ret_t wg_lwip_netif_input(void *netif, void *buffer,
                                                 size_t len, void *eb)
 {
