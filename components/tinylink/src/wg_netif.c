@@ -44,6 +44,18 @@ static const char *TAG = "wg_netif";
 #define WG_REKEY_TIMEOUT_MS  5000
 #define WG_HANDSHAKE_MAX_RETRIES 12
 
+/* First retry of a cold handshake burst (B7c, 1.3.2). At boot the first
+ * INIT goes out right after the netmap, before the peer has validated a
+ * direct path to our (per-boot, new) NAT mapping, so it answers via
+ * DERP — and our DERP is usually not logged in yet: the response is
+ * lost and the peer then treats copies of that INIT as replays (see
+ * WG_INIT_FRESH_AFTER_MS). Seen on the sensor: WG up 5 s after the
+ * netmap, every boot. The netmap-time prepunch pings validate the
+ * direct path within ~0.3 s, so a NEW INIT 2 s later is answered
+ * directly. One extra INIT per burst — responders accept 50/s — and
+ * every later retry, rekeys included, keeps REKEY_TIMEOUT. */
+#define WG_FIRST_RETRY_MS 2000
+
 /* Proactive rekey threshold. WG spec: the *responder* hits
  * REKEY_AFTER_TIME = 120 s and starts initiating a new handshake; if
  * we don't respond (we're initiator-only — incoming HANDSHAKE_INIT is
@@ -1129,6 +1141,18 @@ static void roam_to(const struct sockaddr_in *src, const char *why)
  * in sync (a deadline here that no block acts on would make the RX wait
  * spin at one tick; a block missing here would fire up to
  * WG_RX_MAX_WAIT_MS late). Caller holds hs_lock, like the blocks. */
+/* Retry interval of the handshake in flight: WG_FIRST_RETRY_MS after
+ * the first INIT of a cold burst, REKEY_TIMEOUT otherwise (rekeys, and
+ * attempt 0 — the post-backoff wait, whose back-dated stamp assumes
+ * REKEY_TIMEOUT). */
+static int64_t handshake_retry_us(void)
+{
+    const int ms = (g.state == WG_NETIF_HANDSHAKE_PENDING &&
+                    g.handshake_attempt == 1)
+                       ? WG_FIRST_RETRY_MS : WG_REKEY_TIMEOUT_MS;
+    return (int64_t)ms * 1000LL;
+}
+
 static int64_t rx_next_deadline_us(void)
 {
     int64_t d = INT64_MAX;
@@ -1137,7 +1161,9 @@ static int64_t rx_next_deadline_us(void)
         if (at_ < d) d = at_;                                              \
     } while (0)
     if (g.state == WG_NETIF_HANDSHAKE_PENDING || g.rekey_in_flight) {
-        RX_DEADLINE(g.last_handshake_us, WG_REKEY_TIMEOUT_MS);
+        const int64_t at = wg_timer_at(g.last_handshake_us,
+                                       handshake_retry_us());
+        if (at < d) d = at;
     }
     if (g.state == WG_NETIF_UP && !g.rekey_in_flight) {
         if (g.last_handshake_completed_us > 0) {
@@ -1331,7 +1357,7 @@ retry_timer:;
          * from now (rather than the 5 s that the unmodified
          * `now - last > REKEY_TIMEOUT` predicate would yield). */
         if (g.state == WG_NETIF_HANDSHAKE_PENDING &&
-            wg_timer_due(now, g.last_handshake_us, WG_REKEY_TIMEOUT_MS * 1000LL)) {
+            wg_timer_due(now, g.last_handshake_us, handshake_retry_us())) {
             if (g.handshake_attempt >= WG_HANDSHAKE_MAX_RETRIES) {
                 ESP_LOGW(TAG, "handshake budget exhausted (%d × %ds = %ds) — "
                               "backing off %ds before next burst (peer may be "

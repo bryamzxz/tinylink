@@ -90,6 +90,11 @@ for after the 1.3.2 soak.
   unanswered, new INIT 13.0 s answered in 70 ms). On DERP login and on a
   solicited pong, an INIT older than 1 s is now replaced by a new one;
   CallMeMaybe and link-up still re-send the same bytes.
+- **B7c** — the first retry of a cold handshake burst is 2 s instead of
+  REKEY_TIMEOUT (second 1.3.2 smoke: DERP took 6 s to log in and the
+  prepunch pongs came back 0.3 s after the INIT, so neither B7 nor B7b
+  could fire; by 2 s the prepunch has validated the direct path and a
+  new INIT is answered directly). Later retries and rekeys keep 5 s.
 - **B10** — the direct-path DISCO pong is sealed with the cached shared
   key: ~20 ms → ~50 µs per ping; deepest direct-DISCO wg_rx chain
   5 696 → ~3 250 B.
