@@ -400,6 +400,21 @@ static struct {
     uint32_t                stat_rx_keypair_race;
     uint32_t                stat_rx_dup_race;
     uint32_t                stat_rx_pbuf_fail;     /* C1-S, unlocked like tx_drops */
+    /* Transport packets since the last good decrypt, by fate (1.3.3).
+     * The RX-stale watchdog prints them, so a silent window tells
+     * "nothing arrived" from "arrived and was dropped — why". Zeroed by
+     * every committed packet. Under g.lock, except the two counted
+     * unlocked after the lock-free AEAD (tag, pbuf: a lost increment
+     * only blurs a diagnostic). prev_local_index is the receiver index
+     * of the keypair before the current one: a packet carrying it is
+     * the peer still sending under the old keys. */
+    struct {
+        uint32_t direct, derp;                  /* seen, by path */
+        uint32_t old_idx, other_idx, replay;    /* rx_begin refusals */
+        uint32_t tag, race, pbuf;
+        uint32_t last_idx;                      /* last refused index */
+    } rxd;
+    uint32_t                prev_local_index;
 
     /* Outbound TX ring + worker (see WG_TX_SLOTS). The worker drains in
      * non-TCPIP context so sendto can re-enter lwIP safely. tx_done_sem
@@ -805,6 +820,7 @@ static bool handle_handshake_response_locked(const uint8_t *buf, size_t len,
     }
 
     xSemaphoreTake(g.lock, portMAX_DELAY);
+    g.prev_local_index = g.transport.local_index;
     wg_transport_session_init(&g.transport, g.local_index, remote_index,
                               send_key, recv_key);
     xSemaphoreGive(g.lock);
@@ -946,6 +962,19 @@ static bool handle_transport(const uint8_t *buf, size_t len,
     xSemaphoreTake(g.lock, portMAX_DELAY);
     int rc = wg_transport_rx_begin(&g.transport, buf, len,
                                    WG_RX_BUF_LEN, &t);
+    if (src != NULL) g.rxd.direct++; else g.rxd.derp++;
+    if (rc != 0 && len >= 8) {
+        /* Same reads rx_begin made; it does not say which one failed. */
+        uint32_t idx;
+        memcpy(&idx, buf + 4, sizeof(idx));
+        if (idx == g.transport.local_index) {
+            g.rxd.replay++;   /* or oversize / no keys: rare */
+        } else {
+            if (idx == g.prev_local_index) g.rxd.old_idx++;
+            else g.rxd.other_idx++;
+            g.rxd.last_idx = idx;
+        }
+    }
     xSemaphoreGive(g.lock);
     if (rc != 0) {
         return false;  /* Replay / wrong index / malformed — silent drop. */
@@ -959,6 +988,7 @@ static bool handle_transport(const uint8_t *buf, size_t len,
         p = pbuf_alloc(PBUF_RAW, (u16_t)t.plen, PBUF_RAM);
         if (p == NULL) {
             wg_transport_ticket_scrub(&t, sizeof(t));
+            g.rxd.pbuf++;
             const uint32_t prev = g.stat_rx_pbuf_fail++;
             if ((prev % WG_RX_DROP_LOG_EVERY) == 0) {
                 ESP_LOGW(TAG, "pbuf_alloc(%u) failed — dropping inbound "
@@ -971,6 +1001,7 @@ static bool handle_transport(const uint8_t *buf, size_t len,
     if (wg_transport_rx_open(&t, buf, len,
                              p ? (uint8_t *)p->payload : NULL) != 0) {
         if (p) pbuf_free(p);   /* the tag failed before any decrypt */
+        g.rxd.tag++;
         return false;  /* Tamper / wrong key — silent drop. */
     }
 
@@ -984,11 +1015,13 @@ static bool handle_transport(const uint8_t *buf, size_t len,
          * WG transport keys are mutually valid. The watchdog cares about
          * session liveness, not payload direction. */
         g.last_transport_recv_us = now_us();
+        memset(&g.rxd, 0, sizeof(g.rxd));
     } else if (rc == WG_TRANSPORT_RX_STALE) {
         races = ++g.stat_rx_keypair_race;
     } else {
         races = ++g.stat_rx_dup_race;
     }
+    if (rc != 0) g.rxd.race++;
     xSemaphoreGive(g.lock);
 
     if (rc != 0) {
@@ -1563,6 +1596,20 @@ retry_timer:;
             ESP_LOGW(TAG, "RX stale >%ds (no transport decrypt since) — "
                           "forcing rekey (suspected peer restart)",
                      WG_RX_STALE_THRESHOLD_MS / 1000);
+            xSemaphoreTake(g.lock, portMAX_DELAY);
+            ESP_LOGW(TAG, "RX stale: since then seen direct=%lu derp=%lu; "
+                          "dropped old-key=%lu other-idx=%lu (last 0x%08lx) "
+                          "replay=%lu tag=%lu race=%lu pbuf=%lu; local idx "
+                          "0x%08lx, prev 0x%08lx",
+                     (unsigned long)g.rxd.direct, (unsigned long)g.rxd.derp,
+                     (unsigned long)g.rxd.old_idx,
+                     (unsigned long)g.rxd.other_idx,
+                     (unsigned long)g.rxd.last_idx,
+                     (unsigned long)g.rxd.replay, (unsigned long)g.rxd.tag,
+                     (unsigned long)g.rxd.race, (unsigned long)g.rxd.pbuf,
+                     (unsigned long)g.transport.local_index,
+                     (unsigned long)g.prev_local_index);
+            xSemaphoreGive(g.lock);
             g.stat_rx_stale++;
             g.rekey_attempt = 0;
             /* Reset the watchdog clock so the rekey-in-flight has its
