@@ -86,7 +86,7 @@ flash). Deviations from the table below, each verified against IDF
 ## Round B — small code changes, big wins → 1.3.2
 
 **Status (2026-10-28, branch `feat/opt-1.3.2`): implemented except B18,
-hardware smoke pending.** Four parallel branches (ctl / crypto / dp /
+hardware smoke clean (WG-up − netmap 5.3 → 1.9 s after B7b/B7c, heap +14 KB), 6-h soak running.** Four parallel branches (ctl / crypto / dp /
 sys), merged and reviewed as a whole. Image 826 768 → 762 535 B
 (−64 233 B), static DRAM 108 220 → 95 884 B, host suite 881/0. Measured
 vs plan: B1 −21.9 KB (plan −33.5, measured at -Og), B2 −5.0, B3 −15.4,

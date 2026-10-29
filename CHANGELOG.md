@@ -15,8 +15,9 @@ system), merged, then reviewed as a whole. Image **826 768 → 762 535 B
 (−64 233 B; −196 714 B / −20.5 % since 1.3.0)**; static DRAM 108 220 →
 95 884 B (−12.3 KB); IRAM 73 867 → 73 935 B. Host suite 633 → **881 OK,
 0 FAIL** (CI floor 881), ASan + UBSan clean, 0 compiler warnings.
-**Hardware smoke pending.** B18 (stack trims from soak data) is left
-for after the 1.3.2 soak.
+Flashed to the deployed sensor (three smokes, two fixes found there —
+B7b, B7c); hardware section at the end of this entry. B18 (stack trims
+from soak data) is left for after the 1.3.2 soak.
 
 #### Control plane (`feat/r132-ctl`, −42.1 KB)
 
@@ -152,6 +153,34 @@ Worst-case stack use per task after the merge (frames + 512 B
 overhead): wg_rx 73 % (uncached DISCO → donna), tinylink_tlm ≈ 70 %
 (/stats → sendto → encrypt; STUN 2.5 KiB, NVS write 1.3 KiB), tiT 61 %,
 tinylink_derp 54 %, wg_tx 39 %, tinylink_lp / main 31 %.
+
+#### Hardware (deployed sensor, app partition only; the 1.3.1 `ota_0` + `otadata` read back to `~/tinylink-backups/` first)
+
+Three 180-s smokes at 500 kbaud, each `boots:1 panics:0 wdt:0`, 0 E-level
+lines outside the events below; final image `c1db6c5` (763 072 B).
+- **`5daec1e`**: TLS now AES-128-GCM, `derp_regions=1`, the boot line
+  `boots=1 (brown-out 0, panic 0, task WDT 0, int WDT 0) — RTC record
+  restarted`, **heap_free 62 7xx → 76 7xx B (+14 KB), largest block
+  51 200 → 59 392 B**. But WG still came up 5.1 s after the netmap:
+  INIT 8.1 s, its DERP copy at DERP login 9.8 s and a direct copy on a
+  pong 11.2 s unanswered, the REKEY_TIMEOUT retry answered in 70 ms →
+  B7b.
+- **`f303bab`** (B7b): DERP took 6 s to log in (after the session was
+  up) and the prepunch pongs came 0.3 s after the INIT, so B7b could not
+  fire — WG up 5.2 s after the netmap → B7c.
+- **`c1db6c5`** (B7c): INIT 14.03 s, DERP login 15.78 s, `handshake init
+  sent (attempt 2, …, fresh: DERP relay up)` 15.82 s, **session up
+  15.89 s — WG-up − netmap 1.94 s (5.2–5.4 s in 1.2.0–1.3.1)**. This
+  boot's netmap came 8 s after the stream request (server side: the
+  long-poll reuses the register conn, no TLS in between; 1.1–1.8 s in
+  the other boots). One server-side TCP FIN on the long-poll at 120.6 s
+  (no GOAWAY, as in the first 1.3.0 smoke), reconnected and re-parsed
+  in 5 s.
+Stack HWMs (B free), 1.3.1 → 1.3.2: `wg_rx` 2 084 → 2 808,
+`tinylink_tlm` 940–1 084 → 2 836 (now also runs STUN), `tiT` 2 768 →
+3 000, `wg_tx` 5 628 → 4 948, `tinylink_derp` 5 172 → 5 292,
+`tinylink_lp` 16 584 → 17 300, `wifi` 1 008 → 1 016; `tinylink_stun_re`
+and its 3 KiB stack are gone. 6-h soak running.
 
 ### Optimization round A 1.3.1 (2026-10-28, branch `feat/opt-1.3.1`)
 
