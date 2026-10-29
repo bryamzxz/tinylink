@@ -9,7 +9,8 @@
 // compiles it under ref_* names through mapresp_ref.c and requires the
 // streaming parser to produce the same tl_netmap_t (or the same failure)
 // for every input whose elements fit its buffer. Verbatim below this
-// header.
+// header, except the DERP node's IPv4 / STUNPort (round 1.3.5), marked
+// where they are parsed.
 //
 
 #include "mapreq.h"
@@ -34,6 +35,7 @@
 #include "jsmn.h"
 #include "jsmn_skip.h"
 #include "jsmn_split.h"
+#include "tl_addr.h"   /* 1.3.5 */
 #include "tl_date.h"
 
 #ifdef ESP_PLATFORM
@@ -381,6 +383,7 @@ static esp_err_t parse_one_derp_region(const char *js, const jsmntok_t *toks,
                     tl_derp_node_t *dn = &region->nodes[region->n_nodes];
                     int nfields = toks[nx].size;
                     int nf = nx + 1;
+                    dn->stun_port = TL_STUN_DEFAULT_PORT;   /* 1.3.5, as mapreq.c */
                     for (int q = 0; q < nfields; q++) {
                         const jsmntok_t *nk = &toks[nf];
                         int nv = nf + 1;
@@ -400,6 +403,20 @@ static esp_err_t parse_one_derp_region(const char *js, const jsmntok_t *toks,
                             if (tok_copy(js, &toks[nv], buf, sizeof(buf)) > 0) {
                                 dn->port = (uint16_t)atoi(buf);
                             }
+                        } else if (tok_eq(js, nk, "IPv4") && tok_is_str(&toks[nv])) {
+                            /* Round 1.3.5: the node fields tl_derp_node_t
+                             * gained, parsed as mapreq.c does — the tests
+                             * compare whole netmaps against this parser. */
+                            if (!tl_ipv4_parse(js + toks[nv].start,
+                                               (size_t)(toks[nv].end - toks[nv].start),
+                                               dn->ipv4)) {
+                                memset(dn->ipv4, 0, sizeof(dn->ipv4));
+                            }
+                        } else if (tok_eq(js, nk, "STUNPort") &&
+                                   toks[nv].type == JSMN_PRIMITIVE) {
+                            dn->stun_port = tl_stun_port_parse(
+                                js + toks[nv].start,
+                                (size_t)(toks[nv].end - toks[nv].start));
                         }
                         nf = skip_value(toks, nv);
                     }
