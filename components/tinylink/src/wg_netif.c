@@ -637,7 +637,7 @@ static bool handle_transport(const uint8_t *buf, size_t len)
     }
     /* Best-effort scrub — plaintext might be sensitive (passwords,
      * tokens) and the buffer is on the stack of a long-lived task. */
-    memset(plaintext, 0, plen);
+    tl_secure_zero(plaintext, plen);
     return true;
 }
 
@@ -1563,10 +1563,10 @@ void wg_netif_stop(void)
         g.sock = -1;
     }
     wg_handshake_scrub(&g.handshake);
-    memset(&g.transport, 0, sizeof(g.transport));
+    tl_secure_zero(&g.transport, sizeof(g.transport));
     /* Scrub the cached shared-K so a future wg_netif_start with a
      * different peer DiscoKey can't accidentally reuse stale K. */
-    memset(g.peer_disco_shared_k, 0, sizeof(g.peer_disco_shared_k));
+    tl_secure_zero(g.peer_disco_shared_k, sizeof(g.peer_disco_shared_k));
     g.peer_disco_shared_k_valid = false;
     g.initialized = false;
 }

@@ -277,8 +277,11 @@ TL_HOT_ATTR void chacha20(struct chacha20_ctx *ctx, uint8_t *out, const uint8_t 
 }
 
 /* For wireguard: nonce composed of 32 bits of zeros followed by the
- * 64-bit little-endian counter; word 12 holds the per-block counter. */
-void chacha20_init(struct chacha20_ctx *ctx, const uint8_t *key, uint64_t nonce) {
+ * 64-bit little-endian counter; word 12 holds the per-block counter.
+ * Runs once per AEAD call, so it sits in IRAM with the rest of the hot
+ * path (before 1.3.2 it and mbedtls_platform_zeroize were the AEAD's
+ * last calls into flash). */
+TL_HOT_ATTR void chacha20_init(struct chacha20_ctx *ctx, const uint8_t *key, uint64_t nonce) {
     ctx->state[ 0] = CHACHA20_CONSTANT_1;
     ctx->state[ 1] = CHACHA20_CONSTANT_2;
     ctx->state[ 2] = CHACHA20_CONSTANT_3;

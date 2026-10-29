@@ -11,45 +11,39 @@
 // analysis — but that guarantee is *incidental*, not enforced. Project-wide
 // LTO, a single-TU refactor that inlines the helpers, or a future toolchain
 // could silently drop the scrub. tl_secure_zero() makes the guarantee hold
-// *by construction* on both targets.
+// *by construction*.
 //
-//   - ESP-IDF: mbedtls_platform_zeroize(), the same barrier-backed primitive
-//     tinylink.c already uses for the auth key.
-//   - Host KAT build (no ESP_PLATFORM): a volatile indirect call to memset
-//     that the optimizer must treat as opaque — no mbedtls dependency, so the
-//     vendored-crypto host tests link with stock gcc unchanged.
+// One implementation for the firmware and the host KATs (round 1.3.2; it
+// used to be mbedtls_platform_zeroize() on ESP-IDF): memset followed by an
+// empty asm statement that takes the buffer address as an input and
+// clobbers "memory" — the barrier_data() idiom of Linux's
+// memzero_explicit(). The compiler must assume the asm reads every byte
+// of *buf, so the stores before it are live and stay, across inlining and
+// LTO alike; the asm itself emits no instruction.
+//
+// Why not mbedtls_platform_zeroize: it is an out-of-line call into flash
+// (mbedcrypto's platform_util.c), made 2–3 times per WireGuard packet by
+// the IRAM AEAD — a cache miss on every cold packet. Inlined, the scrub
+// lives wherever its caller lives (IRAM for TL_HOT_ATTR code): GCC
+// expands a small constant-size memset into word stores, larger or
+// variable ones call newlib's memset, which the ESP32 runs from mask ROM
+// (esp32.rom.libc-funcs.ld) — never from flash.
 
 #pragma once
 
 #include <stddef.h>
+#include <string.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-#ifdef ESP_PLATFORM
-
-#include "mbedtls/platform_util.h"
-
-static inline void tl_secure_zero(void *buf, size_t len)
+static inline __attribute__((always_inline))
+void tl_secure_zero(void *buf, size_t len)
 {
-    mbedtls_platform_zeroize(buf, len);
+    memset(buf, 0, len);
+    __asm__ __volatile__("" : : "r"(buf) : "memory");
 }
-
-#else  /* host build */
-
-#include <string.h>
-
-static inline void tl_secure_zero(void *buf, size_t len)
-{
-    /* The volatile function pointer forces the compiler to emit the call:
-     * it cannot prove the indirect target is a no-op, so the store survives
-     * regardless of whether the buffer is read afterwards. */
-    static void *(*const volatile vmemset)(void *, int, size_t) = memset;
-    vmemset(buf, 0, len);
-}
-
-#endif
 
 #ifdef __cplusplus
 }
