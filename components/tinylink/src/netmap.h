@@ -8,10 +8,11 @@
 // docs/SECURITY-MODEL.md non-goals).
 //
 // Sizing rationale: 4 peers covers the M1/M2 sensor → home topology.
-// DERP regions are sized to 28 (the full Tailscale DERPMap) because
-// capping below the production region count silently drops whichever
-// region the parser hits last — observed loss of mia/region 16 at
-// cap=4 left every peer in this tailnet unreachable.
+// Of the DERPMap only the PreferredDERP region is stored (1.3.2), picked
+// by RegionID at parse time (mapreq.c::derp_region_wanted). The 2026-05
+// cap=4 build kept "the first N" regions and silently lost mia/region
+// 16, leaving every peer in this tailnet unreachable; the 1.3.0 fix
+// stored all 28 (~6 KiB). Selecting by ID needs neither.
 
 #pragma once
 
@@ -40,12 +41,14 @@ extern "C" {
 #define TL_MAX_PEER_PATCHES     4
 #define TL_MAX_PEER_ENDPOINTS   4
 #define TL_MAX_PEER_ADDRESSES   2
-/* Tailscale ships 28 DERP regions today (mia/region 16 is the closest
- * to most peers in this tailnet). Capping below that silently dropped
- * region 16 from the parsed netmap, leaving the device unable to reach
- * any peer that homes there. Max nodes per region observed in prod = 5;
- * 3 covers all current regions with headroom. BSS cost: ~6 KiB. */
-#define TL_MAX_DERP_REGIONS     28
+/* DERP regions kept from a DERPMap: only the one whose RegionID is
+ * CONFIG_TINYLINK_PREFERRED_DERP (mia/region 16 here), the region the
+ * DERP supervisor dials; the others (Tailscale ships 28) are skipped at
+ * parse time. n_derp_regions = 0 with have_derp_map set means the map
+ * no longer has that region. Max nodes per region observed in prod = 5;
+ * the supervisor dials nodes[0], 3 leave room for a node failover.
+ * BSS cost: 224 B (was ~6 KiB for 28). */
+#define TL_MAX_DERP_REGIONS     1
 #define TL_MAX_DERP_NODES       3
 
 /* "ip:port" form for an IPv4 endpoint. ESP32 lwIP build is v4-only at the
@@ -143,7 +146,7 @@ typedef struct {
     tl_peer_patch_t patches[TL_MAX_PEER_PATCHES];
     bool            patches_overflow;
 
-    /* DERP map (M5) */
+    /* DERP map (M5): the PreferredDERP region only, see TL_MAX_DERP_REGIONS */
     size_t           n_derp_regions;
     tl_derp_region_t derp_regions[TL_MAX_DERP_REGIONS];
 

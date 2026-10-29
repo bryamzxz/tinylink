@@ -390,8 +390,35 @@ static esp_err_t parse_one_derp_region(const char *js, const jsmntok_t *toks,
     return ESP_OK;
 }
 
+/* Which DERPMap regions are stored (1.3.2). The parsed map has exactly
+ * one consumer, tinylink.c::update_derp_host_from_netmap: the DERP
+ * supervisor dials the region we advertise as PreferredDERP, because
+ * that is where peers relay to us. Peers' HomeDERP needs no region
+ * entry — this node keeps a single DERP connection and the DERP mesh
+ * forwards packets for other regions to it — and nothing else reads
+ * the map. So every other region is dropped here instead of stored
+ * (Tailscale ships 28: −6 KiB BSS). Matched on the RegionID inside the
+ * region object, never on its position: Go marshals the Regions map in
+ * string-key order ("1", "10", …, "16", …, "2", …), and keeping "the
+ * first N" is how the 2026-05 cap=4 build lost region 16. A DERPMap
+ * without the region still sets have_derp_map with n_derp_regions = 0,
+ * and the current DERP host stays as it is — the hook for a future
+ * home-DERP fallback, which would add its pick to this predicate and
+ * raise TL_MAX_DERP_REGIONS. */
+#ifdef ESP_PLATFORM
+#define DERP_KEEP_REGION CONFIG_TINYLINK_PREFERRED_DERP
+#else
+#define DERP_KEEP_REGION 16   /* host KAT: the Kconfig default */
+#endif
+
+static bool derp_region_wanted(int region_id)
+{
+    return region_id > 0 && region_id == DERP_KEEP_REGION;
+}
+
 /* DERPMap: {"Regions": {"<id>": {...region...}, ...}} — one sub-parse per
- * region object. The key (region id as string) is ignored: RegionID is
+ * region object until the wanted region is stored; the rest are drained
+ * by byte range. The key (region id as string) is ignored: RegionID is
  * inside the value too. */
 static esp_err_t parse_derp_map_split(const char *js, size_t len,
                                       tl_netmap_t *out, int *peak)
@@ -402,17 +429,32 @@ static esp_err_t parse_derp_map_split(const char *js, size_t len,
     while ((rc = tl_jsplit_obj_next(js, len, &pos, &kv)) == 1) {
         if (!tl_jsplit_key_is(&kv, "Regions") || kv.val[0] != '{') continue;
         size_t rp = 0;
+        unsigned seen = 0;
         tl_jsplit_kv_t rkv; int rrc;
         while ((rrc = tl_jsplit_obj_next(kv.val, kv.val_len, &rp, &rkv)) == 1) {
+            seen++;
             if (out->n_derp_regions >= TL_MAX_DERP_REGIONS) continue;
             int n = sub_parse(rkv.val, rkv.val_len, peak);
             if (n < 1 || !tok_is_obj(&s_toks[0])) continue;
-            parse_one_derp_region(rkv.val, s_toks, 0,
-                                  &out->derp_regions[out->n_derp_regions]);
-            out->n_derp_regions++;
+            tl_derp_region_t *r = &out->derp_regions[out->n_derp_regions];
+            parse_one_derp_region(rkv.val, s_toks, 0, r);
+            if (derp_region_wanted(r->region_id)) {
+                out->n_derp_regions++;
+            } else {
+                memset(r, 0, sizeof(*r));   /* slot reused by the next one */
+            }
         }
         if (rrc < 0) return ESP_ERR_INVALID_RESPONSE;
         out->have_derp_map = true;
+#ifdef ESP_PLATFORM
+        if (out->n_derp_regions == 0 && DERP_KEEP_REGION > 0) {
+            ESP_LOGW(TAG, "DERPMap (%u regions) has no region %d — "
+                          "keeping the current DERP host",
+                     seen, DERP_KEEP_REGION);
+        }
+#else
+        (void)seen;
+#endif
     }
     return (rc < 0) ? ESP_ERR_INVALID_RESPONSE : ESP_OK;
 }
@@ -832,7 +874,7 @@ static int stream_dispatch(stream_state_t *s)
     ESP_LOGI(TAG, "stream peak: body=%u (cap=%u)",
              (unsigned)s->body_have, (unsigned)s->body_cap);
 
-    static tl_netmap_t nm;  /* ~8 KiB BSS (28 DERP regions dominate); reused */
+    static tl_netmap_t nm;  /* ~2.5 KiB BSS (peers + patches); reused */
     esp_err_t pe = mapresp_parse((const char *)s->body_buf, s->body_have, &nm);
     if (pe != ESP_OK) {
         ESP_LOGW(TAG, "MapResponse parse failed (size=%u err=0x%x free_heap=%u largest_block=%u)",

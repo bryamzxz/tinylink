@@ -1108,8 +1108,8 @@ static void update_derp_host_from_netmap(const tl_netmap_t *nm)
 #endif
 
 /* Cache the latest netmap PEERS for path-stale active probing.
- * tl_peer_t[TL_MAX_PEERS] is ~1 KiB; the full tl_netmap_t is ~7.5 KiB
- * (derp_regions[28] dominates). Caching just the peers BSS keeps the
+ * tl_peer_t[TL_MAX_PEERS] is ~1 KiB; the full tl_netmap_t was ~7.5 KiB
+ * (derp_regions[28]; one region since 1.3.2). Caching just the peers BSS keeps the
  * total static-allocation footprint inside the DRAM budget WiFi init
  * needs contiguous (verified: caching the full netmap pushed boot
  * into vApplicationGetTimerTaskMemory pvPortMalloc-NULL asserts).
