@@ -100,6 +100,11 @@ typedef struct {
     int64_t           hs_deadline_us;
     int64_t           up_us;
 
+    /* The control address this conn reached (round 1.3.5, tl_addr.h;
+     * 0.0.0.0 = unknown): the cached one it was dialed at, or the peer of
+     * a by-name connect. tinylink.c keeps it for the next boot. */
+    uint8_t           peer_v4[4];
+
     /* (Round 1.3.4, D5: the 4 077-B `rx_residual` copy is gone. The
      * HTTP/2 bytes that follow the Noise handshake — after the optional
      * EarlyPayload — stay in h2_rx below as the window
@@ -178,6 +183,16 @@ esp_err_t ts2021_connect(ts2021_conn_t *out,
                          const uint8_t machine_pub[NOISE_DHLEN],
                          const uint8_t control_pub[NOISE_DHLEN],
                          bool key_pinned);
+
+/* The control address to dial first (round 1.3.5, tl_addr.h; NULL or an
+ * unusable address = none): tinylink_init seeds it from NVS. A connect
+ * dials it on the first transport it tries, with a 3-s budget, before
+ * resolving CONFIG_TINYLINK_CONTROL_HOST; the server is authenticated
+ * as without it (Noise IK on :80, the certificate against the host name
+ * on :443), and a failure there is retried by name at once — never
+ * counted against :80. Every conn that comes up replaces it with the
+ * address it reached (out->peer_v4). */
+void ts2021_set_addr(const uint8_t ip_v4[4]);
 
 /* Encrypt and write `data` as Noise transport records (msg type 4) of
  * ≤ TS2021_SMALL_PLAINTEXT_MAX bytes, sealed in a small stack record:

@@ -435,7 +435,13 @@ int esp_tls_conn_http_new_sync(const char *u, const esp_tls_cfg_t *c, esp_tls_t 
 }
 int esp_tls_conn_destroy(esp_tls_t *t) { (void)t; return 0; }
 esp_err_t esp_tls_get_conn_sockfd(esp_tls_t *t, int *fd) { (void)t; *fd = -1; return ESP_FAIL; }
-/* ts2021_connect's :80 path and clock (round 1.3.5) — not dialled here. */
+/* ts2021_connect's :80 path, its dial by cached address and clock (round
+ * 1.3.5) — not dialled here. */
+int esp_tls_conn_new_sync(const char *h, int hl, int p, const esp_tls_cfg_t *c, esp_tls_t *t)
+{
+    (void)h; (void)hl; (void)p; (void)c; (void)t;
+    return -1;
+}
 esp_err_t esp_tls_plain_tcp_connect(const char *h, int hl, int p, const esp_tls_cfg_t *c,
                                     esp_tls_error_handle_t e, int *fd)
 {

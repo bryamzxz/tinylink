@@ -28,11 +28,26 @@
 //    key rotation fails both ports without turning :80 off; an abort is
 //    not a fallback; after Noise IK the socket polls at 30 s; the
 //    early-drop heuristic (a :80 conn that failed within 120 s → the next
-//    dial on :443, once).
+//    dial on :443, once);
+//  - round 1.3.5: the cached control address (ts2021_set_addr) is dialed
+//    first on the first transport, with the host name kept for the Host
+//    header and the certificate check (common_name) and a 3-s budget; any
+//    failure there — refused, silent, another server without the control
+//    key — is retried by name at once, so a stale address never turns :80
+//    off; the address is not retried on :443 once the name was tried; an
+//    outage keeps it; an abort is not retried; every conn that comes up
+//    leaves its address for the next connect.
 //
 // ts2021_client.c is #included so its static functions are reachable;
 // esp_tls is faked below, records are sealed with a second Noise state
 // whose send key is the client's receive key.
+
+/* Which address a by-name conn reached: the fakes' sockets are AF_UNIX,
+ * so the test answers for getpeername (s_name_v4 when s_name_peer_known). */
+#include <stdbool.h>
+#include <stdint.h>
+static bool test_peer_v4(int fd, uint8_t ip_v4[4]);
+#define TS2021_PEER_V4 test_peer_v4
 
 #include "../../components/tinylink/src/ts2021_client.c"
 
@@ -57,23 +72,86 @@ struct esp_tls {
     uint8_t tx[16 * 1024];
     size_t  tx_len;
     int     writes;           /* esp_tls_conn_write calls */
+    bool    has_fd;           /* fd / fd_peer: a socketpair for setsockopt */
+    int     fd, fd_peer;
 };
 
 static struct esp_tls s_tls;
 
+static void tls_fd_close(void)
+{
+    if (!s_tls.has_fd) return;
+    close(s_tls.fd);
+    close(s_tls.fd_peer);
+    s_tls.has_fd = false;
+}
+
+/* The scripted servers. Replies are built when dialed (s_build_reply,
+ * set by main), so s_peer always holds the transport keys of the server
+ * of the last connect. "name" = dialed by host name, "addr" = at an IPv4
+ * literal (the cached address). */
+typedef struct {
+    int  rc;                  /* :80 ESP_OK / error; :443 1 / -1 */
+    int  kind;                /* reply_t */
+    bool eof;                 /* :80: FIN after the reply */
+} srv_t;
+static srv_t  s_name80, s_name443, s_addr80, s_addr443;
+static size_t (*s_build_reply)(int kind, uint8_t *b);
+
+/* The dials of the last script, in order: "A80 N80 A443 N443". */
+static char s_dials[64];
+static void dial_log(const char *d)
+{
+    const size_t n = strlen(s_dials);
+    snprintf(s_dials + n, sizeof(s_dials) - n, "%s%s", n ? " " : "", d);
+}
+
 /* :443 connect script: the result and the number of attempts. */
-static int s_tls_rc = -1;
 static int s_tls_connects;
 static char s_tls_url[200];
+static char s_tls_host[64];
+static int  s_tls_port;
+static int  s_tls_timeout_ms;
+static char s_tls_cn[64];
+
+static int tls_dial(const char *what, const esp_tls_cfg_t *cfg, const srv_t *sv)
+{
+    s_tls_connects++;
+    s_tls_timeout_ms = cfg->timeout_ms;
+    snprintf(s_tls_cn, sizeof(s_tls_cn), "%s", cfg->common_name ? cfg->common_name : "");
+    dial_log(what);
+    if (sv->rc != 1) return sv->rc;
+    tls_fd_close();
+    s_tls.rx_len = s_build_reply(sv->kind, s_tls.rx);
+    s_tls.rx_off = 0;
+    s_tls.tx_len = 0;
+    s_tls.writes = 0;
+    int sv2[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv2) == 0) {
+        s_tls.fd = sv2[0];
+        s_tls.fd_peer = sv2[1];
+        s_tls.has_fd = true;
+    }
+    return 1;
+}
 
 esp_tls_t *esp_tls_init(void) { return &s_tls; }
 int esp_tls_conn_http_new_sync(const char *url, const esp_tls_cfg_t *cfg,
                                esp_tls_t *tls)
 {
-    (void)cfg; (void)tls;
-    s_tls_connects++;
+    (void)tls;
     snprintf(s_tls_url, sizeof(s_tls_url), "%s", url);
-    return s_tls_rc;
+    return tls_dial("N443", cfg, &s_name443);
+}
+int esp_tls_conn_new_sync(const char *hostname, int hostlen, int port,
+                          const esp_tls_cfg_t *cfg, esp_tls_t *tls)
+{
+    (void)tls;
+    uint8_t ip[4];
+    snprintf(s_tls_host, sizeof(s_tls_host), "%.*s", hostlen, hostname);
+    s_tls_port = port;
+    if (!tl_ipv4_parse(hostname, (size_t)hostlen, ip)) return -1;   /* only by address */
+    return tls_dial("A443", cfg, &s_addr443);
 }
 ssize_t esp_tls_conn_read(esp_tls_t *tls, void *data, size_t datalen)
 {
@@ -93,11 +171,12 @@ ssize_t esp_tls_conn_write(esp_tls_t *tls, const void *data, size_t datalen)
     tls->writes++;
     return (ssize_t)datalen;
 }
-int esp_tls_conn_destroy(esp_tls_t *tls) { (void)tls; return 0; }
+int esp_tls_conn_destroy(esp_tls_t *tls) { (void)tls; tls_fd_close(); return 0; }
 esp_err_t esp_tls_get_conn_sockfd(esp_tls_t *tls, int *sockfd)
 {
-    (void)tls; *sockfd = -1;
-    return ESP_FAIL;
+    (void)tls;
+    *sockfd = s_tls.has_fd ? s_tls.fd : -1;
+    return s_tls.has_fd ? ESP_OK : ESP_FAIL;
 }
 esp_err_t tl_crt_bundle_attach(void *conf) { (void)conf; return ESP_OK; }
 /* noise_ik_init's ephemeral key: fixed, so the connect tests can
@@ -109,18 +188,31 @@ static int64_t s_now_us = 1000000;
 static int64_t s_clock_step;
 int64_t esp_timer_get_time(void) { s_now_us += s_clock_step; return s_now_us; }
 
-/* :80 connect script: refuse with s_plain_rc, else a socketpair whose
- * server end already holds s_plain_reply (then EOF if s_plain_eof). The
+/* :80 connect script: refuse with the server's rc, else a socketpair
+ * whose server end already holds its reply (then EOF if eof). The
  * timeouts go on the client end as esp-tls's tcp_connect sets them. */
-static esp_err_t s_plain_rc = ESP_OK;
 static int       s_plain_connects;
 static int       s_plain_port;
+static char      s_plain_host[64];
 static int       s_srv_fd = -1;
 static uint8_t   s_plain_reply[16 * 1024];
 static size_t    s_plain_reply_len;
-static bool      s_plain_eof;
 static bool      s_plain_abort;      /* raise ts2021_abort_reads meanwhile */
 static int       s_plain_timeout_ms;
+
+/* The "DNS answer" a by-name conn reaches (RFC 5737), and whether the
+ * peer is known at all — off for the pre-1.3.5 tests, whose dials must
+ * not learn an address. */
+static const uint8_t kNameV4[4] = { 198, 51, 100, 20 };
+static const uint8_t kAddrV4[4] = { 192, 0, 2, 10 };
+static bool s_name_peer_known;
+
+static bool test_peer_v4(int fd, uint8_t ip_v4[4])
+{
+    if (fd < 0 || !s_name_peer_known) return false;
+    memcpy(ip_v4, kNameV4, 4);
+    return true;
+}
 
 esp_err_t esp_tls_plain_tcp_connect(const char *host, int hostlen, int port,
                                     const esp_tls_cfg_t *cfg,
@@ -128,12 +220,19 @@ esp_err_t esp_tls_plain_tcp_connect(const char *host, int hostlen, int port,
 {
     s_plain_connects++;
     s_plain_port = port;
+    snprintf(s_plain_host, sizeof(s_plain_host), "%s", host);
+    uint8_t ip[4];
+    const bool by_addr = tl_ipv4_parse(host, strlen(host), ip);
     if (eh == NULL || sockfd == NULL || (size_t)hostlen != strlen(host) ||
-        strcmp(host, CONFIG_TINYLINK_CONTROL_HOST) != 0) {
+        (!by_addr && strcmp(host, CONFIG_TINYLINK_CONTROL_HOST) != 0)) {
         return ESP_ERR_INVALID_ARG;
     }
+    dial_log(by_addr ? "A80" : "N80");
+    const srv_t *srv = by_addr ? &s_addr80 : &s_name80;
     if (s_plain_abort) ts2021_abort_reads();
-    if (s_plain_rc != ESP_OK) return s_plain_rc;
+    if (srv->rc != ESP_OK) return srv->rc;
+    if (s_srv_fd >= 0) { close(s_srv_fd); s_srv_fd = -1; }
+    s_plain_reply_len = s_build_reply(srv->kind, s_plain_reply);
     int sv[2];
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) return ESP_FAIL;
     s_plain_timeout_ms = cfg->timeout_ms;
@@ -147,7 +246,7 @@ esp_err_t esp_tls_plain_tcp_connect(const char *host, int hostlen, int port,
         close(sv[1]);
         return ESP_FAIL;
     }
-    if (s_plain_eof) shutdown(sv[1], SHUT_WR);
+    if (srv->eof) shutdown(sv[1], SHUT_WR);
     s_srv_fd = sv[1];
     *sockfd = sv[0];
     return ESP_OK;
@@ -178,6 +277,7 @@ static noise_ik_state_t s_peer;   /* the server's transport half */
 
 static void reset(void)
 {
+    tls_fd_close();
     memset(&s_tls, 0, sizeof(s_tls));
     memset(&s_conn, 0, sizeof(s_conn));
     memset(&s_peer, 0, sizeof(s_peer));
@@ -758,22 +858,37 @@ static void boot_reset(void)
     s_tls_next = false;
     s_abort_reads = false;
     s_clock_step = 0;
+    ts2021_set_addr(NULL);
+    s_name_peer_known = false;
 }
 
+/* The by-name servers; the cached address (if any) is refused on both
+ * ports unless script_addr says otherwise. */
 static void script(int plain_rc, reply_t p80, bool eof80, int tls_rc, reply_t p443)
 {
     if (s_srv_fd >= 0) { close(s_srv_fd); s_srv_fd = -1; }
+    tls_fd_close();
     memset(&s_tls, 0, sizeof(s_tls));
-    s_plain_rc = plain_rc;
-    s_plain_reply_len = build_reply(p80, s_plain_reply);
-    s_plain_eof = eof80;
+    s_name80  = (srv_t){ plain_rc, p80, eof80 };
+    s_name443 = (srv_t){ tls_rc, p443, false };
+    s_addr80  = (srv_t){ ESP_FAIL, RP_SILENT, false };
+    s_addr443 = (srv_t){ -1, RP_SILENT, false };
     s_plain_abort = false;
-    s_tls_rc = tls_rc;
-    s_tls.rx_len = build_reply(p443, s_tls.rx);
     s_plain_connects = 0;
     s_tls_connects = 0;
     s_plain_port = 0;
+    s_dials[0] = '\0';
+    s_tls_url[0] = '\0';
+    s_tls_host[0] = '\0';
 }
+
+static void script_addr(int plain_rc, reply_t p80, bool eof80, int tls_rc, reply_t p443)
+{
+    s_addr80  = (srv_t){ plain_rc, p80, eof80 };
+    s_addr443 = (srv_t){ tls_rc, p443, false };
+}
+
+static size_t build_reply_int(int kind, uint8_t *b) { return build_reply((reply_t)kind, b); }
 
 static esp_err_t dial(bool pinned)
 {
@@ -1035,8 +1150,183 @@ static void test_early_drop(void)
     drop_case("clean_at_5s", 5, 3, false);
 }
 
+/* ---- Round 1.3.5: the cached control address ------------------------ */
+
+static bool addr_is(const uint8_t a[4], const uint8_t b[4]) { return memcmp(a, b, 4) == 0; }
+
+/* A fresh boot whose NVS record holds kAddrV4; by-name conns reach kNameV4. */
+static void addr_boot(void)
+{
+    boot_reset();
+    ts2021_set_addr(kAddrV4);
+    s_name_peer_known = true;
+}
+
+static long wall_ms_since(const struct timespec *w0)
+{
+    struct timespec w1;
+    clock_gettime(CLOCK_MONOTONIC, &w1);
+    return (w1.tv_sec - w0->tv_sec) * 1000 + (w1.tv_nsec - w0->tv_nsec) / 1000000;
+}
+
+static void test_addr_80(void)
+{
+    /* The cached address answers on :80: one dial, no DNS, the same
+     * request bytes (Host: the control host). */
+    addr_boot();
+    script(ESP_OK, RP_OK, false, 1, RP_OK);
+    script_addr(ESP_OK, RP_OK, false, 1, RP_OK);
+    esp_err_t rc = dial(true);
+    uint8_t req[1024];
+    size_t rn = srv_drain(req, sizeof(req));
+    check("dns_addr_80_first",
+          rc == ESP_OK && s_conn.plain && strcmp(s_dials, "A80") == 0 &&
+          addr_is(s_conn.peer_v4, kAddrV4) && addr_is(s_addr, kAddrV4) &&
+          request_ok(req, rn) && window_is_h2() && s_plain_timeout_ms == TS2021_PLAIN_TIMEOUT_MS);
+    ts2021_close(&s_conn);
+
+    /* Stale address, three ways: refused, silent (one :80 budget), and
+     * another server there now — no control key, so its msg2 fails. Each
+     * is retried by name in the same connect, :80 stays on, and the next
+     * connect starts at the address the name reached. */
+    static const struct { const char *name; int rc; reply_t kind; } stale[] = {
+        { "refused", ESP_FAIL, RP_SILENT },
+        { "silent", ESP_OK, RP_SILENT },
+        { "other_server", ESP_OK, RP_WRONG_KEY },
+        { "http_redirect", ESP_OK, RP_REDIRECT },
+    };
+    for (size_t i = 0; i < sizeof(stale) / sizeof(stale[0]); i++) {
+        char n1[64], n2[64];
+        addr_boot();
+        script(ESP_OK, RP_OK, false, 1, RP_OK);
+        script_addr(stale[i].rc, stale[i].kind, false, -1, RP_OK);
+        struct timespec w0;
+        clock_gettime(CLOCK_MONOTONIC, &w0);
+        rc = dial(true);
+        const long ms = wall_ms_since(&w0);
+        snprintf(n1, sizeof(n1), "dns_stale_addr_%s_then_name", stale[i].name);
+        check(n1, rc == ESP_OK && s_conn.plain && strcmp(s_dials, "A80 N80") == 0 &&
+                  !s_plain_off && !s_tls_next && addr_is(s_conn.peer_v4, kNameV4) &&
+                  addr_is(s_addr, kNameV4) && window_is_h2() &&
+                  ms < 2 * TS2021_PLAIN_TIMEOUT_MS + 300);
+        ts2021_close(&s_conn);
+        /* next connect: :80 again, at the new address */
+        script(ESP_OK, RP_OK, false, 1, RP_OK);
+        script_addr(ESP_OK, RP_OK, false, 1, RP_OK);
+        rc = dial(true);
+        snprintf(n2, sizeof(n2), "dns_stale_addr_%s_no_80_latch", stale[i].name);
+        check(n2, rc == ESP_OK && s_conn.plain && strcmp(s_dials, "A80") == 0 &&
+                  strcmp(s_plain_host, "198.51.100.20") == 0 && !s_plain_off);
+        ts2021_close(&s_conn);
+    }
+
+    /* :80 broken for real (a redirecting proxy at every address): the
+     * name fails too, so :443 takes over and :80 is off — decided by the
+     * name's failure. The address is not retried on :443 (lwIP has the
+     * name cached by then). */
+    addr_boot();
+    script(ESP_OK, RP_REDIRECT, false, 1, RP_OK);
+    script_addr(ESP_OK, RP_REDIRECT, false, 1, RP_OK);
+    rc = dial(true);
+    check("dns_80_broken_latches_on_the_name_only",
+          rc == ESP_OK && !s_conn.plain && strcmp(s_dials, "A80 N80 N443") == 0 &&
+          s_plain_off && strcmp(s_tls_url, "https://controlplane.test:443") == 0 &&
+          addr_is(s_addr, kNameV4));
+    ts2021_close(&s_conn);
+    /* ... and the next connect is :443 at the address, first */
+    script(ESP_OK, RP_OK, false, 1, RP_OK);
+    script_addr(ESP_OK, RP_OK, false, 1, RP_OK);
+    rc = dial(true);
+    check("dns_80_off_then_443_at_addr",
+          rc == ESP_OK && !s_conn.plain && strcmp(s_dials, "A443") == 0 &&
+          strcmp(s_tls_host, "198.51.100.20") == 0);
+    ts2021_close(&s_conn);
+
+    /* An outage (nothing answers): the connect fails, the address stays
+     * for the next one, :80 stays on. */
+    addr_boot();
+    script(ESP_FAIL, RP_SILENT, false, -1, RP_OK);
+    rc = dial(true);
+    check("dns_outage_keeps_addr",
+          rc != ESP_OK && strcmp(s_dials, "A80 N80 N443") == 0 && addr_is(s_addr, kAddrV4) &&
+          !s_plain_off && !s_conn.connected);
+
+    /* An abort raised during the address dial ends the connect there:
+     * neither the name nor :443. */
+    addr_boot();
+    script(ESP_OK, RP_OK, false, 1, RP_OK);
+    script_addr(ESP_OK, RP_OK, false, 1, RP_OK);
+    s_plain_abort = true;
+    rc = dial(true);
+    check("dns_abort_at_addr_not_retried",
+          rc != ESP_OK && strcmp(s_dials, "A80") == 0 && !s_plain_off && addr_is(s_addr, kAddrV4));
+    s_abort_reads = false;
+
+    /* No record: by name, as before; the conn's peer becomes the address. */
+    boot_reset();
+    s_name_peer_known = true;
+    script(ESP_OK, RP_OK, false, 1, RP_OK);
+    rc = dial(true);
+    check("dns_no_addr_by_name_then_learnt",
+          rc == ESP_OK && strcmp(s_dials, "N80") == 0 && addr_is(s_addr, kNameV4));
+    ts2021_close(&s_conn);
+    /* A by-name conn whose peer is unknown leaves no address behind. */
+    boot_reset();
+    script(ESP_OK, RP_OK, false, 1, RP_OK);
+    rc = dial(true);
+    static const uint8_t zero[4];
+    check("dns_unknown_peer_no_addr", rc == ESP_OK && addr_is(s_addr, zero) &&
+                                      addr_is(s_conn.peer_v4, zero));
+    ts2021_close(&s_conn);
+
+    /* ts2021_set_addr takes only addresses worth a connect. */
+    static const uint8_t lo[4] = { 127, 0, 0, 1 }, mc[4] = { 239, 1, 2, 3 };
+    ts2021_set_addr(lo);
+    const bool r1 = addr_is(s_addr, zero);
+    ts2021_set_addr(kAddrV4);
+    ts2021_set_addr(mc);
+    check("dns_set_addr_rejects_unusable", r1 && addr_is(s_addr, zero));
+}
+
+static void test_addr_443(void)
+{
+    /* TLS only (no pinned key): the address first, the certificate
+     * checked against the host name (common_name), the 3-s budget for
+     * the connect and handshake, then the stream's 30-s socket polls. */
+    addr_boot();
+    script(ESP_OK, RP_OK, false, 1, RP_OK);
+    script_addr(ESP_OK, RP_OK, false, 1, RP_OK);
+    esp_err_t rc = dial(false);
+    struct timeval tv = { 0 }, tw = { 0 };
+    socklen_t tl = sizeof(tv), twl = sizeof(tw);
+    getsockopt(s_tls.fd, SOL_SOCKET, SO_RCVTIMEO, &tv, &tl);
+    getsockopt(s_tls.fd, SOL_SOCKET, SO_SNDTIMEO, &tw, &twl);
+    check("dns_addr_443_first_host_name_kept",
+          rc == ESP_OK && !s_conn.plain && strcmp(s_dials, "A443") == 0 &&
+          strcmp(s_tls_host, "192.0.2.10") == 0 && s_tls_port == 443 &&
+          strcmp(s_tls_cn, "controlplane.test") == 0 &&
+          s_tls_timeout_ms == TS2021_ADDR_TIMEOUT_MS && request_ok(s_tls.tx, s_tls.tx_len) &&
+          addr_is(s_conn.peer_v4, kAddrV4));
+    check("dns_addr_443_stream_polls_30s", tv.tv_sec == 30 && tw.tv_sec == 30);
+    ts2021_close(&s_conn);
+
+    /* The address fails (refused / not the control host's certificate):
+     * by name, with the full TLS budget, in the same connect. */
+    addr_boot();
+    script(ESP_OK, RP_OK, false, 1, RP_OK);
+    script_addr(ESP_OK, RP_OK, false, -1, RP_OK);
+    rc = dial(false);
+    check("dns_addr_443_fails_then_name",
+          rc == ESP_OK && strcmp(s_dials, "A443 N443") == 0 &&
+          strcmp(s_tls_url, "https://controlplane.test:443") == 0 &&
+          s_tls_timeout_ms == TLS_TIMEOUT_MS && strcmp(s_tls_cn, "controlplane.test") == 0 &&
+          addr_is(s_addr, kNameV4) && !s_plain_off);
+    ts2021_close(&s_conn);
+}
+
 int main(void)
 {
+    s_build_reply = build_reply_int;
     curve25519_derive_pub(s_machine_pub, kMachinePriv);
     curve25519_derive_pub(s_control_pub, kControlPriv);
     test_no_early_payload();
@@ -1053,6 +1343,8 @@ int main(void)
     test_fallbacks();
     test_both_fail();
     test_early_drop();
+    test_addr_80();
+    test_addr_443();
     if (s_srv_fd >= 0) close(s_srv_fd);
     if (s_fails == 0) printf("\nALL OK\n");
     return s_fails ? 1 : 0;

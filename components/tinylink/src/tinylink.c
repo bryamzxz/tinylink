@@ -75,6 +75,12 @@ static stun_probe_result_t s_stun_result;
 static ts2021_conn_t   s_conn;
 static bool            s_conn_open;
 
+/* The control plane's last good address (round 1.3.5: s_conn.peer_v4 of
+ * the last conn that came up), packed for an atomic hand-over to the
+ * telemetry task's NVS write (tinylink_addr_persist_poll); 0 = none.
+ * ts2021_client.c dials it first on its own. */
+static uint32_t        s_ctl_addr;
+
 static esp_err_t ensure_control_conn(void)
 {
     if (s_conn_open) return ESP_OK;
@@ -83,6 +89,12 @@ static esp_err_t ensure_control_conn(void)
                                    control_key_pinned());
     if (err == ESP_OK) {
         s_conn_open = true;
+        /* For the next boot (round 1.3.5): the telemetry housekeeping
+         * stores it when it differs from NVS (tl_addr.h). An unknown peer
+         * (0) leaves the record alone. */
+        uint32_t v;
+        memcpy(&v, s_conn.peer_v4, sizeof(v));
+        if (v != 0) __atomic_store_n(&s_ctl_addr, v, __ATOMIC_RELAXED);
         /* A completed TLS + Noise IK handshake proves the control plane
          * is reachable and our local stack is not wedged — exactly what
          * the wedge-restart last resort exists to detect. Feed it here
@@ -521,6 +533,7 @@ static portMUX_TYPE      s_home_derp_mux = portMUX_INITIALIZER_UNLOCKED;
 
 /* What NVS holds for each record (tl_addr_store compares against it). */
 static tl_addr_blob_t s_derp_nvs;
+static tl_addr_blob_t s_ctl_nvs;
 
 static void home_derp_get(tl_derp_addr_t *out, uint32_t *gen)
 {
@@ -543,6 +556,7 @@ static void addr_cache_load(void)
     nvs_handle_t h;
     if (nvs_open(TAI64N_NVS_NS, NVS_READONLY, &h) == ESP_OK) {
         blob_load(h, TL_ADDR_KEY_DERP, &s_derp_nvs);
+        blob_load(h, TL_ADDR_KEY_CTL, &s_ctl_nvs);
         nvs_close(h);
     }
     tl_derp_addr_boot(s_derp_nvs.b, s_derp_nvs.len, CONFIG_TINYLINK_PREFERRED_DERP,
@@ -552,6 +566,16 @@ static void addr_cache_load(void)
     ESP_LOGI(TAG, "address cache: home DERP node %s (address %s, STUN %u)%s",
              s_home_derp.host, a, (unsigned)s_home_derp.stun_port,
              s_derp_nvs.len > 0 ? "" : " — Kconfig, nothing stored");
+
+    uint8_t ip[4];
+    if (tl_ctl_addr_decode(s_ctl_nvs.b, s_ctl_nvs.len, CONFIG_TINYLINK_CONTROL_HOST, ip)) {
+        ts2021_set_addr(ip);
+        uint32_t v;
+        memcpy(&v, ip, sizeof(v));
+        __atomic_store_n(&s_ctl_addr, v, __ATOMIC_RELAXED);
+        tl_ipv4_str(ip, a);
+        ESP_LOGI(TAG, "address cache: control %s at %s", CONFIG_TINYLINK_CONTROL_HOST, a);
+    }
 }
 
 static int addr_nvs_write(const uint8_t *b, size_t n, const void *ctx)
@@ -575,7 +599,8 @@ static int addr_nvs_write(const uint8_t *b, size_t n, const void *ctx)
  * netmap): write the records whose bytes changed. Never on the boot path
  * — an NVS write may erase a 4-KB sector and stall both CPUs for up to
  * ~0.5 s (tl_time.c) — and only for a change: the DERP record moves
- * with the DERP map. */
+ * with the DERP map, the control one when its cached address stopped
+ * answering and the name led elsewhere. */
 void tinylink_addr_persist_poll(void)
 {
     uint8_t b[TL_ADDR_BLOB_MAX];
@@ -585,9 +610,18 @@ void tinylink_addr_persist_poll(void)
     d = s_home_derp;
     named = s_home_derp_named;
     portEXIT_CRITICAL(&s_home_derp_mux);
-    const size_t n = named ? tl_derp_addr_encode(&d, b, sizeof(b)) : 0;
+    size_t n = named ? tl_derp_addr_encode(&d, b, sizeof(b)) : 0;
     if (n > 0 && tl_addr_store(&s_derp_nvs, b, n, addr_nvs_write, TL_ADDR_KEY_DERP) == 1) {
         ESP_LOGI(TAG, "address cache: home DERP node %s stored", d.host);
+    }
+    const uint32_t v = __atomic_load_n(&s_ctl_addr, __ATOMIC_RELAXED);
+    uint8_t ip[4];
+    memcpy(ip, &v, sizeof(ip));
+    n = tl_ctl_addr_encode(ip, CONFIG_TINYLINK_CONTROL_HOST, b, sizeof(b));
+    if (n > 0 && tl_addr_store(&s_ctl_nvs, b, n, addr_nvs_write, TL_ADDR_KEY_CTL) == 1) {
+        char a[TL_IPV4_STRLEN];
+        tl_ipv4_str(ip, a);
+        ESP_LOGI(TAG, "address cache: control address %s stored", a);
     }
 }
 

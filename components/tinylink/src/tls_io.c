@@ -4,6 +4,7 @@
 #include "tls_io.h"
 
 #include <errno.h>
+#include <string.h>
 
 #include "lwip/sockets.h"
 #include "mbedtls/ssl.h"
@@ -105,4 +106,17 @@ ssize_t tls_io_sock_write(int fd, const uint8_t *buf, size_t len)
 #endif
     const ssize_t w = send(fd, buf, len, flags);
     return (w >= 0) ? w : sock_err(MBEDTLS_ERR_SSL_WANT_WRITE);
+}
+
+bool tls_io_sock_peer_v4(int fd, uint8_t ip_v4[4])
+{
+    struct sockaddr_storage ss;
+    socklen_t len = sizeof(ss);
+    memset(&ss, 0, sizeof(ss));
+    if (fd < 0 || getpeername(fd, (struct sockaddr *)&ss, &len) != 0 ||
+        ss.ss_family != AF_INET || len < sizeof(struct sockaddr_in)) {
+        return false;
+    }
+    memcpy(ip_v4, &((const struct sockaddr_in *)&ss)->sin_addr.s_addr, 4);
+    return true;
 }
