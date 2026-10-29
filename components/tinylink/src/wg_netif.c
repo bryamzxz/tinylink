@@ -6,6 +6,7 @@
 #include "wg_netif.h"
 
 #include <errno.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "freertos/FreeRTOS.h"
@@ -182,18 +183,32 @@ static const char *TAG = "wg_netif";
  * during the recovery window.
  *
  * The queue length (WG_TX_QUEUE_LEN=3) makes a real flood
- * impossible — drops happen at xQueueSend(..., 0) when full. The
- * 1.5 KiB queue item still stays OFF this stack (in
- * g.tx_worker_scratch). */
+ * impossible — a frame is dropped when no TX slot is free. The
+ * 1.5 KiB slots live on the heap (g.tx_slots), never on this stack. */
 #define WG_TX_TASK_STACK_BYTES 7168
 #define WG_TX_TASK_PRIO        (tskIDLE_PRIORITY + 2)
 
-/* Outbound TX queue depth. At 1.5 KiB per item, 3 items = 4.7 KiB
- * heap. Telemetry ticks every 5 s and ICMP responses are sporadic;
- * realistic burst depth is 1–2. Three gives margin without waste.
- * If this ever fills under steady-state operation it shows up in
- * wg_netif_get_tx_drops + the throttled drop log below. */
+/* Outbound TX queue depth: frames that may wait while the worker is
+ * busy with one more. Telemetry ticks every 5 s and ICMP responses are
+ * sporadic; realistic burst depth is 1–2. Three gives margin without
+ * waste. If this ever fills under steady-state operation it shows up
+ * in wg_netif_get_tx_drops + the throttled drop log below. */
 #define WG_TX_QUEUE_LEN        3
+
+/* TX ring (round 1.3.2, B14). Until 1.3.1 a 1 556-B item was encrypted
+ * into a BSS scratch, copied into a FreeRTOS queue of whole items and
+ * copied out again into the worker's BSS scratch (two memcpy of ~1.5 KB
+ * per packet, 4.7 KiB of queue storage + 3.1 KiB of scratch). Now the
+ * frame is encrypted straight into a slot and only its one-byte index
+ * travels: tx_free_q holds the free slot indices, tx_ready_q the filled
+ * ones in wire order. WG_TX_QUEUE_LEN + 1 slots keep the old capacity
+ * exactly — three waiting plus the one the worker is sending (it used to
+ * sit in the worker scratch) — and a frame is dropped exactly when the
+ * old queue was full. tx_ready_q has one spare entry for the stop
+ * sentinel. A slot is owned by whoever dequeued its index; the queues
+ * are the only shared state, so the worker needs no g.lock. */
+#define WG_TX_SLOTS            (WG_TX_QUEUE_LEN + 1)
+#define WG_TX_SLOT_STOP        0xFFu   /* tx_ready_q sentinel: worker exits */
 
 /* Drop-on-full log throttle. Print one warning per N drops so the
  * UART doesn't spam if the worker is stuck for an extended window. */
@@ -204,12 +219,15 @@ static const char *TAG = "wg_netif";
  * headroom for IPv4 over WG. */
 #define WG_RX_BUF_LEN 1536
 
-/* Item shipped from wg_netif_send_plaintext (lwIP TCPIP context) to
- * the TX worker task. Carries the already-encrypted wire bytes plus a
- * snapshot of the destination sockaddr — snapshotting avoids racing
- * wg_netif_update_peer_endpoint between encrypt and send (the WG spec
- * tolerates a short trailing window of packets to the old endpoint
- * during roaming, so the old snapshot landing is fine). */
+/* TX slot filled by wg_netif_send_plaintext (lwIP TCPIP context, or
+ * wg_rx for keepalives/adverts) for the TX worker task. Carries the
+ * already-encrypted wire bytes plus a snapshot of the destination
+ * sockaddr — snapshotting avoids racing wg_netif_update_peer_endpoint
+ * between encrypt and send (the WG spec tolerates a short trailing
+ * window of packets to the old endpoint during roaming, so the old
+ * snapshot landing is fine). buf is word-aligned (offset 20 in a
+ * heap block) so the AEAD writes the ciphertext at buf+16 on its
+ * l32i/s32i fast path. */
 typedef struct {
     size_t              len;
     struct sockaddr_in  dst;
@@ -298,24 +316,17 @@ static struct {
     uint32_t                stat_roams;
     uint32_t                stat_disco_adverts;   /* TSMP adverts queued */
 
-    /* Outbound TX queue + worker. The worker drains in non-TCPIP
-     * context so sendto can re-enter lwIP safely. tx_done_sem is
-     * given by the worker as the last thing it does before
+    /* Outbound TX ring + worker (see WG_TX_SLOTS). The worker drains in
+     * non-TCPIP context so sendto can re-enter lwIP safely. tx_done_sem
+     * is given by the worker as the last thing it does before
      * vTaskDelete(NULL); wg_netif_stop takes it (with timeout) so
      * vQueueDelete cannot race against an in-flight xQueueReceive. */
-    QueueHandle_t           tx_queue;
+    wg_tx_item_t           *tx_slots;      /* WG_TX_SLOTS, heap, never on a stack */
+    QueueHandle_t           tx_free_q;     /* uint8_t slot indices, free */
+    QueueHandle_t           tx_ready_q;    /* uint8_t slot indices, to send */
     TaskHandle_t            tx_task;
     SemaphoreHandle_t       tx_done_sem;
     uint64_t                tx_drops;
-
-    /* Scratch slots that keep the 1.5 KiB tx items OFF the stacks of
-     * the producer (lwIP TCPIP, 3 KiB) and the worker (4 KiB but
-     * sendto's WiFi tx chain eats most of it). Each is single-owner:
-     * only the TCPIP task ever writes to tx_scratch (input to
-     * xQueueSend), only the wg_tx worker ever writes to
-     * tx_worker_scratch (output of xQueueReceive). */
-    wg_tx_item_t            tx_scratch;
-    wg_tx_item_t            tx_worker_scratch;
 
     wg_netif_rx_cb_t        rx_cb;
     void                   *rx_cb_user;
@@ -1159,9 +1170,65 @@ retry_timer:;
     vTaskDelete(NULL);
 }
 
-/* TX worker: drains tx_queue + sendto outside the lwIP TCPIP task.
+/* Send one filled TX slot: DERP relay when the direct path is stale,
+ * direct sendto otherwise (relay again on a sendto error). */
+static void tx_send_item(const wg_tx_item_t *it)
+{
+    /* Preemptive DERP relay when the path-stale watchdog has fired
+     * (RX has been silent past WG_RX_STALE_THRESHOLD_MS). Direct
+     * UDP is almost certainly going to a black hole at this point
+     * (peer NAT mapping aged out, peer changed WAN endpoint, etc.).
+     * Skipping the direct sendto when the relay accepts the bytes
+     * is the lossless-during-recovery property — without it, those
+     * 30 s of telemetry packets between path-goes-stale and
+     * peer-roam-handshake-completes are dropped silently. */
+    bool path_stale =
+        g.relay_cb != NULL &&
+        g.state == WG_NETIF_UP &&
+        g.last_transport_recv_us > 0 &&
+        (now_us() - g.last_transport_recv_us) >
+            (int64_t)WG_RX_STALE_THRESHOLD_MS * 1000LL;
+    uint8_t dst_pub[WG_KEY_LEN];   /* filled only when relaying */
+    if (path_stale) {
+        peer_static_snapshot(dst_pub);
+        esp_err_t rerr = g.relay_cb(dst_pub, it->buf, it->len,
+                                    g.relay_cb_user);
+        if (rerr == ESP_OK) {
+            g.relayed_stale++;
+            return;  /* skip direct sendto: already shipped via relay */
+        }
+        /* relay declined (e.g. supervisor not connected) — fall
+         * through to direct sendto. Errors logged once per worker
+         * iteration cap below to avoid UART spam during sustained
+         * relay-unavailable windows. */
+        g.relay_errors++;
+    }
+
+    ssize_t n = sendto(g.sock, it->buf, it->len, 0,
+                       (const struct sockaddr *)&it->dst, sizeof(it->dst));
+    if (n < 0) {
+        ESP_LOGW(TAG, "tx sendto: errno=%d", errno);
+        /* Direct UDP outright failed (ENETUNREACH, EHOSTUNREACH,
+         * EAGAIN under load). Try the relay as a last resort. The
+         * path_stale branch above already attempted it if relevant,
+         * so we only re-try here when path wasn't yet marked stale
+         * (i.e. errno arrived before the watchdog tripped). */
+        if (!path_stale && g.relay_cb != NULL) {
+            peer_static_snapshot(dst_pub);
+            esp_err_t rerr = g.relay_cb(dst_pub, it->buf, it->len,
+                                        g.relay_cb_user);
+            if (rerr == ESP_OK) {
+                g.relayed_errno++;
+            } else {
+                g.relay_errors++;
+            }
+        }
+    }
+}
+
+/* TX worker: drains tx_ready_q + sendto outside the lwIP TCPIP task.
  * Gives tx_done_sem as the last thing before vTaskDelete(NULL) so
- * wg_netif_stop can wait for clean exit before destroying the queue. */
+ * wg_netif_stop can wait for clean exit before destroying the queues. */
 static void tx_task_fn(void *arg)
 {
     (void)arg;
@@ -1169,77 +1236,49 @@ static void tx_task_fn(void *arg)
     while (!g.stop_requested) {
         tl_wdt_feed();
         /* 500 ms wakeup so stop_requested is observed even when no
-         * outbound traffic is flowing. xQueueReceive memcpys the
-         * dequeued item directly into our BSS scratch — keeping it
-         * off-stack matters here because sendto recurses into the
-         * WiFi TX callback chain and chews into our budget. */
-        if (xQueueReceive(g.tx_queue, &g.tx_worker_scratch,
-                          pdMS_TO_TICKS(500)) != pdTRUE) {
+         * outbound traffic is flowing. Only the slot index is copied;
+         * the frame stays in its heap slot, off this stack (sendto
+         * recurses into the WiFi TX callback chain). */
+        uint8_t slot;
+        if (xQueueReceive(g.tx_ready_q, &slot, pdMS_TO_TICKS(500)) != pdTRUE) {
             continue;
         }
-
-        /* Preemptive DERP relay when the path-stale watchdog has fired
-         * (RX has been silent past WG_RX_STALE_THRESHOLD_MS). Direct
-         * UDP is almost certainly going to a black hole at this point
-         * (peer NAT mapping aged out, peer changed WAN endpoint, etc.).
-         * Skipping the direct sendto when the relay accepts the bytes
-         * is the lossless-during-recovery property — without it, those
-         * 30 s of telemetry packets between path-goes-stale and
-         * peer-roam-handshake-completes are dropped silently. */
-        bool path_stale =
-            g.relay_cb != NULL &&
-            g.state == WG_NETIF_UP &&
-            g.last_transport_recv_us > 0 &&
-            (now_us() - g.last_transport_recv_us) >
-                (int64_t)WG_RX_STALE_THRESHOLD_MS * 1000LL;
-        uint8_t dst_pub[WG_KEY_LEN];   /* filled only when relaying */
-        if (path_stale) {
-            peer_static_snapshot(dst_pub);
-            esp_err_t rerr = g.relay_cb(dst_pub,
-                                        g.tx_worker_scratch.buf,
-                                        g.tx_worker_scratch.len,
-                                        g.relay_cb_user);
-            if (rerr == ESP_OK) {
-                g.relayed_stale++;
-                continue;  /* skip direct sendto: already shipped via relay */
-            }
-            /* relay declined (e.g. supervisor not connected) — fall
-             * through to direct sendto. Errors logged once per worker
-             * iteration cap below to avoid UART spam during sustained
-             * relay-unavailable windows. */
-            g.relay_errors++;
-        }
-
-        ssize_t n = sendto(g.sock,
-                           g.tx_worker_scratch.buf, g.tx_worker_scratch.len, 0,
-                           (struct sockaddr *)&g.tx_worker_scratch.dst,
-                           sizeof(g.tx_worker_scratch.dst));
-        if (n < 0) {
-            ESP_LOGW(TAG, "tx sendto: errno=%d", errno);
-            /* Direct UDP outright failed (ENETUNREACH, EHOSTUNREACH,
-             * EAGAIN under load). Try the relay as a last resort. The
-             * path_stale branch above already attempted it if relevant,
-             * so we only re-try here when path wasn't yet marked stale
-             * (i.e. errno arrived before the watchdog tripped). */
-            if (!path_stale && g.relay_cb != NULL) {
-                peer_static_snapshot(dst_pub);
-                esp_err_t rerr = g.relay_cb(dst_pub,
-                                            g.tx_worker_scratch.buf,
-                                            g.tx_worker_scratch.len,
-                                            g.relay_cb_user);
-                if (rerr == ESP_OK) {
-                    g.relayed_errno++;
-                } else {
-                    g.relay_errors++;
-                }
-            }
-        }
+        if (slot >= WG_TX_SLOTS) continue;   /* stop sentinel */
+        tx_send_item(&g.tx_slots[slot]);
+        (void)xQueueSend(g.tx_free_q, &slot, 0);   /* never full */
     }
     if (g.tx_done_sem != NULL) {
         xSemaphoreGive(g.tx_done_sem);
     }
     tl_wdt_unsubscribe();
     vTaskDelete(NULL);
+}
+
+/* Allocate the TX slots (one heap block, like the old queue storage)
+ * and the two index queues; every slot starts free. Boot-time only. */
+static esp_err_t tx_ring_create(void)
+{
+    g.tx_slots   = calloc(WG_TX_SLOTS, sizeof(wg_tx_item_t));
+    g.tx_free_q  = xQueueCreate(WG_TX_SLOTS, sizeof(uint8_t));
+    g.tx_ready_q = xQueueCreate(WG_TX_SLOTS + 1, sizeof(uint8_t));
+    if (g.tx_slots == NULL || g.tx_free_q == NULL || g.tx_ready_q == NULL) {
+        return ESP_ERR_NO_MEM;   /* caller runs tx_ring_destroy() */
+    }
+    for (uint8_t i = 0; i < WG_TX_SLOTS; i++) {
+        (void)xQueueSend(g.tx_free_q, &i, 0);
+    }
+    return ESP_OK;
+}
+
+static void tx_ring_destroy(void)
+{
+    if (g.tx_free_q != NULL)  { vQueueDelete(g.tx_free_q);  g.tx_free_q  = NULL; }
+    if (g.tx_ready_q != NULL) { vQueueDelete(g.tx_ready_q); g.tx_ready_q = NULL; }
+    if (g.tx_slots != NULL) {
+        tl_secure_zero(g.tx_slots, WG_TX_SLOTS * sizeof(wg_tx_item_t));
+        free(g.tx_slots);
+        g.tx_slots = NULL;
+    }
 }
 
 /* --- Public API ----------------------------------------------------- */
@@ -1284,17 +1323,15 @@ esp_err_t wg_netif_init(const struct wg_netif_local_config *local)
     }
     ESP_LOGI(TAG, "udp bound on port %u", (unsigned)g.bind_port_actual);
 
-    g.tx_queue = xQueueCreate(WG_TX_QUEUE_LEN, sizeof(wg_tx_item_t));
-    if (g.tx_queue == NULL) {
-        ESP_LOGE(TAG, "tx_queue create failed");
+    if (tx_ring_create() != ESP_OK) {
+        ESP_LOGE(TAG, "tx ring alloc failed");
         close(g.sock);
         return ESP_ERR_NO_MEM;
     }
     g.tx_done_sem = xSemaphoreCreateBinary();
     if (g.tx_done_sem == NULL) {
         ESP_LOGE(TAG, "tx_done_sem create failed");
-        vQueueDelete(g.tx_queue);
-        g.tx_queue = NULL;
+        tx_ring_destroy();
         close(g.sock);
         return ESP_ERR_NO_MEM;
     }
@@ -1305,8 +1342,7 @@ esp_err_t wg_netif_init(const struct wg_netif_local_config *local)
         ESP_LOGE(TAG, "tx task spawn failed");
         vSemaphoreDelete(g.tx_done_sem);
         g.tx_done_sem = NULL;
-        vQueueDelete(g.tx_queue);
-        g.tx_queue = NULL;
+        tx_ring_destroy();
         close(g.sock);
         return ESP_ERR_NO_MEM;
     }
@@ -1469,42 +1505,17 @@ esp_err_t wg_netif_send_plaintext(const uint8_t *pkt, size_t len)
     /* Encrypt inline. ChaCha20-Poly1305 is pure CPU + memory and is
      * safe to run on the lwIP TCPIP task. The actual sendto is what
      * re-enters lwIP — that's why the wire bytes are handed off to the
-     * tx worker via tx_queue instead of called here directly.
+     * tx worker via the TX ring instead of called here directly.
      *
-     * Use g.tx_scratch (BSS) instead of a stack-local item so the
-     * TCPIP task's small stack doesn't have to absorb the 1.5 KiB
-     * wire buffer alongside its own frames. xQueueSend memcpys the
-     * full sizeof(wg_tx_item_t) into the queue's internal storage,
-     * so it's safe to reuse the scratch on the next call.
-     *
-     * Wrap the encrypt+enqueue critical section under g.lock so a
-     * concurrent caller (lwIP TCPIP for app traffic vs rx_task for the
-     * persistent-keepalive path) cannot race on g.transport.send_counter
-     * — `wg_transport_encrypt` reads-modifies-writes the 64-bit
-     * counter, which is NOT atomic on ESP32-LX6. Same lock also
-     * protects g.tx_scratch since both callers reuse it. */
-    xSemaphoreTake(g.lock, portMAX_DELAY);
-    int wlen = wg_transport_encrypt(&g.transport,
-                                    g.tx_scratch.buf, sizeof(g.tx_scratch.buf),
-                                    pkt, len);
-    if (wlen < 0) {
-        xSemaphoreGive(g.lock);
-        return ESP_FAIL;
-    }
-    g.tx_scratch.len = (size_t)wlen;
-    /* Snapshot the dest sockaddr at enqueue time so a concurrent
-     * wg_netif_update_peer_endpoint after we release can't redirect a
-     * frame whose counter is already committed. */
-    g.tx_scratch.dst = g.peer_addr;
-
-    BaseType_t qrc = xQueueSend(g.tx_queue, &g.tx_scratch, 0);
-    xSemaphoreGive(g.lock);
-
-    if (qrc != pdTRUE) {
-        /* Queue full. Drop this frame; lwIP treats any non-OK return
-         * as a TX failure and discards its pbuf. The worker is either
-         * starving (priority) or stuck in sendto — log throttled so
-         * UART doesn't spam if backlog runs hot for a sustained burst. */
+     * Claim a free slot first (B14): the frame is encrypted straight
+     * into it (heap, off the TCPIP task's small stack) and only its
+     * index is queued. No free slot = the old "queue full": drop this
+     * frame; lwIP treats any non-OK return as a TX failure and discards
+     * its pbuf. The worker is either starving (priority) or stuck in
+     * sendto — log throttled so UART doesn't spam if backlog runs hot
+     * for a sustained burst. */
+    uint8_t slot;
+    if (xQueueReceive(g.tx_free_q, &slot, 0) != pdTRUE) {
         uint64_t prev = g.tx_drops++;
         if ((prev % WG_TX_DROP_LOG_EVERY) == 0) {
             ESP_LOGW(TAG, "tx queue full — dropped frame (total=%lu)",
@@ -1512,6 +1523,30 @@ esp_err_t wg_netif_send_plaintext(const uint8_t *pkt, size_t len)
         }
         return ESP_FAIL;
     }
+    wg_tx_item_t *it = &g.tx_slots[slot];
+
+    /* Encrypt + enqueue under g.lock so a concurrent caller (lwIP
+     * TCPIP for app traffic vs rx_task for the persistent-keepalive
+     * path) cannot race on g.transport.send_counter —
+     * `wg_transport_encrypt` reads-modifies-writes the 64-bit counter,
+     * which is NOT atomic on ESP32-LX6 — and frames reach tx_ready_q in
+     * counter order. */
+    xSemaphoreTake(g.lock, portMAX_DELAY);
+    int wlen = wg_transport_encrypt(&g.transport,
+                                    it->buf, sizeof(it->buf), pkt, len);
+    if (wlen < 0) {
+        xSemaphoreGive(g.lock);
+        (void)xQueueSend(g.tx_free_q, &slot, 0);
+        return ESP_FAIL;
+    }
+    it->len = (size_t)wlen;
+    /* Snapshot the dest sockaddr at enqueue time so a concurrent
+     * wg_netif_update_peer_endpoint after we release can't redirect a
+     * frame whose counter is already committed. */
+    it->dst = g.peer_addr;
+    (void)xQueueSend(g.tx_ready_q, &slot, 0);   /* WG_TX_SLOTS + 1 deep: never full */
+    xSemaphoreGive(g.lock);
+
     g.last_tx_us = now_us();
     return ESP_OK;
 }
@@ -1561,10 +1596,7 @@ void wg_netif_stop(void)
             ESP_LOGW(TAG, "tx task did not exit within 2s — forcing teardown");
         }
     }
-    if (g.tx_queue != NULL) {
-        vQueueDelete(g.tx_queue);
-        g.tx_queue = NULL;
-    }
+    tx_ring_destroy();
     if (g.tx_done_sem != NULL) {
         vSemaphoreDelete(g.tx_done_sem);
         g.tx_done_sem = NULL;
