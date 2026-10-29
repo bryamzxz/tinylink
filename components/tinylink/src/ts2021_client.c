@@ -105,8 +105,11 @@ static bool s_tls_next;
  * dnscache (UseLastGood) does, but first rather than only when DNS
  * fails: the address is no trust input (see ts2021_connect), so trying
  * it costs at most one TS2021_ADDR_TIMEOUT_MS attempt when stale.
- * Touched only by the task in ts2021_connect (main, then the long-poll). */
+ * Touched only by the task in ts2021_connect (main, then the long-poll).
+ * s_addr_skip: the last conn at it failed young (ts2021_close) — the
+ * next connect resolves the name instead, once. */
 static uint8_t s_addr[4];
+static bool    s_addr_skip;
 
 /* That attempt's budget on :443: esp-tls applies timeout_ms to the TCP
  * connect and to every handshake read, so a stale address — refused,
@@ -800,6 +803,7 @@ static esp_err_t connect_on(ts2021_conn_t *out, bool plain, const uint8_t *ip,
     }
     if (ip != NULL) {
         memcpy(out->peer_v4, ip, sizeof(out->peer_v4));
+        out->at_addr = true;
     } else {
         int fd = out->plain ? out->sock : -1;
         if (!out->plain) (void)esp_tls_get_conn_sockfd(out->tls, &fd);
@@ -888,8 +892,9 @@ esp_err_t ts2021_connect(ts2021_conn_t *out,
 
     esp_err_t err = ESP_FAIL;
     bool fallback = !plain;
-    bool try_addr = tl_ipv4_usable(s_addr);
+    bool try_addr = tl_ipv4_usable(s_addr) && !s_addr_skip;
     bool at_addr = false;
+    s_addr_skip = false;
     if (plain) {
         err = connect_port(out, true, &try_addr, &at_addr, machine_priv, machine_pub,
                            control_pub, &res);
@@ -1024,13 +1029,24 @@ esp_err_t ts2021_recv_record(ts2021_conn_t *c, size_t *len)
 void ts2021_close(ts2021_conn_t *c)
 {
     if (c == NULL) return;
-    if (c->plain && c->connected && c->io_failed) {
-        const int64_t up_s = (esp_timer_get_time() - c->up_us) / 1000000;
-        if (up_s < TS2021_PLAIN_EARLY_DROP_S) {
-            s_tls_next = true;
-            ESP_LOGW(TAG, ":80 conn failed %d s after its handshake — next dial on :%d",
-                     (int)up_s, CONFIG_TINYLINK_CONTROL_PORT);
-        }
+    const int64_t up_s = (esp_timer_get_time() - c->up_us) / 1000000;
+    if (c->plain && c->connected && c->io_failed && up_s < TS2021_PLAIN_EARLY_DROP_S) {
+        s_tls_next = true;
+        ESP_LOGW(TAG, ":80 conn failed %d s after its handshake — next dial on :%d",
+                 (int)up_s, CONFIG_TINYLINK_CONTROL_PORT);
+    }
+    /* A conn at the cached address that failed young — the transport, or
+     * a GOAWAY (a draining server can still take conns) — sends the next
+     * dial to the name, once (round 1.3.5), as upstream re-resolves:
+     * otherwise a server that accepts and then drops would be redialed
+     * forever, since only a failed connect falls back to DNS. A requested
+     * recycle says nothing about the server. */
+    if (c->connected && c->at_addr && !c->aborted && (c->io_failed || c->h2_goaway) &&
+        up_s < TS2021_PLAIN_EARLY_DROP_S) {
+        s_addr_skip = true;
+        ESP_LOGW(TAG, "conn at the cached control address failed %d s after its "
+                      "handshake — next dial resolves %s", (int)up_s,
+                 CONFIG_TINYLINK_CONTROL_HOST);
     }
     conn_teardown(c);
 }

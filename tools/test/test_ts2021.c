@@ -859,6 +859,7 @@ static void boot_reset(void)
     s_abort_reads = false;
     s_clock_step = 0;
     ts2021_set_addr(NULL);
+    s_addr_skip = false;
     s_name_peer_known = false;
 }
 
@@ -1288,6 +1289,56 @@ static void test_addr_80(void)
     check("dns_set_addr_rejects_unusable", r1 && addr_is(s_addr, zero));
 }
 
+/* A conn at the cached address that fails young (transport, GOAWAY)
+ * sends the next dial to the name, once; an old failure, a recycle or a
+ * clean end keep the address. how: 0 FIN, 1 GOAWAY, 2 recycle, 3 clean. */
+static void young_case(const char *name, int64_t age_s, int how, const char *want_next)
+{
+    char n1[80];
+    addr_boot();
+    script(ESP_OK, RP_OK, false, 1, RP_OK);
+    script_addr(ESP_OK, RP_OK, false, 1, RP_OK);
+    esp_err_t rc = dial(true);
+    const bool at = s_conn.at_addr;
+    s_now_us += age_s * 1000000;
+    size_t got = 0;
+    s_conn.h2_rx_off = s_conn.h2_rx_len;
+    if (how == 0) {
+        shutdown(s_srv_fd, SHUT_WR);
+        (void)ts2021_recv_record(&s_conn, &got);
+    } else if (how == 1) {
+        s_conn.h2_goaway = true;
+    } else if (how == 2) {
+        ts2021_abort_reads();
+        (void)ts2021_recv_record(&s_conn, &got);
+    }
+    ts2021_close(&s_conn);
+    s_abort_reads = false;
+    script(ESP_OK, RP_OK, false, 1, RP_OK);
+    script_addr(ESP_OK, RP_OK, false, 1, RP_OK);
+    const esp_err_t rc2 = dial(true);
+    snprintf(n1, sizeof(n1), "dns_at_addr_%s_next_%s", name, want_next);
+    check(n1, rc == ESP_OK && at && rc2 == ESP_OK && strcmp(s_dials, want_next) == 0);
+    ts2021_close(&s_conn);
+    /* only once: the dial after that is at the address again */
+    script(ESP_OK, RP_OK, false, 1, RP_OK);
+    script_addr(ESP_OK, RP_OK, false, 1, RP_OK);
+    const esp_err_t rc3 = dial(true);
+    snprintf(n1, sizeof(n1), "dns_at_addr_%s_then_addr", name);
+    check(n1, rc3 == ESP_OK && strcmp(s_dials, "A80") == 0);
+    ts2021_close(&s_conn);
+}
+
+static void test_addr_young_failure(void)
+{
+    /* FIN at 30 s: the :80 early drop sends it to :443 too — by name */
+    young_case("fin_30s", 30, 0, "N443");
+    young_case("goaway_5s", 5, 1, "N80");
+    young_case("fin_121s", TS2021_PLAIN_EARLY_DROP_S + 1, 0, "A80");
+    young_case("recycle_5s", 5, 2, "A80");
+    young_case("clean_5s", 5, 3, "A80");
+}
+
 static void test_addr_443(void)
 {
     /* TLS only (no pinned key): the address first, the certificate
@@ -1497,6 +1548,7 @@ int main(void)
     test_both_fail();
     test_early_drop();
     test_addr_80();
+    test_addr_young_failure();
     test_addr_443();
     test_request_deadline();
     test_recycle_marked();

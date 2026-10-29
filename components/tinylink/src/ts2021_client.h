@@ -121,9 +121,11 @@ typedef struct {
     int64_t           up_us;
 
     /* The control address this conn reached (round 1.3.5, tl_addr.h;
-     * 0.0.0.0 = unknown): the cached one it was dialed at, or the peer of
-     * a by-name connect. tinylink.c keeps it for the next boot. */
+     * 0.0.0.0 = unknown): the cached one it was dialed at (at_addr), or
+     * the peer of a by-name connect. tinylink.c keeps it for the next
+     * boot. */
     uint8_t           peer_v4[4];
+    bool              at_addr;
 
     /* One-shot request deadline (round 1.3.5, ts2021_request_deadline):
      * while req_deadline_us != 0 each socket poll is TS2021_REQ_POLL_MS,
