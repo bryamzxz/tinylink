@@ -29,9 +29,11 @@
 // single exit (wrapper functions), so a claim can never leak.
 //
 // Layout. The map stream collects MapResponse elements at offset 0 and
-// sends its MapRequest from a separate tail region, because nghttp2 may
-// still be reading the request body while response DATA is already
-// being parsed:
+// sends its MapRequest from a separate tail region. nghttp2 (until 1.3.4)
+// could still be reading the request body while response DATA was
+// already being parsed; the in-tree client (1.3.4, D1) seals the whole
+// body into its records before it reads, so the split is now only a
+// cheap margin:
 //
 //   [0, TL_CTRL_MAPRESP_CAP)          the MapResponse element being parsed;
 //                                     response bodies (register, /key, push)

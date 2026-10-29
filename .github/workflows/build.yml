@@ -26,7 +26,7 @@ concurrency:
 env:
   # Strict per-case count of `[name] OK` lines the suite must reach.
   # Bump when tests are added (see CHANGELOG for the running number).
-  HOST_TESTS_MIN_OK: 1039
+  HOST_TESTS_MIN_OK: 1330
 
 jobs:
   host-tests:
@@ -35,6 +35,13 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      # libnghttp2 is the independent HTTP/2 server the in-tree client
+      # (round 1.3.4, D1) is interop-tested against (test_h2_interop /
+      # test_h2_ref); without it those two binaries are skipped and the
+      # floor below is not reached.
+      - name: Install libnghttp2 (HTTP/2 interop peer)
+        run: sudo apt-get update && sudo apt-get install -y libnghttp2-dev pkg-config
 
       # The suite is plain C11 + stock gcc — no ESP-IDF needed. Each test
       # binary exits non-zero on any failed assertion and the Makefile

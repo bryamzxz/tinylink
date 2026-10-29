@@ -7,6 +7,92 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Optimization round D 1.3.4 (in progress, branch `feat/opt-1.3.4`)
+
+Round D of `docs/rounds/2026-10-optimization-list.md` (memory), built in
+two parallel branches — control transport (`feat/r134-ctl`) and map
+parsing (`feat/r134-map`) — on top of 1.3.3. Image 763 328 → **707 088 B
+(−56 240 B; −252 161 B / −26.3 % since 1.3.0)**; static DRAM
+95 516 → ~56 800 B (−38.7 KB); static IRAM +10 240 B (NOLOAD token
+table); no nghttp2 session per connect; `tinylink_lp` 12 → 7 KiB and the
+main task 24 → 8 KiB of stack. Host suite 1 006 → **1 330 OK** (CI floor
+1 330; CI now installs libnghttp2 as the HTTP/2 interop peer), ASan +
+UBSan clean, 0 warnings. Not yet on the sensor.
+
+#### Control transport (`feat/r134-ctl`)
+
+- **D5 — no `rx_residual` copy.** `consume_early_payload` leaves the
+  first HTTP/2 bytes in the conn's `h2_rx` record buffer and the HTTP/2
+  layer reads them by offset, instead of copying them into a second
+  4 077-B buffer; bytes that matched the EarlyPayload magic on a stream
+  without one are put back in front. `h2_rx` grows to 4 096 B. Static
+  DRAM −4 064 B; `test_ts2021` (window by offset, put-back across
+  records, worst-case window, 2 000-case record-segmentation fuzz).
+- **D1 — in-tree HTTP/2 client replaces nghttp2.** `h2_core.c` (frames,
+  flow control, one stream at a time) and `hpack.c` (literal encoder,
+  streaming decoder, canonical Huffman over 282 B of tables) behind the
+  unchanged `h2_client.h`; no heap — the engine lives in `ts2021_conn_t`,
+  received records are parsed where they lie, requests are built in the
+  record buffer. On the wire: the same preface, SETTINGS
+  (HEADER_TABLE_SIZE 0, ENABLE_PUSH 0) and header list; literal without
+  indexing with raw values instead of never-indexed + Huffman (+17–19 B
+  per HEADERS); preface + SETTINGS in one Noise record and HEADERS + DATA
+  in one (register + endpoint push: 7 records → 3); the server's
+  SETTINGS ACKed on arrival. Behaviour changes: a 1xx is followed by the
+  final status; no DATA reaches the stream callback after it stops; a
+  connection-level protocol error returns `ESP_FAIL`. The nghttp2
+  component and `CONFIG_ESP_NGHTTP2_INBOUND_BUFFER_LENGTH` are gone.
+  Image −57 104 B (nghttp2 59 946 B, the new client 9 564 B), static DRAM
+  +368 B, no 10–14 KiB nghttp2 session per connect. Tests: RFC 7541
+  C.1–C.6, codec / flow-control / malformed-frame tests and fuzz,
+  `test_h2_interop` / `test_h2_ref` — nghttp2's server in memory against
+  the new client and the 1.3.3 nghttp2 client on the same scenarios.
+- **D4 — records decrypted and sealed in place.** Each received record
+  is decrypted in place in `h2_rx` (was a 4 096-B `ct` stack array);
+  requests are sealed there in records of ≤ 2 048 B, one TLS record each
+  at `MBEDTLS_SSL_OUT_CONTENT_LEN` (was a 4 096-B `rec` stack array).
+  `tools/stack_worst.py`: `tinylink_lp` static worst case 7 856 →
+  4 864 B (a reconnect's TLS handshake 4 672 B) → stack **12 → 7 KiB**;
+  main task 8 272 → 5 312 B → **24 → 8 KiB** (+16 KiB of heap during
+  bringup); `app_main` logs `main stack: hwm=` since the 60-s stack diag
+  never sees main. Image +176 B.
+
+#### Map parsing (`feat/r134-map`)
+
+- **Fix found on the way: token walks bounded by the token count.**
+  jsmn (non-strict) counts an object member without its colon
+  (`{"NodeID"02,…}`) as two children; the key/value walkers never looked
+  at the token count, so such an element read stale tokens of an earlier
+  sub-parse and, with a full table, past its end (1.3.3: ASan
+  global-buffer-overflow in `tok_eq`). Reachable only from the
+  authenticated control plane. `jsmn_tree_ok` (`jsmn_skip.h`) checks the
+  tree iteratively, bounded by the count and the depth cap; `sub_parse`
+  refuses a tree it rejects like a jsmn error. +228 B.
+- **D2 — MapResponse split on the stream: 32 → 8 KiB.**
+  `mapresp_stream_feed` takes the DATA bytes cut anywhere (the LE32
+  length prefix included), follows the top object byte by byte, scans
+  past every member tinylink does not read, and copies only the element
+  being collected — the self `Node`, one `Peers` / `PeersChanged` /
+  `PeersRemoved` / `PeersChangedPatch` entry, one `DERPMap.Regions`
+  value — into an 8 KiB element buffer for the unchanged element
+  parsers. Same results as the 1.3.3 whole-body parser for any input
+  whose elements fit (kept as `tools/test/ref/mapresp_133.c`; 100 random
+  chunkings from 1 B, every two-chunk cut, every truncation + resync,
+  40 000 random edits). An element over 8 KiB is skipped with an error
+  log (an oversized patch forces a full-map refetch); the frame cap is
+  now a 4 MiB desync guard. The sensor's largest element is the
+  179-token self node (~3.2 KB in a real-shaped fixture, 2.6×
+  headroom); `stream peak: … elem=E (cap=8192)` reports it. Static DRAM
+  −24 440 B, image +784 B.
+- **D6 — jsmn token table in IRAM.** The 640-token table (10 KiB) moves
+  to IDF's NOLOAD `.iram.bss`. IRAM takes 32-bit loads / stores only;
+  `tools/iram_access_check.py` proves on the object code that every
+  access to the table is 32-bit (8 functions in `mapreq.c`, all
+  `l32i` / `s32i`) and runs after every component build, failing it on a
+  finding — its fixture `tools/iram_check_neg.c` plants 8 violations,
+  all caught, including `(type & 0xff) == 4`, which GCC compiles to an
+  `l8ui`. Static DRAM −10 240 B.
+
 ### Optimization round 1.3.3 (in progress, branch `feat/opt-1.3.3`)
 
 - **B22 — a known node registers without Auth.** A restarted tailscaled

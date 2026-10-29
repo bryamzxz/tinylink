@@ -12,8 +12,10 @@
  * Addresses array -> string), so 64 is far above anything legitimate. The
  * cap exists purely to stop an adversarial control plane from sending
  * deeply-nested JSON that recurses jsmn_skip deep enough to overflow the
- * 24 KiB long-poll task stack (a frame is ~32-48 B on Xtensa, so a few
- * hundred levels overflow). At 64 the recursion is bounded to ~3 KiB. */
+ * long-poll task stack (7 KiB since 1.3.4; a frame is ~32-48 B on Xtensa,
+ * so a few hundred levels overflow). At 64 the recursion is bounded to
+ * ~3 KiB — tools/stack_worst.py: 65 levels reach 3 472 B, under the
+ * task's static worst case. */
 #define JSMN_SKIP_MAX_DEPTH 64
 
 /* Return the token index just past the value at toks[i] (i.e. skip the

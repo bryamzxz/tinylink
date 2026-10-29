@@ -1247,8 +1247,8 @@ esp_err_t mapreq_push_endpoints(ts2021_conn_t *conn,
 
 /* ---- streaming reader ----------------------------------------------------
  *
- * The chunk callback feeds the DATA bytes, split anywhere (nghttp2 may
- * deliver partial / multiple frames per DATA frame), into the framing +
+ * The chunk callback feeds the DATA bytes, split anywhere (the HTTP/2
+ * layer delivers partial / multiple frames per DATA frame), into the framing +
  * splitter above (round 1.3.4, D2); each complete frame lands in
  * stream_frame. Until 1.3.3 every frame was first assembled whole in
  * the shared control buffer's 32 KiB MapResponse area.
@@ -1262,7 +1262,7 @@ typedef struct {
 } stream_state_t;
 
 /* Returns 0 to keep the stream running, -1 to stop it (the caller's
- * chunk callback propagates the stop through nghttp2 so the long-poll
+ * chunk callback propagates the stop through the HTTP/2 layer so the long-poll
  * task tears the conn down and reconnects — used when a frame demands
  * a full-netmap refetch we can't satisfy in-stream). */
 static int stream_frame(const mapresp_stream_t *ms, esp_err_t pe, void *ctx)
@@ -1350,8 +1350,9 @@ static esp_err_t run_stream_in(ts2021_conn_t *conn,
                                uint8_t *buf)
 {
     /* MapRequest from the buffer's tail, MapResponse elements collected at
-     * offset 0 — disjoint, because nghttp2 may still be reading the
-     * request body (data_provider_read) while response DATA arrives. */
+     * offset 0 — disjoint: nghttp2 (until 1.3.4) could still be reading
+     * the request body while response DATA arrived; the in-tree client
+     * seals the body before it reads, so this is now only a margin. */
     char *body = (char *)buf + TL_CTRL_REQ_OFF;
     int body_len = build_request_body(keys, true, false, body, TL_CTRL_REQ_CAP);
     if (body_len < 0) return ESP_ERR_INVALID_SIZE;

@@ -5,7 +5,7 @@
 **A clean-room, single-peer Tailscale-compatible node for the bare ESP32 — no PSRAM, ~916 KiB of flash, pure C.**
 
 [![CI](https://github.com/bryamzxz/tinylink/actions/workflows/build.yml/badge.svg)](https://github.com/bryamzxz/tinylink/actions/workflows/build.yml)
-[![Firmware](https://img.shields.io/badge/firmware-1.3.3-yellow)](CHANGELOG.md)
+[![Firmware](https://img.shields.io/badge/firmware-1.3.4-yellow)](CHANGELOG.md)
 [![Target](https://img.shields.io/badge/target-ESP32--WROOM%20(no%20PSRAM)-orange)](#hardware)
 [![Framework](https://img.shields.io/badge/ESP--IDF-v5.5-e7352c)](docs/BUILDING.md)
 [![Host tests](https://img.shields.io/badge/host%20KATs-546%20%C2%B7%200%20fail-brightgreen)](#testing)
@@ -31,9 +31,9 @@ the tunnel — 24/7, on a 4 MB module with 520 KiB of SRAM.
 ## Highlights
 
 - **Full control-plane client** — ts2021 Noise IK over TLS-Upgrade,
-  HTTP/2 (nghttp2) inside the Noise channel, `/machine/register`,
-  streaming `/machine/map` long-poll with KeepAlives, capability
-  version 138 governed from a single macro.
+  HTTP/2 inside the Noise channel (in-tree client since 1.3.4; nghttp2
+  before), `/machine/register`, streaming `/machine/map` long-poll with
+  KeepAlives, capability version 148 governed from a single macro.
 - **Real WireGuard, from scratch** — `Noise_IK_25519_ChaChaPoly_BLAKE2s`
   handshake, transport with RFC 6479 replay windows, make-before-break
   rekey, persistent keepalive, cross-reboot TAI64N monotonicity.
