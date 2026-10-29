@@ -396,9 +396,11 @@ static esp_err_t parse_one_derp_region(const char *js, const jsmntok_t *toks,
  * one consumer, tinylink.c::update_derp_host_from_netmap: the DERP
  * supervisor dials the region we advertise as PreferredDERP, because
  * that is where peers relay to us. Peers' HomeDERP needs no region
- * entry — this node keeps a single DERP connection and the DERP mesh
- * forwards packets for other regions to it — and nothing else reads
- * the map. So every other region is dropped here instead of stored
+ * entry — this node keeps a single DERP connection: a peer that wants
+ * to reach us dials our home region (DERP servers do not forward
+ * across regions; the mesh is per region), and our relayed replies go
+ * back through that same server while the peer holds its connection
+ * there — and nothing else reads the map. So every other region is dropped here instead of stored
  * (Tailscale ships 28: −6 KiB BSS). Matched on the RegionID inside the
  * region object, never on its position: Go marshals the Regions map in
  * string-key order ("1", "10", …, "16", …, "2", …), and keeping "the

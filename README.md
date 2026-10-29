@@ -343,8 +343,9 @@ Not commitments — bigger-than-QoL extensions, none blocking the current
 sensor-→-collector use case. Rationale and effort sketches in
 [`docs/ROADMAP.md` § "Future directions"](docs/ROADMAP.md#future-directions).
 
-- **Streaming JSON parser** — eliminate the `RESPONSE_BUF_SZ` body
-  buffer; lifts the BSS ceiling behind `TL_MAX_PEERS = 4`.
+- **Streaming JSON parser** — eliminate the 32 KiB MapResponse area of
+  the shared control buffer (`ctrl_buf.h`); lifts the BSS ceiling behind
+  `TL_MAX_PEERS = 4`.
 - **Multi-peer support** — peer table in `wg_netif.c`, per-peer RFC 6479
   replay windows, netmap-driven peer add/remove.
 - **PSRAM support** — move lwIP pools, mbedTLS transients, and the WG

@@ -80,7 +80,7 @@ int nacl_box(uint8_t *c,
     uint8_t k[NACL_BOX_KEY_LEN];
     if (box_beforenm(k, peer_pub, my_priv) != 0) return -1;
     const int rc = nacl_box_after_shared(c, m, mlen, nonce, k);
-    memset(k, 0, sizeof(k));
+    tl_secure_zero(k, sizeof(k));
     return rc;
 }
 

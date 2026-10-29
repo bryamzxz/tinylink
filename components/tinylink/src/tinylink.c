@@ -543,7 +543,7 @@ static bool disco_addr_is_v4_mapped(const uint8_t addr[16])
  * fail silently in the WiFi default route — cheap. */
 /* Refactored from `(const tl_netmap_t *nm)` so the path-stale callback
  * can cache JUST the peers array (~1 KiB) instead of the full netmap
- * struct (~7.5 KiB; derp_regions[28] dominates). The function only
+ * struct (~2.5 KiB since 1.3.2 keeps one DERP region; ~8 KiB before). The function only
  * ever reads n_peers + peers[] anyway. */
 static void prepunch_pings_to_peers(const tl_peer_t *peers, size_t n_peers)
 {

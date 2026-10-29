@@ -185,7 +185,7 @@ multi-day run. Every round: size report vs the previous one, the 6-h
 soak with stack-diag dumps, `/stats` deltas.
 
 Scratch artifacts (copied out of /tmp, git-ignored, local only):
-`build_opt-artifacts-2026-10/` — `maps-mem/` + `maps-cpu/` (linker maps /
+`work/artifacts/` (was `build_opt-artifacts-2026-10/`) — `maps-mem/` + `maps-cpu/` (linker maps /
 size reports per measured variant), `tlopt_cc/` (ChaCha20 / Poly1305
 variants + host equivalence tests), `tlopt-asym/` (fiat32 X25519,
 handshake PoC, BLAKE2s), `tlopt_replay/t.c` (S1 PoC), `tlopt-tls-556/`,

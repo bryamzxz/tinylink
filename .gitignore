@@ -58,3 +58,7 @@ tools/test/test_*
 
 # ESP32 vendor PDFs (Espressif / Cadence copyright) — fetched by docs/esp32/fetch-docs.sh
 docs/esp32/pdf/
+
+# The repo's temp folder: worktrees (work/worktrees/), build artifacts,
+# measurement data and scratch scripts (work/artifacts/). Never committed.
+work/

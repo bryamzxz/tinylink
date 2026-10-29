@@ -652,9 +652,12 @@ CONFIG_ESP_TIMER_TASK_STACK_SIZE=6144
 CONFIG_LIBC_NEWLIB_NANO_FORMAT=y
 # Global -Os (round 1.3.1; IDF default is -Og). −62 KB flash, −6.6 KB
 # IRAM, and still faster than -Og everywhere. The hot paths stay -O2 as
-# islands: the tinylink and main components, mbedcrypto (CMakeLists.txt
-# here, components/tinylink, main), plus lwIP's checksum / pbuf / UDP /
-# IPv4 input-output and FreeRTOS queue.c (top-level CMakeLists.txt).
+# per-source islands (round 1.3.2, B6): in tinylink the crypto, WG data
+# plane + handshake, DISCO, DERP, keys and TMP117 files
+# (components/tinylink/CMakeLists.txt); in mbedcrypto bignum /
+# bignum_core / ecp / ecp_curves, the MPI glue and the AES-GCM record
+# path, plus lwIP's checksum / pbuf / UDP / IPv4 and FreeRTOS queue.c
+# (top-level CMakeLists.txt); main/ stays -O2 as a whole.
 # -Os also drops FreeRTOS's task-function wrapper (it needs -Og): a task
 # body that returns crashes at PC=0 instead of aborting with "should not
 # return". No tinylink task returns (all six checked 2026-10-28) — keep

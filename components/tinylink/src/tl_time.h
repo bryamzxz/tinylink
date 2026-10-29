@@ -58,7 +58,7 @@ bool tl_time_synced(void);
  * (the telemetry task), never from the SNTP callback (lwIP context). */
 void tl_time_poll_persist(void);
 
-/* Drop-in for esp_tls_cfg_t / esp_http_client_config_t .crt_bundle_attach:
+/* Drop-in for esp_tls_cfg_t .crt_bundle_attach:
  * the IDF bundle plus the date-tolerance-until-synced verify callback. */
 esp_err_t tl_crt_bundle_attach(void *conf);
 
