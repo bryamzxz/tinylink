@@ -565,7 +565,7 @@ The original M1-only layout, kept for historical reference:
 |     ts2021_client.c  — TLS, HTTP Upgrade, Noise framing        |
 |     register.c       — RegisterRequest JSON + response parse   |
 |     noise_ik.c       — Noise_IK_25519_ChaChaPoly_BLAKE2s SM    |
-|     json_helpers.c   — cJSON wrappers                          |
+|     json_helpers.c   — top-level JSON reader/escaping writer   |
 |                                                                |
 |  Vendored crypto (src/crypto/)                                 |
 |     blake2s.c        — RFC 7693 reference                      |
@@ -584,7 +584,6 @@ The original M1-only layout, kept for historical reference:
 +------------- ESP-IDF v5.5 ------------------------------------+
 |  wifi / lwIP                                                  |
 |  esp_tls + mbedtls (ChaCha20-Poly1305, Poly1305, X.509 bundle)|
-|  cJSON                                                        |
 |  nvs_flash                                                    |
 +---------------------------------------------------------------+
 ```

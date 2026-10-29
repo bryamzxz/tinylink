@@ -54,7 +54,6 @@ idf_component_register(
         esp_driver_i2c
         lwip
         mbedtls
-        json
     PRIV_REQUIRES
         espressif__nghttp
         esp_timer

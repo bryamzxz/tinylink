@@ -12,8 +12,6 @@
 #include "nvs.h"
 #include "sdkconfig.h"
 
-#include "cJSON.h"
-
 #include "ctrl_buf.h"
 #include "json_helpers.h"
 #include "tinylink.h"        /* TINYLINK_CAPVER / TINYLINK_STR */
@@ -129,14 +127,14 @@ static esp_err_t fetch_pubkey_in(uint8_t *buf, uint8_t out[CONTROL_KEY_LEN])
         return ESP_FAIL;
     }
 
-    cJSON *root = cJSON_ParseWithLength(body, bb.len);
-    if (root == NULL) return ESP_ERR_INVALID_RESPONSE;
-
     char pub_b64_or_hex[80] = {0};
-    err = json_get_string(root, "publicKey",
+    err = json_get_string(body, bb.len, "publicKey",
                           pub_b64_or_hex, sizeof(pub_b64_or_hex));
-    cJSON_Delete(root);
-    if (err != ESP_OK) return err;
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "GET %s: no usable publicKey in the response (0x%x)",
+                 KEY_PATH, err);
+        return err;
+    }
 
     /* Tailscale's /key endpoint returns "nlpub:<64hex>". */
     const char *p = pub_b64_or_hex;
