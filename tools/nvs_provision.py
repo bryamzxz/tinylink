@@ -32,7 +32,11 @@ from pathlib import Path
 
 NAMESPACE = "tl_creds"
 REQUIRED_KEYS = {"wifi_ssid", "wifi_pass", "auth_key"}
-AUTH_KEY_PREFIX = "tskey-"
+# tailscale.com: "tskey-auth-…"; headscale ≥0.28: "hskey-auth-<12>-<64>"
+# (hscontrol/db/preauth_keys.go). Pre-0.28 headscale plaintext keys (no
+# prefix) are still accepted by headscale until 0.32 — pass them with
+# --allow-legacy-key.
+AUTH_KEY_PREFIXES = ("tskey-", "hskey-")
 
 
 def find_idf_tool() -> Path:
@@ -46,7 +50,7 @@ def find_idf_tool() -> Path:
     return candidate
 
 
-def validate_csv(csv_path: Path) -> None:
+def validate_csv(csv_path: Path, allow_legacy_key: bool = False) -> None:
     seen: set[str] = set()
     namespaces: set[str] = set()
     with csv_path.open(newline="") as f:
@@ -63,9 +67,13 @@ def validate_csv(csv_path: Path) -> None:
             if value.startswith("REPLACE_WITH_") or value.endswith("REPLACE_ME"):
                 sys.exit(f"error: {csv_path} still has placeholder for '{key}'")
             seen.add(key)
-            if key == "auth_key" and not value.startswith(AUTH_KEY_PREFIX):
-                sys.exit(f"error: auth_key must start with '{AUTH_KEY_PREFIX}' "
-                         f"(got '{value[:8]}…')")
+            if (key == "auth_key" and not allow_legacy_key
+                    and not value.startswith(AUTH_KEY_PREFIXES)):
+                sys.exit(f"error: auth_key must start with one of "
+                         f"{', '.join(AUTH_KEY_PREFIXES)} (got '{value[:8]}…'); "
+                         f"use --allow-legacy-key for a pre-0.28 headscale key")
+            if key == "auth_key" and len(value) > 127:
+                sys.exit("error: auth_key longer than the firmware's 127-char buffer")
     if NAMESPACE not in namespaces:
         sys.exit(f"error: {csv_path} must declare the '{NAMESPACE}' namespace "
                  f"(found: {', '.join(sorted(namespaces)) or 'none'})")
@@ -90,13 +98,16 @@ def main() -> int:
     parser.add_argument("--keyfile", type=Path,
                         help="With --encrypt: NVS encryption keyfile. If omitted, "
                              "nvs_partition_gen.py generates one next to --output.")
+    parser.add_argument("--allow-legacy-key", action="store_true",
+                        help="Accept an auth_key without the tskey-/hskey- prefix "
+                             "(pre-0.28 headscale plaintext pre-auth key).")
     args = parser.parse_args()
 
     if not args.input.is_file():
         sys.exit(f"error: input {args.input} does not exist")
     args.output.parent.mkdir(parents=True, exist_ok=True)
 
-    validate_csv(args.input)
+    validate_csv(args.input, args.allow_legacy_key)
 
     tool = find_idf_tool()
     cmd = [sys.executable, str(tool)]

@@ -40,7 +40,7 @@ namespaces by itself.
 |-------------|--------|------------------------------------------------------|
 | `wifi_ssid` | string | WPA2-PSK SSID                                        |
 | `wifi_pass` | string | WPA2-PSK passphrase                                  |
-| `auth_key`  | string | Tailscale auth key (`tskey-auth-…`)                  |
+| `auth_key`  | string | Pre-auth key: tailscale.com `tskey-auth-…`, headscale `hskey-auth-…` |
 
 There are no WireGuard keys to provision — the node's MachineKey,
 NodeKey and DiscoKey are generated on-device at first boot.
@@ -89,6 +89,14 @@ In the Tailscale admin panel (`Settings → Keys → Generate auth key`):
 
 The `tskey-auth-…` string only appears once in the admin UI; copy it
 straight into `tools/credentials.csv`.
+
+**headscale**: `headscale preauthkeys create --user <u> --reusable`
+prints an `hskey-auth-…` key, accepted as is (a pre-0.28 plaintext key
+needs `--allow-legacy-key`). Use a **reusable** (or tagged) key: since
+headscale 0.29.4 a deleted or expired node is told so on its map stream
+and tinylink re-registers with the stored key, which a spent single-use
+key cannot do (expired user-owned nodes need a valid key,
+`state.go pakSkipsValidation`).
 
 ## Rotating credentials
 
