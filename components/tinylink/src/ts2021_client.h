@@ -232,8 +232,9 @@ esp_err_t ts2021_connect(ts2021_conn_t *out,
  * resolving CONFIG_TINYLINK_CONTROL_HOST; the server is authenticated
  * as without it (Noise IK on :80, the certificate against the host name
  * on :443), and a failure there is retried by name at once — never
- * counted against :80. Every conn that comes up replaces it with the
- * address it reached (out->peer_v4). */
+ * counted against :80. It stays first for TS2021_ADDR_TTL_S; every conn
+ * that comes up by name replaces it with the address it reached
+ * (out->peer_v4) for another TS2021_ADDR_TTL_S. */
 void ts2021_set_addr(const uint8_t ip_v4[4]);
 
 /* Arm (ms > 0) or disarm (0) the one-shot request deadline on a

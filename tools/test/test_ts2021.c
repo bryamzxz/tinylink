@@ -36,7 +36,10 @@
 //    key — is retried by name at once, so a stale address never turns :80
 //    off; the address is not retried on :443 once the name was tried; an
 //    outage keeps it; an abort is not retried; every conn that comes up
-//    leaves its address for the next connect.
+//    leaves its address for the next connect; on :443 the rest of the
+//    handshake at the address has one 3-s poll and one deadline too; the
+//    address is first for TS2021_ADDR_TTL_S from the seed or the by-name
+//    conn that reached it.
 //
 // ts2021_client.c is #included so its static functions are reachable;
 // esp_tls is faked below, records are sealed with a second Noise state
@@ -74,6 +77,7 @@ struct esp_tls {
     int     writes;           /* esp_tls_conn_write calls */
     bool    has_fd;           /* fd / fd_peer: a socketpair for setsockopt */
     int     fd, fd_peer;
+    bool    stall;            /* past rx: every read a socket timeout */
 };
 
 static struct esp_tls s_tls;
@@ -113,6 +117,7 @@ static char s_tls_host[64];
 static int  s_tls_port;
 static int  s_tls_timeout_ms;
 static char s_tls_cn[64];
+static int  s_tls_stalls;     /* reads that timed out (stall) */
 
 static int tls_dial(const char *what, const esp_tls_cfg_t *cfg, const srv_t *sv)
 {
@@ -124,6 +129,7 @@ static int tls_dial(const char *what, const esp_tls_cfg_t *cfg, const srv_t *sv)
     tls_fd_close();
     s_tls.rx_len = s_build_reply(sv->kind, s_tls.rx);
     s_tls.rx_off = 0;
+    s_tls.stall = sv->kind == 10;   /* RP_STALL, below */
     s_tls.tx_len = 0;
     s_tls.writes = 0;
     int sv2[2];
@@ -156,6 +162,10 @@ int esp_tls_conn_new_sync(const char *hostname, int hostlen, int port,
 ssize_t esp_tls_conn_read(esp_tls_t *tls, void *data, size_t datalen)
 {
     size_t avail = tls->rx_len - tls->rx_off;
+    if (avail == 0 && tls->stall) {
+        s_tls_stalls++;
+        return MBEDTLS_ERR_SSL_WANT_READ;         /* SO_RCVTIMEO fired */
+    }
     if (avail == 0) return 0;                     /* EOF */
     size_t n = datalen < avail ? datalen : avail;
     if (tls->chunk && n > tls->chunk) n = tls->chunk;
@@ -765,7 +775,9 @@ typedef enum {
     RP_HUGE_FRAME,    /* 101, a frame header announcing 60 000 B */
     RP_HALF_101,      /* half a status line, then EOF */
     RP_SILENT,        /* nothing */
+    RP_STALL,         /* nothing; on :443 every read times out (no EOF) */
 } reply_t;
+_Static_assert(RP_STALL == 10, "tls_dial's stall test");
 
 static const char k101[] = "HTTP/1.1 101 Switching Protocols\r\n"
                            "Upgrade: tailscale-control-protocol\r\n"
@@ -801,6 +813,7 @@ static size_t build_reply(reply_t kind, uint8_t *b)
     static const uint8_t hdr2[3] = { TS2021_MSG_RESPONSE, 0, NOISE_IK_MSG2_LEN };
     switch (kind) {
     case RP_SILENT:
+    case RP_STALL:
         return 0;
     case RP_HALF_101:
         put(b, &n, "HTTP/1.1 10", 11);
@@ -1373,6 +1386,72 @@ static void test_addr_443(void)
           s_tls_timeout_ms == TLS_TIMEOUT_MS && strcmp(s_tls_cn, "controlplane.test") == 0 &&
           addr_is(s_addr, kNameV4) && !s_plain_off);
     ts2021_close(&s_conn);
+
+    /* A stale address that still terminates TLS for the name but never
+     * answers the upgrade: the rest of the handshake gets one 3-s poll,
+     * not the stream's 4 × 30 s per read, then the name. */
+    addr_boot();
+    script(ESP_OK, RP_OK, false, 1, RP_OK);
+    script_addr(ESP_OK, RP_OK, false, 1, RP_STALL);
+    s_tls_stalls = 0;
+    rc = dial(false);
+    check("dns_addr_443_silent_after_tls_one_poll",
+          rc == ESP_OK && strcmp(s_dials, "A443 N443") == 0 && s_tls_stalls == 1 &&
+          addr_is(s_addr, kNameV4) && s_conn.hs_idle == 0 && s_conn.hs_deadline_us == 0);
+    ts2021_close(&s_conn);
+    /* ... and one that trickles: the deadline is absolute (the clock moves
+     * 0.4 × the budget per read). */
+    addr_boot();
+    script(ESP_OK, RP_OK, false, 1, RP_OK);
+    script_addr(ESP_OK, RP_OK, false, 1, RP_OK);
+    s_clock_step = (int64_t)TS2021_ADDR_TIMEOUT_MS * 1000 * 4 / 10;
+    rc = dial(false);
+    s_clock_step = 0;
+    check("dns_addr_443_trickle_hits_the_deadline",
+          rc == ESP_OK && strcmp(s_dials, "A443 N443") == 0);
+    ts2021_close(&s_conn);
+}
+
+/* The cached address is first for TS2021_ADDR_TTL_S from the NVS seed or
+ * from the by-name conn that reached it — a conn at it does not extend
+ * that — so an address that left the name's answer is not kept forever. */
+static void test_addr_ttl(void)
+{
+    addr_boot();
+    script(ESP_OK, RP_OK, false, 1, RP_OK);
+    script_addr(ESP_OK, RP_OK, false, 1, RP_OK);
+    esp_err_t rc = dial(true);
+    const bool first = rc == ESP_OK && strcmp(s_dials, "A80") == 0;
+    ts2021_close(&s_conn);
+    s_now_us += ((int64_t)TS2021_ADDR_TTL_S - 2) * 1000000;
+    script(ESP_OK, RP_OK, false, 1, RP_OK);
+    script_addr(ESP_OK, RP_OK, false, 1, RP_OK);
+    rc = dial(true);
+    const bool within = rc == ESP_OK && strcmp(s_dials, "A80") == 0;
+    ts2021_close(&s_conn);
+    s_now_us += 3 * 1000000;
+    script(ESP_OK, RP_OK, false, 1, RP_OK);
+    script_addr(ESP_OK, RP_OK, false, 1, RP_OK);
+    rc = dial(true);
+    check("dns_addr_ttl_seed_then_name",
+          first && within && rc == ESP_OK && strcmp(s_dials, "N80") == 0 &&
+          addr_is(s_addr, kNameV4) && !s_plain_off);
+    ts2021_close(&s_conn);
+    /* the name's answer is first for another TTL, then the name again */
+    s_now_us += ((int64_t)TS2021_ADDR_TTL_S - 2) * 1000000;
+    script(ESP_OK, RP_OK, false, 1, RP_OK);
+    script_addr(ESP_OK, RP_OK, false, 1, RP_OK);
+    rc = dial(true);
+    const bool renewed = rc == ESP_OK && strcmp(s_dials, "A80") == 0 &&
+                         strcmp(s_plain_host, "198.51.100.20") == 0;
+    ts2021_close(&s_conn);
+    s_now_us += 3 * 1000000;
+    script(ESP_OK, RP_OK, false, 1, RP_OK);
+    script_addr(ESP_OK, RP_OK, false, 1, RP_OK);
+    rc = dial(true);
+    check("dns_addr_ttl_renewed_by_the_name", renewed && rc == ESP_OK &&
+                                              strcmp(s_dials, "N80") == 0);
+    ts2021_close(&s_conn);
 }
 
 /* ---- Round 1.3.5: the one-shot request deadline ---------------------- */
@@ -1550,6 +1629,7 @@ int main(void)
     test_addr_80();
     test_addr_young_failure();
     test_addr_443();
+    test_addr_ttl();
     test_request_deadline();
     test_recycle_marked();
     if (s_srv_fd >= 0) close(s_srv_fd);

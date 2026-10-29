@@ -241,10 +241,12 @@ cheaper than dragging in another dependency.
   keyed by name — and the DNS answers these replace were never
   authenticated either. A stale or forged address (an attacker who can
   write NVS can also replace the pinned key) can only fail the attempt,
-  which is retried by name in the same connect, with a 3-s budget for
-  the address; the `:80 off` latch is decided on the name's failure
-  only, and a conn at the address that fails young sends the next dial
-  to the name. The records' host names are checked for host-name bytes
+  which is retried by name in the same connect, with a 3-s budget per
+  step at the address up to the end of the Noise handshake / DERP
+  login; the `:80 off` latch is decided on the name's failure only, a
+  conn at the address that fails young sends the next dial to the name,
+  and the control address is first for 10 min after the boot or the
+  by-name conn that reached it (then the name is resolved again). The records' host names are checked for host-name bytes
   on load (they reach the SNI and an HTTP Host header). STUN answers
   were never authenticated (the transaction ID is the check, as before).
   Host tests: `test_addr`, `test_ts2021` (`dns_*`).
