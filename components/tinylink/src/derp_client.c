@@ -12,6 +12,7 @@
 #include "tl_time.h"
 #include "esp_log.h"
 #include "esp_random.h"
+#include "lwip/sockets.h"
 #include "mbedtls/ssl.h"
 
 #include "tls_io.h"
@@ -84,6 +85,21 @@ static esp_err_t tls_write_full(esp_tls_t *tls, const uint8_t *buf, size_t len)
         return ESP_FAIL;
     }
     return ESP_OK;
+}
+
+/* TCP_NODELAY on the DERP conn (round 1.3.2, B8), same reasoning as
+ * ts2021_client.c: every write is a whole frame and relayed packets are
+ * latency-bound, so Nagle (holding a frame until the previous segment is
+ * ACKed) only ever added an RTT. Set after the TLS handshake; a failure
+ * only costs latency. */
+static void set_tcp_nodelay(esp_tls_t *tls)
+{
+    int fd = -1;
+    int one = 1;
+    if (esp_tls_get_conn_sockfd(tls, &fd) != ESP_OK || fd < 0 ||
+        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one)) != 0) {
+        ESP_LOGW(TAG, "TCP_NODELAY not set (fd=%d)", fd);
+    }
 }
 
 /* Read the HTTP/1.1 upgrade response one byte at a time until the
@@ -210,6 +226,7 @@ esp_err_t derp_client_connect_login(derp_client_t *out,
         derp_client_close(out);
         return ESP_FAIL;
     }
+    set_tcp_nodelay(out->tls);
     ESP_LOGI(TAG, "TLS up to %s:%u, sending HTTP upgrade", server_host, (unsigned)port);
 
     /* Build and send: GET /derp HTTP/1.1 + Upgrade: DERP. The Host
@@ -332,10 +349,45 @@ void derp_client_close(derp_client_t *c)
     }
 }
 
-/* Atomic-frame writer used both by the recv loop's pongs (via
- * derp_run_loop) and the public derp_client_send_packet. Holds
- * c->write_lock across header + payload so concurrent senders cannot
- * interleave and corrupt the wire framing. */
+/* Write one frame: header, then `key` (DERP_KEY_LEN bytes, NULL = none),
+ * then `payload`. Caller holds c->write_lock and has re-checked c->tls.
+ * Up to DERP_TX_STAGE_MAX of key + payload the frame is assembled in
+ * c->tx_stage and leaves as one write (one TLS record); anything bigger
+ * — nothing tinylink sends today — as separate writes, still atomic on
+ * the wire because the lock is held. */
+static int write_frame_locked(derp_client_t *c, derp_frame_type_t type,
+                              const uint8_t *key,
+                              const uint8_t *payload, size_t plen)
+{
+    const size_t klen = (key != NULL) ? DERP_KEY_LEN : 0;
+    const size_t body = klen + plen;
+    if (body <= DERP_TX_STAGE_MAX) {
+        uint8_t *f = c->tx_stage;
+        derp_write_frame_header(f, type, (uint32_t)body);
+        if (klen > 0) memcpy(f + DERP_FRAME_HDR_LEN, key, klen);
+        if (plen > 0) memcpy(f + DERP_FRAME_HDR_LEN + klen, payload, plen);
+        return tls_io_write_full(derp_tls_write_raw, c->tls, f,
+                                 DERP_FRAME_HDR_LEN + body,
+                                 DERP_MAX_IDLE_POLLS);
+    }
+    uint8_t hdr[DERP_FRAME_HDR_LEN];
+    derp_write_frame_header(hdr, type, (uint32_t)body);
+    int rc = tls_io_write_full(derp_tls_write_raw, c->tls, hdr, sizeof(hdr),
+                               DERP_MAX_IDLE_POLLS);
+    if (rc == 0 && klen > 0) {
+        rc = tls_io_write_full(derp_tls_write_raw, c->tls, key, klen,
+                               DERP_MAX_IDLE_POLLS);
+    }
+    if (rc == 0 && plen > 0) {
+        rc = tls_io_write_full(derp_tls_write_raw, c->tls, payload, plen,
+                               DERP_MAX_IDLE_POLLS);
+    }
+    return rc;
+}
+
+/* Atomic-frame writer used by the recv loop's pongs (via derp_run_loop).
+ * Holds c->write_lock across the whole frame so concurrent senders
+ * (derp_client_send_packet) cannot interleave and corrupt the framing. */
 static int derp_send_frame_locked(void *ctx, derp_frame_type_t type,
                                   const uint8_t *payload, size_t plen)
 {
@@ -343,20 +395,12 @@ static int derp_send_frame_locked(void *ctx, derp_frame_type_t type,
     if (c == NULL || c->tls == NULL) return -1;
     if (plen > 0xffffffffU) return -1;
 
-    uint8_t hdr[DERP_FRAME_HDR_LEN];
-    derp_write_frame_header(hdr, type, (uint32_t)plen);
-
     xSemaphoreTake(c->write_lock, portMAX_DELAY);
     if (c->tls == NULL) {           /* closed while we waited for the lock */
         xSemaphoreGive(c->write_lock);
         return -1;
     }
-    int rc = tls_io_write_full(derp_tls_write_raw, c->tls, hdr, sizeof(hdr),
-                               DERP_MAX_IDLE_POLLS);
-    if (rc == 0 && plen > 0) {
-        rc = tls_io_write_full(derp_tls_write_raw, c->tls, payload, plen,
-                               DERP_MAX_IDLE_POLLS);
-    }
+    int rc = write_frame_locked(c, type, NULL, payload, plen);
     xSemaphoreGive(c->write_lock);
     return rc;
 }
@@ -390,14 +434,9 @@ esp_err_t derp_client_send_packet(derp_client_t *c,
     }
     if (plen > DERP_MAX_PACKET) return ESP_ERR_INVALID_SIZE;
 
-    /* FrameSendPacket payload = dstPub[32] || packet[plen]. We hold
-     * the write lock across all three writes (header, dst_pub, packet)
-     * so the recv loop's pongs cannot land between chunks. */
-    const size_t total_payload = DERP_KEY_LEN + plen;
-    uint8_t hdr[DERP_FRAME_HDR_LEN];
-    derp_write_frame_header(hdr, DERP_FRAME_SEND_PACKET,
-                            (uint32_t)total_payload);
-
+    /* FrameSendPacket payload = dstPub[32] || packet[plen], one frame
+     * written under the write lock so the recv loop's pongs cannot land
+     * inside it. */
     xSemaphoreTake(c->write_lock, portMAX_DELAY);
     /* Re-validate under the lock: derp_client_close may have torn the
      * connection down between the unlocked pre-check above and here. */
@@ -405,16 +444,8 @@ esp_err_t derp_client_send_packet(derp_client_t *c,
         xSemaphoreGive(c->write_lock);
         return ESP_ERR_INVALID_STATE;
     }
-    int rc = tls_io_write_full(derp_tls_write_raw, c->tls, hdr, sizeof(hdr),
-                               DERP_MAX_IDLE_POLLS);
-    if (rc == 0) {
-        rc = tls_io_write_full(derp_tls_write_raw, c->tls, dst_pub,
-                               DERP_KEY_LEN, DERP_MAX_IDLE_POLLS);
-    }
-    if (rc == 0 && plen > 0) {
-        rc = tls_io_write_full(derp_tls_write_raw, c->tls, packet, plen,
-                               DERP_MAX_IDLE_POLLS);
-    }
+    int rc = write_frame_locked(c, DERP_FRAME_SEND_PACKET, dst_pub,
+                                packet, plen);
     xSemaphoreGive(c->write_lock);
     return (rc == 0) ? ESP_OK : ESP_FAIL;
 }
