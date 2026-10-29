@@ -33,7 +33,7 @@ islands keep the hot-path gains (lwIP checksum 21 → 9 µs per 1 500 B).
 ## Round A — Kconfig / one-liners (biggest win, lowest risk) → 1.3.1
 
 **Status (2026-10-28, branch `feat/opt-1.3.1`): implemented, hardware
-smoke pending.** Image 959 249 → 826 768 B (−132 481 B, −13.8 %),
+smoke clean (boot to WG 16.6 → 13.6 s), 6-h soak running.** Image 959 249 → 826 768 B (−132 481 B, −13.8 %),
 static IRAM 78 767 → 73 867 B, static DRAM 108 952 → 108 220 B. Host
 suite 633/0, 0 warnings, partition table byte-identical (app-only
 flash). Deviations from the table below, each verified against IDF

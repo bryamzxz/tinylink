@@ -15,7 +15,8 @@ then an independent review (its findings are folded in below). Image
 **959 249 → 826 768 B (−132 481 B, −13.8 %)**; static IRAM 78 767 →
 73 867 B; static DRAM 108 952 → 108 220 B. Host suite 633 OK / 0 FAIL,
 0 compiler warnings, partition table byte-identical (app-only flash).
-**Hardware smoke pending.**
+Flashed to the deployed sensor: boot to WG session **16.6 → 13.6 s**,
+hardware section at the end of this entry.
 
 - **-Os globally, -O2 where packets flow.** `COMPILER_OPTIMIZATION_SIZE`
   replaces IDF's -Og; tinylink, main and mbedcrypto stay -O2, and lwIP
@@ -62,6 +63,32 @@ then an independent review (its findings are folded in below). Image
 - Comment fixes in `sdkconfig.defaults` (TLS 1.2 only, ECDHE-ECDSA suite,
   current LE chain, Camellia gone / ARIA still linked, printf float,
   partition offsets, a no-op `SSL_MAX_CONTENT_LEN` line removed).
+
+#### Hardware (deployed sensor, app partition only; the 1.3.0 `ota_0` + `otadata` read back to `~/tinylink-backups/` first)
+
+`build_r131/tinylink.bin` (commit `e16ecf5`, 826 816 B) → 0x20000,
+hash verified; `otadata` untouched (seq 1 → `ota_0`). 180-s smoke at
+500 000 baud: `boots:1 panics:0 wdt:0 stream_ended:0`, boot line
+`tinylink 1.3.1 starting on sensor-cali (reset: power-on, 1)`, 0 E-level
+lines, only the usual warnings. Boot milestones against the 1.3.0
+smoke:
+
+| milestone | 1.3.0 | 1.3.1 |
+|---|---:|---:|
+| got IP (DHCP ARP probe gone, modem awake) | 4.4 s | 3.0 s |
+| register 200 | 8.8 s | 6.4 s |
+| initial netmap | 11.2 s | 8.2 s |
+| DERP login | 13.6 s | 10.0 s |
+| WG session up | 16.6 s | 13.6 s |
+
+Modem sleep switched on 13.5 s after Wi-Fi start (right after session
+up). The remaining ≈ 5 s before session up is the lost first INIT
+(round B). heap_free 60 324 → 62 692 B, largest block 47 104 → 51 200 B.
+Stack HWMs (B free): `tinylink_lp` 13 488 → 17 308 (nghttp2 buffer),
+`tinylink_tlm` 572 → 1 084 (same 3 524 B used — its peak is not a log
+call), `wifi` 616 → 1 008 (+120 B used under Log V2: the +512 was
+needed), `esp_timer` 5 292 → 4 572, `wg_rx` 2 052 → 2 084, `tiT`
+2 848 → 2 768. 6-h soak running.
 
 ### Upstream sync round 1.3.0 (2026-10-28, branch `feat/upstream-sync-2026-10`)
 
