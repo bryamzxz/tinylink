@@ -172,6 +172,12 @@ void ts2021_abort_reads(void)
     s_abort_reads = true;
 }
 
+/* A one-shot request past its deadline (ts2021_request_deadline). */
+static bool req_overdue(const ts2021_conn_t *c)
+{
+    return c->req_deadline_us != 0 && esp_timer_get_time() > c->req_deadline_us;
+}
+
 /* Transport shims for tls_io_*: esp_tls on :443, the socket on :80
  * (tls_io_sock_*: same return contract). The cast on the TLS write side
  * hides esp_tls_conn_write's `void *` (non-const) second parameter — we
@@ -180,6 +186,7 @@ static ssize_t ts2021_conn_read(void *ctx, uint8_t *buf, size_t len)
 {
     ts2021_conn_t *c = (ts2021_conn_t *)ctx;
     if (s_abort_reads) return TS2021_ERR_READ_ABORTED;
+    if (req_overdue(c)) return TS2021_ERR_REQ_DEADLINE;
     if (!c->plain) return esp_tls_conn_read(c->tls, buf, len);
     if (c->hs_deadline_us != 0 && esp_timer_get_time() > c->hs_deadline_us) {
         return TS2021_ERR_HS_DEADLINE;
@@ -189,21 +196,35 @@ static ssize_t ts2021_conn_read(void *ctx, uint8_t *buf, size_t len)
 static ssize_t ts2021_conn_write(void *ctx, const uint8_t *buf, size_t len)
 {
     ts2021_conn_t *c = (ts2021_conn_t *)ctx;
+    if (req_overdue(c)) return TS2021_ERR_REQ_DEADLINE;
     return c->plain ? tls_io_sock_write(c->sock, buf, len)
                     : esp_tls_conn_write(c->tls, (void *)buf, len);
 }
 
 /* Consecutive silent socket polls a read / write may sit out: the stream
- * budget, or one poll during the unauthenticated part of a :80 handshake. */
+ * budget, one poll during the unauthenticated part of a :80 handshake,
+ * or a one-shot request's share of its deadline. */
 static uint32_t idle_budget(const ts2021_conn_t *c)
 {
-    return c->hs_idle != 0 ? c->hs_idle : TS2021_MAX_IDLE_POLLS;
+    return c->hs_idle != 0 ? c->hs_idle : c->req_idle != 0 ? c->req_idle
+                                                            : TS2021_MAX_IDLE_POLLS;
 }
 
 /* The socket timeout behind one such poll. */
 static uint32_t poll_ms(const ts2021_conn_t *c)
 {
-    return c->hs_idle != 0 ? TS2021_PLAIN_TIMEOUT_MS : TLS_TIMEOUT_MS;
+    return c->hs_idle != 0 ? TS2021_PLAIN_TIMEOUT_MS :
+           c->req_idle != 0 ? TS2021_REQ_POLL_MS : TLS_TIMEOUT_MS;
+}
+
+/* A one-shot request ran out of time: one W line per request. */
+static void note_req_expired(ts2021_conn_t *c)
+{
+    if (!c->req_expired) {
+        ESP_LOGW(TAG, "control request: no answer within %d ms — dropping the conn",
+                 TS2021_REQ_TIMEOUT_MS);
+    }
+    c->req_expired = true;
 }
 
 static esp_err_t tls_read_full(ts2021_conn_t *c, uint8_t *buf, size_t need)
@@ -211,11 +232,17 @@ static esp_err_t tls_read_full(ts2021_conn_t *c, uint8_t *buf, size_t need)
     int rc = tls_io_read_full(ts2021_conn_read, c, buf, need, idle_budget(c));
     if (rc != 0) {
         if (rc == TS2021_ERR_READ_ABORTED) {
+            /* The one line a requested recycle logs (round 1.3.5): the
+             * HTTP/2 and map layers above stay below I for it. */
+            c->aborted = true;
             ESP_LOGI(TAG, "control stream read aborted on request (recycle)");
             return ESP_FAIL;
         }
         c->io_failed = true;
-        if (rc == TS2021_ERR_HS_DEADLINE ||
+        if (rc == TS2021_ERR_REQ_DEADLINE ||
+            (rc == TLS_IO_ERR_IDLE_TIMEOUT && c->req_idle != 0)) {
+            note_req_expired(c);
+        } else if (rc == TS2021_ERR_HS_DEADLINE ||
             (rc == TLS_IO_ERR_IDLE_TIMEOUT && c->hs_idle != 0)) {
             ESP_LOGW(TAG, ":80 handshake: no answer within %d ms",
                      TS2021_PLAIN_TIMEOUT_MS);
@@ -235,7 +262,12 @@ static esp_err_t tls_write_full(ts2021_conn_t *c, const uint8_t *buf, size_t len
     int rc = tls_io_write_full(ts2021_conn_write, c, buf, len, idle_budget(c));
     if (rc != 0) {
         c->io_failed = true;
-        ESP_LOGE(TAG, "tls_write_full failed: %d", rc);
+        if (rc == TS2021_ERR_REQ_DEADLINE ||
+            (rc == TLS_IO_ERR_IDLE_TIMEOUT && c->req_idle != 0)) {
+            note_req_expired(c);
+        } else {
+            ESP_LOGE(TAG, "tls_write_full failed: %d", rc);
+        }
         return ESP_FAIL;
     }
     return ESP_OK;
@@ -481,15 +513,22 @@ static esp_err_t consume_early_payload(ts2021_conn_t *c)
     return ESP_OK;
 }
 
-/* SO_RCVTIMEO / SO_SNDTIMEO to the stream's TLS_TIMEOUT_MS polls, after
- * a connect made with a 3-s budget: left at 3 s, the idle budget
- * (TS2021_MAX_IDLE_POLLS polls) would declare the long-poll dead after
- * 12 s of silence between KeepAlives. */
-static bool set_stream_timeouts(int fd)
+/* SO_RCVTIMEO / SO_SNDTIMEO: one socket poll of `ms`. */
+static bool set_socket_timeouts(int fd, uint32_t ms)
 {
-    struct timeval tv = { .tv_sec = TLS_TIMEOUT_MS / 1000, .tv_usec = 0 };
+    struct timeval tv = { .tv_sec = (time_t)(ms / 1000),
+                          .tv_usec = (suseconds_t)((ms % 1000) * 1000) };
     return fd >= 0 && setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) == 0 &&
            setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) == 0;
+}
+
+/* Back to the stream's TLS_TIMEOUT_MS polls after a connect made with a
+ * 3-s budget: left at 3 s, the idle budget (TS2021_MAX_IDLE_POLLS polls)
+ * would declare the long-poll dead after 12 s of silence between
+ * KeepAlives. */
+static bool set_stream_timeouts(int fd)
+{
+    return set_socket_timeouts(fd, TLS_TIMEOUT_MS);
 }
 
 /* Open the :443 transport: TLS, offering the session the previous :443
@@ -886,6 +925,28 @@ esp_err_t ts2021_connect(ts2021_conn_t *out,
                  (unsigned)((esp_timer_get_time() - t0) / 1000));
     }
     return err;
+}
+
+esp_err_t ts2021_request_deadline(ts2021_conn_t *c, uint32_t ms)
+{
+    if (c == NULL || !c->connected) return ESP_ERR_INVALID_STATE;
+    int fd = c->plain ? c->sock : -1;
+    if (!c->plain) (void)esp_tls_get_conn_sockfd(c->tls, &fd);
+    if (!set_socket_timeouts(fd, ms != 0 ? TS2021_REQ_POLL_MS : TLS_TIMEOUT_MS)) {
+        c->io_failed = true;
+        ESP_LOGW(TAG, "control request: socket timeouts not set (fd=%d)", fd);
+        return ESP_FAIL;
+    }
+    if (ms == 0) {
+        c->req_idle = 0;
+        c->req_deadline_us = 0;
+        return ESP_OK;
+    }
+    const uint32_t polls = (ms + TS2021_REQ_POLL_MS - 1) / TS2021_REQ_POLL_MS;
+    c->req_idle = (uint8_t)(polls > 0 && polls < 255 ? polls : 255);
+    c->req_expired = false;
+    c->req_deadline_us = esp_timer_get_time() + (int64_t)ms * 1000;
+    return ESP_OK;
 }
 
 /* Seal rec[4..4 + len) in place (the tag lands right behind it) and

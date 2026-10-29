@@ -167,12 +167,14 @@ test_noise_ik: test_noise_ik.c $(NOISE_SRCS) $(TL_SRC)/noise_ik.h $(CRYPTO)/secu
 # EarlyPayload window) and the connect over plain :80 with the :443
 # fallback (round 1.3.5, D10a: a real socketpair for :80, the :80
 # budget cut to 200 ms so the silent-server case stays fast), first at
-# the cached control address (round 1.3.5). Includes
+# the cached control address, and the one-shot request deadline (cut
+# to 300 ms in 100-ms polls; round 1.3.5). Includes
 # ts2021_client.c over a fake esp_tls; host_include/ supplies esp_tls.h,
 # esp_timer.h, lwip/sockets.h and friends.
 TS2021_DEFS := -DCONFIG_TINYLINK_CONTROL_HOST='"controlplane.test"' \
                -DCONFIG_TINYLINK_CONTROL_PORT=443 -DCONFIG_TINYLINK_STREAM_IDLE_TIMEOUT_S=120 \
-               -DCONFIG_TINYLINK_CONTROL_PLAIN_HTTP=1 -DTS2021_PLAIN_TIMEOUT_MS=200
+               -DCONFIG_TINYLINK_CONTROL_PLAIN_HTTP=1 -DTS2021_PLAIN_TIMEOUT_MS=200 \
+               -DTS2021_REQ_TIMEOUT_MS=300 -DTS2021_REQ_POLL_MS=100
 test_ts2021: test_ts2021.c $(TL_SRC)/ts2021_client.c $(TL_SRC)/ts2021_client.h \
              $(TL_SRC)/tls_io.c $(TL_SRC)/tls_resume.h $(TL_SRC)/tl_addr.h $(NOISE_SRCS) \
              host_include/esp_tls.h host_include/esp_timer.h

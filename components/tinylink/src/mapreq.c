@@ -1228,7 +1228,13 @@ static esp_err_t push_endpoints_in(ts2021_conn_t *conn,
                                  (const uint8_t *)body, (size_t)body_len,
                                  &status, resp, 256, &resp_len);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "endpoint push h2_post_json failed: 0x%x", err);
+        /* A recycle or the request deadline is logged once in ts2021
+         * (I / W), the consequence by the caller (round 1.3.5). */
+        if (conn->aborted || conn->req_expired) {
+            ESP_LOGD(TAG, "endpoint push left: %s", conn->aborted ? "recycle" : "deadline");
+        } else {
+            ESP_LOGE(TAG, "endpoint push h2_post_json failed: 0x%x", err);
+        }
         return err;
     }
     ESP_LOGI(TAG, "endpoint push: HTTP %d (resp %u B)",
@@ -1389,7 +1395,14 @@ static esp_err_t run_stream_in(ts2021_conn_t *conn,
                                         (size_t)body_len,
                                         &status, stream_chunk_cb, &s);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "h2_post_json_stream failed: 0x%x", err);
+        /* A requested recycle (endpoint push, IP change) is no error: its
+         * one line is ts2021's "control stream read aborted on request"
+         * (round 1.3.5; it logged two E lines here and in h2 before). */
+        if (conn->aborted) {
+            ESP_LOGD(TAG, "map stream left on request (recycle)");
+        } else {
+            ESP_LOGE(TAG, "h2_post_json_stream failed: 0x%x", err);
+        }
         return err;
     }
     if (status != 200) {

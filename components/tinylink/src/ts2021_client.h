@@ -56,6 +56,26 @@
 /* The read adapter's answer once a :80 handshake overran its deadline
  * (TS2021_PLAIN_TIMEOUT_MS after the TCP connect). */
 #define TS2021_ERR_HS_DEADLINE  (-0x10003)
+/* The read / write adapters' answer once a one-shot request overran its
+ * deadline (ts2021_request_deadline). */
+#define TS2021_ERR_REQ_DEADLINE (-0x10004)
+
+/* One-shot requests (register, the endpoint push — h2_post_json; not the
+ * map stream) get TS2021_REQ_TIMEOUT_MS from the moment they are sent
+ * until the response is complete, in TS2021_REQ_POLL_MS socket polls
+ * (round 1.3.5). Control answers them in ~0.2 s; without this they had
+ * the stream's budget — 4 × 30-s polls, sized for the map stream's ~60-s
+ * KeepAlives — and a 1.3.5 boot on the sensor sat 52 s in an endpoint
+ * push ("pushing endpoint" 9.77 s → "HTTP 200" 61.94 s, nothing logged
+ * in between). 10 s still covers a slow answer many times over; a poll
+ * of 2 s lets the deadline bite within 2 s of its time (a blocked read
+ * notices it only when its poll ends). */
+#ifndef TS2021_REQ_TIMEOUT_MS
+#define TS2021_REQ_TIMEOUT_MS   10000
+#endif
+#ifndef TS2021_REQ_POLL_MS
+#define TS2021_REQ_POLL_MS      2000
+#endif
 #define TS2021_RECORD_PLAINTEXT_MAX (TS2021_MAX_MESSAGE - TS2021_HEADER_LEN - NOISE_TAGLEN)
 /* The records we send (round 1.3.4, D4): header + ciphertext ≤ 2 048 B,
  * CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN, so each one is one TLS record. */
@@ -104,6 +124,18 @@ typedef struct {
      * 0.0.0.0 = unknown): the cached one it was dialed at, or the peer of
      * a by-name connect. tinylink.c keeps it for the next boot. */
     uint8_t           peer_v4[4];
+
+    /* One-shot request deadline (round 1.3.5, ts2021_request_deadline):
+     * while req_deadline_us != 0 each socket poll is TS2021_REQ_POLL_MS,
+     * req_idle of them in a row at most, and the adapters fail at the
+     * deadline. How the last failed transfer ended, for the layers above
+     * (their log levels): `aborted` — ts2021_abort_reads asked for it (a
+     * requested recycle, not a failure); `req_expired` — a one-shot
+     * request ran out of its deadline (logged once, here). */
+    uint8_t           req_idle;
+    bool              aborted;
+    bool              req_expired;
+    int64_t           req_deadline_us;
 
     /* (Round 1.3.4, D5: the 4 077-B `rx_residual` copy is gone. The
      * HTTP/2 bytes that follow the Noise handshake — after the optional
@@ -193,6 +225,19 @@ esp_err_t ts2021_connect(ts2021_conn_t *out,
  * counted against :80. Every conn that comes up replaces it with the
  * address it reached (out->peer_v4). */
 void ts2021_set_addr(const uint8_t ip_v4[4]);
+
+/* Arm (ms > 0) or disarm (0) the one-shot request deadline on a
+ * connected conn: the socket's SO_RCVTIMEO / SO_SNDTIMEO go to
+ * TS2021_REQ_POLL_MS — back to the stream's 30 s on disarm — and every
+ * read and write from now on fails with TS2021_ERR_REQ_DEADLINE once
+ * `ms` have passed (io_failed and req_expired set, one W line), so the
+ * caller drops the conn as after any transport failure; on :80 that is
+ * also an early drop (the next dial goes to :443). h2_post_json brackets
+ * each one-shot request with it; the map stream never arms it, so its
+ * first frame (a netmap can take ~11 s server-side) and its KeepAlives
+ * keep the stream budget. ESP_FAIL (io_failed) when the socket timeouts
+ * cannot be set: a conn left at the wrong poll period must not be used. */
+esp_err_t ts2021_request_deadline(ts2021_conn_t *c, uint32_t ms);
 
 /* Encrypt and write `data` as Noise transport records (msg type 4) of
  * ≤ TS2021_SMALL_PLAINTEXT_MAX bytes, sealed in a small stack record:

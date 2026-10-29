@@ -254,7 +254,11 @@ static esp_err_t h2_drive_request(ts2021_conn_t *conn,
     int rc = h2c_request(h, hdrs, sizeof(hdrs) / sizeof(hdrs[0]),
                          conn->h2_req_body, body_len);
     if (rc != H2C_OK) {
-        ESP_LOGE(TAG, "request send failed: %d", rc);
+        if (conn->req_expired) {
+            ESP_LOGD(TAG, "request send left: request deadline");
+        } else {
+            ESP_LOGE(TAG, "request send failed: %d", rc);
+        }
         return ESP_FAIL;
     }
     conn->h2_stream_id = (int32_t)h->s.id;
@@ -265,7 +269,15 @@ static esp_err_t h2_drive_request(ts2021_conn_t *conn,
     while (!h->s.closed && !h->s.stop) {
         size_t got = 0;
         if (ts2021_recv_record(conn, &got) != ESP_OK) {
-            ESP_LOGE(TAG, "stream read failed (stream %d)", (int)conn->h2_stream_id);
+            /* A requested recycle (ts2021_abort_reads) or a one-shot
+             * request past its deadline already has its one line in
+             * ts2021 (I / W); only a real read failure is an error here. */
+            if (conn->aborted || conn->req_expired) {
+                ESP_LOGD(TAG, "stream %d left: %s", (int)conn->h2_stream_id,
+                         conn->aborted ? "recycle requested" : "request deadline");
+            } else {
+                ESP_LOGE(TAG, "stream read failed (stream %d)", (int)conn->h2_stream_id);
+            }
             return ESP_FAIL;
         }
         rc = h2c_feed(h, conn->h2_rx, got);
@@ -316,7 +328,14 @@ esp_err_t h2_post_json(ts2021_conn_t *conn,
     conn->h2_resp_buf     = response_buf;
     conn->h2_resp_cap     = response_buf_size;
 
-    esp_err_t err = h2_drive_request(conn, path, authority, body_len);
+    /* A one-shot request has TS2021_REQ_TIMEOUT_MS from here to its last
+     * response byte (round 1.3.5), not the map stream's 120-s budget: on
+     * expiry it fails like a dropped conn — the callers (register,
+     * endpoint push) drop the conn and the next dial is fresh. */
+    esp_err_t err = ts2021_request_deadline(conn, TS2021_REQ_TIMEOUT_MS);
+    if (err == ESP_OK) err = h2_drive_request(conn, path, authority, body_len);
+    const esp_err_t derr = ts2021_request_deadline(conn, 0);
+    if (err == ESP_OK) err = derr;   /* not usable for a stream at 2-s polls */
 
     *status_out   = conn->h2_status;
     *response_len = conn->h2_resp_len;

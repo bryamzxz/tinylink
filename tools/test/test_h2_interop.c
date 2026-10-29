@@ -30,6 +30,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
+#include <sys/time.h>
 
 #include <nghttp2/nghttp2.h>
 
@@ -434,7 +436,29 @@ int esp_tls_conn_http_new_sync(const char *u, const esp_tls_cfg_t *c, esp_tls_t 
     return -1;
 }
 int esp_tls_conn_destroy(esp_tls_t *t) { (void)t; return 0; }
-esp_err_t esp_tls_get_conn_sockfd(esp_tls_t *t, int *fd) { (void)t; *fd = -1; return ESP_FAIL; }
+/* A real (unconnected) socket for the conn's SO_RCVTIMEO (round 1.3.5:
+ * a one-shot request runs on short polls, the stream on 30-s ones); each
+ * read records the poll it ran under. */
+static int s_sock_fd = -1;
+static int s_reads_short, s_reads_stream, s_reads_other;
+static long sock_poll_ms(void)
+{
+    struct timeval tv = { 0 };
+    socklen_t tl = sizeof(tv);
+    if (s_sock_fd < 0 || getsockopt(s_sock_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, &tl) != 0) return -1;
+    return (long)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+}
+esp_err_t esp_tls_get_conn_sockfd(esp_tls_t *t, int *fd)
+{
+    (void)t;
+    if (s_sock_fd < 0) {
+        s_sock_fd = socket(AF_INET, SOCK_STREAM, 0);
+        struct timeval tv = { .tv_sec = 30, .tv_usec = 0 };   /* as esp-tls leaves it */
+        setsockopt(s_sock_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    }
+    *fd = s_sock_fd;
+    return s_sock_fd >= 0 ? ESP_OK : ESP_FAIL;
+}
 /* ts2021_connect's :80 path, its dial by cached address and clock (round
  * 1.3.5) — not dialled here. */
 int esp_tls_conn_new_sync(const char *h, int hl, int p, const esp_tls_cfg_t *c, esp_tls_t *t)
@@ -475,6 +499,10 @@ static void seal_records(const uint8_t *p, size_t n)
 
 ssize_t esp_tls_conn_read(esp_tls_t *t, void *data, size_t len)
 {
+    const long poll = sock_poll_ms();
+    if (poll == TS2021_REQ_POLL_MS) s_reads_short++;
+    else if (poll == 30000) s_reads_stream++;
+    else s_reads_other++;
     if (t->s2c_off == t->s2c_len) {
         t->s2c_off = t->s2c_len = 0;
         size_t n = srv_output();
@@ -789,15 +817,34 @@ static void sc_sequence(void)
     S.sc = SC_OK;
     memcpy(S.resp, kOkBody, sizeof(kOkBody) - 1);
     S.resp_len = sizeof(kOkBody) - 1;
+#ifndef H2_REF
+    s_reads_short = s_reads_stream = s_reads_other = 0;
+#endif
     res_t r1 = post("/machine/register", kRegBody, sizeof(kRegBody) - 1, 4095);
     S.sc = SC_OK;
     S.resp_len = 2;
     memcpy(S.resp, "{}", 2);
     res_t r2 = post("/machine/map", kRegBody, sizeof(kRegBody) - 1, 256);
+#ifndef H2_REF
+    /* round 1.3.5: both one-shot requests read under the request
+     * deadline's short polls, disarmed afterwards; the stream after them
+     * reads under the stream's 30-s polls only */
+    const int oneshot_short = s_reads_short, oneshot_other = s_reads_stream + s_reads_other;
+    const bool disarmed = sock_poll_ms() == 30000 && s_conn.req_idle == 0 &&
+                          s_conn.req_deadline_us == 0 && !s_conn.req_expired;
+    s_reads_short = s_reads_stream = s_reads_other = 0;
+#endif
     S.sc = SC_STREAM;
     fill_mapresponses(2, 9000);
     S.chunk = 5000;
     res_t r3 = stream(kRegBody, sizeof(kRegBody) - 1);
+#ifndef H2_REF
+    check("deadline_oneshot_short_polls_then_disarmed",
+          oneshot_short > 0 && oneshot_other == 0 && disarmed);
+    check("deadline_stream_on_stream_polls",
+          s_reads_stream > 0 && s_reads_short == 0 && s_reads_other == 0 &&
+          s_conn.req_deadline_us == 0);
+#endif
     check("sequence_register_push_stream",
           r1.err == ESP_OK && r1.status == 200 && r2.err == ESP_OK && r2.status == 200 &&
           r2.len == 2 && r3.err == ESP_OK && r3.status == 200 && r3.len == S.resp_len &&

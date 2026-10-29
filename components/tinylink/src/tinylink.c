@@ -440,6 +440,7 @@ esp_err_t tinylink_register(void)
 }
 
 static void stun_boot_join(void);
+static volatile bool s_ep_push_pending;   /* the long-poll's push request, below */
 
 esp_err_t tinylink_dataplane_start(void)
 {
@@ -496,9 +497,14 @@ esp_err_t tinylink_dataplane_start(void)
         /* Drop the conn so the long-poll's next ensure_control_conn
          * gets a fresh one. Don't fail bringup — the long-poll path
          * will keep trying and may eventually succeed (or surface a
-         * different error). */
+         * different error). Since round 1.3.5 the push itself is retried
+         * there too, on the fresh conn before the stream: with the
+         * one-shot deadline a stalled push now fails after 10 s (it sat
+         * 52 s in one sensor boot), and nothing else would push an
+         * endpoint that does not change. */
         ESP_LOGW(TAG, "dataplane_start: mapreq_push_endpoints: 0x%x — "
-                      "endpoints not pushed; long-poll will run anyway", err);
+                      "the long-poll pushes after its connect", err);
+        s_ep_push_pending = true;
         drop_control_conn();
         return ESP_OK;
     }

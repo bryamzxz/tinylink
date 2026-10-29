@@ -59,7 +59,13 @@ static esp_err_t register_emit_in(ts2021_conn_t *conn,
      * (it used to sit in a dead stack frame; the buffer is long-lived). */
     tl_secure_zero(body, body_len);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "h2_post_json failed: 0x%x", err);
+        /* The request deadline (round 1.3.5) or a recycle has its line in
+         * ts2021; the register loop logs the retry. */
+        if (conn->req_expired || conn->aborted) {
+            ESP_LOGD(TAG, "register left: %s", conn->aborted ? "recycle" : "deadline");
+        } else {
+            ESP_LOGE(TAG, "h2_post_json failed: 0x%x", err);
+        }
         return err;
     }
     /* Only an answered request reports a status (register_retry_with_auth
