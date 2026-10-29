@@ -51,24 +51,42 @@ static esp_err_t wg_transmit(void *h, void *buffer, size_t len)
  * the ingress fix: just like `wg_rx_inject` calls `tcpip_input` to
  * skip the PPP `input_fn`, here we override `linkoutput` to ship the
  * raw IP payload straight to wg_netif. */
+/* Chained pbuf (rare: LWIP_NETIF_TX_SINGLE_PBUF=1 makes TCP and socket
+ * UDP build one pbuf per packet; IP fragments and raw-API callers can
+ * still chain). The encrypt needs contiguous bytes, so flatten into a
+ * fresh PBUF_RAM — not a stack scratch: until round 1.3.2 a 1 536-B
+ * array here put a 1 568-B frame on EVERY packet's path through this
+ * function (tiT 4.5 KiB, the telemetry task 4.5 KiB), the likely cause
+ * of the 2026-05 lwIP-task overflow (B13). Not a static either: no BSS
+ * for a path that almost never runs. pbuf_clone allocates from lwIP's
+ * own heap under the core lock every caller of linkoutput already holds
+ * (tiT, or a socket call under LOCK_TCPIP_CORE), and the clone lives
+ * only until send_plaintext has encrypted it into a TX slot. noinline
+ * keeps its locals out of the fast path's frame. */
+static __attribute__((noinline)) err_t wg_lwip_linkoutput_chained(struct pbuf *p)
+{
+    /* Same bound the old scratch had (wg_netif's wire buffer is 1 536 B;
+     * send_plaintext rejects anything that does not fit) — checked
+     * before allocating so a bogus tot_len never reaches the heap. */
+    if (p->tot_len > 1536) return ERR_BUF;
+    struct pbuf *flat = pbuf_clone(PBUF_RAW, PBUF_RAM, p);
+    if (flat == NULL) return ERR_MEM;
+    esp_err_t err = wg_netif_send_plaintext((const uint8_t *)flat->payload,
+                                            flat->len);
+    pbuf_free(flat);
+    return (err == ESP_OK) ? ERR_OK : ERR_IF;
+}
+
 static err_t wg_lwip_linkoutput(struct netif *netif, struct pbuf *p)
 {
     (void)netif;
-    /* Single-segment pbuf is the common case for our 1280-MTU packets.
-     * For the rare chained pbuf, copy into a contiguous scratch — the
-     * encrypt path needs contiguous bytes anyway. */
+    /* Single-segment pbuf is the common case for our 1280-MTU packets. */
     if (p->next == NULL) {
         esp_err_t err = wg_netif_send_plaintext((const uint8_t *)p->payload,
                                                 p->len);
         return (err == ESP_OK) ? ERR_OK : ERR_IF;
     }
-    uint8_t __attribute__((aligned(4))) scratch[1536];
-    if (p->tot_len > sizeof(scratch)) return ERR_BUF;
-    if (pbuf_copy_partial(p, scratch, p->tot_len, 0) != p->tot_len) {
-        return ERR_BUF;
-    }
-    esp_err_t err = wg_netif_send_plaintext(scratch, p->tot_len);
-    return (err == ESP_OK) ? ERR_OK : ERR_IF;
+    return wg_lwip_linkoutput_chained(p);
 }
 
 /* lwIP IPv4 output for our raw-IP tunnel netif. The pbuf already has
