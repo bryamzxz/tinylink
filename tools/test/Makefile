@@ -101,9 +101,12 @@ test_curve25519: test_curve25519.c $(CRYPTO)/curve25519.c $(CRYPTO)/curve25519_d
 test_mapresp: test_mapresp.c $(TL_SRC)/mapreq.c $(TL_SRC)/netmap.h $(TL_SRC)/jsmn.h $(TL_SRC)/jsmn_split.h
 	$(CC) $(CFLAGS) -I$(TL_SRC) -o $@ test_mapresp.c $(TL_SRC)/mapreq.c
 
-# RFC 8439 §2.4.2 — ChaCha20 keystream KAT.
-test_chacha20: test_chacha20.c $(CRYPTO)/chacha20.c $(CRYPTO)/chacha20.h
-	$(CC) $(CFLAGS) -I$(CRYPTO) -o $@ test_chacha20.c $(CRYPTO)/chacha20.c
+# RFC 8439 §2.3.2 / §2.4.2 / A.1 / A.2 + HChaCha20 KATs, and a
+# differential test against the 1.3.2 ChaCha20 (ref/chacha20_132.c,
+# linked as ref_* through ref/chacha20_ref.c) — round 1.3.3, C4.
+test_chacha20: test_chacha20.c $(CRYPTO)/chacha20.c $(CRYPTO)/chacha20.h \
+               ref/chacha20_ref.c ref/chacha20_132.c
+	$(CC) $(CFLAGS) -I$(CRYPTO) -o $@ test_chacha20.c $(CRYPTO)/chacha20.c ref/chacha20_ref.c
 
 # RFC 8439 §2.5.2 — poly1305-donna one-time-MAC KAT.
 test_poly1305: test_poly1305.c $(CRYPTO)/poly1305_donna.c $(CRYPTO)/poly1305_donna.h $(CRYPTO)/poly1305_donna_32.h

@@ -11,6 +11,7 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 
+#include "crypto/chacha20.h"
 #include "crypto/chacha20poly1305.h"
 
 static const char *TAG = "bench-aead";
@@ -119,6 +120,22 @@ static void bench_cold(const char *label, size_t mlen, uint32_t iters)
              (unsigned)(enc_us / iters), (unsigned)(dec_us / iters), rc, (unsigned)sink);
 }
 
+/* The keystream half of the MTU number alone (round 1.3.3, C4), so the
+ * ChaCha20 and Poly1305 shares can be told apart across builds. */
+static void bench_chacha20(size_t mlen, uint32_t iters)
+{
+    struct chacha20_ctx ctx;
+    int64_t t0 = esp_timer_get_time();
+    for (uint32_t i = 0; i < iters; ++i) {
+        chacha20_init(&ctx, s_key, i);
+        chacha20(&ctx, s_ct, s_pt, (uint32_t)mlen);
+    }
+    int64_t us = esp_timer_get_time() - t0;
+    ESP_LOGI(TAG, "chacha20 mlen=%4u iters=%4u | %u ns/call, %u ns/B",
+             (unsigned)mlen, (unsigned)iters,
+             (unsigned)((us * 1000) / iters), (unsigned)((us * 1000) / iters / mlen));
+}
+
 esp_err_t tinylink_bench_aead(void)
 {
     /* Fixed inputs: we want bit-identical work across builds so two
@@ -156,8 +173,22 @@ esp_err_t tinylink_bench_aead(void)
         static const uint8_t tag[16] = { 0x1a,0xe1,0x0b,0x59,0x4f,0x09,0xe2,0x6a,0x7e,0x90,0x2e,0xcb,0xd0,0x60,0x06,0x91 };
         uint8_t out[114 + 16];
         chacha20poly1305_encrypt(out, (const uint8_t *)pt, 114, ad, sizeof(ad), k, n12);
-        const bool ok = memcmp(out, ct_head, 16) == 0 && memcmp(out + 114, tag, 16) == 0;
-        ESP_LOGI(TAG, "RFC 8439 2.8.2 KAT: %s", ok ? "OK" : "MISMATCH");
+        bool ok = memcmp(out, ct_head, 16) == 0 && memcmp(out + 114, tag, 16) == 0;
+        /* Both ChaCha20 paths (round 1.3.3, C4): word-aligned buffers take
+         * the fused block → XOR loop for every full block, others the
+         * keystream + byte-assembly one; the tag covers every ciphertext
+         * byte. The 1500-B round trip above cannot tell: it decrypts with
+         * the same keystream it encrypted with. */
+        memcpy(s_pt, pt, 114);
+        chacha20poly1305_encrypt(s_ct, s_pt, 114, ad, sizeof(ad), k, n12);
+        const bool ok_al = memcmp(s_ct, ct_head, 16) == 0 && memcmp(s_ct + 114, tag, 16) == 0;
+        memmove(s_pt + 1, s_pt, 114);
+        chacha20poly1305_encrypt(s_ct + 3, s_pt + 1, 114, ad, sizeof(ad), k, n12);
+        const bool ok_un = memcmp(s_ct + 3, ct_head, 16) == 0 && memcmp(s_ct + 3 + 114, tag, 16) == 0;
+        ESP_LOGI(TAG, "RFC 8439 2.8.2 KAT: %s (aligned %s, unaligned %s)", ok ? "OK" : "MISMATCH",
+                 ok_al ? "OK" : "MISMATCH", ok_un ? "OK" : "MISMATCH");
+        ok = ok && ok_al && ok_un;
+        for (int i = 0; i < BENCH_MAX_PT; ++i) s_pt[i] = (uint8_t)(i & 0xff);
         if (!ok) return ESP_FAIL;
     }
 
@@ -171,6 +202,7 @@ esp_err_t tinylink_bench_aead(void)
     bench_one("mtu",   1500,   500);
     bench_cold("cold", 64, 50);
     bench_cold("cold", 1500, 50);
+    bench_chacha20(1500, 500);
 
     return ESP_OK;
 }

@@ -83,104 +83,95 @@ static const uint32_t CHACHA20_CONSTANT_4 = 0x6b206574;
 #define PLUS(v, w)   (U32V((v) + (w)))
 #define PLUSONE(v)   (PLUS((v), 1))
 
-/* 2.1. The ChaCha Quarter Round (RFC 8439). */
-#define QUARTERROUND(a, b, c, d)                  \
-    a += b;  d ^= a;  d = ROTL32(d, 16);          \
-    c += d;  b ^= c;  b = ROTL32(b, 12);          \
-    a += b;  d ^= a;  d = ROTL32(d,  8);          \
-    c += d;  b ^= c;  b = ROTL32(b,  7)
-
-/* One double round (column + diagonal). Force-inlined: at -O2 GCC left
- * this out of line and the 10 calls per block compiled to 10× `l32r` +
- * `callx8` (-mlongcalls) plus 10 windowed `entry`/`retw` pairs, each a
- * potential window-overflow exception on the deep wg_rx → transport →
- * AEAD call chain. With a single inlined body inside a counted loop the
- * rounds run under one Xtensa zero-overhead `loop` with no calls. */
-/* Xtensa note (ISA RM §8.3.2, table 8-246): a constant rotate is the
+/* 2.1. The ChaCha Quarter Round (RFC 8439):
+ *   a += b; d ^= a; d <<<= 16;   c += d; b ^= c; b <<<= 12;
+ *   a += b; d ^= a; d <<<=  8;   c += d; b ^= c; b <<<=  7;
+ * applied to the columns (0,4,8,12) (1,5,9,13) (2,6,10,14) (3,7,11,15)
+ * and then the diagonals (0,5,10,15) (1,6,11,12) (2,7,8,13) (3,4,9,14).
+ *
+ * Xtensa note (ISA RM §8.3.2, table 8-246): a constant rotate is the
  * two-instruction idiom `ssai n; src ax, ay, ay` — the amount lives in
- * the special register SAR. Running the four quarter-rounds of a half
- * round in LOCKSTEP (step 1 of all four columns, then step 2 of all
- * four, …) puts four rotates by the same amount back to back, so the
- * compiler can set SAR once per step instead of once per rotate: 8
- * `ssai` per double round instead of 32. Same arithmetic, same order
- * of operations within each quarter-round. */
-/* Rotation primitive. GCC emits `ssai n; src d, d, d` for every constant
- * rotate and — verified on the 2026-09 objects — never merges the SAR
- * writes of four consecutive rotates by the same amount (64 `ssai` per
- * double round, one per `src`). On Xtensa we therefore set SAR by hand
- * once per lockstep step (ISA RM: rotl(v, n) = SRC v,v with SAR = 32-n;
+ * the special register SAR, and GCC never merges the SAR writes of
+ * consecutive rotates by the same amount (one `ssai` per `src`, verified
+ * on the 2026-09 objects). So SAR is set by hand once per step of
+ * quarter-rounds run in lockstep (rotl(v, n) = SRC v,v with SAR = 32-n:
  * "left funnel shifts are done by swapping the operands and setting SAR
- * to 32 minus the shift amount") and issue bare `src` per rotate: 8
- * `ssai` per double round instead of 32. Both asm statements are
- * volatile, so their relative order is preserved; nothing else in this
- * translation unit touches SAR (no variable shifts). Hosts / other
- * targets keep the plain C rotate. */
+ * to 32 minus the shift amount") and each rotate is a bare `src`. Both
+ * asm statements are volatile, so their relative order is preserved;
+ * nothing else in this translation unit touches SAR (no variable or
+ * 64-bit shifts). Hosts / other targets keep the plain C rotate. */
 #if defined(__XTENSA__)
 #define SET_SAR_ROTL(n)  __asm__ volatile ("ssai %0" : : "i"(32 - (n)))
-#define ROTL_SAR(v)      ({ uint32_t _r; \
+#define ROTL_SAR(v, n)   ({ uint32_t _r; \
                             __asm__ volatile ("src %0, %1, %1" : "=a"(_r) : "a"(v)); \
                             _r; })
 #else
 #define SET_SAR_ROTL(n)  do { } while (0)
-#define ROTL_SAR_N(v, n) ROTL32((v), (n))
+#define ROTL_SAR(v, n)   ROTL32((v), (n))
 #endif
 
-#if defined(__XTENSA__)
-#define QR_STEP(a, b, c, d, n)  a += b;  d ^= a;  d = ROTL_SAR(d)
-#define QR_STEP2(a, b, c, d, n) c += d;  b ^= c;  b = ROTL_SAR(b)
-#else
-#define QR_STEP(a, b, c, d, n)  a += b;  d ^= a;  d = ROTL_SAR_N(d, n)
-#define QR_STEP2(a, b, c, d, n) c += d;  b ^= c;  b = ROTL_SAR_N(b, n)
-#endif
+#define QR_STEP(a, b, c, d, n)  a += b;  d ^= a;  d = ROTL_SAR(d, n)
+#define QR_STEP2(a, b, c, d, n) c += d;  b ^= c;  b = ROTL_SAR(b, n)
 
-#define HALF_ROUND(x, a0,b0,c0,d0, a1,b1,c1,d1, a2,b2,c2,d2, a3,b3,c3,d3)      \
-    SET_SAR_ROTL(16);                                                           \
-    QR_STEP (x[a0],x[b0],x[c0],x[d0],16); QR_STEP (x[a1],x[b1],x[c1],x[d1],16); \
-    QR_STEP (x[a2],x[b2],x[c2],x[d2],16); QR_STEP (x[a3],x[b3],x[c3],x[d3],16); \
-    SET_SAR_ROTL(12);                                                           \
-    QR_STEP2(x[a0],x[b0],x[c0],x[d0],12); QR_STEP2(x[a1],x[b1],x[c1],x[d1],12); \
-    QR_STEP2(x[a2],x[b2],x[c2],x[d2],12); QR_STEP2(x[a3],x[b3],x[c3],x[d3],12); \
-    SET_SAR_ROTL(8);                                                            \
-    QR_STEP (x[a0],x[b0],x[c0],x[d0], 8); QR_STEP (x[a1],x[b1],x[c1],x[d1], 8); \
-    QR_STEP (x[a2],x[b2],x[c2],x[d2], 8); QR_STEP (x[a3],x[b3],x[c3],x[d3], 8); \
-    SET_SAR_ROTL(7);                                                            \
-    QR_STEP2(x[a0],x[b0],x[c0],x[d0], 7); QR_STEP2(x[a1],x[b1],x[c1],x[d1], 7); \
-    QR_STEP2(x[a2],x[b2],x[c2],x[d2], 7); QR_STEP2(x[a3],x[b3],x[c3],x[d3], 7)
+/* Two quarter-rounds in lockstep (round 1.3.3, C4). Until 1.3.2 all four
+ * quarter-rounds of a half round ran in lockstep on a uint32_t[16]
+ * (8 `ssai` per double round), which needs all 16 state words live at
+ * every step: with a0 (return address) and a1 (stack) taken, the
+ * windowed ABI leaves 14 address registers, so GCC kept the array on
+ * the stack — 35 a1-relative loads/stores per double round. Pairs keep
+ * 8 words hot while the other 8 sit idle (the compiler parks the few
+ * that do not fit), for 16 `ssai` per double round: 19 spills, −18 %
+ * instructions per block (measured, Xtensa GCC 14.2 -O2). */
+#define QR_PAIR(a0, b0, c0, d0, a1, b1, c1, d1)                           \
+    SET_SAR_ROTL(16);                                                     \
+    QR_STEP (a0, b0, c0, d0, 16); QR_STEP (a1, b1, c1, d1, 16);           \
+    SET_SAR_ROTL(12);                                                     \
+    QR_STEP2(a0, b0, c0, d0, 12); QR_STEP2(a1, b1, c1, d1, 12);           \
+    SET_SAR_ROTL(8);                                                      \
+    QR_STEP (a0, b0, c0, d0,  8); QR_STEP (a1, b1, c1, d1,  8);           \
+    SET_SAR_ROTL(7);                                                      \
+    QR_STEP2(a0, b0, c0, d0,  7); QR_STEP2(a1, b1, c1, d1,  7)
 
-static inline __attribute__((always_inline)) void INNER_BLOCK(uint32_t *block) {
-    /* columns */
-    HALF_ROUND(block, 0,4,8,12,  1,5,9,13,  2,6,10,14,  3,7,11,15);
-    /* diagonals */
-    HALF_ROUND(block, 0,5,10,15, 1,6,11,12, 2,7,8,13,   3,4,9,14);
-}
+/* 2.3. The ChaCha20 block function on scalar locals, with the final
+ * "state += working state" fused into the output:
+ *   out[i] = in[i] ^ (rounds(st)[i] + st[i])   (in != NULL: encrypt)
+ *   out[i] =          rounds(st)[i] + st[i]    (in == NULL: keystream)
+ * `in` is a constant NULL or a pointer at each inlined call site, so the
+ * test folds away. The fused form is the C4 gain beyond the pairs: the
+ * keystream block is never stored to the stack and re-read (the 1.3.2
+ * code wrote it out, then XORed it in a second loop — 10 instructions
+ * per word against 5 here).
+ *
+ * Force-inlined into its callers so the words stay in registers; the 10
+ * double rounds are a counted loop rather than unrolled (the body is
+ * ~130 instructions, above GCC's complete-unroll threshold at -O2, so
+ * it stays a loop: one copy, fixed trip count, no data-dependent
+ * control flow). At -O2 GCC left the old double round out of line and
+ * the 10 calls per block compiled to `l32r` + `callx8` + windowed
+ * `entry`/`retw` each; always_inline keeps that from coming back. */
+static inline __attribute__((always_inline))
+void chacha20_block(uint32_t out[16], const uint32_t *in, const uint32_t st[16])
+{
+    uint32_t x0 = st[0],   x1 = st[1],   x2 = st[2],   x3 = st[3];
+    uint32_t x4 = st[4],   x5 = st[5],   x6 = st[6],   x7 = st[7];
+    uint32_t x8 = st[8],   x9 = st[9],   x10 = st[10], x11 = st[11];
+    uint32_t x12 = st[12], x13 = st[13], x14 = st[14], x15 = st[15];
 
-/* 20 rounds = 10 double rounds. A counted loop rather than 10 textual
- * calls: the body is ~100 instructions, well above GCC's complete-unroll
- * threshold at -O2, so it stays a loop — one copy in the I-cache/flash
- * cache instead of ten, and fixed trip count (no data-dependent
- * control flow). */
-#define TWENTY_ROUNDS(x)                                   \
-    do {                                                   \
-        for (int _r = 0; _r < 10; ++_r) INNER_BLOCK(x);    \
-    } while (0)
-
-/* Keystream block as 16 little-endian words. Word-typed on purpose: the
- * writer below and the XOR reader both touch it with plain l32i/s32i,
- * and reading a uint32_t[] through a uint8_t* (for the tail bytes) is
- * always legal, whereas the reverse is not. */
-static TL_HOT_ATTR void chacha20_block(struct chacha20_ctx *ctx, uint32_t stream[16]) {
-    uint32_t working_state[16];
-    int i;
-
-    for (i = 0; i < 16; ++i) {
-        working_state[i] = ctx->state[i];
+    for (int r = 10; r != 0; --r) {
+        /* columns */
+        QR_PAIR(x0, x4, x8,  x12,  x1, x5, x9,  x13);
+        QR_PAIR(x2, x6, x10, x14,  x3, x7, x11, x15);
+        /* diagonals */
+        QR_PAIR(x0, x5, x10, x15,  x1, x6, x11, x12);
+        QR_PAIR(x2, x7, x8,  x13,  x3, x4, x9,  x14);
     }
 
-    TWENTY_ROUNDS(working_state);
-
-    for (i = 0; i < 16; ++i) {
-        stream[i] = PLUS(working_state[i], ctx->state[i]);
-    }
+#define BLOCK_OUT(i, x) out[i] = (in ? in[i] : 0u) ^ PLUS((x), st[i])
+    BLOCK_OUT(0, x0);   BLOCK_OUT(1, x1);   BLOCK_OUT(2, x2);   BLOCK_OUT(3, x3);
+    BLOCK_OUT(4, x4);   BLOCK_OUT(5, x5);   BLOCK_OUT(6, x6);   BLOCK_OUT(7, x7);
+    BLOCK_OUT(8, x8);   BLOCK_OUT(9, x9);   BLOCK_OUT(10, x10); BLOCK_OUT(11, x11);
+    BLOCK_OUT(12, x12); BLOCK_OUT(13, x13); BLOCK_OUT(14, x14); BLOCK_OUT(15, x15);
+#undef BLOCK_OUT
 }
 
 /* Little-endian u32 load/store from a pointer of UNKNOWN alignment,
@@ -208,17 +199,15 @@ static inline void store32_le_unaligned(uint8_t *p, uint32_t v) {
     p[3] = (uint8_t)(v >> 24);
 }
 
-/* Hot path: XOR one keystream block into the data, a word at a time.
+/* XOR one keystream block (16 LE words) into n <= 64 bytes. Used for
+ * the last partial block and for buffers that are not word-aligned;
+ * aligned full blocks take the fused loop in chacha20() instead.
  *
  * Two loops, selected once per call on the ACTUAL alignment of in/out:
- *   - aligned:   __builtin_assume_aligned lets GCC emit one l32i, one
- *                xor and one s32i per word — no aliasing games, no UB.
- *                This is the path every WireGuard packet takes: the
- *                transport payload sits at offset 16 of a word-aligned
- *                packet buffer (wg_netif.c) and lwIP pbuf payloads are
- *                MEM_ALIGNMENT(4)-aligned.
+ *   - aligned:   l32i + xor + s32i per word (a partial last block of an
+ *                aligned buffer: every WireGuard packet ends here);
  *   - unaligned: register-only byte assembly (above), for callers that
- *                hand us an odd offset (DISCO / DERP scratch, tests).
+ *                hand us an odd offset (scratch buffers, tests).
  * The branch is on buffer ADDRESSES, never on data, so timing stays
  * independent of the key/plaintext. */
 static inline void xor_block_u32(uint8_t *out, const uint8_t *in,
@@ -256,23 +245,38 @@ static inline void xor_block_u32(uint8_t *out, const uint8_t *in,
 }
 
 TL_HOT_ATTR void chacha20(struct chacha20_ctx *ctx, uint8_t *out, const uint8_t *in, uint32_t len) {
-    /* Keystream block; word-typed so it is 4-byte aligned by
-     * construction (Xtensa requires it for l32i/s32i). */
-    uint32_t output[CHACHA20_BLOCK_SIZE / 4];
-
-    if (len) {
-        for (;;) {
-            chacha20_block(ctx, output);
+    /* Aligned full blocks: one fused pass per block straight into out[]
+     * (in place is fine: word i is read before it is written). Every
+     * WireGuard packet takes this path for all but its last block (the
+     * transport payload sits at offset 16 of a word-aligned packet
+     * buffer, wg_netif.c, and lwIP pbuf payloads are
+     * MEM_ALIGNMENT(4)-aligned). Branches are on lengths and buffer
+     * addresses only. */
+    if (((((uintptr_t)out) | ((uintptr_t)in)) & 3u) == 0) {
+        const uint32_t *ai = __builtin_assume_aligned(in, 4);
+        uint32_t       *ao = __builtin_assume_aligned(out, 4);
+        for (; len >= CHACHA20_BLOCK_SIZE; len -= CHACHA20_BLOCK_SIZE) {
+            chacha20_block(ao, ai, ctx->state);
             ctx->state[12] = PLUSONE(ctx->state[12]);
-            if (len <= 64) {
-                xor_block_u32(out, in, output, len);
-                return;
-            }
-            xor_block_u32(out, in, output, 64);
-            len -= 64;
-            out += 64;
-            in += 64;
+            ai += 16;
+            ao += 16;
         }
+        in = (const uint8_t *)ai;
+        out = (uint8_t *)ao;
+    }
+
+    /* The last partial block, and every block of a buffer that is not
+     * word-aligned: keystream block, then XOR. Word-typed so it is
+     * 4-byte aligned by construction (Xtensa requires it for l32i). */
+    uint32_t ks[CHACHA20_BLOCK_SIZE / 4];
+    while (len) {
+        chacha20_block(ks, NULL, ctx->state);
+        ctx->state[12] = PLUSONE(ctx->state[12]);
+        const uint32_t n = len < CHACHA20_BLOCK_SIZE ? len : CHACHA20_BLOCK_SIZE;
+        xor_block_u32(out, in, ks, n);
+        len -= n;
+        out += n;
+        in += n;
     }
 }
 
@@ -318,14 +322,17 @@ void hchacha20(uint8_t *out, const uint8_t *nonce, const uint8_t *key) {
     state[14] = U8TO32_LITTLE(nonce +  8);
     state[15] = U8TO32_LITTLE(nonce + 12);
 
-    TWENTY_ROUNDS(state);
+    /* HChaCha20 is the 20 rounds without the feed-forward add: take the
+     * block and subtract the state back out (cold path, one block). */
+    uint32_t x[16];
+    chacha20_block(x, NULL, state);
 
-    U32TO8_LITTLE(out +  0, state[ 0]);
-    U32TO8_LITTLE(out +  4, state[ 1]);
-    U32TO8_LITTLE(out +  8, state[ 2]);
-    U32TO8_LITTLE(out + 12, state[ 3]);
-    U32TO8_LITTLE(out + 16, state[12]);
-    U32TO8_LITTLE(out + 20, state[13]);
-    U32TO8_LITTLE(out + 24, state[14]);
-    U32TO8_LITTLE(out + 28, state[15]);
+    U32TO8_LITTLE(out +  0, x[ 0] - state[ 0]);
+    U32TO8_LITTLE(out +  4, x[ 1] - state[ 1]);
+    U32TO8_LITTLE(out +  8, x[ 2] - state[ 2]);
+    U32TO8_LITTLE(out + 12, x[ 3] - state[ 3]);
+    U32TO8_LITTLE(out + 16, x[12] - state[12]);
+    U32TO8_LITTLE(out + 20, x[13] - state[13]);
+    U32TO8_LITTLE(out + 24, x[14] - state[14]);
+    U32TO8_LITTLE(out + 28, x[15] - state[15]);
 }
