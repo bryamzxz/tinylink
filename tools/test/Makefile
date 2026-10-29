@@ -31,9 +31,13 @@ TARGETS := test_blake2s test_curve25519 test_mapresp \
            test_disco_handler test_disco_prober test_retry_after \
            test_backoff test_keys_regen test_skip_value test_jsmn_split \
            test_tai64n test_nacl_box test_tsmp test_tl_date \
-           test_ctrl_json
+           test_http1 test_ctrl_json
 
 all: $(TARGETS)
+
+# HTTP/1.1 response parser behind the TOFU GET /key (round 1.3.2). Header-only.
+test_http1: test_http1.c $(TL_SRC)/tl_http1.h
+	$(CC) $(CFLAGS) -I$(TL_SRC) -o $@ test_http1.c
 
 # cJSON replacement on the control plane (round 1.3.2): top-level JSON
 # reader + escaping writer, RegisterRequest bytes pinned to cJSON's.
@@ -249,7 +253,10 @@ test: test_blake2s.run test_curve25519.run test_mapresp.run \
       test_retry_after.run test_backoff.run test_keys_regen.run \
       test_skip_value.run test_jsmn_split.run test_tai64n.run \
       test_nacl_box.run test_tsmp.run test_tl_date.run \
-      test_ctrl_json.run
+      test_http1.run test_ctrl_json.run
+
+test_http1.run: test_http1
+	$(RUNNER) ./test_http1
 
 test_ctrl_json.run: test_ctrl_json
 	$(RUNNER) ./test_ctrl_json

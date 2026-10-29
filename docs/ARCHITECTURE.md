@@ -561,7 +561,7 @@ The original M1-only layout, kept for historical reference:
 |                        machine+node regenerate ATOMICALLY      |
 |                        (1:1 binding, policy in keys_regen.h),  |
 |                        disco independent                       |
-|     control_key.c    — HTTPS GET /key + NVS pinning            |
+|     control_key.c    — HTTPS GET /key (esp_tls) + NVS pinning  |
 |     ts2021_client.c  — TLS, HTTP Upgrade, Noise framing        |
 |     register.c       — RegisterRequest JSON + response parse   |
 |     noise_ik.c       — Noise_IK_25519_ChaChaPoly_BLAKE2s SM    |

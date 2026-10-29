@@ -50,7 +50,6 @@ idf_component_register(
         esp_event
         esp_netif
         esp-tls
-        esp_http_client
         esp_driver_i2c
         lwip
         mbedtls
