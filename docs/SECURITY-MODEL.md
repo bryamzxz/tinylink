@@ -230,6 +230,24 @@ cheaper than dragging in another dependency.
   a full handshake tolerates certificate dates (`tl_time.h`); a session
   from that window can be resumed after the sync, i.e. it lives as long
   as an open conn would have.
+- **Last-known server addresses** (`tl_addr.h`, NVS `tl_state/derp_node`
+  and `ctl_addr`): the control conn dials the address of the last conn
+  that came up, the DERP supervisor and the STUN probes the home DERP
+  node's IPv4 from the DERP map (which arrives over the Noise channel),
+  before any DNS. An address only decides where the SYN goes: on :80
+  the server must still complete Noise IK with the pinned key, on :443
+  and DERP the chain is verified against the host *name* (esp-tls
+  `common_name` → SNI + `mbedtls_ssl_set_hostname`), TLS sessions stay
+  keyed by name — and the DNS answers these replace were never
+  authenticated either. A stale or forged address (an attacker who can
+  write NVS can also replace the pinned key) can only fail the attempt,
+  which is retried by name in the same connect, with a 3-s budget for
+  the address; the `:80 off` latch is decided on the name's failure
+  only, and a conn at the address that fails young sends the next dial
+  to the name. The records' host names are checked for host-name bytes
+  on load (they reach the SNI and an HTTP Host header). STUN answers
+  were never authenticated (the transaction ID is the check, as before).
+  Host tests: `test_addr`, `test_ts2021` (`dns_*`).
 
 ## Audit + optimization round (2026-09) — memory safety + upstream drift
 
