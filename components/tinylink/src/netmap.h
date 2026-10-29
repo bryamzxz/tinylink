@@ -31,7 +31,13 @@ extern "C" {
 #endif
 
 #define TL_MAX_PEERS            4
+/* Per-frame caps for the delta lists. Overflowing either one sets the
+ * matching *_overflow flag and the streaming caller recycles the stream
+ * for a full netmap instead of applying a partial delta. headscale folds
+ * one batching tick into a single frame (a5d5e838, 7a2335dc), so these
+ * can be exceeded by mass changes — rare, and the full map is correct. */
 #define TL_MAX_PEERS_REMOVED    8
+#define TL_MAX_PEER_PATCHES     4
 #define TL_MAX_PEER_ENDPOINTS   4
 #define TL_MAX_PEER_ADDRESSES   2
 /* Tailscale ships 28 DERP regions today (mia/region 16 is the closest
@@ -74,6 +80,24 @@ typedef struct {
     tl_cidr_t     addresses[TL_MAX_PEER_ADDRESSES];
 } tl_peer_t;
 
+/* One tailcfg.PeerChange (PeersChangedPatch entry), reduced to the
+ * fields the data plane consumes. Applied by NodeID to a peer already in
+ * the caller's table (upstream map.go updatePeersStateFromResponse);
+ * a patch for an unknown NodeID is ignored, like upstream. headscale
+ * sends peer endpoint/DERP changes (59f3ff12) and peer re-logins /
+ * tailscaled restarts (Key / DiscoKey, NodeKeyRotated) this way. */
+typedef struct {
+    uint64_t      id;                              /* NodeID */
+    bool          has_key;
+    uint8_t       node_pub[TINYLINK_KEY_LEN];
+    bool          has_disco;
+    uint8_t       disco_pub[TINYLINK_KEY_LEN];
+    bool          has_endpoints;                   /* Endpoints present → replace */
+    size_t        n_endpoints;
+    tl_endpoint_t endpoints[TL_MAX_PEER_ENDPOINTS];
+    int           derp_region;                     /* 0 = unchanged */
+} tl_peer_patch_t;
+
 typedef struct {
     int      region_id;
     char     hostname[TL_DERP_HOSTNAME_LEN];
@@ -91,6 +115,17 @@ typedef struct {
     uint64_t  self_id;
     size_t    n_self_addresses;
     tl_cidr_t self_addresses[TL_MAX_PEER_ADDRESSES];
+    /* Self node expiry. `self_expired` = explicit "Expired":true;
+     * `self_key_expiry` = KeyExpiry as Unix seconds, 0 when absent or the
+     * Go zero time (= never expires). headscale ≥0.29.4 answers the map
+     * stream of a deleted node with HTTP 200 and a single self node
+     * {"Key","KeyExpiry":"1970-01-01T00:00:01Z","Expired":true}
+     * (noise.go, juanfont/headscale#3410) instead of a 404, and keeps an
+     * expired node's stream open with Expired set; upstream clients go to
+     * NeedsLogin on either (capver 53: respects Expired, derives it from
+     * KeyExpiry). The streaming caller re-registers. */
+    bool      self_expired;
+    int64_t   self_key_expiry;
 
     /* Peers. `peers_is_delta` = the array came from PeersChanged (an
      * upsert into the caller's peer table) rather than Peers (a full
@@ -103,6 +138,10 @@ typedef struct {
     bool      peers_is_delta;
     size_t    n_removed;
     uint64_t  removed_ids[TL_MAX_PEERS_REMOVED];
+    bool      removed_overflow;
+    size_t          n_patches;
+    tl_peer_patch_t patches[TL_MAX_PEER_PATCHES];
+    bool            patches_overflow;
 
     /* DERP map (M5) */
     size_t           n_derp_regions;
@@ -111,20 +150,6 @@ typedef struct {
     /* Bookkeeping for the streaming caller. */
     bool    have_self;
     bool    have_derp_map;
-
-    /* Set when the frame carried a PeersChangedPatch entry touching a
-     * peer's "Key" or "DiscoKey". tinylink does not implement delta
-     * merge (single-peer deployments get full peers on every state
-     * change of consequence — except this one: headscale ≥0.29.2 and
-     * tailscale.com deliver PEER RE-LOGIN, i.e. a NodeKey/DiscoKey
-     * rotation, as a patch). Ignoring such a patch leaves the data
-     * plane handshaking against the peer's dead keys until the next
-     * full netmap, which on a healthy stream may be hours away. The
-     * streaming caller reacts by recycling the stream — the first
-     * frame of the reconnect is always a full netmap. Endpoint-only
-     * patches stay ignored (DISCO/CMM handles endpoint discovery,
-     * same as upstream). */
-    bool    patch_identity_changed;
 } tl_netmap_t;
 
 void tl_netmap_clear(tl_netmap_t *nm);

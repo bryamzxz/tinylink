@@ -37,7 +37,8 @@ static uint64_t      s_last_sync_s;
 
 /* IDF's bundle verify callback is a non-static symbol in
  * esp_crt_bundle.c but not declared in its public header; the project
- * pins ESP-IDF v5.5.4, where the signature is exactly this. */
+ * pins ESP-IDF v5.5.6 (identical in v5.5.4), where the signature is
+ * exactly this. */
 extern int esp_crt_verify_callback(void *buf, mbedtls_x509_crt *const crt,
                                    const int depth, uint32_t *const flags);
 

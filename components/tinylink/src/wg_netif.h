@@ -55,6 +55,11 @@ struct wg_netif_peer_config {
     uint8_t  preshared_key[WG_KEY_LEN];     /* zero if no PSK */
     uint32_t peer_endpoint_v4_be;           /* big-endian (network) IPv4 */
     uint16_t peer_endpoint_port;            /* host order */
+    /* Tailnet (inner) IPv4 of this node and of the peer, network order:
+     * src/dst of the TSMP disco-key advertisement sent after every
+     * completed handshake (capver 144). 0 = unknown → no advertisement. */
+    uint32_t self_tailnet_v4_be;
+    uint32_t peer_tailnet_v4_be;
 };
 
 struct wg_netif_local_config {
@@ -85,6 +90,16 @@ esp_err_t wg_netif_start(const struct wg_netif_peer_config *peer);
  * live session. This is what hot-update from MapResponse calls when
  * the peer has roamed. */
 esp_err_t wg_netif_update_peer_endpoint(uint32_t v4_be, uint16_t port);
+
+/* Apply a peer identity change reported by control (headscale sends it
+ * as a PeersChangedPatch: every tailscaled restart rotates the DiscoKey,
+ * a re-login rotates the NodeKey). `disco_pub` NULL = unchanged. A new
+ * DiscoKey re-arms the DISCO pre-filter, the relayed-DISCO gate and the
+ * cached NaCl shared key; a new static key also restarts the session
+ * with a cold handshake. Computes X25519 in the caller's task — call it
+ * from a task with a few KiB of stack headroom (long-poll), not wg_rx. */
+esp_err_t wg_netif_update_peer_keys(const uint8_t static_pub[WG_KEY_LEN],
+                                    const uint8_t *disco_pub);
 
 /* Encrypt and send a plaintext IP packet through the tunnel. Returns
  * ESP_ERR_INVALID_STATE if no transport session is up yet. */
@@ -223,14 +238,6 @@ int wg_netif_get_socket(void);
  * of the two would receive a given datagram). */
 bool wg_netif_rx_running(void);
 
-/* Copy the active WG peer's DiscoKey into out (WG_KEY_LEN bytes) and
- * return true if one is known (has_peer_disco_pub). Returns false (and
- * leaves out untouched) when no peer DiscoKey is configured yet — the
- * caller should then treat all DISCO senders as permissive, matching
- * the direct-path roaming gate. Exposed so the DERP-relayed DISCO
- * handler in tinylink.c can apply the same knownPeerDiscoKey gate the
- * direct UDP path applies in handle_disco_direct, instead of acting on
- * a PING/CallMeMaybe sealed by any tailnet node's DiscoKey. */
 /* /stats snapshot (M16). */
 typedef struct {
     int      state;                  /* wg_netif_state_t */
@@ -238,6 +245,7 @@ typedef struct {
     uint32_t cold_handshakes;
     uint32_t rx_stale_events;
     uint32_t roams;
+    uint32_t disco_adverts;          /* TSMP disco-key adverts sent (capver 144) */
     uint64_t tx_drops;
     uint64_t relayed_stale;
     uint64_t relay_errors;
@@ -247,6 +255,14 @@ typedef struct {
 
 void wg_netif_get_stats(wg_netif_stats_t *out);
 
+/* Copy the active WG peer's DiscoKey into out (WG_KEY_LEN bytes) and
+ * return true if one is known (has_peer_disco_pub). Returns false (and
+ * leaves out untouched) when no peer DiscoKey is configured yet — the
+ * caller should then treat all DISCO senders as permissive, matching
+ * the direct-path roaming gate. Exposed so the DERP-relayed DISCO
+ * handler in tinylink.c can apply the same knownPeerDiscoKey gate the
+ * direct UDP path applies in handle_disco_direct, instead of acting on
+ * a PING/CallMeMaybe sealed by any tailnet node's DiscoKey. */
 bool wg_netif_get_peer_disco_pub(uint8_t out[WG_KEY_LEN]);
 
 #ifdef __cplusplus

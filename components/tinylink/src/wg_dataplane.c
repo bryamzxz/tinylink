@@ -26,7 +26,17 @@ static const char *TAG = "wg";
 static bool     s_started;
 static char     s_endpoint_host[64];   /* string form of last applied endpoint */
 static uint16_t s_endpoint_port;
-static uint8_t  s_peer_node_pub[32];   /* node_pub of the peer we handshook with */
+/* Identity of the peer the session runs against. Tracked by NodeID (the
+ * stable handle; upstream keys its peer map by it too) so a re-login
+ * (new NodeKey) or a tailscaled restart (new DiscoKey) reported by
+ * control is applied to the live session instead of being mistaken for
+ * a different peer. NodeID 0 (never sent by real control) falls back to
+ * NodeKey matching. */
+static uint64_t s_peer_id;
+static uint8_t  s_peer_node_pub[32];
+static uint8_t  s_peer_disco_pub[32];
+static bool     s_peer_has_disco;
+static uint32_t s_self_v4_be;           /* tunnel-side IPv4 the netif was attached with */
 
 /* Parse "1.2.3.4/32" → host out + numeric prefix length. Tailscale
  * always assigns each node a /32 host route, but parse defensively. */
@@ -41,6 +51,23 @@ static int parse_cidr(const char *cidr, char *host_out, size_t host_size,
     host_out[hlen] = '\0';
     *prefix_out = atoi(slash + 1);
     if (*prefix_out < 0 || *prefix_out > 32) return -1;
+    return 0;
+}
+
+/* First single-host IPv4 (x.x.x.x/32) in a node's Addresses, network
+ * order, or 0 if there is none. That is the address the peer's
+ * AllowedIPs and peerForIP() resolve — the src/dst a TSMP disco advert
+ * must carry to be accepted. */
+static uint32_t first_host_v4(const tl_cidr_t *addrs, size_t n)
+{
+    for (size_t i = 0; i < n; i++) {
+        char     host[16];
+        int      prefix = 0;
+        uint32_t v4_be = 0;
+        if (parse_cidr(addrs[i].str, host, sizeof(host), &prefix) != 0) continue;
+        if (prefix != 32) continue;
+        if (inet_pton(AF_INET, host, &v4_be) == 1) return v4_be;
+    }
     return 0;
 }
 
@@ -210,7 +237,7 @@ static bool peer_has_directly_reachable_endpoint(const tl_peer_t *peer,
  * reach. Prefer the first peer with at least one cross-NAT public
  * endpoint; fall back to peers[0] when no peer qualifies (DERP-relay
  * territory — that's the M5+ work). */
-static const tl_peer_t *select_target_peer(const tl_netmap_t *nm)
+static const tl_peer_t *select_target_peer(const tl_peer_t *peers, size_t n_peers)
 {
     uint8_t  our_addr[4];
     uint16_t our_port_unused;
@@ -220,8 +247,8 @@ static const tl_peer_t *select_target_peer(const tl_netmap_t *nm)
         memcpy(&our_v4_be, our_addr, sizeof(our_v4_be));
     }
 
-    for (size_t i = 0; i < nm->n_peers; i++) {
-        const tl_peer_t *p = &nm->peers[i];
+    for (size_t i = 0; i < n_peers; i++) {
+        const tl_peer_t *p = &peers[i];
         if (peer_has_directly_reachable_endpoint(p, have_our_public, our_v4_be)) {
             if (i != 0) {
                 const char *addr = (p->n_addresses > 0)
@@ -237,27 +264,28 @@ static const tl_peer_t *select_target_peer(const tl_netmap_t *nm)
      * CGNAT scenario. Fall through to peers[0]; direct path will fail
      * but we keep the legacy behavior so DERP-relay (M5+) can take
      * over once it lands. */
-    if (nm->n_peers > 0) {
+    if (n_peers > 0) {
         ESP_LOGW(TAG, "no peer has a cross-NAT public endpoint; "
                       "falling back to peers[0] — DERP relay required for ping");
     }
-    return &nm->peers[0];
+    return &peers[0];
 }
 
 esp_err_t wg_dataplane_start(const tinylink_keys_t *keys,
-                             const tl_netmap_t *nm)
+                             const tl_cidr_t *self_addrs, size_t n_self,
+                             const tl_peer_t *peers, size_t n_peers)
 {
-    if (keys == NULL || nm == NULL) return ESP_ERR_INVALID_ARG;
+    if (keys == NULL || self_addrs == NULL || peers == NULL) return ESP_ERR_INVALID_ARG;
     if (s_started) return ESP_ERR_INVALID_STATE;
-    if (nm->n_peers == 0) {
+    if (n_peers == 0) {
         ESP_LOGE(TAG, "no peers in netmap");
         return ESP_ERR_INVALID_STATE;
     }
-    if (nm->n_self_addresses == 0) {
+    if (n_self == 0) {
         ESP_LOGE(TAG, "self has no v4 address");
         return ESP_ERR_INVALID_STATE;
     }
-    const tl_peer_t *peer = select_target_peer(nm);
+    const tl_peer_t *peer = select_target_peer(peers, n_peers);
     if (peer->n_endpoints == 0) {
         ESP_LOGE(TAG, "peer has no v4 endpoint — DERP-only path is M5");
         return ESP_ERR_NOT_SUPPORTED;
@@ -266,9 +294,9 @@ esp_err_t wg_dataplane_start(const tinylink_keys_t *keys,
     /* Local v4 (tunnel side). */
     char self_ip_str[16];
     int  self_prefix = 32;
-    if (parse_cidr(nm->self_addresses[0].str,
+    if (parse_cidr(self_addrs[0].str,
                    self_ip_str, sizeof(self_ip_str), &self_prefix) != 0) {
-        ESP_LOGE(TAG, "self CIDR malformed: %s", nm->self_addresses[0].str);
+        ESP_LOGE(TAG, "self CIDR malformed: %s", self_addrs[0].str);
         return ESP_ERR_INVALID_ARG;
     }
     uint32_t local_ip_be = 0;
@@ -320,6 +348,9 @@ esp_err_t wg_dataplane_start(const tinylink_keys_t *keys,
     }
     peer_cfg.peer_endpoint_v4_be = peer_v4_be;
     peer_cfg.peer_endpoint_port  = s_endpoint_port;
+    peer_cfg.self_tailnet_v4_be  = first_host_v4(self_addrs, n_self);
+    peer_cfg.peer_tailnet_v4_be  = first_host_v4(peer->addresses,
+                                                 peer->n_addresses);
     err = wg_netif_start(&peer_cfg);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "wg_netif_start: %s", esp_err_to_name(err));
@@ -338,13 +369,22 @@ esp_err_t wg_dataplane_start(const tinylink_keys_t *keys,
     }
 
     s_started = true;
+    s_self_v4_be = local_ip_be;
+    s_peer_id = peer->id;
     memcpy(s_peer_node_pub, peer->node_pub, sizeof(s_peer_node_pub));
+    memcpy(s_peer_disco_pub, peer->disco_pub, sizeof(s_peer_disco_pub));
+    s_peer_has_disco = peer->has_disco_pub;
     const char *peer_ts_ip = (peer->n_addresses > 0) ? peer->addresses[0].str
                                                      : "(no-ts-ip)";
     ESP_LOGI(TAG, "WG bringup (tinylink_wg): self=%s/%d peer=%s @ %s:%u",
              self_ip_str, self_prefix, peer_ts_ip,
              s_endpoint_host, (unsigned)s_endpoint_port);
     return ESP_OK;
+}
+
+uint32_t wg_dataplane_self_v4(void)
+{
+    return s_started ? s_self_v4_be : 0;
 }
 
 esp_err_t wg_dataplane_peer_is_up(void)
@@ -361,34 +401,52 @@ void wg_dataplane_stop(void)
     s_started = false;
 }
 
-esp_err_t wg_dataplane_update_peer(const tinylink_keys_t *keys,
-                                   const tl_netmap_t *nm)
-{
-    if (keys == NULL || nm == NULL) return ESP_ERR_INVALID_ARG;
-    if (nm->n_peers == 0) return ESP_OK;
-    /* Not started yet — go through the full bring-up (which runs
-     * select_target_peer itself). */
-    if (!s_started) return wg_dataplane_start(keys, nm);
-    return wg_dataplane_update_peers(keys, nm->peers, nm->n_peers);
-}
-
 esp_err_t wg_dataplane_update_peers(const tinylink_keys_t *keys,
                                     const tl_peer_t *peers, size_t n_peers)
 {
     if (keys == NULL || peers == NULL) return ESP_ERR_INVALID_ARG;
     if (!s_started || n_peers == 0) return ESP_OK;
 
-    /* Lock onto the peer we handshook with by matching s_peer_node_pub.
+    /* Lock onto the peer we handshook with — by NodeID, see s_peer_id.
      * Re-running select_target_peer here could pick a different peer
      * mid-session, which would point encrypted traffic at a peer that
      * holds different keys. Roaming the *endpoint* of the same peer is
      * fine; switching peers is not — leave the live session alone. */
     const tl_peer_t *peer = NULL;
     for (size_t i = 0; i < n_peers; i++) {
-        if (memcmp(peers[i].node_pub, s_peer_node_pub,
-                   sizeof(s_peer_node_pub)) == 0) {
+        const bool same = (s_peer_id != 0)
+            ? peers[i].id == s_peer_id
+            : memcmp(peers[i].node_pub, s_peer_node_pub,
+                     sizeof(s_peer_node_pub)) == 0;
+        if (same) {
             peer = &peers[i];
             break;
+        }
+    }
+    if (peer != NULL) {
+        /* Same peer, new identity keys: a re-login (NodeKey) or a
+         * tailscaled restart (DiscoKey, every start). Without this the
+         * DISCO filters kept the boot-time DiscoKey forever and a
+         * re-logged peer left the session dead until our reboot. */
+        const bool static_changed =
+            memcmp(peer->node_pub, s_peer_node_pub, sizeof(s_peer_node_pub)) != 0;
+        const bool disco_changed = peer->has_disco_pub &&
+            (!s_peer_has_disco ||
+             memcmp(peer->disco_pub, s_peer_disco_pub, sizeof(s_peer_disco_pub)) != 0);
+        if (static_changed || disco_changed) {
+            ESP_LOGI(TAG, "peer identity changed (%s%s%s) — updating session",
+                     static_changed ? "NodeKey" : "",
+                     static_changed && disco_changed ? " + " : "",
+                     disco_changed ? "DiscoKey" : "");
+            esp_err_t kerr = wg_netif_update_peer_keys(
+                peer->node_pub, disco_changed ? peer->disco_pub : NULL);
+            if (kerr == ESP_OK) {
+                memcpy(s_peer_node_pub, peer->node_pub, sizeof(s_peer_node_pub));
+                if (disco_changed) {
+                    memcpy(s_peer_disco_pub, peer->disco_pub, sizeof(s_peer_disco_pub));
+                    s_peer_has_disco = true;
+                }
+            }
         }
     }
     if (peer == NULL || peer->n_endpoints == 0) {

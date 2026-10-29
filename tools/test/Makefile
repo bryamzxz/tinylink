@@ -30,9 +30,17 @@ TARGETS := test_blake2s test_curve25519 test_mapresp \
            test_wg_demux test_disco test_stun test_tls_io test_derp \
            test_disco_handler test_disco_prober test_retry_after \
            test_backoff test_keys_regen test_skip_value test_jsmn_split \
-           test_tai64n test_nacl_box
+           test_tai64n test_nacl_box test_tsmp test_tl_date
 
 all: $(TARGETS)
+
+# RFC 3339 / IMF-fixdate parsers (KeyExpiry, Retry-After). Header-only.
+test_tl_date: test_tl_date.c $(TL_SRC)/tl_date.h
+	$(CC) $(CFLAGS) -I$(TL_SRC) -o $@ test_tl_date.c
+
+# TSMP disco-key advertisement builder (capver 144). Header-only.
+test_tsmp: test_tsmp.c $(TL_SRC)/tsmp.h
+	$(CC) $(CFLAGS) -I$(TL_SRC) -o $@ test_tsmp.c
 
 # Pure exponential-backoff-with-jitter helper (RC-2). Header-only.
 test_backoff: test_backoff.c $(TL_INC)/backoff.h
@@ -195,7 +203,7 @@ test_derp: test_derp.c \
 # HTTP/2 Retry-After header parser (RFC 7231 §7.1.3 delta-seconds).
 # Header-only; the test just compiles the .c against the .h. No platform
 # deps, no crypto.
-test_retry_after: test_retry_after.c $(TL_SRC)/h2_retry_after.h
+test_retry_after: test_retry_after.c $(TL_SRC)/h2_retry_after.h $(TL_SRC)/tl_date.h
 	$(CC) $(CFLAGS) -I$(TL_SRC) -o $@ test_retry_after.c
 
 # WG transport (data plane) — encrypt/decrypt + RFC 6479 anti-replay.
@@ -233,7 +241,7 @@ test: test_blake2s.run test_curve25519.run test_mapresp.run \
       test_derp.run test_disco_handler.run test_disco_prober.run \
       test_retry_after.run test_backoff.run test_keys_regen.run \
       test_skip_value.run test_jsmn_split.run test_tai64n.run \
-      test_nacl_box.run
+      test_nacl_box.run test_tsmp.run test_tl_date.run
 
 test_blake2s.run: test_blake2s
 	$(RUNNER) ./test_blake2s
@@ -246,6 +254,12 @@ test_mapresp.run: test_mapresp
 
 test_chacha20.run: test_chacha20
 	$(RUNNER) ./test_chacha20
+
+test_tl_date.run: test_tl_date
+	$(RUNNER) ./test_tl_date
+
+test_tsmp.run: test_tsmp
+	$(RUNNER) ./test_tsmp
 
 test_backoff.run: test_backoff
 	$(RUNNER) ./test_backoff

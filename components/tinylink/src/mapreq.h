@@ -62,6 +62,12 @@ esp_err_t mapreq_push_endpoints(ts2021_conn_t *conn,
  * Returns when the stream closes (server EOF or transport error). The
  * caller is expected to retry on a slow cadence.
  */
+/* `on_netmap` returning MAPREQ_STREAM_RECYCLE ends the stream at once
+ * (mapreq_run_stream returns an error and the caller reconnects or
+ * re-registers); any other return value is ignored and the stream goes
+ * on. Used for a self node that control marks expired/deleted. Outside
+ * the ESP-IDF error ranges on purpose. */
+#define MAPREQ_STREAM_RECYCLE ((esp_err_t)0x7e01)
 typedef esp_err_t (*mapreq_handler_t)(const tl_netmap_t *nm, void *ctx);
 
 esp_err_t mapreq_run_stream(ts2021_conn_t *conn,

@@ -25,6 +25,7 @@
 #include "tl_wdt.h"
 #include "disco_handler.h"
 #include "disco_prober.h"
+#include "tsmp.h"
 #include "wg_demux.h"
 #include "wg_handshake.h"
 #include "wg_transport.h"
@@ -292,6 +293,7 @@ static struct {
     uint32_t                stat_cold_handshakes;
     uint32_t                stat_rx_stale;
     uint32_t                stat_roams;
+    uint32_t                stat_disco_adverts;   /* TSMP adverts queued */
 
     /* Outbound TX queue + worker. The worker drains in non-TCPIP
      * context so sendto can re-enter lwIP safely. tx_done_sem is
@@ -533,13 +535,40 @@ static bool handle_handshake_response_locked(const uint8_t *buf, size_t len)
     return true;
 }
 
+/* Capver 144: tailscaled advertises its disco key in-tunnel on every new
+ * keypair (wireguard-go receive.go → magicsock sendTSMPDiscoAdvertisement,
+ * tailscale 3799eaf26 + b87203b83). tinylink is initiator-only, so every
+ * completed handshake — cold or rekey, direct or DERP-relayed response —
+ * is a new keypair. The advert is also the first transport packet under
+ * the new keys, so the peer confirms the keypair at once instead of on
+ * the next telemetry frame. Best effort like upstream: a full TX queue
+ * drops it. Skipped when either tailnet address is unknown or the peer
+ * has no DiscoKey (WireGuard-only peers never get one). */
+static void send_disco_advert(void)
+{
+    if (!g.peer.has_peer_disco_pub ||
+        g.peer.self_tailnet_v4_be == 0 || g.peer.peer_tailnet_v4_be == 0) {
+        return;
+    }
+    uint8_t __attribute__((aligned(4))) pkt[TSMP_DISCO_ADVERT_LEN];
+    const size_t n = tsmp_build_disco_advert(pkt, sizeof(pkt),
+                                             g.peer.self_tailnet_v4_be,
+                                             g.peer.peer_tailnet_v4_be,
+                                             g.local.disco_pub);
+    if (wg_netif_send_plaintext(pkt, n) == ESP_OK) {
+        g.stat_disco_adverts++;
+    }
+}
+
 /* Serialized entry point — see g.hs_lock. Returns true when the response
- * was accepted (session up / rekeyed). */
+ * was accepted (session up / rekeyed). The disco advert goes out after
+ * hs_lock is released: it only needs g.lock (inside send_plaintext). */
 static bool handle_handshake_response(const uint8_t *buf, size_t len)
 {
     xSemaphoreTake(g.hs_lock, portMAX_DELAY);
     const bool ok = handle_handshake_response_locked(buf, len);
     xSemaphoreGive(g.hs_lock);
+    if (ok) send_disco_advert();
     return ok;
 }
 
@@ -608,8 +637,37 @@ static bool handle_transport(const uint8_t *buf, size_t len)
  * reply on g.sock back to that exact src so the response traverses the
  * same NAT mappings as the request (which is how peer A learns its own
  * public AddrPort works to reach us). */
+/* The WG peer's DISCO identity, snapshotted under g.lock per frame: the
+ * long-poll task swaps it when control reports a new DiscoKey
+ * (wg_netif_update_peer_keys — every peer tailscaled restart). */
+typedef struct {
+    bool    has_pub;
+    bool    k_valid;
+    uint8_t pub[WG_KEY_LEN];
+    uint8_t k[WG_KEY_LEN];
+} disco_peer_snap_t;
+
+static void handle_disco_direct_snap(const uint8_t *buf, size_t len,
+                                     const struct sockaddr_in *src,
+                                     const disco_peer_snap_t *peer);
+
 static void handle_disco_direct(const uint8_t *buf, size_t len,
                                 const struct sockaddr_in *src)
+{
+    disco_peer_snap_t peer;
+    xSemaphoreTake(g.lock, portMAX_DELAY);
+    peer.has_pub = g.peer.has_peer_disco_pub;
+    peer.k_valid = g.peer_disco_shared_k_valid;
+    memcpy(peer.pub, g.peer.peer_disco_pub, WG_KEY_LEN);
+    memcpy(peer.k, g.peer_disco_shared_k, WG_KEY_LEN);
+    xSemaphoreGive(g.lock);
+    handle_disco_direct_snap(buf, len, src, &peer);
+    tl_secure_zero(peer.k, sizeof(peer.k));
+}
+
+static void handle_disco_direct_snap(const uint8_t *buf, size_t len,
+                                     const struct sockaddr_in *src,
+                                     const disco_peer_snap_t *peer)
 {
     uint8_t reply[DISCO_HANDLER_REPLY_MAX];
     disco_msg_type_t type = (disco_msg_type_t)0;
@@ -626,10 +684,10 @@ static void handle_disco_direct(const uint8_t *buf, size_t len,
      * per packet under a UDP flood at our public AddrPort. Models
      * upstream tailscale's `c.peerMap.knownPeerDiscoKey(sender)` check
      * at `wgengine/magicsock/magicsock.go:2170-2177`. */
-    if (g.peer.has_peer_disco_pub &&
+    if (peer->has_pub &&
         len >= DISCO_MAGIC_LEN + DISCO_KEY_LEN) {
         const uint8_t *sender_pub = buf + DISCO_MAGIC_LEN;
-        if (memcmp(sender_pub, g.peer.peer_disco_pub, DISCO_KEY_LEN) != 0) {
+        if (memcmp(sender_pub, peer->pub, DISCO_KEY_LEN) != 0) {
             ESP_LOGD(TAG,
                 "drop DISCO from unknown DiscoKey (pre-AEAD)");
             return;
@@ -640,10 +698,10 @@ static void handle_disco_direct(const uint8_t *buf, size_t len,
      * HSalsa20 per frame). Falls back to the per-frame compute path
      * for the (rare) bringup where peer_disco_pub wasn't supplied. */
     size_t reply_len;
-    if (g.peer_disco_shared_k_valid) {
+    if (peer->k_valid) {
         reply_len = disco_handle_recv_with_shared(
             reply, sizeof(reply), buf, len,
-            g.peer_disco_shared_k,
+            peer->k,
             g.local.disco_priv, g.local.disco_pub,
             &type, peer_disco_pub, txid);
     } else {
@@ -674,8 +732,8 @@ static void handle_disco_direct(const uint8_t *buf, size_t len,
      * during the legacy permissive boot window before peer config has
      * propagated. */
     const bool roam_allowed =
-        !g.peer.has_peer_disco_pub ||
-        memcmp(peer_disco_pub, g.peer.peer_disco_pub, WG_KEY_LEN) == 0;
+        !peer->has_pub ||
+        memcmp(peer_disco_pub, peer->pub, WG_KEY_LEN) == 0;
 
     if (type == DISCO_TYPE_PING && reply_len > 0) {
         /* Reply to the peer's Ping with our sealed Pong on the same UDP
@@ -1288,6 +1346,52 @@ esp_err_t wg_netif_update_peer_endpoint(uint32_t v4_be, uint16_t port)
     return ESP_OK;
 }
 
+esp_err_t wg_netif_update_peer_keys(const uint8_t static_pub[WG_KEY_LEN],
+                                    const uint8_t *disco_pub)
+{
+    if (!g.initialized) return ESP_ERR_INVALID_STATE;
+    if (static_pub == NULL) return ESP_ERR_INVALID_ARG;
+
+    /* X25519 + HSalsa20 for the new DISCO shared key runs here, in the
+     * caller's task (the long-poll task, 24 KiB stack) and outside both
+     * locks: curve25519_donna alone is a 2.7 KiB frame, which wg_rx could
+     * not absorb on top of its own (see wg_netif.h). */
+    uint8_t k[WG_KEY_LEN];
+    bool    k_ok = false;
+    if (disco_pub != NULL) {
+        k_ok = nacl_box_compute_shared(k, disco_pub, g.local.disco_priv) == 0;
+    }
+
+    xSemaphoreTake(g.hs_lock, portMAX_DELAY);
+    const bool static_changed =
+        memcmp(g.peer.peer_static_pub, static_pub, WG_KEY_LEN) != 0;
+    xSemaphoreTake(g.lock, portMAX_DELAY);
+    if (static_changed) {
+        memcpy(g.peer.peer_static_pub, static_pub, WG_KEY_LEN);
+    }
+    if (disco_pub != NULL) {
+        memcpy(g.peer.peer_disco_pub, disco_pub, WG_KEY_LEN);
+        g.peer.has_peer_disco_pub = true;
+        memcpy(g.peer_disco_shared_k, k, WG_KEY_LEN);
+        g.peer_disco_shared_k_valid = k_ok;
+    }
+    xSemaphoreGive(g.lock);
+    if (static_changed) {
+        /* Peer re-login: the live session belongs to an identity that no
+         * longer exists and the peer will not answer a rekey for it.
+         * Start over with a cold handshake to the new static key (app
+         * traffic pauses until it lands, as at boot). */
+        g.rekey_in_flight = false;
+        g.rekey_attempt = 0;
+        g.handshake_attempt = 0;
+        ESP_LOGI(TAG, "peer static key changed — cold handshake");
+        (void)kick_off_handshake();
+    }
+    xSemaphoreGive(g.hs_lock);
+    tl_secure_zero(k, sizeof(k));
+    return ESP_OK;
+}
+
 esp_err_t wg_netif_inject_packet(const uint8_t *src_node_pub,
                                  const uint8_t *buf, size_t len)
 {
@@ -1488,6 +1592,7 @@ void wg_netif_get_stats(wg_netif_stats_t *out)
     out->cold_handshakes       = g.stat_cold_handshakes;
     out->rx_stale_events       = g.stat_rx_stale;
     out->roams                 = g.stat_roams;
+    out->disco_adverts         = g.stat_disco_adverts;
     out->tx_drops              = g.tx_drops;
     out->relayed_stale         = g.relayed_stale;
     out->relay_errors          = g.relay_errors;
@@ -1497,9 +1602,12 @@ void wg_netif_get_stats(wg_netif_stats_t *out)
 
 bool wg_netif_get_peer_disco_pub(uint8_t out[WG_KEY_LEN])
 {
-    if (!g.peer.has_peer_disco_pub) return false;
-    memcpy(out, g.peer.peer_disco_pub, WG_KEY_LEN);
-    return true;
+    if (!g.initialized) return false;
+    xSemaphoreTake(g.lock, portMAX_DELAY);
+    const bool have = g.peer.has_peer_disco_pub;
+    if (have) memcpy(out, g.peer.peer_disco_pub, WG_KEY_LEN);
+    xSemaphoreGive(g.lock);
+    return have;
 }
 
 #endif /* ESP_PLATFORM */

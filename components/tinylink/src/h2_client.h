@@ -27,9 +27,10 @@ extern "C" {
  * - The connection is left open for further requests; call ts2021_close
  *   when done with the connection.
  *
- * This is the canonical Tailscale wire path: the control plane runs
- * http2.Server.ServeConn over the Noise channel, so HTTP/1.1 inside
- * Noise is rejected with PROTOCOL_ERROR.
+ * This is the canonical Tailscale wire path: the control plane serves
+ * HTTP/2 over the Noise channel (headscale: net/http unencrypted HTTP/2
+ * since 62714564, x/net http2.Server.ServeConn before), so HTTP/1.1
+ * inside Noise is rejected with PROTOCOL_ERROR.
  */
 esp_err_t h2_post_json(ts2021_conn_t *conn,
                        const char *path,

@@ -122,70 +122,158 @@ int main(void)
         return 1;
     }
 
-    /* Full-map frames must never request a patch-driven refetch. */
-    if (nm.patch_identity_changed) {
-        printf("[patch/full-map-clear] FAIL\n");
+    /* A full map carries no patches and no expiry. */
+    if (nm.n_patches != 0 || nm.patches_overflow || nm.self_expired) {
+        printf("[full-map/no-patches] FAIL\n");
         return 1;
     }
     printf("[mapresp-stub] OK\n");
 
-    /* --- PeersChangedPatch identity detection (2026-07 audit) --------
-     * headscale ≥0.29.2 / tailscale.com deliver a peer's re-login (new
-     * NodeKey + DiscoKey) as a PeersChangedPatch. tinylink doesn't merge
-     * patches; it must FLAG identity-bearing ones so the stream layer
-     * recycles for a full map, and must keep ignoring endpoint-only
-     * churn (covered by DISCO). */
+    /* --- PeersChangedPatch parsing (round 1.3.0) ----------------------
+     * headscale sends peer endpoint/DERP moves (59f3ff12), re-logins and
+     * every tailscaled restart (DiscoKey) as PeerChange entries; they are
+     * applied by NodeID in tinylink.c merge_peers. */
     static const char *kPatchKey =
         "{\"PeersChangedPatch\":[{\"NodeID\":99,"
-        "\"Key\":\"nodekey:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\","
+        "\"Key\":\"nodekey:0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20\","
         "\"KeyExpiry\":\"2027-01-01T00:00:00Z\"}]}";
     if (mapresp_parse(kPatchKey, strlen(kPatchKey), &nm) != ESP_OK ||
-        !nm.patch_identity_changed || nm.n_peers != 0) {
-        printf("[patch/key-flagged] FAIL flag=%d peers=%zu\n",
-               nm.patch_identity_changed, nm.n_peers);
+        nm.n_patches != 1 || nm.patches[0].id != 99 || !nm.patches[0].has_key ||
+        nm.patches[0].node_pub[0] != 0x01 || nm.patches[0].node_pub[31] != 0x20 ||
+        nm.patches[0].has_disco || nm.patches[0].has_endpoints ||
+        nm.patches[0].derp_region != 0 || nm.n_peers != 0) {
+        printf("[patch/key] FAIL n=%zu\n", nm.n_patches);
         return 1;
     }
-    printf("[patch/key-flagged] OK\n");
+    printf("[patch/key] OK\n");
 
     static const char *kPatchDisco =
         "{\"PeersChangedPatch\":[{\"NodeID\":99,"
         "\"DiscoKey\":\"discokey:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"}]}";
     if (mapresp_parse(kPatchDisco, strlen(kPatchDisco), &nm) != ESP_OK ||
-        !nm.patch_identity_changed) {
-        printf("[patch/disco-flagged] FAIL\n");
+        nm.n_patches != 1 || !nm.patches[0].has_disco || nm.patches[0].has_key ||
+        nm.patches[0].disco_pub[0] != 0xbb) {
+        printf("[patch/disco] FAIL\n");
         return 1;
     }
-    printf("[patch/disco-flagged] OK\n");
+    printf("[patch/disco] OK\n");
 
-    /* Endpoint/DERP-only patch: routine churn, must NOT trigger. */
     static const char *kPatchEndpoints =
         "{\"PeersChangedPatch\":[{\"NodeID\":99,"
-        "\"Endpoints\":[\"203.0.113.9:41641\"],\"DERPRegion\":16,"
-        "\"Online\":true}]}";
+        "\"Endpoints\":[\"203.0.113.9:41641\",\"[2001:db8::1]:41641\"],\"DERPRegion\":16,"
+        "\"Online\":true,\"LastSeen\":\"2026-10-28T10:00:00Z\"}]}";
     if (mapresp_parse(kPatchEndpoints, strlen(kPatchEndpoints), &nm) != ESP_OK ||
-        nm.patch_identity_changed) {
-        printf("[patch/endpoints-ignored] FAIL\n");
+        nm.n_patches != 1 || !nm.patches[0].has_endpoints ||
+        nm.patches[0].n_endpoints != 1 ||
+        strcmp(nm.patches[0].endpoints[0].str, "203.0.113.9:41641") != 0 ||
+        nm.patches[0].derp_region != 16 || nm.patches[0].has_key) {
+        printf("[patch/endpoints-derp] FAIL\n");
         return 1;
     }
-    printf("[patch/endpoints-ignored] OK\n");
+    printf("[patch/endpoints-derp] OK\n");
 
-    /* Mixed frame: full peer list + identity patch. The flag is set but
-     * the stream layer gates the recycle on n_peers==0, because the full
-     * list in the same frame already delivers the fresh keys. Lock both
-     * halves of that contract here. */
-    static const char *kMixed =
-        "{\"Peers\":[{\"ID\":99,"
+    /* Malformed key in a patch: the field stays unset (never a partial key). */
+    static const char *kPatchBadKey =
+        "{\"PeersChangedPatch\":[{\"NodeID\":7,\"Key\":\"nodekey:zz\"}]}";
+    if (mapresp_parse(kPatchBadKey, strlen(kPatchBadKey), &nm) != ESP_OK ||
+        nm.n_patches != 1 || nm.patches[0].has_key) {
+        printf("[patch/bad-key-unset] FAIL\n");
+        return 1;
+    }
+    printf("[patch/bad-key-unset] OK\n");
+
+    /* Combined frame (headscale 7a2335dc folds a tick into one response):
+     * PeersChanged for A + patch for B — both must survive the parse. */
+    static const char *kCombined =
+        "{\"PeersChanged\":[{\"ID\":1,"
         "\"Key\":\"nodekey:0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20\""
         "}],"
-        "\"PeersChangedPatch\":[{\"NodeID\":99,"
-        "\"DiscoKey\":\"discokey:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"}]}";
-    if (mapresp_parse(kMixed, strlen(kMixed), &nm) != ESP_OK ||
-        !nm.patch_identity_changed || nm.n_peers != 1) {
-        printf("[patch/mixed-frame] FAIL flag=%d peers=%zu\n",
-               nm.patch_identity_changed, nm.n_peers);
+        "\"PeersChangedPatch\":[{\"NodeID\":2,"
+        "\"DiscoKey\":\"discokey:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"}],"
+        "\"PeersRemoved\":[3]}";
+    if (mapresp_parse(kCombined, strlen(kCombined), &nm) != ESP_OK ||
+        nm.n_peers != 1 || !nm.peers_is_delta || nm.n_patches != 1 ||
+        nm.patches[0].id != 2 || nm.n_removed != 1 || nm.removed_ids[0] != 3) {
+        printf("[patch/combined-frame] FAIL peers=%zu patches=%zu removed=%zu\n",
+               nm.n_peers, nm.n_patches, nm.n_removed);
         return 1;
     }
-    printf("[patch/mixed-frame] OK\n");
+    printf("[patch/combined-frame] OK\n");
+
+    /* More patches than TL_MAX_PEER_PATCHES → overflow flag (stream layer
+     * recycles for a full map instead of applying a partial delta). */
+    static const char *kPatchMany =
+        "{\"PeersChangedPatch\":[{\"NodeID\":1,\"DERPRegion\":1},{\"NodeID\":2,\"DERPRegion\":1},"
+        "{\"NodeID\":3,\"DERPRegion\":1},{\"NodeID\":4,\"DERPRegion\":1},"
+        "{\"NodeID\":5,\"DERPRegion\":1}]}";
+    if (mapresp_parse(kPatchMany, strlen(kPatchMany), &nm) != ESP_OK ||
+        nm.n_patches != TL_MAX_PEER_PATCHES || !nm.patches_overflow) {
+        printf("[patch/overflow] FAIL n=%zu ovf=%d\n", nm.n_patches, nm.patches_overflow);
+        return 1;
+    }
+    printf("[patch/overflow] OK\n");
+
+    static const char *kRemovedMany =
+        "{\"PeersRemoved\":[1,2,3,4,5,6,7,8,9]}";
+    if (mapresp_parse(kRemovedMany, strlen(kRemovedMany), &nm) != ESP_OK ||
+        nm.n_removed != TL_MAX_PEERS_REMOVED || !nm.removed_overflow) {
+        printf("[removed/overflow] FAIL\n");
+        return 1;
+    }
+    printf("[removed/overflow] OK\n");
+
+    /* --- Self expiry (headscale ≥0.29.4 deleted / expired node) -------
+     * The exact frame noise.go writes for an unknown NodeKey on a
+     * Stream=true map request. */
+    static const char *kExpiredSelf =
+        "{\"Node\":{\"Key\":\"nodekey:0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20\","
+        "\"KeyExpiry\":\"1970-01-01T00:00:01Z\",\"Expired\":true},"
+        "\"Debug\":{\"DisableLogTail\":true}}";
+    if (mapresp_parse(kExpiredSelf, strlen(kExpiredSelf), &nm) != ESP_OK ||
+        !nm.have_self || !nm.self_expired || nm.self_key_expiry != 1 ||
+        nm.n_self_addresses != 0) {
+        printf("[self/deleted-frame] FAIL exp=%d key_expiry=%lld\n",
+               nm.self_expired, (long long)nm.self_key_expiry);
+        return 1;
+    }
+    printf("[self/deleted-frame] OK\n");
+
+    /* Live self node: future KeyExpiry parsed, not expired; Go zero time
+     * means "never expires" → 0; StableTailnetID (capver 148) ignored. */
+    static const char *kSelfLive =
+        "{\"Node\":{\"ID\":5,\"Addresses\":[\"100.64.0.5/32\"],"
+        "\"KeyExpiry\":\"2027-04-26T12:34:56.123456789Z\","
+        "\"StableTailnetID\":\"T1234CNTRL\",\"Expired\":false}}";
+    if (mapresp_parse(kSelfLive, strlen(kSelfLive), &nm) != ESP_OK ||
+        !nm.have_self || nm.self_expired || nm.self_key_expiry != 1808742896 ||
+        nm.n_self_addresses != 1) {
+        printf("[self/live-expiry] FAIL exp=%d key_expiry=%lld\n",
+               nm.self_expired, (long long)nm.self_key_expiry);
+        return 1;
+    }
+    printf("[self/live-expiry] OK\n");
+
+    static const char *kSelfZeroTime =
+        "{\"Node\":{\"ID\":5,\"KeyExpiry\":\"0001-01-01T00:00:00Z\"}}";
+    if (mapresp_parse(kSelfZeroTime, strlen(kSelfZeroTime), &nm) != ESP_OK ||
+        nm.self_key_expiry != 0 || nm.self_expired) {
+        printf("[self/zero-time-never-expires] FAIL\n");
+        return 1;
+    }
+    printf("[self/zero-time-never-expires] OK\n");
+
+    /* Removal-only and DERPMap-only frames carry data (headscale sends
+     * them alone) — the parse must report them so the stream layer does
+     * not mistake them for KeepAlives. */
+    static const char *kDerpOnly =
+        "{\"DERPMap\":{\"Regions\":{\"1\":{\"RegionID\":1,\"Nodes\":["
+        "{\"RegionID\":1,\"HostName\":\"derp1.example\"}]}}}}";
+    if (mapresp_parse(kDerpOnly, strlen(kDerpOnly), &nm) != ESP_OK ||
+        !nm.have_derp_map || nm.n_derp_regions != 1 || nm.have_self || nm.n_peers != 0) {
+        printf("[derp-only-frame] FAIL\n");
+        return 1;
+    }
+    printf("[derp-only-frame] OK\n");
 
     /* --- Peers vs PeersChanged vs PeersRemoved (M16 merge contract) --- */
     static const char *kFull = "{\"Peers\":[{\"ID\":1},{\"ID\":2}]}";

@@ -4,7 +4,9 @@
 #include "tinylink.h"
 
 #include <errno.h>
+#include <stdint.h>
 #include <string.h>
+#include <time.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -21,6 +23,7 @@
 #include "sdkconfig.h"
 
 #include "backoff.h"
+#include "h2_retry_after.h"
 #include "tl_wdt.h"
 #include "tl_time.h"
 #include "control_key.h"
@@ -93,14 +96,22 @@ static void drop_control_conn(void)
     s_conn_open = false;
 }
 
-/* Snapshotted from s_conn.h2_retry_after_s inside tinylink_register, before
- * drop_control_conn tears the conn down. Lets the boot register loop
- * (main.c) read the hint without holding a reference to the live conn. */
-static int s_last_register_retry_after_s;
-
-int tinylink_last_retry_after_s(void)
+/* Rate-limit wait for the response currently on s_conn (capver 147):
+ * 0 unless control answered 429, or 503 with a Retry-After. */
+static uint32_t control_rate_limit_ms(void)
 {
-    return s_last_register_retry_after_s;
+    return h2_rate_limit_wait_ms(s_conn.h2_status, s_conn.h2_retry_after_present,
+                                 s_conn.h2_retry_after_s, esp_random());
+}
+
+/* Snapshotted inside tinylink_register, before drop_control_conn tears
+ * the conn down. Lets the boot register loop (main.c) and the in-loop
+ * re-register read it without a reference to the live conn. */
+static uint32_t s_last_register_wait_ms;
+
+uint32_t tinylink_last_rate_limit_ms(void)
+{
+    return s_last_register_wait_ms;
 }
 
 const char *tinylink_version_string(void)
@@ -277,9 +288,9 @@ esp_err_t tinylink_register(void)
 {
     if (!s_initialized) return ESP_ERR_INVALID_STATE;
 
-    /* Reset the per-attempt retry-after hint so a TLS / NVS / network
-     * failure path doesn't surface a stale value from a previous 429. */
-    s_last_register_retry_after_s = 0;
+    /* Reset the per-attempt wait so a TLS / NVS / network failure path
+     * doesn't surface a stale value from a previous 429. */
+    s_last_register_wait_ms = 0;
 
     char auth_key[128];
     esp_err_t err = read_auth_key(auth_key, sizeof(auth_key));
@@ -294,10 +305,10 @@ esp_err_t tinylink_register(void)
 
     err = register_emit(&s_conn, &s_keys, auth_key);
 
-    /* Snapshot before drop_control_conn — register.c parses Retry-After
-     * on 429/503 into s_conn; drop_control_conn calls ts2021_close
-     * which may zero per-conn state on a future change. */
-    s_last_register_retry_after_s = s_conn.h2_retry_after_s;
+    /* Snapshot before drop_control_conn — the status + Retry-After live
+     * on s_conn; drop_control_conn calls ts2021_close which may zero
+     * per-conn state on a future change. */
+    s_last_register_wait_ms = control_rate_limit_ms();
 
     /* Scrub the auth key in stack memory. mbedtls_platform_zeroize is a
      * compiler-barrier'd zero (won't be optimized out as a dead store the
@@ -618,13 +629,6 @@ static void prepunch_pings_to_peers(const tl_peer_t *peers, size_t n_peers)
         ESP_LOGI(TAG, "prepunch on netmap-receive: sent %zu pings across %zu peers",
                  total_sent, n_peers);
     }
-}
-
-/* Thin wrapper for callers that already have a tl_netmap_t handy. */
-static inline void prepunch_pings_to_peer_endpoints(const tl_netmap_t *nm)
-{
-    if (nm == NULL) return;
-    prepunch_pings_to_peers(nm->peers, nm->n_peers);
 }
 
 static void send_disco_pings_to_cmm_endpoints(const derp_event_t *e)
@@ -1130,76 +1134,177 @@ static void on_wg_path_stale(void *user)
     prepunch_pings_to_peers(s_last_peers, s_last_peers_count);
 }
 
-/* Merge one frame into the canonical peer table (M16, 2026-09):
- *   Peers          → replace;
- *   PeersChanged   → upsert by NodeKey (append while there is room);
- *   PeersRemoved   → delete by NodeID.
- * Returns true when the table changed. KeepAlive / patch-only frames
- * leave it alone — before this, every frame overwrote the table and a
- * KeepAlive emptied it, so the path-stale probe had no endpoints to
- * try for most of the stream's life. */
+/* Self Addresses from the latest frame that carried the self node. The
+ * data plane starts from this + the merged peer table, not from a single
+ * frame (headscale sends removals, DERPMap updates and endpoint patches
+ * as frames of their own). */
+static tl_cidr_t s_self_addrs[TL_MAX_PEER_ADDRESSES];
+static size_t    s_self_addrs_count;
+
+/* Set by long_poll_handler when control marks this node expired or
+ * deleted; consumed by long_poll_task (same task — no lock). */
+static bool s_self_expired;
+
+/* Index of a peer in s_last_peers by NodeID (the stable handle; upstream
+ * keys its peer map by it), or by NodeKey when the ID is 0. */
+static size_t peer_index(uint64_t id, const uint8_t *node_pub)
+{
+    for (size_t j = 0; j < s_last_peers_count; j++) {
+        if (id != 0 ? s_last_peers[j].id == id
+                    : (node_pub != NULL &&
+                       memcmp(s_last_peers[j].node_pub, node_pub,
+                              TINYLINK_KEY_LEN) == 0)) {
+            return j;
+        }
+    }
+    return SIZE_MAX;
+}
+
+/* Merge one frame into the canonical peer table, in upstream's order
+ * (control/controlclient/map.go updatePeersStateFromResponse):
+ *   Peers             → replace; no other delta in the frame applies;
+ *   PeersRemoved      → delete by NodeID;
+ *   PeersChanged      → upsert by NodeID (append while there is room);
+ *   PeersChangedPatch → patch Key / DiscoKey / Endpoints / DERPRegion of
+ *                       a known NodeID in place (unknown IDs ignored).
+ * Returns true when the table changed. KeepAlive frames never get here.
+ * Patches used to be ignored (a Key/DiscoKey patch recycled the stream),
+ * so peer endpoint moves, re-logins and tailscaled restarts reported by
+ * headscale as patches never reached the data plane. */
 static bool merge_peers(const tl_netmap_t *nm)
 {
-    bool changed = false;
     if (nm->n_peers > 0 && !nm->peers_is_delta) {
         size_t n = nm->n_peers > TL_MAX_PEERS ? TL_MAX_PEERS : nm->n_peers;
         memcpy(s_last_peers, nm->peers, n * sizeof(tl_peer_t));
         s_last_peers_count = n;
-        changed = true;
-    } else if (nm->n_peers > 0) {
-        for (size_t i = 0; i < nm->n_peers; i++) {
-            const tl_peer_t *p = &nm->peers[i];
-            size_t j;
-            for (j = 0; j < s_last_peers_count; j++) {
-                if (memcmp(s_last_peers[j].node_pub, p->node_pub,
-                           TINYLINK_KEY_LEN) == 0) break;
-            }
-            if (j == s_last_peers_count) {
-                if (s_last_peers_count >= TL_MAX_PEERS) {
-                    ESP_LOGW(TAG, "peer table full (%d) — delta peer dropped",
-                             TL_MAX_PEERS);
-                    continue;
-                }
-                s_last_peers_count++;
-            }
-            s_last_peers[j] = *p;
-            changed = true;
-        }
+        return true;
     }
+    bool changed = false;
     for (size_t r = 0; r < nm->n_removed; r++) {
-        for (size_t j = 0; j < s_last_peers_count; j++) {
-            if (s_last_peers[j].id != nm->removed_ids[r]) continue;
-            ESP_LOGI(TAG, "peer removed from netmap: id=0x%08lx%08lx",
-                     (unsigned long)(s_last_peers[j].id >> 32),
-                     (unsigned long)(s_last_peers[j].id & 0xFFFFFFFFul));
-            for (size_t k = j + 1; k < s_last_peers_count; k++) {
-                s_last_peers[k - 1] = s_last_peers[k];
-            }
-            s_last_peers_count--;
-            changed = true;
-            break;
+        if (nm->removed_ids[r] == 0) continue;
+        size_t j = peer_index(nm->removed_ids[r], NULL);
+        if (j == SIZE_MAX) continue;
+        ESP_LOGI(TAG, "peer removed from netmap: id=0x%08lx%08lx",
+                 (unsigned long)(s_last_peers[j].id >> 32),
+                 (unsigned long)(s_last_peers[j].id & 0xFFFFFFFFul));
+        for (size_t k = j + 1; k < s_last_peers_count; k++) {
+            s_last_peers[k - 1] = s_last_peers[k];
         }
+        s_last_peers_count--;
+        changed = true;
+    }
+    for (size_t i = 0; i < nm->n_peers; i++) {
+        const tl_peer_t *p = &nm->peers[i];
+        size_t j = peer_index(p->id, p->node_pub);
+        if (j == SIZE_MAX) {
+            if (s_last_peers_count >= TL_MAX_PEERS) {
+                ESP_LOGW(TAG, "peer table full (%d) — delta peer dropped",
+                         TL_MAX_PEERS);
+                continue;
+            }
+            j = s_last_peers_count++;
+        }
+        s_last_peers[j] = *p;
+        changed = true;
+    }
+    for (size_t i = 0; i < nm->n_patches; i++) {
+        const tl_peer_patch_t *pc = &nm->patches[i];
+        size_t j = peer_index(pc->id, NULL);
+        if (j == SIZE_MAX) continue;
+        tl_peer_t *t = &s_last_peers[j];
+        if (pc->has_key) memcpy(t->node_pub, pc->node_pub, TINYLINK_KEY_LEN);
+        if (pc->has_disco) {
+            memcpy(t->disco_pub, pc->disco_pub, TINYLINK_KEY_LEN);
+            t->has_disco_pub = true;
+        }
+        if (pc->has_endpoints) {
+            t->n_endpoints = pc->n_endpoints;
+            memcpy(t->endpoints, pc->endpoints, sizeof(t->endpoints));
+        }
+        if (pc->derp_region != 0) t->home_derp = pc->derp_region;
+        changed = true;
     }
     return changed;
+}
+
+/* True when control says this node is expired or deleted: an explicit
+ * Expired, or a KeyExpiry not after now. time(NULL) is floored at the
+ * build epoch / last NTP time (tl_time.c), both ≤ real time, so an
+ * unsynced clock can report an expiry late but never early — and
+ * headscale's deleted-node marker (1970-01-01T00:00:01Z) is always in
+ * the past. */
+static bool self_node_expired(const tl_netmap_t *nm)
+{
+    if (!nm->have_self) return false;
+    if (nm->self_expired) return true;
+    return nm->self_key_expiry > 0 &&
+           nm->self_key_expiry <= (int64_t)time(NULL);
+}
+
+/* "a.b.c.d/nn" → network-order IPv4, 0 if not parseable. */
+static uint32_t cidr_host_v4(const tl_cidr_t *c)
+{
+    char host[16];
+    const char *slash = strchr(c->str, '/');
+    size_t n = slash ? (size_t)(slash - c->str) : strlen(c->str);
+    if (n >= sizeof(host)) return 0;
+    memcpy(host, c->str, n);
+    host[n] = '\0';
+    uint32_t v4_be = 0;
+    return inet_pton(AF_INET, host, &v4_be) == 1 ? v4_be : 0;
 }
 
 static esp_err_t long_poll_handler(const tl_netmap_t *nm, void *ctx)
 {
     (void)ctx;
+    if (self_node_expired(nm)) {
+        /* headscale ≥0.29.4 answers a deleted node's stream with HTTP
+         * 200 + this frame and an expired node's with Expired set — no
+         * 4xx ever reaches the re-register path, and the bytes keep the
+         * wedge clock fed. Upstream clients go to NeedsLogin; we have the
+         * authkey, so long_poll_task re-registers. */
+        ESP_LOGW(TAG, "control marks this node %s — leaving the stream to "
+                      "re-register",
+                 nm->self_expired ? "expired/deleted" : "key-expired");
+        s_self_expired = true;
+        return MAPREQ_STREAM_RECYCLE;
+    }
+    if (nm->have_self && nm->n_self_addresses > 0) {
+        memcpy(s_self_addrs, nm->self_addresses,
+               nm->n_self_addresses * sizeof(tl_cidr_t));
+        s_self_addrs_count = nm->n_self_addresses;
+        if (s_dataplane_started) {
+            /* A deleted-and-re-registered node can come back with a new
+             * tailnet address; the lwIP tunnel netif, the TSMP advert
+             * source and the peers' AllowedIPs for us would all disagree.
+             * Rare (admin deleted the node) — restart into the boot path,
+             * which brings everything up against the new address. */
+            const uint32_t now_v4 = cidr_host_v4(&s_self_addrs[0]);
+            if (now_v4 != 0 && now_v4 != wg_dataplane_self_v4()) {
+                ESP_LOGW(TAG, "self address changed to %s — restarting to "
+                              "re-attach the tunnel", s_self_addrs[0].str);
+                esp_restart();
+            }
+        }
+    }
     const bool peers_changed = merge_peers(nm);
 #if CONFIG_TINYLINK_DERP_SUPERVISED
     update_derp_host_from_netmap(nm);
 #endif
     if (!s_dataplane_started) {
+        if (s_self_addrs_count == 0 || s_last_peers_count == 0) {
+            return ESP_OK;   /* wait for self + peers (first full map) */
+        }
         /* Tailscale node ID is genuinely 64-bit (random server-assigned);
          * high/low hex split keeps it printable under NEWLIB_NANO_FORMAT
          * without dragging in full %llu. */
         ESP_LOGI(TAG, "netmap (initial): self.id=0x%08lx%08lx peers=%u derp_regions=%u",
                  (unsigned long)(nm->self_id >> 32),
                  (unsigned long)(nm->self_id & 0xFFFFFFFFul),
-                 (unsigned)nm->n_peers,
+                 (unsigned)s_last_peers_count,
                  (unsigned)nm->n_derp_regions);
-        esp_err_t err = wg_dataplane_start(&s_keys, nm);
+        esp_err_t err = wg_dataplane_start(&s_keys, s_self_addrs, s_self_addrs_count,
+                                           s_last_peers, s_last_peers_count);
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "wg_dataplane_start failed: 0x%x", err);
             return err;
@@ -1217,26 +1322,23 @@ static esp_err_t long_poll_handler(const tl_netmap_t *nm, void *ctx)
          * to every peer endpoint advertised in the bootstrap netmap so a
          * cold-start `tailscale ping` from any peer has a fresh path
          * available without waiting for a DERP-relayed CMM round trip. */
-        prepunch_pings_to_peer_endpoints(nm);
+        prepunch_pings_to_peers(s_last_peers, s_last_peers_count);
         return ESP_OK;
     }
-    ESP_LOGI(TAG, "netmap (update): peers=%u%s removed=%u derp_regions=%u table=%u",
+    ESP_LOGI(TAG, "netmap (update): peers=%u%s removed=%u patches=%u "
+                  "derp_regions=%u table=%u",
              (unsigned)nm->n_peers, nm->peers_is_delta ? " (delta)" : "",
-             (unsigned)nm->n_removed, (unsigned)nm->n_derp_regions,
-             (unsigned)s_last_peers_count);
-    /* Apply the merged table to the data plane (endpoint roam of the
-     * WG peer; a removed WG peer leaves the live session alone). */
-    esp_err_t err = ESP_OK;
-    if (peers_changed) {
-        err = wg_dataplane_update_peers(&s_keys, s_last_peers, s_last_peers_count);
-    }
-    /* Refresh NAT mappings on every netmap update too. Idle ages out
-     * mappings (typical UDP timeout 30-120 s); without a periodic punch
-     * the peer's first packet after silence finds a closed path and
-     * forces DERP fallback. Cheap to repeat — ~50-200 bytes per peer
-     * endpoint, fires only on non-KeepAlive netmaps (every minute or
-     * two on the Tailscale control plane). */
-    prepunch_pings_to_peer_endpoints(nm);
+             (unsigned)nm->n_removed, (unsigned)nm->n_patches,
+             (unsigned)nm->n_derp_regions, (unsigned)s_last_peers_count);
+    if (!peers_changed) return ESP_OK;
+    /* Apply the merged table to the data plane: endpoint roam and peer
+     * NodeKey/DiscoKey rotation of the WG peer (a removed WG peer leaves
+     * the live session alone). Then refresh NAT mappings towards the
+     * merged endpoints — idle ages them out (typical UDP timeout
+     * 30-120 s) and the peer's first packet after silence would find a
+     * closed path and fall back to DERP. ~50-200 bytes per endpoint. */
+    esp_err_t err = wg_dataplane_update_peers(&s_keys, s_last_peers, s_last_peers_count);
+    prepunch_pings_to_peers(s_last_peers, s_last_peers_count);
     return err;
 }
 
@@ -1286,13 +1388,13 @@ static void long_poll_task(void *arg)
      * surfaces NeedsLogin to a human. A headless sensor has no human,
      * but it does have the authkey in NVS, so the equivalent recovery
      * is an in-place re-register (the exact path every boot exercises). */
-    uint32_t consec_4xx = 0;
+    uint32_t consec_rejected = 0;
     tinylink_control_mark_alive();  /* arm the wedge clock from task start */
     tl_wdt_subscribe();
     for (;;) {
         tl_wdt_feed();
-        int retry_after_s = 0;
-        int http_status   = 0;
+        uint32_t rate_limit_ms = 0;
+        int      http_status   = 0;
         esp_err_t err = ensure_control_conn();
         if (err == ESP_OK && s_ep_push_pending) {
             /* Endpoint push (Stream=false lite MapRequest) on the freshly
@@ -1316,7 +1418,7 @@ static void long_poll_task(void *arg)
                  * paces it and a server Retry-After is honored like any
                  * other map failure. */
                 s_ep_push_pending = true;
-                retry_after_s = s_conn.h2_retry_after_s;
+                rate_limit_ms = control_rate_limit_ms();
                 http_status   = s_conn.h2_status;
                 ESP_LOGW(TAG, "endpoint push failed: 0x%x — retrying after "
                               "reconnect", perr);
@@ -1328,11 +1430,10 @@ static void long_poll_task(void *arg)
             const int64_t t0 = esp_timer_get_time();
             err = mapreq_run_stream(&s_conn, &s_keys, long_poll_handler, NULL);
             /* Stream ended: either the server closed it (idle / ping
-             * failure / restart) or our side errored. Capture any
-             * Retry-After hint from the response (mapreq.c parses it on
-             * 429/503) and the HTTP status before drop_control_conn
-             * clears the conn. */
-            retry_after_s = s_conn.h2_retry_after_s;
+             * failure / restart), our side errored, or the handler left
+             * an expired-node frame. Capture the rate-limit wait and the
+             * HTTP status before drop_control_conn clears the conn. */
+            rate_limit_ms = control_rate_limit_ms();
             http_status   = s_conn.h2_status;
             const int64_t up_us = esp_timer_get_time() - t0;
             if (s_ep_push_pending) {
@@ -1352,16 +1453,27 @@ static void long_poll_task(void *arg)
         const bool rejected_4xx = (err != ESP_OK &&
                                    http_status >= 400 && http_status < 500 &&
                                    http_status != 429);
-        if (rejected_4xx) {
-            if (consec_4xx < 1024u) consec_4xx++;
-            /* Power-of-two schedule (2, 4, 8, ... cycles) so a control
+        const bool expired = s_self_expired;
+        s_self_expired = false;
+        if (rejected_4xx || expired) {
+            if (consec_rejected < 1024u) consec_rejected++;
+            /* Power-of-two schedule (1|2, 4, 8, ... cycles) so a control
              * plane that keeps rejecting us isn't hammered with one
              * register per reconnect cycle, yet a transient server-side
-             * state loss recovers within a couple of cycles. */
-            if (consec_4xx >= 2u && (consec_4xx & (consec_4xx - 1u)) == 0u) {
-                ESP_LOGW(TAG, "map rejected %u consecutive times (HTTP %d) — "
-                              "re-registering with stored authkey",
-                         (unsigned)consec_4xx, http_status);
+             * state loss recovers within a couple of cycles. A self node
+             * marked expired/deleted is definitive (headscale sends it
+             * once, then ends the stream) → re-register on the first;
+             * a bare 4xx may be transient → from the second. */
+            const bool pow2 = (consec_rejected & (consec_rejected - 1u)) == 0u;
+            if (pow2 && (expired || consec_rejected >= 2u)) {
+                if (expired) {
+                    ESP_LOGW(TAG, "node expired/deleted server-side — "
+                                  "re-registering with stored authkey");
+                } else {
+                    ESP_LOGW(TAG, "map rejected %u consecutive times (HTTP %d) — "
+                                  "re-registering with stored authkey",
+                             (unsigned)consec_rejected, http_status);
+                }
                 esp_err_t rr = tinylink_register();
                 if (rr == ESP_OK) {
                     ESP_LOGI(TAG, "re-register OK — refreshing endpoints");
@@ -1370,14 +1482,18 @@ static void long_poll_task(void *arg)
                      * the long-poll task, so just flag it: the next
                      * ensure_control_conn below runs the push. */
                     s_ep_push_pending = true;
-                    consec_4xx = 0;
+                    consec_rejected = 0;
                 } else {
                     ESP_LOGW(TAG, "re-register failed: 0x%x — map retry "
                                   "continues", rr);
+                    /* A throttled register paces the next cycle too. */
+                    if (s_last_register_wait_ms > rate_limit_ms) {
+                        rate_limit_ms = s_last_register_wait_ms;
+                    }
                 }
             }
         } else {
-            consec_4xx = 0;
+            consec_rejected = 0;
         }
 
 #if CONFIG_TINYLINK_CONTROL_WEDGE_RESTART_S > 0
@@ -1401,11 +1517,13 @@ static void long_poll_task(void *arg)
 #endif
 
         uint32_t delay_ms;
-        if (retry_after_s > 0) {
-            /* Server-directed delay overrides our backoff. */
-            delay_ms = (uint32_t)retry_after_s * 1000U;
-            ESP_LOGI(TAG, "long-poll: honoring server Retry-After=%d s",
-                     retry_after_s);
+        if (rate_limit_ms > 0) {
+            /* Rate limited (429, or 503 + Retry-After): the server's
+             * delay replaces our backoff, which — like upstream's — is
+             * neither advanced nor reset by it. */
+            delay_ms = rate_limit_ms;
+            ESP_LOGI(TAG, "long-poll: rate limited by control — waiting %u ms",
+                     (unsigned)delay_ms);
         } else {
             delay_ms = tl_backoff_ms(fail_attempt, LP_BACKOFF_BASE_MS,
                                      LP_BACKOFF_CAP_MS, esp_random());
@@ -1510,6 +1628,7 @@ void tinylink_get_stats(tinylink_stats_t *out)
     out->wg_cold_handshakes = ws.cold_handshakes;
     out->wg_rx_stale_events = ws.rx_stale_events;
     out->wg_roams           = ws.roams;
+    out->wg_disco_adverts   = ws.disco_adverts;
     out->wg_tx_drops        = (uint32_t)ws.tx_drops;
     out->wg_relayed_stale   = (uint32_t)ws.relayed_stale;
     out->wg_relay_errors    = (uint32_t)ws.relay_errors;

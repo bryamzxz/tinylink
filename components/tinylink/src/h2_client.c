@@ -9,11 +9,13 @@
 #include "h2_client.h"
 
 #include <string.h>
+#include <time.h>
 
 #include "esp_log.h"
 #include "nghttp2/nghttp2.h"
 
 #include "h2_retry_after.h"
+#include "tl_time.h"
 #include "ts2021_client.h"
 
 static const char *TAG = "h2";
@@ -30,6 +32,7 @@ static void h2_request_reset(ts2021_conn_t *conn)
     conn->h2_stream_closed = false;
     conn->h2_stream_error  = 0;
     conn->h2_retry_after_s = 0;
+    conn->h2_retry_after_present = false;
     conn->h2_resp_buf      = NULL;
     conn->h2_resp_cap      = 0;
     conn->h2_resp_len      = 0;
@@ -145,10 +148,13 @@ static int header_cb(nghttp2_session *session, const nghttp2_frame *frame,
         conn->h2_status = atoi(status_str);
     } else if (namelen == 11 && memcmp(name, "retry-after", 11) == 0) {
         /* HTTP/2 normalizes header names to lowercase (RFC 7540 §8.1.2),
-         * so an exact match is sufficient. Parser clamps and rejects
-         * malformed input — see h2_retry_after.h. Captured unconditionally
-         * here; callers gate on h2_status ∈ {429, 503}. */
-        conn->h2_retry_after_s = h2_parse_retry_after_seconds(value, valuelen);
+         * so an exact match is sufficient. Captured unconditionally;
+         * h2_rate_limit_wait_ms decides whether the status makes it a
+         * rate limit. An HTTP-date needs a real clock, so `now` is only
+         * passed once SNTP has synced. */
+        conn->h2_retry_after_present = valuelen > 0;
+        conn->h2_retry_after_s = h2_parse_retry_after_seconds(
+            value, valuelen, tl_time_synced() ? (int64_t)time(NULL) : 0);
     }
     return 0;
 }

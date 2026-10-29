@@ -10,7 +10,7 @@
 // `tailscale/control/controlhttp/{client,controlhttpcommon}.go`.
 // h2_client.c sits on top of ts2021_send / ts2021_recv to carry HTTP/2
 // frames; do not call ts2021_send with raw HTTP/1.1 bytes — the control
-// plane runs http2.Server.ServeConn after the Upgrade.
+// plane serves HTTP/2 (prior knowledge) after the Upgrade.
 
 #pragma once
 
@@ -134,12 +134,11 @@ typedef struct {
     bool     h2_stream_closed;
     int      h2_stream_error;
 
-    /* Parsed Retry-After header value in seconds (RFC 7231 §7.1.3
-     * delta-seconds form, clamped into [1, 300] by
-     * h2_parse_retry_after_seconds). 0 means the response had no
-     * Retry-After or the value was malformed; caller falls back to its
-     * own backoff. Only meaningful when h2_status is 429 or 503 — other
-     * statuses ignore the field. */
+    /* Retry-After of the current response (capver 147): `present` =
+     * the header was there and non-empty; `_s` = its delay when valid
+     * (1..3600 s, see h2_retry_after.h), else 0. Turned into a wait by
+     * h2_rate_limit_wait_ms together with h2_status. */
+    bool     h2_retry_after_present;
     int      h2_retry_after_s;
 
     /* Response collection (one-shot mode). Pointer is borrowed from

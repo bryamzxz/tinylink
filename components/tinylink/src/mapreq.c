@@ -21,6 +21,7 @@
 #include "jsmn.h"
 #include "jsmn_skip.h"
 #include "jsmn_split.h"
+#include "tl_date.h"
 
 #ifdef ESP_PLATFORM
 static const char *TAG = "mapreq";
@@ -217,6 +218,18 @@ static esp_err_t parse_node_obj(const char *js, const jsmntok_t *toks,
             parse_addresses(js, toks, val_idx,
                             out->self_addresses, TL_MAX_PEER_ADDRESSES,
                             &out->n_self_addresses);
+        } else if (tok_eq(js, key, "Expired") &&
+                   toks[val_idx].type == JSMN_PRIMITIVE) {
+            out->self_expired = tok_eq(js, &toks[val_idx], "true");
+        } else if (tok_eq(js, key, "KeyExpiry") && tok_is_str(&toks[val_idx])) {
+            /* Go's zero time ("0001-01-01T00:00:00Z", = never expires)
+             * lands at a negative Unix time; keep 0 for "no expiry". */
+            int64_t t = 0;
+            if (tl_parse_rfc3339(js + toks[val_idx].start,
+                                 (size_t)(toks[val_idx].end - toks[val_idx].start),
+                                 &t) && t > 0) {
+                out->self_key_expiry = t;
+            }
         }
         next = skip_value(toks, val_idx);
     }
@@ -410,7 +423,10 @@ static esp_err_t parse_removed_split(const char *js, size_t len, tl_netmap_t *ou
     size_t pos = 0;
     const char *v; size_t vlen; int rc;
     while ((rc = tl_jsplit_arr_next(js, len, &pos, &v, &vlen)) == 1) {
-        if (out->n_removed >= TL_MAX_PEERS_REMOVED) continue;
+        if (out->n_removed >= TL_MAX_PEERS_REMOVED) {
+            out->removed_overflow = true;
+            continue;
+        }
         char buf[24];
         if (vlen == 0 || vlen >= sizeof(buf) || v[0] < '0' || v[0] > '9') continue;
         memcpy(buf, v, vlen);
@@ -420,23 +436,70 @@ static esp_err_t parse_removed_split(const char *js, size_t len, tl_netmap_t *ou
     return (rc < 0) ? ESP_ERR_INVALID_RESPONSE : ESP_OK;
 }
 
-/* PeersChangedPatch: array of tailcfg.PeerChange objects. Only the
- * presence of "Key" / "DiscoKey" matters (see netmap.h) — read straight
- * off the split, no tokens needed. */
-static esp_err_t parse_patch_split(const char *js, size_t len, tl_netmap_t *out)
+/* One tailcfg.PeerChange object → tl_peer_patch_t. Fields tinylink does
+ * not consume (Cap, CapMap, KeySignature, Online, LastSeen, KeyExpiry)
+ * are skipped. A malformed Key/DiscoKey leaves that field unset rather
+ * than publishing a partial key. */
+static void parse_one_patch(const char *js, const jsmntok_t *toks,
+                            int obj_idx, tl_peer_patch_t *pc)
+{
+    int n = toks[obj_idx].size;
+    int next = obj_idx + 1;
+    memset(pc, 0, sizeof(*pc));
+    for (int k = 0; k < n; k++) {
+        const jsmntok_t *key = &toks[next];
+        int val_idx = next + 1;
+        const jsmntok_t *val = &toks[val_idx];
+        if (tok_eq(js, key, "NodeID") && val->type == JSMN_PRIMITIVE) {
+            char buf[24];
+            if (tok_copy(js, val, buf, sizeof(buf)) > 0) {
+                pc->id = strtoull(buf, NULL, 10);
+            }
+        } else if (tok_eq(js, key, "DERPRegion") && val->type == JSMN_PRIMITIVE) {
+            char buf[12];
+            if (tok_copy(js, val, buf, sizeof(buf)) > 0) pc->derp_region = atoi(buf);
+        } else if (tok_eq(js, key, "Endpoints") && tok_is_arr(val)) {
+            /* Present (omitempty) = replace; v6 entries are dropped by
+             * parse_endpoints, so a v6-only list replaces with none. */
+            parse_endpoints(js, toks, val_idx, pc->endpoints,
+                            TL_MAX_PEER_ENDPOINTS, &pc->n_endpoints);
+            pc->has_endpoints = true;
+        } else if (tok_eq(js, key, "Key") && tok_is_str(val)) {
+            pc->has_key = parse_keyed_hex(js + val->start,
+                                          (size_t)(val->end - val->start),
+                                          "nodekey:", pc->node_pub) == ESP_OK;
+        } else if (tok_eq(js, key, "DiscoKey") && tok_is_str(val)) {
+            pc->has_disco = parse_keyed_hex(js + val->start,
+                                            (size_t)(val->end - val->start),
+                                            "discokey:", pc->disco_pub) == ESP_OK;
+        }
+        next = skip_value(toks, val_idx);
+    }
+}
+
+/* PeersChangedPatch: array of tailcfg.PeerChange objects, one sub-parse
+ * each. Applied by NodeID in tinylink.c (merge_peers). Entries past
+ * TL_MAX_PEER_PATCHES raise patches_overflow → the caller recycles the
+ * stream for a full map instead of applying a partial delta. */
+static esp_err_t parse_patch_split(const char *js, size_t len,
+                                   tl_netmap_t *out, int *peak)
 {
     size_t pos = 0;
     const char *v; size_t vlen; int rc;
     while ((rc = tl_jsplit_arr_next(js, len, &pos, &v, &vlen)) == 1) {
         if (v[0] != '{') continue;
-        size_t ep = 0;
-        tl_jsplit_kv_t ekv; int erc;
-        while ((erc = tl_jsplit_obj_next(v, vlen, &ep, &ekv)) == 1) {
-            if (tl_jsplit_key_is(&ekv, "Key") || tl_jsplit_key_is(&ekv, "DiscoKey")) {
-                out->patch_identity_changed = true;
-            }
+        if (out->n_patches >= TL_MAX_PEER_PATCHES) {
+            out->patches_overflow = true;
+            continue;
         }
-        if (erc < 0) return ESP_ERR_INVALID_RESPONSE;
+        int n = sub_parse(v, vlen, peak);
+        if (n < 1 || !tok_is_obj(&s_toks[0])) {
+            out->patches_overflow = true;   /* unparseable: don't guess */
+            continue;
+        }
+        tl_peer_patch_t *pc = &out->patches[out->n_patches];
+        parse_one_patch(v, s_toks, 0, pc);
+        if (pc->id != 0) out->n_patches++;
     }
     return (rc < 0) ? ESP_ERR_INVALID_RESPONSE : ESP_OK;
 }
@@ -475,11 +538,7 @@ esp_err_t mapresp_parse(const char *json, size_t json_len, tl_netmap_t *out)
         } else if (tl_jsplit_key_is(&kv, "PeersRemoved") && kv.val[0] == '[') {
             err = parse_removed_split(kv.val, kv.val_len, out);
         } else if (tl_jsplit_key_is(&kv, "PeersChangedPatch") && kv.val[0] == '[') {
-            /* Minimal patch handling (upstream-audit 2026-07-16): a patch
-             * touching a peer's "Key" (NodeKey rotation) or "DiscoKey"
-             * flags the netmap so the streaming caller recycles the
-             * stream and refetches a full map. Nothing is merged. */
-            err = parse_patch_split(kv.val, kv.val_len, out);
+            err = parse_patch_split(kv.val, kv.val_len, out, &peak);
         } else if (tl_jsplit_key_is(&kv, "DERPMap") && kv.val[0] == '{') {
             err = parse_derp_map_split(kv.val, kv.val_len, out, &peak);
         }
@@ -674,8 +733,9 @@ esp_err_t mapreq_push_endpoints(ts2021_conn_t *conn,
     if (status != 200) {
         if (status == 429 || status == 503) {
             ESP_LOGW(TAG, "endpoint push throttled: HTTP %d "
-                          "(Retry-After=%d s)",
-                     status, conn->h2_retry_after_s);
+                          "(Retry-After %s, %d s valid)",
+                     status, conn->h2_retry_after_present ? "set" : "absent",
+                     conn->h2_retry_after_s);
         } else {
             ESP_LOGE(TAG, "endpoint push HTTP %d (server rejected lite update)",
                      status);
@@ -723,14 +783,11 @@ typedef struct {
  * a full-netmap refetch we can't satisfy in-stream). */
 static int stream_dispatch(stream_state_t *s)
 {
-    /* Parse the assembled body. KeepAlive messages set `KeepAlive:true`
-     * with no peer data — `mapresp_parse` will leave `have_self=false`
-     * and `n_peers=0`, which is safe to recognize.
-     *
-     * For the M2 long-poll first cut, only full netmaps trigger the
-     * handler. Partial/incremental updates beyond KeepAlive are logged
-     * and skipped — the upstream server only sends incrementals to
-     * clients that opt in via capability flags we don't advertise. */
+    /* Parse the assembled body and hand every frame that carries
+     * something the data plane consumes — self node, Peers /
+     * PeersChanged, PeersRemoved, PeersChangedPatch, DERPMap — to the
+     * handler, which merges deltas (tinylink.c merge_peers). KeepAlive
+     * frames parse to none of those and are absorbed here. */
     /* The 2026-05-02 framing diagnostic (hex dump of the first 16 bytes
      * + six memcmp-per-byte substring scans over the whole body, three
      * INFO lines per frame) was removed 2026-09: the framing question it
@@ -749,7 +806,7 @@ static int stream_dispatch(stream_state_t *s)
     ESP_LOGI(TAG, "stream peak: body=%u (cap=%u)",
              (unsigned)s->body_have, (unsigned)s->body_cap);
 
-    static tl_netmap_t nm;  /* ~1 KiB; reused across messages */
+    static tl_netmap_t nm;  /* ~8 KiB BSS (28 DERP regions dominate); reused */
     esp_err_t pe = mapresp_parse((const char *)s->body_buf, s->body_have, &nm);
     if (pe != ESP_OK) {
         ESP_LOGW(TAG, "MapResponse parse failed (size=%u err=0x%x free_heap=%u largest_block=%u)",
@@ -758,24 +815,29 @@ static int stream_dispatch(stream_state_t *s)
                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
         return 0;
     }
-    if (nm.patch_identity_changed && nm.n_peers == 0) {
-        /* A peer rotated its NodeKey/DiscoKey and the server told us
-         * via PeersChangedPatch, which we don't merge. Recycle the
-         * stream: the reconnect's first frame is always a full netmap
-         * (headscale f4eeb94b guarantees it; tailscale.com always did),
-         * so the data plane gets the fresh keys within seconds instead
-         * of handshaking against dead ones until the next full push. */
-        ESP_LOGW(TAG, "PeersChangedPatch carries peer Key/DiscoKey change — "
-                      "recycling stream for a full netmap");
+    if (nm.patches_overflow || nm.removed_overflow) {
+        /* More deltas than the per-frame caps (netmap.h): applying a
+         * partial delta could leave a peer with stale keys or endpoints.
+         * Recycle — the reconnect's first frame is a full netmap
+         * (headscale f4eeb94b; tailscale.com always did). */
+        ESP_LOGW(TAG, "delta frame over caps (patches%s removed%s) — "
+                      "recycling stream for a full netmap",
+                 nm.patches_overflow ? "+" : "", nm.removed_overflow ? "+" : "");
         return -1;
     }
-    if (!nm.have_self && nm.n_peers == 0) {
-        /* KeepAlive (or empty incremental). Nothing actionable. */
+    if (!nm.have_self && nm.n_peers == 0 && nm.n_removed == 0 &&
+        nm.n_patches == 0 && !nm.have_derp_map) {
+        /* KeepAlive, or a frame carrying only fields tinylink does not
+         * consume (DNSConfig, SSHPolicy, PacketFilter, Debug, ...).
+         * headscale sends removals and DERPMap updates as frames of their
+         * own (batcher withRemovals, change.go), so those must NOT be
+         * folded in here. */
         ESP_LOGD(TAG, "KeepAlive (%u bytes)", (unsigned)s->body_have);
         return 0;
     }
-    if (s->on_netmap != NULL) {
-        s->on_netmap(&nm, s->handler_ctx);
+    if (s->on_netmap != NULL &&
+        s->on_netmap(&nm, s->handler_ctx) == MAPREQ_STREAM_RECYCLE) {
+        return -1;
     }
     return 0;
 }
@@ -871,8 +933,9 @@ esp_err_t mapreq_run_stream(ts2021_conn_t *conn,
     if (status != 200) {
         if (status == 429 || status == 503) {
             ESP_LOGW(TAG, "/machine/map (stream) throttled: HTTP %d "
-                          "(Retry-After=%d s)",
-                     status, conn->h2_retry_after_s);
+                          "(Retry-After %s, %d s valid)",
+                     status, conn->h2_retry_after_present ? "set" : "absent",
+                     conn->h2_retry_after_s);
         } else {
             ESP_LOGE(TAG, "/machine/map (stream) returned HTTP %d", status);
         }

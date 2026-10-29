@@ -14,7 +14,7 @@ extern "C" {
 #endif
 
 #define TINYLINK_VERSION_MAJOR 1
-#define TINYLINK_VERSION_MINOR 2
+#define TINYLINK_VERSION_MINOR 3
 #define TINYLINK_VERSION_PATCH 0
 
 /* String forms derived from the integer components above so a future
@@ -26,7 +26,9 @@ extern "C" {
  * the MINOR component via `version.IsUnstableBuild` in
  * tailscale/version/prop.go — minor%2==1 → unstable, even → stable. So
  * a MINOR bump 1→0 (or any even value) flips the admin panel from
- * "unstable" to "stable" automatically. */
+ * "unstable" to "stable" automatically. Release line (owner, 2026-10):
+ * 1.3.x is the work line (upstream sync + optimization rounds, shown as
+ * unstable on purpose), 1.4.0 the next stable release. */
 #define TINYLINK_STR_HELPER(x) #x
 #define TINYLINK_STR(x) TINYLINK_STR_HELPER(x)
 #define TINYLINK_VERSION_STRING                                         \
@@ -51,22 +53,31 @@ extern "C" {
  *      the old fixed "v=100" now gets a 400 there.
  *
  * Floor check (verify on every upstream-audit round): headscale main
- * enforces MinSupportedCapabilityVersion = 115 (= Tailscale v1.82) as of
- * 89fa72e0 (audit 2026-09-03; was 113 in 2026-07 — the floor is "latest
- * 10 minor versions" and moves with every capver regen). Bumped 138 → 142
- * (= Tailscale v1.102, the newest version headscale's capver table maps)
- * on 2026-09-04 with a hardware A/B smoke against tailscale.com: 139–142
- * gate only client-side node attributes (runtime metrics, GRO/GSO
- * toggles) and the c2n localapi proxy, none of which changes what
- * control sends or expects from a register+map+disco+derp client; 143
- * (conn25 attrs), 144 (client SENDS TSMP disco-key adverts) and 145
- * (macOS quad-100 scoping) are deliberately not claimed — 144 would
- * promise a behaviour tinylink does not implement. Upstream
- * CurrentCapabilityVersion is 145 as of 2026-09-03. Bumping the value
- * changes the Noise prologue hash, so every bump requires a hardware
- * A/B smoke against the live control plane per the repo's
- * verify-regression rule. */
-#define TINYLINK_CAPVER 142
+ * enforces MinSupportedCapabilityVersion = 116 (= Tailscale v1.84) as of
+ * 2d220b2e (audit 2026-10-28; 0.29.x releases still enforce 113; the
+ * floor is "latest 10 minor versions" and moves with every capver regen)
+ * and has no upper bound. Its capver table maps up to 148 (= v1.104).
+ *
+ * Value policy (owner): claim only a capver that maps to an even-minor
+ * (stable) Tailscale release, never a sentinel from an odd -pre line.
+ * 148 = v1.104 since round 1.3.0 (2026-10-28), every step honoured:
+ *   143  control stops sending conn25 attrs below it — nothing to do
+ *        (CapMap / DNSConfig are skipped);
+ *   144  client SENDS a TSMPDiscoKeyAdvertisement on every new keypair —
+ *        implemented (wg_netif.c send_disco_advert, tsmp.h);
+ *   145  macOS quad-100 DNS scoping — n/a;
+ *   146  debug-conn-reject attr + c2n /debug/rejects: a local aggregator
+ *        only, nothing to enforce; c2n is ignored like 127/128/138/142;
+ *   147  Retry-After on /machine/register + /machine/map with upstream's
+ *        exact rules (h2_retry_after.h);
+ *   148  Node.StableTailnetID — an unknown key, skipped.
+ * 149 (upstream CurrentCapabilityVersion as of f7c1b8e52, a sentinel
+ * asking control to enable cache-network-maps on the odd 1.105-pre line)
+ * is not claimed. Peers only gate on a remote's capver ≥ 121 (relay) and
+ * ≥ 26 (DNS proxy). Bumping the value changes the Noise prologue hash,
+ * so every bump requires a hardware A/B smoke against the live control
+ * plane per the repo's verify-regression rule. */
+#define TINYLINK_CAPVER 148
 
 #define TINYLINK_KEY_LEN 32
 
@@ -122,6 +133,7 @@ typedef struct {
     uint32_t wg_cold_handshakes;
     uint32_t wg_rx_stale_events;
     uint32_t wg_roams;
+    uint32_t wg_disco_adverts;       /* TSMP disco-key adverts (capver 144) */
     uint32_t wg_tx_drops;
     uint32_t wg_relayed_stale;
     uint32_t wg_relay_errors;
@@ -154,14 +166,12 @@ esp_err_t tinylink_tai64n_floor_init(void);
  */
 esp_err_t tinylink_register(void);
 
-/* Returns the most recent Retry-After hint (RFC 7231 §7.1.3
- * delta-seconds, clamped into [1, 300]) parsed from the last response
- * on the shared control-plane ts2021 conn — typically the most recent
- * tinylink_register() attempt. Returns 0 if the last response had no
- * Retry-After header, the value was malformed, or no request has
- * completed yet. Callers use this to pace boot-loop retries when the
- * control plane signals a 429/503. */
-int tinylink_last_retry_after_s(void);
+/* Rate-limit wait, in ms, from the last tinylink_register() attempt
+ * (capver 147): non-zero only when control answered 429, or 503 with a
+ * Retry-After — the server's delay when valid (capped at 5 min), else
+ * 5–10 s. 0 means "not rate limited": use your own retry cadence.
+ * main.c's boot register loop paces itself with it. */
+uint32_t tinylink_last_rate_limit_ms(void);
 
 /* Read-only view of the current node identities, useful for debugging and
  * for M2+ which needs the NodeKey for the WireGuard data plane. The output

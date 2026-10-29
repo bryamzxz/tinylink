@@ -169,22 +169,21 @@ static esp_err_t bringup(void)
 
     /* Register loop: control plane may answer MachineAuthorized=false until
      * the operator approves the new node. Retry on a slow cadence. When
-     * the server returns 429/503 with a Retry-After header, honor that
-     * delay instead of CONFIG_TINYLINK_REGISTER_RETRY_MS so we pace at
-     * the server's requested cadence. */
+     * control rate-limits us (429, or 503 + Retry-After) wait what it
+     * asks instead of CONFIG_TINYLINK_REGISTER_RETRY_MS (capver 147). */
     for (;;) {
         err = tinylink_register();
         if (err == ESP_OK) {
             ESP_LOGI(TAG, "node registered");
             break;
         }
-        int retry_after_s = tinylink_last_retry_after_s();
-        uint32_t delay_ms = (retry_after_s > 0)
-                              ? (uint32_t)retry_after_s * 1000U
-                              : (uint32_t)CONFIG_TINYLINK_REGISTER_RETRY_MS;
+        const uint32_t rate_limit_ms = tinylink_last_rate_limit_ms();
+        const uint32_t delay_ms = (rate_limit_ms > 0)
+                                    ? rate_limit_ms
+                                    : (uint32_t)CONFIG_TINYLINK_REGISTER_RETRY_MS;
         ESP_LOGW(TAG, "register attempt failed: 0x%x — retrying in %u ms%s",
                  err, (unsigned)delay_ms,
-                 retry_after_s > 0 ? " (server Retry-After)" : "");
+                 rate_limit_ms > 0 ? " (rate limited by control)" : "");
         vTaskDelay(pdMS_TO_TICKS(delay_ms));
     }
 

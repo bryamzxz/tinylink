@@ -85,7 +85,7 @@ static int stats_json(char *out, size_t cap, uint32_t telemetry_seq)
         "\"derp\":{\"connected\":%s,\"host\":\"%s\"},"
         "\"endpoint\":\"%u.%u.%u.%u:%u\","
         "\"wg\":{\"state\":%d,\"rekeys\":%u,\"cold_handshakes\":%u,\"rx_stale\":%u,"
-        "\"roams\":%u,\"tx_drops\":%u,\"relayed_stale\":%u,\"relay_errors\":%u,\"last_rx_age_s\":%u},"
+        "\"roams\":%u,\"disco_adverts\":%u,\"tx_drops\":%u,\"relayed_stale\":%u,\"relay_errors\":%u,\"last_rx_age_s\":%u},"
         "\"telemetry_seq\":%u}\n",
         CONFIG_TINYLINK_DEVICE_HOSTNAME, tinylink_version_string(),
         (unsigned)st.uptime_s, (unsigned)st.heap_free, (unsigned)st.heap_largest,
@@ -97,13 +97,16 @@ static int stats_json(char *out, size_t cap, uint32_t telemetry_seq)
         (unsigned)st.public_port,
         st.wg_state, (unsigned)st.wg_rekeys, (unsigned)st.wg_cold_handshakes,
         (unsigned)st.wg_rx_stale_events, (unsigned)st.wg_roams,
+        (unsigned)st.wg_disco_adverts,
         (unsigned)st.wg_tx_drops, (unsigned)st.wg_relayed_stale,
         (unsigned)st.wg_relay_errors, (unsigned)st.wg_last_rx_age_s,
         (unsigned)telemetry_seq);
 }
 
 static uint32_t s_stats_seq;
-static char     s_stats_buf[640];
+/* ~560 B with the default hostname; a truncated reply is not sent, so
+ * size for a 63-char hostname + DERP host with headroom. */
+static char     s_stats_buf[768];
 
 static void stats_wait(int sock, uint32_t period_ms)
 {
