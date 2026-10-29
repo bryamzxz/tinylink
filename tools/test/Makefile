@@ -234,14 +234,15 @@ test_derp: test_derp.c \
 test_retry_after: test_retry_after.c $(TL_SRC)/h2_retry_after.h $(TL_SRC)/tl_date.h
 	$(CC) $(CFLAGS) -I$(TL_SRC) -o $@ test_retry_after.c
 
-# WG transport (data plane) — encrypt/decrypt + RFC 6479 anti-replay.
+# WG transport (data plane) — encrypt/decrypt + RFC 6479 anti-replay, and
+# the 1.3.3 (C2) split RX/TX lock protocol (pthread stress: -pthread).
 test_wg_transport: test_wg_transport.c \
                   $(TL_SRC)/wg_transport.c $(TL_SRC)/wg_transport.h \
                   $(TL_SRC)/wg_proto.c $(TL_SRC)/wg_proto.h \
                   $(CRYPTO)/blake2s.c $(CRYPTO)/hkdf_blake2s.c \
                   $(CRYPTO)/chacha20.c $(CRYPTO)/poly1305_donna.c \
-                  $(CRYPTO)/chacha20poly1305.c
-	$(CC) $(CFLAGS) -I$(TL_SRC) -I$(CRYPTO) -o $@ test_wg_transport.c \
+                  $(CRYPTO)/chacha20poly1305.c $(CRYPTO)/secure_zero.h
+	$(CC) $(CFLAGS) -pthread -I$(TL_SRC) -I$(CRYPTO) -o $@ test_wg_transport.c \
 	    $(TL_SRC)/wg_transport.c $(TL_SRC)/wg_proto.c \
 	    $(CRYPTO)/blake2s.c $(CRYPTO)/hkdf_blake2s.c \
 	    $(CRYPTO)/chacha20.c $(CRYPTO)/poly1305_donna.c \

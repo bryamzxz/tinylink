@@ -364,6 +364,11 @@ static struct {
     int64_t                 last_tx_us;
 
     TaskHandle_t            rx_task;
+    /* Guards g.transport, g.peer / g.peer_addr, the DISCO shared key and
+     * the RX-stale clock. Held only for copies and bookkeeping, never
+     * across an AEAD (round 1.3.3, C2: the packet crypto runs on ticket
+     * key copies between two short sections, see wg_transport.h), a
+     * socket call, rx_cb or a DERP/TLS call. */
     SemaphoreHandle_t       lock;
     /* Serializes the handshake state machine (g.handshake, state,
      * rekey flags, attempt counters, the pending INIT): rx_task's timer
@@ -380,6 +385,12 @@ static struct {
     uint32_t                stat_rx_stale;
     uint32_t                stat_roams;
     uint32_t                stat_disco_adverts;   /* TSMP adverts queued */
+    /* Not in /stats (the reply has no room to spare): C2 commit refusals,
+     * under g.lock, totals in their log lines — the keypair changed while
+     * the packet was being opened / another copy of it was accepted
+     * first. */
+    uint32_t                stat_rx_keypair_race;
+    uint32_t                stat_rx_dup_race;
 
     /* Outbound TX ring + worker (see WG_TX_SLOTS). The worker drains in
      * non-TCPIP context so sendto can re-enter lwIP safely. tx_done_sem
@@ -744,14 +755,19 @@ static void start_rekey(void)
  *
  * wg_transport_session_init overwrites g.transport IN PLACE — it installs
  * the new send_key AND resets send_counter to 0. That swap MUST be mutually
- * exclusive with wg_transport_encrypt (which read-modify-writes the same
- * g.transport.send_counter and reads g.transport.send_key, under g.lock, on
+ * exclusive with wg_transport_tx_reserve (which read-modify-writes the same
+ * g.transport.send_counter and copies g.transport.send_key, under g.lock, on
  * the lwIP-TCPIP task). wg_rx is unpinned and TCPIP is pinned to CPU0, so on
  * the dual-core LX6 they run truly in parallel: without the lock a concurrent
- * encrypt could latch the OLD high counter, then read the NEWLY installed
+ * reserve could latch the OLD high counter, then copy the NEWLY installed
  * send_key, emitting (new_key, old_counter) — a counter the fresh session
  * re-uses as it climbs from 0, i.e. catastrophic ChaCha20-Poly1305 nonce
  * reuse. So we take the SAME g.lock send_plaintext uses around the swap.
+ * Since 1.3.3 (C2) the AEADs run outside g.lock on ticket copies of the
+ * keys: a frame being sealed during the swap goes out under the old
+ * keypair with its old counter (the peer still accepts it), and a packet
+ * being opened is dropped at its commit — the swap took a new keypair
+ * generation (see handle_transport).
  *
  * `via_relay`: the response came through DERP (wg_netif_inject_packet),
  * which proves nothing about the direct path — see session_via_relay. */
@@ -865,49 +881,88 @@ static bool handle_handshake_response(const uint8_t *buf, size_t len,
 
 /* Process a MessageTransport from the peer.
  *
- * WGN-1 (rx side): wg_transport_decrypt does a non-atomic read-modify-write
- * of the replay window (g.transport.replay.highest + .bitmap) and reads
- * g.transport.recv_key. handle_transport is reachable from TWO unpinned
- * FreeRTOS tasks that run in parallel on the dual-core LX6: the wg_rx UDP
- * task (rx_task) and the tinylink_derp relay task (via
- * wg_netif_inject_packet). Whenever a direct-UDP session and a DERP relay
- * are simultaneously active (the normal NAT-traversal transition + every
- * path-stale -> DERP fallback) two transport packets can be decrypted
- * concurrently -> racing RMWs on the replay bitmap (lost update could
- * ACCEPT a replayed packet or corrupt the window across a rekey) and a
- * recv_key read racing the session_init writer in
- * handle_handshake_response. The #105 fix locked only that writer; this
- * locks the reader so the mutual exclusion actually holds. Lock scope is
- * the decrypt + watchdog-clock update ONLY: g.rx_cb re-enters lwIP, which
- * calls back into wg_netif_send_plaintext (takes g.lock), so holding the
- * lock across it would deadlock. */
+ * WGN-1 (rx side): handle_transport is reachable from TWO unpinned FreeRTOS
+ * tasks that run in parallel on the dual-core LX6: the wg_rx UDP task
+ * (rx_task) and the tinylink_derp relay task (via wg_netif_inject_packet).
+ * Whenever a direct-UDP session and a DERP relay are simultaneously active
+ * (the normal NAT-traversal transition, the dual send after a DERP-completed
+ * handshake, every path-stale -> DERP fallback) two transport packets — often
+ * the two copies of ONE packet — are decrypted concurrently, while
+ * handle_handshake_response may swap in a new keypair. Until 1.3.2 g.lock
+ * was held across the whole decrypt, so the two tasks (and TX, which takes
+ * the same lock) could never run their AEAD at the same time.
+ *
+ * Round 1.3.3 (C2) — three steps, only two under g.lock:
+ *  1. rx_begin (locked): header, receiver index, replay PRE-check (S1:
+ *     replays and stale counters are shed before any crypto), and a copy
+ *     of the receive key + the keypair generation into a stack ticket.
+ *  2. rx_open (unlocked): tag verify + decrypt with the ticket's key copy.
+ *     A rekey or wg_netif_stop may overwrite or scrub g.transport meanwhile;
+ *     this step never reads it, and it scrubs the copy before returning.
+ *  3. rx_commit (locked): drop if the generation changed (the window now
+ *     belongs to another keypair — the packet shares the fate of every
+ *     later old-key packet, which step 1 rejects on the index), re-check
+ *     the window (the other task may have accepted this counter since
+ *     step 1) and only then record the counter (S1: a forgery never moves
+ *     the window) and stamp the RX-stale clock.
+ * Each locked step is a few hundred cycles; the window update is
+ * byte-wise. g.rx_cb re-enters lwIP, which calls back into
+ * wg_netif_send_plaintext (takes g.lock), so it runs after step 3 with no
+ * lock held. */
 static bool handle_transport(const uint8_t *buf, size_t len)
 {
     if (g.state != WG_NETIF_UP) return false;
 
     /* Decrypt straight into a stack buffer; max payload bounded by
-     * WG_RX_BUF_LEN - WG_TRANSPORT_OVERHEAD. Word-aligned so the AEAD's
-     * XOR loop takes its l32i/s32i fast path (chacha20.c) — GCC gives a
-     * uint8_t[] on the Xtensa stack no alignment guarantee otherwise. */
+     * WG_RX_BUF_LEN. Word-aligned so the AEAD's XOR loop takes its
+     * l32i/s32i fast path (chacha20.c) — GCC gives a uint8_t[] on the
+     * Xtensa stack no alignment guarantee otherwise. */
     uint8_t __attribute__((aligned(4))) plaintext[WG_RX_BUF_LEN];
-    size_t   plen = 0;
+    struct wg_rx_ticket t;
 
     xSemaphoreTake(g.lock, portMAX_DELAY);
-    int drc = wg_transport_decrypt(&g.transport, buf, len,
-                                   plaintext, sizeof(plaintext), &plen);
-    if (drc == 0) {
+    int rc = wg_transport_rx_begin(&g.transport, buf, len,
+                                   sizeof(plaintext), &t);
+    xSemaphoreGive(g.lock);
+    if (rc != 0) {
+        return false;  /* Replay / wrong index / malformed — silent drop. */
+    }
+    if (wg_transport_rx_open(&t, buf, len, plaintext) != 0) {
+        return false;  /* Tamper / wrong key — silent drop. */
+    }
+
+    xSemaphoreTake(g.lock, portMAX_DELAY);
+    rc = wg_transport_rx_commit(&g.transport, &t);
+    uint32_t races = 0;
+    if (rc == 0) {
         /* Successful decrypt = peer's session keys still match ours.
          * Update the RX-stale watchdog clock under the same lock for both
          * data packets AND zero-length keepalives, since both prove the
          * WG transport keys are mutually valid. The watchdog cares about
          * session liveness, not payload direction. */
         g.last_transport_recv_us = now_us();
+    } else if (rc == WG_TRANSPORT_RX_STALE) {
+        races = ++g.stat_rx_keypair_race;
+    } else {
+        races = ++g.stat_rx_dup_race;
     }
     xSemaphoreGive(g.lock);
 
-    if (drc != 0) {
-        return false;  /* Replay / tamper / wrong index — silent drop. */
+    if (rc != 0) {
+        /* Authentic but not deliverable. A rekey race is at most one or
+         * two packets per rekey; a duplicate is the second copy of a
+         * dual-path packet that lost the race to the first. */
+        if (rc == WG_TRANSPORT_RX_STALE) {
+            ESP_LOGI(TAG, "transport rx: keypair replaced during decrypt — "
+                          "packet dropped (total %lu)", (unsigned long)races);
+        } else {
+            ESP_LOGD(TAG, "transport rx: duplicate committed first — "
+                          "dropped (total %lu)", (unsigned long)races);
+        }
+        tl_secure_zero(plaintext, t.plen);
+        return false;
     }
+    const size_t plen = t.plen;
     if (plen == 0) {
         /* WG keepalive (zero plaintext) — peer is alive, nothing to
          * deliver upstream. */
@@ -1503,9 +1558,9 @@ retry_timer:;
          * Send a zero-byte WG transport packet after
          * WG_PERSISTENT_KEEPALIVE_MS of outbound silence; the peer
          * accepts it (legitimate WG keepalive) and the sendto refreshes
-         * the upstream NAT mapping. wg_netif_send_plaintext is mutex-
-         * protected so this rx_task path does not race with TCPIP-side
-         * encrypts on g.transport.send_counter. */
+         * the upstream NAT mapping. wg_netif_send_plaintext reserves its
+         * counter under g.lock, so this rx_task path does not race with
+         * TCPIP-side encrypts on g.transport.send_counter. */
         if (g.state == WG_NETIF_UP && g.last_tx_us > 0 &&
             wg_timer_due(now, g.last_tx_us,
                          WG_PERSISTENT_KEEPALIVE_MS * 1000LL)) {
@@ -1971,28 +2026,35 @@ esp_err_t wg_netif_send_plaintext(const uint8_t *pkt, size_t len)
     }
     wg_tx_item_t *it = &g.tx_slots[slot];
 
-    /* Encrypt + enqueue under g.lock so a concurrent caller (lwIP
-     * TCPIP for app traffic vs rx_task for the persistent-keepalive
-     * path) cannot race on g.transport.send_counter —
-     * `wg_transport_encrypt` reads-modifies-writes the 64-bit counter,
-     * which is NOT atomic on ESP32-LX6 — and frames reach tx_ready_q in
-     * counter order. */
+    /* Reserve under g.lock, seal outside it (round 1.3.3, C2). The
+     * reservation is the only shared step: it takes the next
+     * g.transport.send_counter — a 64-bit read-modify-write, NOT atomic on
+     * ESP32-LX6, and concurrent callers exist (lwIP TCPIP for app traffic,
+     * rx_task for the persistent keepalive, wg_rx / the DERP task for the
+     * disco advert) — together with a copy of the send key from the same
+     * keypair, and snapshots the destination so a concurrent
+     * wg_netif_update_peer_endpoint after we release can't redirect a
+     * frame whose counter is already committed. The AEAD then runs on the
+     * ticket into our own slot with no lock held, in parallel with an RX
+     * decrypt on the other core. Two producers can now reach tx_ready_q
+     * out of counter order (by a frame or two); the peer's replay window
+     * (wireguard-go: 8 128 counters) takes any order within it —
+     * WireGuard never promised in-order delivery. */
+    struct wg_tx_ticket t;
     xSemaphoreTake(g.lock, portMAX_DELAY);
-    int wlen = wg_transport_encrypt(&g.transport,
-                                    it->buf, sizeof(it->buf), pkt, len);
+    const int rrc = wg_transport_tx_reserve(&g.transport, &t);
+    it->dst = g.peer_addr;
+    xSemaphoreGive(g.lock);
+    const int wlen = (rrc == 0)
+        ? wg_transport_tx_seal(&t, it->buf, sizeof(it->buf), pkt, len)
+        : -1;
     if (wlen < 0) {
-        xSemaphoreGive(g.lock);
         (void)xQueueSend(g.tx_free_q, &slot, 0);
         return ESP_FAIL;
     }
     it->len = (size_t)wlen;
     it->relay_only = false;
-    /* Snapshot the dest sockaddr at enqueue time so a concurrent
-     * wg_netif_update_peer_endpoint after we release can't redirect a
-     * frame whose counter is already committed. */
-    it->dst = g.peer_addr;
     (void)xQueueSend(g.tx_ready_q, &slot, 0);   /* WG_TX_SLOTS + 1 deep: never full */
-    xSemaphoreGive(g.lock);
 
     g.last_tx_us = now_us();
     return ESP_OK;
@@ -2068,7 +2130,12 @@ void wg_netif_stop(void)
         g.sock = -1;
     }
     wg_handshake_scrub(&g.handshake);
-    tl_secure_zero(&g.transport, sizeof(g.transport));
+    /* Under g.lock and with a new keypair generation (C2): an RX ticket
+     * still in flight on the DERP task fails its commit instead of
+     * recording into a wiped window; its key copy is its own. */
+    xSemaphoreTake(g.lock, portMAX_DELAY);
+    wg_transport_session_scrub(&g.transport);
+    xSemaphoreGive(g.lock);
     /* Scrub the cached shared-K so a future wg_netif_start with a
      * different peer DiscoKey can't accidentally reuse stale K. */
     tl_secure_zero(g.peer_disco_shared_k, sizeof(g.peer_disco_shared_k));
