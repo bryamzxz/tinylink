@@ -29,7 +29,7 @@ TARGETS := test_blake2s test_curve25519 test_x25519 test_mapresp \
            test_hkdf_noise test_wg_handshake test_wg_transport \
            test_wg_demux test_wg_timers test_disco test_stun test_tls_io test_derp \
            test_disco_handler test_disco_prober test_retry_after \
-           test_backoff test_keys_regen test_skip_value test_jsmn_split \
+           test_backoff test_keys_regen test_stun_boot test_skip_value test_jsmn_split \
            test_tai64n test_nacl_box test_tsmp test_tl_date test_stats test_noise_ik \
            test_http1 test_ctrl_json test_ts2021 test_hpack test_h2_core
 
@@ -66,6 +66,11 @@ test_backoff: test_backoff.c $(TL_INC)/backoff.h
 # Pure identity-regeneration policy (headscale 1:1 NodeKey/MachineKey). Header-only.
 test_keys_regen: test_keys_regen.c $(TL_SRC)/keys_regen.h
 	$(CC) $(CFLAGS) -I$(TL_SRC) -o $@ test_keys_regen.c
+
+# Boot STUN probe hand-off (round 1.3.5): every interleaving of the
+# probe task and the waiter. Header-only.
+test_stun_boot: test_stun_boot.c $(TL_SRC)/stun_boot.h
+	$(CC) $(CFLAGS) -I$(TL_SRC) -o $@ test_stun_boot.c
 
 # Depth-bounded JSON value skipper (MapResponse stack-overflow guard). Header-only.
 test_skip_value: test_skip_value.c $(TL_SRC)/jsmn_skip.h $(TL_SRC)/jsmn.h
@@ -393,7 +398,7 @@ test: test_blake2s.run test_curve25519.run test_x25519.run test_mapresp.run \
       test_hkdf_noise.run test_wg_handshake.run test_wg_transport.run \
       test_wg_demux.run test_wg_timers.run test_disco.run test_stun.run test_tls_io.run \
       test_derp.run test_disco_handler.run test_disco_prober.run \
-      test_retry_after.run test_backoff.run test_keys_regen.run \
+      test_retry_after.run test_backoff.run test_keys_regen.run test_stun_boot.run \
       test_skip_value.run test_jsmn_split.run test_tai64n.run \
       test_nacl_box.run test_tsmp.run test_tl_date.run test_stats.run test_noise_ik.run \
       test_http1.run test_ctrl_json.run test_ts2021.run test_hpack.run test_h2_core.run \
@@ -452,6 +457,9 @@ test_backoff.run: test_backoff
 
 test_keys_regen.run: test_keys_regen
 	$(RUNNER) ./test_keys_regen
+
+test_stun_boot.run: test_stun_boot
+	$(RUNNER) ./test_stun_boot
 
 test_skip_value.run: test_skip_value
 	$(RUNNER) ./test_skip_value

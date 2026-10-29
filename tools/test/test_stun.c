@@ -18,6 +18,8 @@
  *   - Truncation (header-only, header+1, etc.).
  *   - MAPPED-ADDRESS legacy fallback when XOR-MAPPED-ADDRESS is absent.
  *   - Stable bytes for a fixed txid (regression guard on the request).
+ *   - stun_match_v4: golden vectors, every txid bit, v6 / error / non-STUN
+ *     datagrams refused.
  */
 
 #include <stdio.h>
@@ -577,6 +579,72 @@ static void test_parse_bad_args(void) {
 }
 
 /* ------------------------------------------------------------------ */
+/* stun_match_v4 (round 1.3.5: shared by the boot probe and the        */
+/* re-probe's wg_rx callback)                                          */
+/* ------------------------------------------------------------------ */
+
+static void test_match_v4(void) {
+    char tname[64];
+    /* Every golden vector: a v4 answer matches its own txid and yields
+     * the tail of the v4-mapped address; a v6 answer is refused. */
+    for (size_t i = 0; i < sizeof(k_resp_kats)/sizeof(k_resp_kats[0]); i++) {
+        const struct resp_kat *t = &k_resp_kats[i];
+        uint8_t  v4[4] = {0};
+        uint16_t port  = 0;
+        int rc = stun_match_v4(t->data, t->len, t->txid, v4, &port);
+        snprintf(tname, sizeof(tname), "match/%s/rc", t->name);
+        fails += ok(tname, rc == (t->is_v6 ? STUN_ERR_NOT_V4 : 0));
+        if (t->is_v6) continue;
+        snprintf(tname, sizeof(tname), "match/%s/addr", t->name);
+        fails += eq_bytes(tname, v4, &t->addr[12], 4);
+        snprintf(tname, sizeof(tname), "match/%s/port", t->name);
+        fails += eq_u16(tname, port, t->port);
+    }
+
+    /* Another request's answer (any single txid bit) is not ours, and
+     * leaves the outputs alone. */
+    uint8_t txid[STUN_TXID_LEN];
+    for (int i = 0; i < STUN_TXID_LEN; i++) txid[i] = (uint8_t)(0xa0 + i);
+    const uint8_t v4[4] = { 203, 0, 113, 9 };
+    uint8_t pkt[64];
+    size_t n = build_xor_response(pkt, sizeof(pkt), txid, v4, 4, 41641);
+    int bad = 0;
+    for (int bit = 0; bit < STUN_TXID_LEN * 8; bit++) {
+        uint8_t other[STUN_TXID_LEN];
+        memcpy(other, txid, sizeof(other));
+        other[bit / 8] ^= (uint8_t)(1u << (bit % 8));
+        uint8_t  got[4] = { 1, 2, 3, 4 };
+        uint16_t port   = 7;
+        if (stun_match_v4(pkt, n, other, got, &port) != STUN_ERR_TXID_MISMATCH ||
+            got[0] != 1 || got[3] != 4 || port != 7) {
+            bad++;
+        }
+    }
+    fails += ok("match/txid-mismatch-every-bit", bad == 0);
+
+    uint8_t  got[4];
+    uint16_t port;
+    fails += ok("match/roundtrip", stun_match_v4(pkt, n, txid, got, &port) == 0 &&
+                                   memcmp(got, v4, 4) == 0 && port == 41641);
+
+    /* Parse errors pass through: not STUN (a WG / DISCO datagram on the
+     * same socket), an error response, a truncation. */
+    uint8_t wg_init[148] = { 0x01 };
+    fails += ok("match/wg-datagram", stun_match_v4(wg_init, sizeof(wg_init), txid, got, &port)
+                                     == STUN_ERR_NOT_STUN);
+    uint8_t err_pkt[64];
+    memcpy(err_pkt, pkt, n);
+    err_pkt[1] = 0x11;
+    fails += ok("match/error-response", stun_match_v4(err_pkt, n, txid, got, &port)
+                                        == STUN_ERR_NOT_SUCCESS);
+    fails += ok("match/truncated", stun_match_v4(pkt, n - 1, txid, got, &port) != 0);
+    fails += ok("match/null-txid", stun_match_v4(pkt, n, NULL, got, &port) == STUN_ERR_BAD_ARG);
+    fails += ok("match/null-addr", stun_match_v4(pkt, n, txid, NULL, &port) == STUN_ERR_BAD_ARG);
+    fails += ok("match/null-port", stun_match_v4(pkt, n, txid, got, NULL) == STUN_ERR_BAD_ARG);
+    fails += ok("match/null-buf", stun_match_v4(NULL, n, txid, got, &port) == STUN_ERR_BAD_ARG);
+}
+
+/* ------------------------------------------------------------------ */
 /* main                                                                */
 /* ------------------------------------------------------------------ */
 
@@ -595,6 +663,7 @@ int main(void) {
     test_xor_wins_over_mapped();
     test_request_deterministic();
     test_parse_bad_args();
+    test_match_v4();
 
     if (fails) {
         printf("\n[FAIL] %d assertion(s) failed\n", fails);

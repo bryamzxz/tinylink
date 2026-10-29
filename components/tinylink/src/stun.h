@@ -62,6 +62,20 @@ int stun_parse_response(const uint8_t *buf, size_t len,
 #define STUN_ERR_MALFORMED_ATTRS   (-3)
 #define STUN_ERR_NO_MAPPED_ADDR    (-4)
 #define STUN_ERR_BAD_ARG           (-5)
+#define STUN_ERR_TXID_MISMATCH     (-6)
+#define STUN_ERR_NOT_V4            (-7)
+
+/* Accept `buf` only as the answer to our binding request `txid`: a
+ * success response carrying that transaction ID (basic anti-spoof: a
+ * forged answer has to know a txid that was never on the wire before we
+ * sent it) and an IPv4 mapped address — we ask over AF_INET, a native
+ * v6 answer is not an address our v4 socket can be reached at. Fills
+ * addr_v4 (a.b.c.d order) and port (host order) on a match. Returns 0,
+ * or a STUN_ERR_* code. Shared by the boot probe and the re-probe's
+ * wg_rx callback (round 1.3.5; both open-coded it before). */
+int stun_match_v4(const uint8_t *buf, size_t len,
+                  const uint8_t txid[STUN_TXID_LEN],
+                  uint8_t addr_v4[4], uint16_t *port);
 
 #ifdef __cplusplus
 }

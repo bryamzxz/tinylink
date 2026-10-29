@@ -30,10 +30,13 @@ primitives we did, see [`SECURITY-MODEL.md`](SECURITY-MODEL.md).
 |     app_nvs_init / app_wifi_start / app_wifi_wait_connected   |
 |     tinylink_init                                             |
 |     tinylink_wg_socket_init   ← bind WG UDP socket EARLY      |
-|     tinylink_stun_probe       ← STUN probes via WG socket so  |
-|                                  advertised port == NAT map   |
+|     tinylink_stun_probe_start ← STUN probes via WG socket so  |
+|                                  advertised port == NAT map;  |
+|                                  own task, parallel to the    |
+|                                  register (1.3.5)             |
 |     tinylink_register loop                                    |
-|     tinylink_dataplane_start  ← Stream=false + OmitPeers=true |
+|     tinylink_dataplane_start  ← waits ≤ 300 ms for STUN, then |
+|                                  Stream=false + OmitPeers=true|
 |                                  lite update with WorkingUDP  |
 |     tinylink_long_poll_start  ← stream=true read-only poll    |
 |     tinylink_derp_supervised_start                            |
@@ -332,11 +335,17 @@ anyone bisecting an unrelated regression to before the netstack switch.
 `tailscale ping` shows `via 190.x.x.x:port` (direct UDP) instead of
 `via DERP(mia)` only when ALL of these are true:
 
-1. **STUN ran on the WG socket** — `tinylink_stun_probe` calls
-   `stun_probe_run_on_socket(wg_netif_get_socket(), …)` so the public
-   AddrPort the control plane advertises is the same NAT mapping the
-   WG keepalives keep alive. Without this, the advertised port is for
-   an ephemeral STUN socket that closes immediately.
+1. **STUN ran on the WG socket** — the boot probe
+   (`tinylink_stun_probe_start`) sends and reads on
+   `wg_netif_get_socket()` until wg_rx exists, the re-probe sends there
+   and wg_rx hands it the answer, so the public AddrPort the control
+   plane advertises is the same NAT mapping the WG keepalives keep
+   alive. Without this, the advertised port is for an ephemeral STUN
+   socket that closes immediately. Since 1.3.5 the boot probe runs
+   alongside the register and the endpoint push waits ≤ 300 ms for it;
+   a later or failed probe hands over to the re-probe, which pushes the
+   endpoint once the data plane is up (`stun_boot.h` has the socket
+   hand-off).
 2. **WG_DEMUX_DISCO classified before the peer-source filter** — the
    RX task in `wg_netif.c` runs `wg_demux_classify` first, then only
    applies the WG-peer source filter to WG protocol kinds. DISCO from
@@ -748,16 +757,18 @@ or a stack size changes.
 
 | Task               | Stack    | Prio    | Where                              | Role                                                       |
 |--------------------|----------|---------|------------------------------------|------------------------------------------------------------|
-| `main`             | 8 KiB    | 1       | `CONFIG_ESP_MAIN_TASK_STACK_SIZE`  | bringup: WiFi, keys, register, STUN, dataplane, spawns; exits |
+| `main`             | 8 KiB    | 1       | `CONFIG_ESP_MAIN_TASK_STACK_SIZE`  | bringup: WiFi, keys, register, dataplane (takes the STUN result), spawns; exits |
 | `tinylink_lp`      | 7 KiB    | IDLE+4  | `tinylink.c::tinylink_long_poll_start` | control conn: ts2021 connect, endpoint push, map long-poll, re-register, wedge restart |
 | `tinylink_derp`    | 10 KiB   | IDLE+3  | `tinylink.c::tinylink_derp_supervised_start` | DERP TLS session: relayed DISCO / WG inject, CMM punch |
 | `wg_rx`            | 8 KiB    | IDLE+3  | `wg_netif.c::wg_netif_start`       | UDP recv, demux (WG/DISCO/STUN), handshake, decrypt → lwIP  |
 | `wg_tx`            | 7 KiB    | IDLE+2  | `wg_netif.c::wg_netif_start`       | encrypted-frame queue → `sendto` (direct) or DERP relay     |
+| `tinylink_stun`    | 5 KiB    | IDLE+2  | `tinylink.c::tinylink_stun_probe_start` | boot STUN probe on the WG socket while the register runs (1.3.5); exits after one probe (≤ 3 s + DNS) |
 | `tinylink_tlm`     | 4.5 KiB  | IDLE+2  | `telemetry.c::telemetry_task_start` | TMP117 sample → JSON → UDP over the tunnel; `/stats`; periodic / GOT_IP-triggered STUN re-probe (flags endpoint push); 60 s stack diag + NVS time floor |
 | `tiT` (lwIP)       | 4.5 KiB  | 18      | `CONFIG_LWIP_TCPIP_TASK_STACK_SIZE`| TCP/IP thread (raised 3 → 4.5 KiB in #104)                 |
 
 Application task stacks total ≈ 36.5 KiB (the 8 KiB `main` stack is
-returned to the heap when `app_main` returns; 1.3.4's D4 took
+returned to the heap when `app_main` returns, the 5 KiB of
+`tinylink_stun` when its probe ends, seconds into the boot; 1.3.4's D4 took
 `tinylink_lp` 12 → 7 KiB and `main` 24 → 8 KiB, sized from
 `tools/stack_worst.py`). The STUN re-probe had its
 own 3 KiB task, `tinylink_stun_re`, until 1.3.2; it now runs on

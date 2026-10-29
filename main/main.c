@@ -7,6 +7,7 @@
 //      control plane public key.
 //   3. tinylink_register() — POST /machine/register; retry slow on
 //      MachineAuthorized=false until the operator approves the node.
+//      The STUN probe runs alongside it on its own task (round 1.3.5).
 //   4. tinylink_dataplane_start() — fetch one MapResponse and bring up
 //      the WireGuard netif against the home peer it announces. The
 //      long-lived `Stream:true` MapRequest loop and DISCO/STUN follow
@@ -180,14 +181,17 @@ static esp_err_t bringup(void)
     }
 #endif
 
-    /* M4 — best-effort STUN probe. Runs once before the first
-     * MapRequest so HostInfo.Endpoints can advertise our reflexive
-     * AddrPort to the control plane (which forwards it to peers).
-     * Non-load-bearing: a probe failure leaves us with no endpoint
-     * advertised, identical to the pre-M4 baseline. */
-    esp_err_t serr = tinylink_stun_probe();
+    /* M4 — best-effort STUN probe, so HostInfo.Endpoints can advertise
+     * our reflexive AddrPort to the control plane (which forwards it to
+     * peers). Since round 1.3.5 it runs on its own task WHILE the
+     * register runs — it cost the boot 0.04–7.1 s here before — and
+     * tinylink_dataplane_start's endpoint push waits ≤ 300 ms for it.
+     * Non-load-bearing: no result in time = the push goes without an
+     * endpoint, and the re-probe pushes it once the data plane is up. */
+    esp_err_t serr = tinylink_stun_probe_start();
     if (serr != ESP_OK) {
-        ESP_LOGW(TAG, "stun probe failed: 0x%x — continuing without endpoint", serr);
+        ESP_LOGW(TAG, "stun probe start failed: 0x%x — continuing without endpoint",
+                 serr);
     }
 
     /* Register loop: control plane may answer MachineAuthorized=false until

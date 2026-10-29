@@ -1759,10 +1759,14 @@ def project_config():
                                                 'long_poll_task>mapreq_push_endpoints'],
                   'prune': ['stream_chunk_cb']},
              ]},
-            {'name': DERP, 'alloc': 10240, 'entry': ['derp_supervised_task']},
+            {'name': DERP, 'alloc': 8192, 'entry': ['derp_supervised_task']},
             {'name': RX, 'alloc': 8192, 'entry': ['rx_task'], 'cut': UDP_ONLY},
-            {'name': TX, 'alloc': 7168, 'entry': ['tx_task_fn'], 'cut': UDP_ONLY},
+            {'name': TX, 'alloc': 5120, 'entry': ['tx_task_fn'], 'cut': UDP_ONLY},
             {'name': TLM, 'alloc': 4608, 'entry': ['telemetry_task'],
+             'cut': UDP_ONLY},
+            # boot STUN probe (round 1.3.5): DNS + select / sendto /
+            # recvfrom on the WG socket while the register runs; exits.
+            {'name': 'tinylink_stun', 'alloc': 5120, 'entry': ['stun_boot_task'],
              'cut': UDP_ONLY},
             {'name': TIT, 'alloc': 4608, 'entry': ['tcpip_thread']},
             {'name': TMR, 'alloc': 6144, 'entry': ['timer_task']},
