@@ -358,6 +358,16 @@ static struct {
 
 static int64_t now_us(void) { return esp_timer_get_time(); }
 
+/* The peer's static key under g.lock: wg_netif_update_peer_keys (long-poll
+ * task) rewrites it on a peer re-login; wg_tx (DERP relay destination) and
+ * tinylink_derp (inject source check) read it. */
+static void peer_static_snapshot(uint8_t out[WG_KEY_LEN])
+{
+    xSemaphoreTake(g.lock, portMAX_DELAY);
+    memcpy(out, g.peer.peer_static_pub, WG_KEY_LEN);
+    xSemaphoreGive(g.lock);
+}
+
 static uint32_t fresh_local_index(void)
 {
     /* WG sender_index is "non-zero, never-reused (within a session
@@ -1171,8 +1181,10 @@ static void tx_task_fn(void *arg)
             g.last_transport_recv_us > 0 &&
             (now_us() - g.last_transport_recv_us) >
                 (int64_t)WG_RX_STALE_THRESHOLD_MS * 1000LL;
+        uint8_t dst_pub[WG_KEY_LEN];   /* filled only when relaying */
         if (path_stale) {
-            esp_err_t rerr = g.relay_cb(g.peer.peer_static_pub,
+            peer_static_snapshot(dst_pub);
+            esp_err_t rerr = g.relay_cb(dst_pub,
                                         g.tx_worker_scratch.buf,
                                         g.tx_worker_scratch.len,
                                         g.relay_cb_user);
@@ -1199,7 +1211,8 @@ static void tx_task_fn(void *arg)
              * so we only re-try here when path wasn't yet marked stale
              * (i.e. errno arrived before the watchdog tripped). */
             if (!path_stale && g.relay_cb != NULL) {
-                esp_err_t rerr = g.relay_cb(g.peer.peer_static_pub,
+                peer_static_snapshot(dst_pub);
+                esp_err_t rerr = g.relay_cb(dst_pub,
                                             g.tx_worker_scratch.buf,
                                             g.tx_worker_scratch.len,
                                             g.relay_cb_user);
@@ -1357,8 +1370,8 @@ esp_err_t wg_netif_update_peer_keys(const uint8_t static_pub[WG_KEY_LEN],
 
     /* X25519 + HSalsa20 for the new DISCO shared key runs here, in the
      * caller's task (the long-poll task, 24 KiB stack) and outside both
-     * locks: curve25519_donna alone is a 2.7 KiB frame, which wg_rx could
-     * not absorb on top of its own (see wg_netif.h). */
+     * locks, so neither the swap nor wg_rx waits ~20 ms on it
+     * (curve25519_donna is also a 2.7 KiB frame). */
     uint8_t k[WG_KEY_LEN];
     bool    k_ok = false;
     if (disco_pub != NULL) {
@@ -1407,7 +1420,9 @@ esp_err_t wg_netif_inject_packet(const uint8_t *src_node_pub,
      * peer's NodeKey, so an adversary can't trivially spoof it. A
      * mismatch here means a different peer (CC'd PEER_PRESENT, etc.)
      * — drop. */
-    if (memcmp(src_node_pub, g.peer.peer_static_pub, WG_KEY_LEN) != 0) {
+    uint8_t peer_pub[WG_KEY_LEN];
+    peer_static_snapshot(peer_pub);
+    if (memcmp(src_node_pub, peer_pub, WG_KEY_LEN) != 0) {
         return ESP_ERR_INVALID_RESPONSE;
     }
 
@@ -1601,6 +1616,26 @@ void wg_netif_get_stats(wg_netif_stats_t *out)
     out->relay_errors          = g.relay_errors;
     out->last_transport_recv_us = g.last_transport_recv_us;
     out->last_handshake_completed_us = g.last_handshake_completed_us;
+}
+
+bool wg_netif_get_peer_endpoint(uint32_t *v4_be, uint16_t *port)
+{
+    if (!g.initialized || v4_be == NULL || port == NULL) return false;
+    xSemaphoreTake(g.lock, portMAX_DELAY);
+    *v4_be = g.peer.peer_endpoint_v4_be;
+    *port  = g.peer.peer_endpoint_port;
+    xSemaphoreGive(g.lock);
+    return *v4_be != 0;
+}
+
+bool wg_netif_path_alive(void)
+{
+    if (!g.initialized) return false;
+    xSemaphoreTake(g.lock, portMAX_DELAY);
+    const int64_t last = g.last_transport_recv_us;
+    xSemaphoreGive(g.lock);
+    return g.state == WG_NETIF_UP && last > 0 &&
+           (now_us() - last) <= (int64_t)WG_RX_STALE_THRESHOLD_MS * 1000LL;
 }
 
 bool wg_netif_get_peer_disco_pub(uint8_t out[WG_KEY_LEN])

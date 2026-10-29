@@ -111,10 +111,12 @@ Legend: [x] done in tree · [~] in progress · [ ] pending
 - [ ] T5 (may) home-DERP fallback when PreferredDERP region disappears
   from DERPMap (upstream `508d654dd`); `update_derp_host_from_netmap`.
 - [ ] T6 (may, deferred) inbound TSMP: apply received `'a'` adverts /
-  answer TSMP ping. **Deferred**: X25519 for the new shared K cannot run
-  inside wg_rx's handle_transport (frames: rx_task 0x740, handle_transport
-  0x630, curve25519_donna **0xa70 = 2 672 B**; wg_rx stack 8 KiB with
-  ~2.1 KiB free at HWM). Netmap patches deliver the key within seconds.
+  answer TSMP ping. Deferred because control's DiscoKey patches now
+  reach the data plane within seconds. (Correction from the review: the
+  original "X25519 can't run on wg_rx" reason was wrong — donna already
+  runs there on handshake send/response, uncached DISCO and the
+  path-stale prepunch; deepest wg_rx path ≈ 5.7 KiB of 8 KiB. Doing it
+  inside handle_transport would still stack 0x780 + 0x630 + 0xa70.)
 
 ### Headscale side
 - [x] **H1 (HIGH) deleted/expired node never recovers.** headscale
@@ -232,6 +234,32 @@ loops, parser bounds, upstream parity) — results to be folded in here.
   secret-dependent branches per scalarmult; some secret scrubs use
   plain memset → fiat32-style constant-time field code (also −30 %).
 Host suite now **631 OK / 0 FAIL**, CI floor 631.
+
+### Independent review (`5de412b..002465e`) — all fixed
+
+No deadlock (order always hs_lock → g.lock; send_disco_advert runs with
+no wg lock held), no new stack peak on any task (rx_task 0x740 → 0x780
+for the DISCO snapshot; deepest wg_rx path still path-stale → prepunch
+→ donna ≈ 5.7 KiB), tsmp.h / h2_retry_after.h / mac1 match upstream.
+Six issues, fixed in the next commit:
+1. (med-high) every PeerChange counted against the 4-slot cap — headscale
+   Online/LastSeen patches (one per peer (dis)connect, folded per tick)
+   forced stream recycles → only Key/DiscoKey/Endpoints/DERPRegion
+   entries kept, duplicates folded; merge `changed` only on real change.
+2. (med) expired node could re-register OK every cycle (control accepts,
+   key stays expired) → `NodeKeyExpired` = failure; streak resets only
+   after a stream with a live self node.
+3. (low-med) control endpoint patch could override a working roamed
+   endpoint → keep live if still advertised or authenticated within the
+   RX-stale window.
+4. (low) unlocked reads of `g.peer.peer_static_pub` (relay dst, inject
+   check) → snapshot under g.lock (lazily, only when relaying).
+5. (low) keys applied before endpoint → endpoint first.
+6. (low, old) streak saturated at 1024 = power of two → re-register every
+   cycle after ~8.5 h → every 1024th cycle past 1024.
+Host suite 633 OK / 0 FAIL, CI floor 633. Pending design item:
+NodeKey rotation on expiry (upstream regenerates; tinylink re-sends the
+same key) — candidate for a later round.
 
 ## Optimization track (Goal 2)
 

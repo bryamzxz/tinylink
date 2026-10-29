@@ -184,8 +184,22 @@ esp_err_t register_emit(ts2021_conn_t *conn,
         cJSON_Delete(root);
         return ESP_FAIL;
     }
+    /* RegisterResponse.NodeKeyExpired: control accepted the machine but
+     * the NodeKey we keep re-sending is expired. Upstream rotates the
+     * node key here (direct.go); tinylink does not (yet), so this is a
+     * failure — otherwise an expired node "registers" OK and the next
+     * stream is expired again, every cycle. Recovery: disable key
+     * expiry for the node (tailscale.com) or re-auth with a valid key
+     * (headscale clears it). */
+    bool key_expired = false;
+    (void)json_get_bool(root, "NodeKeyExpired", &key_expired);
     cJSON_Delete(root);
     if (err != ESP_OK) return err;
+    if (key_expired) {
+        ESP_LOGE(TAG, "register: NodeKeyExpired=true — node key expired on "
+                      "the control plane (disable key expiry or re-auth)");
+        return ESP_ERR_INVALID_STATE;
+    }
 
     if (!authorized) {
         ESP_LOGW(TAG, "MachineAuthorized=false — waiting for operator approval");

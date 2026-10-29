@@ -172,11 +172,15 @@ int main(void)
     }
     printf("[patch/endpoints-derp] OK\n");
 
-    /* Malformed key in a patch: the field stays unset (never a partial key). */
+    /* Malformed key in a patch: the field stays unset (never a partial
+     * key); with nothing else usable the entry is dropped, and a valid
+     * field next to it survives without the key. */
     static const char *kPatchBadKey =
-        "{\"PeersChangedPatch\":[{\"NodeID\":7,\"Key\":\"nodekey:zz\"}]}";
+        "{\"PeersChangedPatch\":[{\"NodeID\":7,\"Key\":\"nodekey:zz\"},"
+        "{\"NodeID\":8,\"Key\":\"nodekey:zz\",\"DERPRegion\":4}]}";
     if (mapresp_parse(kPatchBadKey, strlen(kPatchBadKey), &nm) != ESP_OK ||
-        nm.n_patches != 1 || nm.patches[0].has_key) {
+        nm.n_patches != 1 || nm.patches[0].id != 8 || nm.patches[0].has_key ||
+        nm.patches[0].derp_region != 4) {
         printf("[patch/bad-key-unset] FAIL\n");
         return 1;
     }
@@ -212,6 +216,33 @@ int main(void)
         return 1;
     }
     printf("[patch/overflow] OK\n");
+
+    /* Online / LastSeen-only patches (headscale: one per peer
+     * (dis)connect, folded per tick) carry nothing the data plane uses:
+     * not stored, not counted — five of them must not overflow. */
+    static const char *kPatchOnlineOnly =
+        "{\"PeersChangedPatch\":[{\"NodeID\":1,\"Online\":true},{\"NodeID\":2,\"Online\":false},"
+        "{\"NodeID\":3,\"LastSeen\":\"2026-10-28T10:00:00Z\"},{\"NodeID\":4,\"Online\":true},"
+        "{\"NodeID\":5,\"KeyExpiry\":\"2027-01-01T00:00:00Z\"}]}";
+    if (mapresp_parse(kPatchOnlineOnly, strlen(kPatchOnlineOnly), &nm) != ESP_OK ||
+        nm.n_patches != 0 || nm.patches_overflow) {
+        printf("[patch/online-only-ignored] FAIL n=%zu ovf=%d\n", nm.n_patches, nm.patches_overflow);
+        return 1;
+    }
+    printf("[patch/online-only-ignored] OK\n");
+
+    /* Same NodeID twice in one frame folds into one entry. */
+    static const char *kPatchDup =
+        "{\"PeersChangedPatch\":[{\"NodeID\":7,\"DERPRegion\":3},"
+        "{\"NodeID\":7,\"Endpoints\":[\"198.51.100.7:41641\"]},"
+        "{\"NodeID\":7,\"DERPRegion\":9}]}";
+    if (mapresp_parse(kPatchDup, strlen(kPatchDup), &nm) != ESP_OK ||
+        nm.n_patches != 1 || nm.patches[0].derp_region != 9 ||
+        !nm.patches[0].has_endpoints || nm.patches[0].n_endpoints != 1) {
+        printf("[patch/duplicate-folded] FAIL n=%zu\n", nm.n_patches);
+        return 1;
+    }
+    printf("[patch/duplicate-folded] OK\n");
 
     static const char *kRemovedMany =
         "{\"PeersRemoved\":[1,2,3,4,5,6,7,8,9]}";

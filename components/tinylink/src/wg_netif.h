@@ -96,8 +96,8 @@ esp_err_t wg_netif_update_peer_endpoint(uint32_t v4_be, uint16_t port);
  * a re-login rotates the NodeKey). `disco_pub` NULL = unchanged. A new
  * DiscoKey re-arms the DISCO pre-filter, the relayed-DISCO gate and the
  * cached NaCl shared key; a new static key also restarts the session
- * with a cold handshake. Computes X25519 in the caller's task — call it
- * from a task with a few KiB of stack headroom (long-poll), not wg_rx. */
+ * with a cold handshake. Computes X25519 (~20 ms, 2.7 KiB frame) in the
+ * caller's task, outside the locks — call it from the long-poll task. */
 esp_err_t wg_netif_update_peer_keys(const uint8_t static_pub[WG_KEY_LEN],
                                     const uint8_t *disco_pub);
 
@@ -264,6 +264,14 @@ void wg_netif_get_stats(wg_netif_stats_t *out);
  * direct UDP path applies in handle_disco_direct, instead of acting on
  * a PING/CallMeMaybe sealed by any tailnet node's DiscoKey. */
 bool wg_netif_get_peer_disco_pub(uint8_t out[WG_KEY_LEN]);
+
+/* The live WG target (network-order v4 + port), which also moves on its
+ * own (roam on authenticated packets, pong roam). False before start. */
+bool wg_netif_get_peer_endpoint(uint32_t *v4_be, uint16_t *port);
+
+/* True while the session is up and a transport packet authenticated
+ * within the RX-stale window (WG_RX_STALE_THRESHOLD_MS). */
+bool wg_netif_path_alive(void);
 
 #ifdef __cplusplus
 }

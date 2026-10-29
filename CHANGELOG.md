@@ -43,7 +43,8 @@ only checks its floor. The two that do need behaviour:
   skipped without a peer DiscoKey. Being the first transport packet
   under the new keys it also makes the peer confirm them at once after a
   rekey. `/stats` gained `wg.disco_adverts`. Inbound adverts are still
-  dropped before lwIP (applying them needs X25519 off wg_rx — deferred).
+  dropped before lwIP (applying them is deferred: control's DiscoKey
+  patches now reach the data plane within seconds anyway).
 - **147 — Retry-After, upstream's exact rules** (`direct.go`
   `isRateLimitedResponse` + `parseRateLimitError`, `auto.go`
   `waitRetryAfter`): rate-limited iff 429, or 503 with a non-empty
@@ -99,6 +100,32 @@ only checks its floor. The two that do need behaviour:
   of applying part of a delta.
 - `wg_dataplane_start` takes the merged table (self addresses + peers)
   instead of one frame; dead `wg_dataplane_update_peer()` removed.
+
+#### 2b — Independent review of the round (fixed before any flash)
+
+- **Irrelevant patches recycled the stream**: every PeerChange counted
+  against the 4-slot cap, incl. headscale's per-peer `Online` /
+  `LastSeen` patches folded per tick — two or three peers reconnecting
+  together forced a TLS + Noise reconnect + full map. Only entries with
+  Key / DiscoKey / Endpoints / DERPRegion are kept now (duplicates by
+  NodeID folded), and the table counts as changed only when a value
+  actually moved (each change costs a prepunch round of X25519s).
+- **Expired node could re-register every cycle forever** (control
+  accepts the register but keeps the key expired): `NodeKeyExpired` in
+  the RegisterResponse is now a failure (upstream rotates the key;
+  tinylink doesn't yet — disable key expiry for the node or re-auth),
+  and the rejection streak only resets after a stream delivers a live
+  self node, so the 1, 2, 4… schedule holds. The streak no longer
+  saturates at 1024 (a power of two → re-register on every cycle after
+  ~8.5 h); past 1024 it fires every 1024th cycle.
+- **A control endpoint patch could override a working roamed endpoint**
+  (endpoint-dependent NAT: the live target is the peer's real source
+  port). Kept when it is still advertised or a packet authenticated
+  within the RX-stale window; the stale probe + pong roam move it when
+  the path dies. Endpoint is applied before keys, so a re-login's
+  cold-handshake INIT goes to the new address.
+- Unlocked reads of the peer static key (DERP relay destination, inject
+  source check) now snapshot under `g.lock` — only when relaying.
 
 #### 3 — ESP-IDF v5.5.4 → v5.5.6, tooling, docs
 

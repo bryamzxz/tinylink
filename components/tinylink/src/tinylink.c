@@ -1143,8 +1143,12 @@ static tl_cidr_t s_self_addrs[TL_MAX_PEER_ADDRESSES];
 static size_t    s_self_addrs_count;
 
 /* Set by long_poll_handler when control marks this node expired or
- * deleted; consumed by long_poll_task (same task — no lock). */
+ * deleted / when a frame carried a live (non-expired) self node;
+ * consumed by long_poll_task (same task — no lock). The rejection
+ * schedule only resets on the latter, so an expired node that keeps
+ * "registering" fine still backs off. */
 static bool s_self_expired;
+static bool s_self_live;
 
 /* Index of a peer in s_last_peers by NodeID (the stable handle; upstream
  * keys its peer map by it), or by NodeKey when the ID is 0. */
@@ -1213,18 +1217,33 @@ static bool merge_peers(const tl_netmap_t *nm)
         size_t j = peer_index(pc->id, NULL);
         if (j == SIZE_MAX) continue;
         tl_peer_t *t = &s_last_peers[j];
-        if (pc->has_key) memcpy(t->node_pub, pc->node_pub, TINYLINK_KEY_LEN);
-        if (pc->has_disco) {
+        if (pc->has_key &&
+            memcmp(t->node_pub, pc->node_pub, TINYLINK_KEY_LEN) != 0) {
+            memcpy(t->node_pub, pc->node_pub, TINYLINK_KEY_LEN);
+            changed = true;
+        }
+        if (pc->has_disco &&
+            (!t->has_disco_pub ||
+             memcmp(t->disco_pub, pc->disco_pub, TINYLINK_KEY_LEN) != 0)) {
             memcpy(t->disco_pub, pc->disco_pub, TINYLINK_KEY_LEN);
             t->has_disco_pub = true;
+            changed = true;
         }
-        if (pc->has_endpoints) {
+        if (pc->has_endpoints &&
+            (t->n_endpoints != pc->n_endpoints ||
+             memcmp(t->endpoints, pc->endpoints,
+                    pc->n_endpoints * sizeof(tl_endpoint_t)) != 0)) {
             t->n_endpoints = pc->n_endpoints;
             memcpy(t->endpoints, pc->endpoints, sizeof(t->endpoints));
+            changed = true;
         }
-        if (pc->derp_region != 0) t->home_derp = pc->derp_region;
-        changed = true;
+        if (pc->derp_region != 0 && t->home_derp != pc->derp_region) {
+            t->home_derp = pc->derp_region;
+            changed = true;
+        }
     }
+    /* `changed` only when a value actually moved: each true costs a
+     * data-plane update + a prepunch round (one X25519 per endpoint). */
     return changed;
 }
 
@@ -1270,6 +1289,7 @@ static esp_err_t long_poll_handler(const tl_netmap_t *nm, void *ctx)
         s_self_expired = true;
         return MAPREQ_STREAM_RECYCLE;
     }
+    if (nm->have_self) s_self_live = true;
     if (nm->have_self && nm->n_self_addresses > 0) {
         memcpy(s_self_addrs, nm->self_addresses,
                nm->n_self_addresses * sizeof(tl_cidr_t));
@@ -1455,18 +1475,24 @@ static void long_poll_task(void *arg)
                                    http_status >= 400 && http_status < 500 &&
                                    http_status != 429);
         const bool expired = s_self_expired;
+        const bool self_live = s_self_live;
         s_self_expired = false;
+        s_self_live = false;
         if (rejected_4xx || expired) {
-            if (consec_rejected < 1024u) consec_rejected++;
-            /* Power-of-two schedule (1|2, 4, 8, ... cycles) so a control
-             * plane that keeps rejecting us isn't hammered with one
-             * register per reconnect cycle, yet a transient server-side
-             * state loss recovers within a couple of cycles. A self node
-             * marked expired/deleted is definitive (headscale sends it
-             * once, then ends the stream) → re-register on the first;
-             * a bare 4xx may be transient → from the second. */
-            const bool pow2 = (consec_rejected & (consec_rejected - 1u)) == 0u;
-            if (pow2 && (expired || consec_rejected >= 2u)) {
+            consec_rejected++;   /* 32-bit: ~4 000 years of 30-s cycles */
+            /* Power-of-two schedule (1|2, 4, 8, ... 1024 cycles, then every
+             * 1024th) so a control plane that keeps rejecting us isn't
+             * hammered with one register per reconnect cycle, yet a
+             * transient server-side state loss recovers within a couple
+             * of cycles. (It used to saturate at 1024 — a power of two —
+             * and then re-register on every cycle.) A self node marked
+             * expired/deleted is definitive (headscale sends it once,
+             * then ends the stream) → re-register on the first; a bare
+             * 4xx may be transient → from the second. */
+            const bool due = (consec_rejected <= 1024u)
+                ? (consec_rejected & (consec_rejected - 1u)) == 0u
+                : (consec_rejected % 1024u) == 0u;
+            if (due && (expired || consec_rejected >= 2u)) {
                 if (expired) {
                     ESP_LOGW(TAG, "node expired/deleted server-side — "
                                   "re-registering with stored authkey");
@@ -1483,7 +1509,9 @@ static void long_poll_task(void *arg)
                      * the long-poll task, so just flag it: the next
                      * ensure_control_conn below runs the push. */
                     s_ep_push_pending = true;
-                    consec_rejected = 0;
+                    /* consec_rejected is NOT reset here: only a stream that
+                     * delivers a live self node proves the re-register
+                     * worked (see s_self_live). */
                 } else {
                     ESP_LOGW(TAG, "re-register failed: 0x%x — map retry "
                                   "continues", rr);
@@ -1493,7 +1521,10 @@ static void long_poll_task(void *arg)
                     }
                 }
             }
-        } else {
+        } else if (self_live || err == ESP_OK) {
+            /* A cycle that got a live self node (or ran a clean stream)
+             * ends the rejection streak; a bare transport failure in
+             * between neither extends nor ends it. */
             consec_rejected = 0;
         }
 

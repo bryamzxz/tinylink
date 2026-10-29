@@ -401,6 +401,67 @@ void wg_dataplane_stop(void)
     s_started = false;
 }
 
+/* True if network-order v4 `v4_be`:`port` is one of `peer`'s endpoints. */
+static bool peer_lists_endpoint(const tl_peer_t *peer, uint32_t v4_be, uint16_t port)
+{
+    for (size_t i = 0; i < peer->n_endpoints; i++) {
+        char     h[64];
+        int      p = 0;
+        uint32_t v4 = 0;
+        if (parse_endpoint(peer->endpoints[i].str, h, sizeof(h), &p) != 0) continue;
+        if (inet_pton(AF_INET, h, &v4) != 1) continue;
+        if (v4 == v4_be && (uint16_t)p == port) return true;
+    }
+    return false;
+}
+
+/* Apply a control-advertised endpoint change for the session peer —
+ * unless it would break a working path. The live WG target also moves
+ * on its own (roam on authenticated packets, pong-driven roam), which
+ * s_endpoint_host never sees: behind an endpoint-dependent NAT the
+ * working address is the peer's real source port, not what it
+ * advertises. So if the live endpoint is still advertised, or the
+ * session decrypted something within the RX-stale window, keep it
+ * (upstream magicsock likewise keeps a trusted bestAddr and treats
+ * control's endpoints as candidates); the RX-stale probe + pong roam
+ * move it when the path really dies. */
+static esp_err_t apply_peer_endpoint(const tl_peer_t *peer)
+{
+    if (peer->n_endpoints == 0) return ESP_OK;
+    char     new_host[64];
+    int      new_port = 0;
+    uint32_t v4_be = 0;
+    if (pick_peer_endpoint(peer, new_host, sizeof(new_host),
+                           &new_port, &v4_be, NULL) != 0) {
+        return ESP_OK;  /* nothing usable; leave the live session alone */
+    }
+    if (strcmp(new_host, s_endpoint_host) == 0 &&
+        (uint16_t)new_port == s_endpoint_port) {
+        return ESP_OK;  /* unchanged */
+    }
+    const char *const old_host = s_endpoint_host;
+    const unsigned    old_port = s_endpoint_port;
+    uint32_t live_v4 = 0;
+    uint16_t live_port = 0;
+    const bool have_live = wg_netif_get_peer_endpoint(&live_v4, &live_port);
+    if (have_live && (peer_lists_endpoint(peer, live_v4, live_port) ||
+                      wg_netif_path_alive())) {
+        ESP_LOGI(TAG, "peer endpoint advertised %s:%d — keeping the live "
+                      "path (still advertised or recently authenticated)",
+                 new_host, new_port);
+        memcpy(s_endpoint_host, new_host, sizeof(s_endpoint_host));
+        s_endpoint_port = (uint16_t)new_port;
+        return ESP_OK;
+    }
+    /* Roaming does NOT require a fresh handshake — we just point the UDP
+     * socket at the new sockaddr. The transport keys remain valid. */
+    ESP_LOGI(TAG, "peer endpoint changed: %s:%u → %s:%d",
+             old_host, old_port, new_host, new_port);
+    memcpy(s_endpoint_host, new_host, sizeof(s_endpoint_host));
+    s_endpoint_port = (uint16_t)new_port;
+    return wg_netif_update_peer_endpoint(v4_be, (uint16_t)new_port);
+}
+
 esp_err_t wg_dataplane_update_peers(const tinylink_keys_t *keys,
                                     const tl_peer_t *peers, size_t n_peers)
 {
@@ -423,61 +484,45 @@ esp_err_t wg_dataplane_update_peers(const tinylink_keys_t *keys,
             break;
         }
     }
-    if (peer != NULL) {
-        /* Same peer, new identity keys: a re-login (NodeKey) or a
-         * tailscaled restart (DiscoKey, every start). Without this the
-         * DISCO filters kept the boot-time DiscoKey forever and a
-         * re-logged peer left the session dead until our reboot. */
-        const bool static_changed =
-            memcmp(peer->node_pub, s_peer_node_pub, sizeof(s_peer_node_pub)) != 0;
-        const bool disco_changed = peer->has_disco_pub &&
-            (!s_peer_has_disco ||
-             memcmp(peer->disco_pub, s_peer_disco_pub, sizeof(s_peer_disco_pub)) != 0);
-        if (static_changed || disco_changed) {
-            ESP_LOGI(TAG, "peer identity changed (%s%s%s) — updating session",
-                     static_changed ? "NodeKey" : "",
-                     static_changed && disco_changed ? " + " : "",
-                     disco_changed ? "DiscoKey" : "");
-            esp_err_t kerr = wg_netif_update_peer_keys(
-                peer->node_pub, disco_changed ? peer->disco_pub : NULL);
-            if (kerr == ESP_OK) {
-                memcpy(s_peer_node_pub, peer->node_pub, sizeof(s_peer_node_pub));
-                if (disco_changed) {
-                    memcpy(s_peer_disco_pub, peer->disco_pub, sizeof(s_peer_disco_pub));
-                    s_peer_has_disco = true;
-                }
-            }
-        }
-    }
-    if (peer == NULL || peer->n_endpoints == 0) {
-        /* Peer dropped from the table or lost endpoints. We don't tear
-         * down here — the WG handshake retry budget will surface the
-         * dead path eventually, and a future netmap may re-add the
-         * peer. */
+    if (peer == NULL) {
+        /* Peer dropped from the table. We don't tear down here — the WG
+         * handshake retry budget will surface a dead path eventually,
+         * and a future netmap may re-add the peer. */
         return ESP_OK;
     }
 
-    char     new_host[64];
-    int      new_port = 0;
-    uint32_t v4_be = 0;
-    if (pick_peer_endpoint(peer, new_host, sizeof(new_host),
-                           &new_port, &v4_be, NULL) != 0) {
-        return ESP_OK;  /* nothing usable; leave the live session alone */
-    }
-    if (strcmp(new_host, s_endpoint_host) == 0 &&
-        (uint16_t)new_port == s_endpoint_port) {
-        return ESP_OK;  /* unchanged */
-    }
+    /* Endpoint before keys: a re-login patch (NodeKeyRotated) carries
+     * both, and the cold-handshake INIT a new NodeKey triggers must go
+     * to the new address, not wait out a 5-s retry against the old. */
+    esp_err_t err = apply_peer_endpoint(peer);
 
-    /* Endpoint changed. With tinylink_wg, roaming does NOT require a
-     * fresh handshake — we just point the UDP socket at the new
-     * sockaddr. The transport keys remain valid. */
-    ESP_LOGI(TAG, "peer endpoint changed: %s:%u → %s:%d",
-             s_endpoint_host, (unsigned)s_endpoint_port,
-             new_host, new_port);
-    memcpy(s_endpoint_host, new_host, sizeof(s_endpoint_host));
-    s_endpoint_port = (uint16_t)new_port;
-    return wg_netif_update_peer_endpoint(v4_be, (uint16_t)new_port);
+    /* Same peer, new identity keys: a re-login (NodeKey) or a
+     * tailscaled restart (DiscoKey, every start). Without this the
+     * DISCO filters kept the boot-time DiscoKey forever and a
+     * re-logged peer left the session dead until our reboot. */
+    const bool static_changed =
+        memcmp(peer->node_pub, s_peer_node_pub, sizeof(s_peer_node_pub)) != 0;
+    const bool disco_changed = peer->has_disco_pub &&
+        (!s_peer_has_disco ||
+         memcmp(peer->disco_pub, s_peer_disco_pub, sizeof(s_peer_disco_pub)) != 0);
+    if (static_changed || disco_changed) {
+        ESP_LOGI(TAG, "peer identity changed (%s%s%s) — updating session",
+                 static_changed ? "NodeKey" : "",
+                 static_changed && disco_changed ? " + " : "",
+                 disco_changed ? "DiscoKey" : "");
+        esp_err_t kerr = wg_netif_update_peer_keys(
+            peer->node_pub, disco_changed ? peer->disco_pub : NULL);
+        if (kerr == ESP_OK) {
+            memcpy(s_peer_node_pub, peer->node_pub, sizeof(s_peer_node_pub));
+            if (disco_changed) {
+                memcpy(s_peer_disco_pub, peer->disco_pub, sizeof(s_peer_disco_pub));
+                s_peer_has_disco = true;
+            }
+        } else {
+            err = kerr;
+        }
+    }
+    return err;
 }
 
 #endif /* ESP_PLATFORM */

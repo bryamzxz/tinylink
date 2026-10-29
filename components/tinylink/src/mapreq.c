@@ -478,9 +478,11 @@ static void parse_one_patch(const char *js, const jsmntok_t *toks,
 }
 
 /* PeersChangedPatch: array of tailcfg.PeerChange objects, one sub-parse
- * each. Applied by NodeID in tinylink.c (merge_peers). Entries past
- * TL_MAX_PEER_PATCHES raise patches_overflow → the caller recycles the
- * stream for a full map instead of applying a partial delta. */
+ * each. Only entries touching Key / DiscoKey / Endpoints / DERPRegion
+ * are kept (one per NodeID); they are applied in tinylink.c merge_peers.
+ * More than TL_MAX_PEER_PATCHES distinct relevant NodeIDs raise
+ * patches_overflow → the caller recycles the stream for a full map
+ * instead of applying a partial delta. */
 static esp_err_t parse_patch_split(const char *js, size_t len,
                                    tl_netmap_t *out, int *peak)
 {
@@ -488,18 +490,42 @@ static esp_err_t parse_patch_split(const char *js, size_t len,
     const char *v; size_t vlen; int rc;
     while ((rc = tl_jsplit_arr_next(js, len, &pos, &v, &vlen)) == 1) {
         if (v[0] != '{') continue;
-        if (out->n_patches >= TL_MAX_PEER_PATCHES) {
-            out->patches_overflow = true;
-            continue;
-        }
         int n = sub_parse(v, vlen, peak);
         if (n < 1 || !tok_is_obj(&s_toks[0])) {
             out->patches_overflow = true;   /* unparseable: don't guess */
             continue;
         }
-        tl_peer_patch_t *pc = &out->patches[out->n_patches];
-        parse_one_patch(v, s_toks, 0, pc);
-        if (pc->id != 0) out->n_patches++;
+        tl_peer_patch_t pc;
+        parse_one_patch(v, s_toks, 0, &pc);
+        /* Online / LastSeen / KeyExpiry / Cap-only entries carry nothing
+         * the data plane uses — headscale sends one per peer (dis)connect
+         * and folds a tick's worth into one frame, so counting them would
+         * overflow the cap and recycle the stream for nothing. */
+        if (pc.id == 0 ||
+            !(pc.has_key || pc.has_disco || pc.has_endpoints || pc.derp_region != 0)) {
+            continue;
+        }
+        /* Same NodeID twice in one frame: fold into the first entry, later
+         * fields winning, as applying both in order would. */
+        size_t j = 0;
+        while (j < out->n_patches && out->patches[j].id != pc.id) j++;
+        if (j < out->n_patches) {
+            tl_peer_patch_t *d = &out->patches[j];
+            if (pc.has_key) { d->has_key = true; memcpy(d->node_pub, pc.node_pub, sizeof(d->node_pub)); }
+            if (pc.has_disco) { d->has_disco = true; memcpy(d->disco_pub, pc.disco_pub, sizeof(d->disco_pub)); }
+            if (pc.has_endpoints) {
+                d->has_endpoints = true;
+                d->n_endpoints = pc.n_endpoints;
+                memcpy(d->endpoints, pc.endpoints, sizeof(d->endpoints));
+            }
+            if (pc.derp_region != 0) d->derp_region = pc.derp_region;
+            continue;
+        }
+        if (out->n_patches >= TL_MAX_PEER_PATCHES) {
+            out->patches_overflow = true;
+            continue;
+        }
+        out->patches[out->n_patches++] = pc;
     }
     return (rc < 0) ? ESP_ERR_INVALID_RESPONSE : ESP_OK;
 }
