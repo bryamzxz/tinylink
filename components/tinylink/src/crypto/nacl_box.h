@@ -45,6 +45,15 @@ int nacl_box_compute_shared(uint8_t k[NACL_BOX_KEY_LEN],
                             const uint8_t peer_pub[NACL_BOX_KEY_LEN],
                             const uint8_t my_priv[NACL_BOX_KEY_LEN]);
 
+/* Equivalent to nacl_box but seals with a precomputed shared key (from
+ * nacl_box_compute_shared): no X25519 + HSalsa20 per call. Same output
+ * as nacl_box for the same (K, nonce, m). Returns 0, or -1 if mlen is
+ * over the internal bound (256). */
+int nacl_box_after_shared(uint8_t *c,
+                          const uint8_t *m, size_t mlen,
+                          const uint8_t nonce[NACL_BOX_NONCE_LEN],
+                          const uint8_t k[NACL_BOX_KEY_LEN]);
+
 /* Equivalent to nacl_box_open but starts from a precomputed shared key
  * (from nacl_box_compute_shared). Saves the X25519 + HSalsa20 per call.
  * Returns 0 on success, -1 on auth failure (constant-time tag compare). */

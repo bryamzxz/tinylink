@@ -117,6 +117,17 @@ size_t disco_seal(uint8_t *out, size_t out_cap,
                   const uint8_t recipient_pub[DISCO_KEY_LEN],
                   const uint8_t my_priv[DISCO_KEY_LEN]);
 
+/* Same as disco_seal, sealing with a precomputed NaCl shared key
+ * K = nacl_box_compute_shared(recipient_pub, my_priv) instead of
+ * deriving it (one X25519 + HSalsa20 saved per frame). Byte-identical
+ * to disco_seal for the same nonce. The caller keeps K coherent with
+ * the recipient's key. */
+size_t disco_seal_with_shared(uint8_t *out, size_t out_cap,
+                              const uint8_t *plaintext, size_t plen,
+                              const uint8_t nonce[DISCO_NONCE_LEN],
+                              const uint8_t sender_pub[DISCO_KEY_LEN],
+                              const uint8_t shared_k[DISCO_KEY_LEN]);
+
 /* Open a wire-format disco frame using my_priv. On success, copies the
  * sender's disco pubkey into out_sender_pub, writes the inner plaintext
  * into pt (which must hold at least ilen - DISCO_OVERHEAD bytes), and

@@ -95,6 +95,18 @@ bool disco_looks_like(const uint8_t *buf, size_t len)
     return memcmp(buf, DISCO_MAGIC, DISCO_MAGIC_LEN) == 0;
 }
 
+/* Cleartext header [magic | sender_pub | nonce]; returns the box start. */
+static uint8_t *put_seal_header(uint8_t *out,
+                                const uint8_t nonce[DISCO_NONCE_LEN],
+                                const uint8_t sender_pub[DISCO_KEY_LEN])
+{
+    uint8_t *p = out;
+    memcpy(p, DISCO_MAGIC, DISCO_MAGIC_LEN);    p += DISCO_MAGIC_LEN;
+    memcpy(p, sender_pub, DISCO_KEY_LEN);       p += DISCO_KEY_LEN;
+    memcpy(p, nonce, DISCO_NONCE_LEN);          p += DISCO_NONCE_LEN;
+    return p;
+}
+
 size_t disco_seal(uint8_t *out, size_t out_cap,
                   const uint8_t *plaintext, size_t plen,
                   const uint8_t nonce[DISCO_NONCE_LEN],
@@ -109,14 +121,31 @@ size_t disco_seal(uint8_t *out, size_t out_cap,
     const size_t wire = DISCO_OVERHEAD + plen;
     if (out_cap < wire) return 0;
 
-    uint8_t *p = out;
-    memcpy(p, DISCO_MAGIC, DISCO_MAGIC_LEN);    p += DISCO_MAGIC_LEN;
-    memcpy(p, sender_pub, DISCO_KEY_LEN);       p += DISCO_KEY_LEN;
-    memcpy(p, nonce, DISCO_NONCE_LEN);          p += DISCO_NONCE_LEN;
+    uint8_t *p = put_seal_header(out, nonce, sender_pub);
 
     /* nacl_box writes [tag(16) || ciphertext(plen)] which is exactly
      * what the disco wire format expects after the cleartext header. */
     if (nacl_box(p, plaintext, plen, nonce, recipient_pub, my_priv) != 0) {
+        return 0;
+    }
+    return wire;
+}
+
+size_t disco_seal_with_shared(uint8_t *out, size_t out_cap,
+                              const uint8_t *plaintext, size_t plen,
+                              const uint8_t nonce[DISCO_NONCE_LEN],
+                              const uint8_t sender_pub[DISCO_KEY_LEN],
+                              const uint8_t shared_k[DISCO_KEY_LEN])
+{
+    if (out == NULL || plaintext == NULL || nonce == NULL ||
+        sender_pub == NULL || shared_k == NULL) {
+        return 0;
+    }
+    const size_t wire = DISCO_OVERHEAD + plen;
+    if (out_cap < wire) return 0;
+
+    uint8_t *p = put_seal_header(out, nonce, sender_pub);
+    if (nacl_box_after_shared(p, plaintext, plen, nonce, shared_k) != 0) {
         return 0;
     }
     return wire;

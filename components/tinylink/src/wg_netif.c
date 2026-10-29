@@ -133,7 +133,10 @@ static const char *TAG = "wg_netif";
  * overflow in task wg_rx" reset on every inbound CMM-punched ping).
  * 8 KiB has comfortable headroom for the deepest path (handle_disco_direct
  * → disco_handle_recv → disco_open → NaCl box_open with curve25519/salsa20
- * crypto on the stack → disco_seal → sendto into WiFi TX). */
+ * crypto on the stack → disco_seal → sendto into WiFi TX). Since round
+ * 1.3.2 (B10) the cached-K branch seals with K and never reaches
+ * curve25519_donna (2.7 KiB frame); the uncached fallback, the INIT
+ * build and the path-stale prepunch still do. */
 #define WG_RX_TASK_STACK_BYTES 8192
 #define WG_RX_TASK_PRIO        (tskIDLE_PRIORITY + 3)
 
@@ -708,15 +711,19 @@ static void handle_disco_direct_snap(const uint8_t *buf, size_t len,
         }
     }
 
-    /* Hot path: use the cached shared K if available (skips X25519 +
-     * HSalsa20 per frame). Falls back to the per-frame compute path
-     * for the (rare) bringup where peer_disco_pub wasn't supplied. */
+    /* Hot path: use the cached shared K if available — both the open
+     * and the Pong seal skip X25519 + HSalsa20 (B10: ~20 ms → ~50 µs per
+     * direct ping, and no donna frame on this stack). The snapshot holds
+     * K and the DiscoKey it was derived from together (both swapped under
+     * g.lock by wg_netif_update_peer_keys), and the pre-AEAD gate above
+     * already dropped any other sender. Falls back to the per-frame
+     * compute path for the (rare) bringup where peer_disco_pub wasn't
+     * supplied. */
     size_t reply_len;
     if (peer->k_valid) {
         reply_len = disco_handle_recv_with_shared(
             reply, sizeof(reply), buf, len,
-            peer->k,
-            g.local.disco_priv, g.local.disco_pub,
+            peer->k, g.local.disco_pub,
             &type, peer_disco_pub, txid);
     } else {
         reply_len = disco_handle_recv(

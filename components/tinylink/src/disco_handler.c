@@ -27,11 +27,16 @@ extern void esp_fill_random(void *buf, size_t len);
 /* Common post-decrypt handler. Both disco_handle_recv and the
  * with_shared variant land here after the inbound frame has been
  * decrypted into pt[0..pt_len] and the cleartext sender pubkey copied
- * to peer_disco_pub. */
+ * to peer_disco_pub. With shared_k (the with_shared variant) the Pong is
+ * sealed with that same K — it is the box key for the sender we just
+ * opened — so the cached path runs no X25519 at all (round 1.3.2, B10:
+ * ~20 ms of wg_rx per direct ping before). Otherwise K is derived from
+ * my_disco_priv and the sender's key, as for any unknown sender. */
 static size_t finish_disco_recv(uint8_t *out_reply, size_t out_cap,
                                 const uint8_t *pt, size_t pt_len,
                                 const uint8_t peer_disco_pub[DISCO_KEY_LEN],
-                                const uint8_t my_disco_priv[DISCO_KEY_LEN],
+                                const uint8_t *shared_k,
+                                const uint8_t *my_disco_priv,
                                 const uint8_t my_disco_pub[DISCO_KEY_LEN],
                                 disco_msg_type_t *out_type,
                                 uint8_t out_peer_disco_pub[DISCO_KEY_LEN],
@@ -79,10 +84,11 @@ static size_t finish_disco_recv(uint8_t *out_reply, size_t out_cap,
     esp_fill_random(nonce, sizeof(nonce));
 
     /* Seal back to the same DiscoKey we just decrypted from. */
-    size_t wire_len = disco_seal(out_reply, out_cap,
-                                 inner, inner_len,
-                                 nonce, my_disco_pub,
-                                 peer_disco_pub, my_disco_priv);
+    size_t wire_len = (shared_k != NULL)
+        ? disco_seal_with_shared(out_reply, out_cap, inner, inner_len,
+                                 nonce, my_disco_pub, shared_k)
+        : disco_seal(out_reply, out_cap, inner, inner_len,
+                     nonce, my_disco_pub, peer_disco_pub, my_disco_priv);
     return wire_len;
 }
 
@@ -114,7 +120,7 @@ size_t disco_handle_recv(uint8_t *out_reply, size_t out_cap,
     if (pt_len == 0) return 0;
 
     return finish_disco_recv(out_reply, out_cap, pt, pt_len,
-                             peer_disco_pub,
+                             peer_disco_pub, NULL,
                              my_disco_priv, my_disco_pub,
                              out_type, out_peer_disco_pub, out_txid);
 }
@@ -122,14 +128,13 @@ size_t disco_handle_recv(uint8_t *out_reply, size_t out_cap,
 size_t disco_handle_recv_with_shared(uint8_t *out_reply, size_t out_cap,
                                      const uint8_t *frame, size_t frame_len,
                                      const uint8_t shared_k[DISCO_KEY_LEN],
-                                     const uint8_t my_disco_priv[DISCO_KEY_LEN],
                                      const uint8_t my_disco_pub[DISCO_KEY_LEN],
                                      disco_msg_type_t *out_type,
                                      uint8_t out_peer_disco_pub[DISCO_KEY_LEN],
                                      uint8_t out_txid[DISCO_TXID_LEN])
 {
     if (out_reply == NULL || frame == NULL || shared_k == NULL ||
-        my_disco_priv == NULL || my_disco_pub == NULL) {
+        my_disco_pub == NULL) {
         return 0;
     }
     if (out_cap < DISCO_HANDLER_REPLY_MAX) return 0;
@@ -143,7 +148,7 @@ size_t disco_handle_recv_with_shared(uint8_t *out_reply, size_t out_cap,
     if (pt_len == 0) return 0;
 
     return finish_disco_recv(out_reply, out_cap, pt, pt_len,
-                             peer_disco_pub,
-                             my_disco_priv, my_disco_pub,
+                             peer_disco_pub, shared_k,
+                             NULL, my_disco_pub,
                              out_type, out_peer_disco_pub, out_txid);
 }

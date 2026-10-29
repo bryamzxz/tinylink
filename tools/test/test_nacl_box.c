@@ -72,6 +72,22 @@ int main(void)
         snprintf(name, sizeof(name), "tamper/%s", v->name);
         CHECK(name, nacl_box_open(buf, bad, v->clen, kNonce, kPkA, kSkB) != 0);
     }
+    /* Seal from a precomputed shared key (round 1.3.2, B10: the DISCO
+     * pong on the cached-K path): K = beforenm(pkB, skA) once, then the
+     * same libsodium bytes for every vector. */
+    {
+        uint8_t k[32];
+        CHECK("seal-shared/beforenm", nacl_box_compute_shared(k, kPkB, kSkA) == 0);
+        for (size_t i = 0; i < sizeof(kVecs) / sizeof(kVecs[0]); i++) {
+            const vec_t *v = &kVecs[i];
+            char name[64];
+            memset(buf, 0xAA, sizeof(buf));
+            int rc = nacl_box_after_shared(buf, v->m, v->mlen, kNonce, k);
+            snprintf(name, sizeof(name), "seal-shared/%s", v->name);
+            CHECK(name, rc == 0 && memcmp(buf, v->c, v->clen) == 0);
+        }
+        CHECK("seal-shared/oversize", nacl_box_after_shared(buf, buf, 257, kNonce, k) != 0);
+    }
     if (g_fail) { printf("\nFAIL\n"); return 1; }
     printf("\n[PASS] all nacl_box assertions passed\n");
     return 0;
