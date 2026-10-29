@@ -125,16 +125,38 @@ if(NOT CONFIG_COMPILER_OPTIMIZATION_SIZE OR NOT CONFIG_LOG_VERSION_2
                     "deliberate debug configuration.")
 endif()
 
-# -O2 for IDF's mbedcrypto library only. This is what mbedtls uses for
-# its symmetric/asymmetric primitives — i.e. the SHA/AES/RSA building
-# blocks behind every TLS handshake on the control plane and DERP
-# uplink. HW SHA/AES paths are already enabled (HARDWARE_AES=y,
-# HARDWARE_SHA=y, HARDWARE_MPI=y in sdkconfig.defaults), so the win
-# is on the SW glue around them. mbedtls + mbedx509 are intentionally
-# left at the default opt level — the bulk of their code is parsing/
-# validation, not arithmetic, and we want to minimize binary growth
-# on the cold paths.
-target_compile_options(mbedcrypto PRIVATE -O2)
+# -O2 islands inside mbedcrypto (round 1.3.2, B6); the rest of mbedTLS
+# (mbedcrypto, mbedtls, mbedx509) runs at the global -Os. Measured on
+# the host (IDF's mbedTLS 3.6.7, gcov line counts of a full TLS 1.2
+# handshake + response against controlplane): bignum_core.c 44.5 %, the
+# constant_time_impl.h inlines 25.7 %, bignum.c 16.2 %, ecp_curves.c
+# 10.1 %, ecp.c 2.0 %, everything else < 0.5 % (SHA, AES, ASN.1,
+# X.509, RSA glue). Every handshake does X25519 ECDHE (mbedTLS ECP),
+# one P-256 and three P-384 ECDSA verifies and one RSA verify. On the
+# ESP32 each field multiplication goes through the MPI accelerator, so
+# its glue (esp_bignum.c, bignum_alt.c) is per-mul hot too, and since
+# TLS records are AES-128-GCM (B4) the record path is esp_aes_gcm.c
+# (software GHASH, GCM_ALT) + esp_aes.c (HW block) per 16 bytes.
+# ecdh.c, pk.c, pk_wrap.c, cipher_wrap.c and esp_sha512.c come out
+# smaller at -O2 than at -Os, so they keep it. Everything else at -Os:
+# libmbedcrypto.a 4.2 KB smaller than all-at-O2.
+idf_component_get_property(tl_mbedtls_dir mbedtls COMPONENT_DIR)
+set_property(SOURCE
+        "${tl_mbedtls_dir}/mbedtls/library/bignum.c"
+        "${tl_mbedtls_dir}/mbedtls/library/bignum_core.c"
+        "${tl_mbedtls_dir}/mbedtls/library/ecp.c"
+        "${tl_mbedtls_dir}/mbedtls/library/ecp_curves.c"
+        "${tl_mbedtls_dir}/port/bignum/esp_bignum.c"
+        "${tl_mbedtls_dir}/port/bignum/bignum_alt.c"
+        "${tl_mbedtls_dir}/port/aes/esp_aes_gcm.c"
+        "${tl_mbedtls_dir}/port/aes/block/esp_aes.c"
+        "${tl_mbedtls_dir}/mbedtls/library/ecdh.c"
+        "${tl_mbedtls_dir}/mbedtls/library/pk.c"
+        "${tl_mbedtls_dir}/mbedtls/library/pk_wrap.c"
+        "${tl_mbedtls_dir}/mbedtls/library/cipher_wrap.c"
+        "${tl_mbedtls_dir}/port/sha/parallel_engine/esp_sha512.c"
+    TARGET_DIRECTORY mbedcrypto
+    APPEND PROPERTY COMPILE_OPTIONS -O2)
 
 # -O2 islands inside IDF components (round 1.3.1). The global level is
 # -Os (CONFIG_COMPILER_OPTIMIZATION_SIZE); these files sit on every WG

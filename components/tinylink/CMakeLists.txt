@@ -61,14 +61,56 @@ idf_component_register(
         esp_timer
 )
 
-# -O2 for the entire tinylink component. This is the perf-critical
-# code: WG transport, ChaCha20-Poly1305 AEAD, Curve25519, BLAKE2s,
-# HKDF, the DISCO/STUN/DERP codecs, and the netif fast path. The
-# global level is -Os (CONFIG_COMPILER_OPTIMIZATION_SIZE, round 1.3.1);
-# this is one of the -O2 islands listed in sdkconfig.defaults. (The old
-# note about toolchain hangs on lwIP files at -O2 is stale: all of lwIP
-# builds at -O2 on the v5.5.6 toolchain.)
-target_compile_options(${COMPONENT_LIB} PRIVATE -O2)
+# -O2 islands inside tinylink (round 1.3.2, B6). The global level is -Os
+# (CONFIG_COMPILER_OPTIMIZATION_SIZE); a source-level COMPILE_OPTIONS
+# lands after the target's flags, so -O2 wins for these files only:
+#  - crypto/*: the IRAM AEAD (every WG packet and Noise record), X25519
+#    (WG / DISCO / Noise handshakes, 20 ms each), BLAKE2s + HKDF, XSalsa20
+#    + NaCl box (DISCO, DERP login);
+#  - the WireGuard data plane and handshake: wg_netif, wg_lwip,
+#    wg_transport, wg_demux (per packet), wg_handshake, wg_proto;
+#  - DISCO (disco, disco_handler, disco_prober — on wg_rx) and the DERP
+#    relay codec / client (derp, derp_client — every relayed packet);
+#  - keys.c: boot-only, but -Os makes it 5 B larger;
+#  - tmp117.c: 1/min, but -Os outlines read_reg16 (+64 B on the I2C
+#    read chain of tinylink_tlm, the task with the smallest soak margin)
+#    to save 63 B.
+# Everything else is control plane, per-netmap or once-per-minute code
+# at -Os: ts2021_client / noise_ik (record glue; the AEAD itself is in
+# IRAM), h2_client, tls_io, register, control_key, json_helpers,
+# mapreq (netmap parse, ~4 ms), wg_dataplane (peer selection per
+# netmap), stun / stun_probe, tinylink (bring-up, supervisors, thin
+# DERP dispatch), telemetry (1/min), tl_time, tinylink_bench: the
+# component is 5.4 KB smaller than all-at-O2. Their frames shrink or
+# merge through inlining; the few that grow do so by 16 B on the
+# 24 KiB long-poll task (worst case below long_poll_task +32 B, still
+# 192 B under 1.3.1). New sources default to -Os: add them here only
+# with a reason.
+set_property(SOURCE
+        "src/crypto/blake2s.c"
+        "src/crypto/curve25519.c"
+        "src/crypto/curve25519_donna.c"
+        "src/crypto/hkdf_blake2s.c"
+        "src/crypto/salsa20.c"
+        "src/crypto/nacl_box.c"
+        "src/crypto/chacha20.c"
+        "src/crypto/poly1305_donna.c"
+        "src/crypto/chacha20poly1305.c"
+        "src/crypto/secure_zero.c"
+        "src/wg_netif.c"
+        "src/wg_lwip.c"
+        "src/wg_transport.c"
+        "src/wg_demux.c"
+        "src/wg_handshake.c"
+        "src/wg_proto.c"
+        "src/disco.c"
+        "src/disco_handler.c"
+        "src/disco_prober.c"
+        "src/derp.c"
+        "src/derp_client.c"
+        "src/keys.c"
+        "src/tmp117.c"
+    APPEND PROPERTY COMPILE_OPTIONS -O2)
 
 # Build epoch for tl_time.c's clock floor (see tl_time.h). Evaluated at
 # configure time, so a reconfigure moves it; that is the intent — the
