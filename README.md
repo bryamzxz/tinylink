@@ -5,7 +5,7 @@
 **A clean-room, single-peer Tailscale-compatible node for the bare ESP32 — no PSRAM, ~916 KiB of flash, pure C.**
 
 [![CI](https://github.com/bryamzxz/tinylink/actions/workflows/build.yml/badge.svg)](https://github.com/bryamzxz/tinylink/actions/workflows/build.yml)
-[![Firmware](https://img.shields.io/badge/firmware-1.2.0-brightgreen)](CHANGELOG.md)
+[![Firmware](https://img.shields.io/badge/firmware-1.3.0-yellow)](CHANGELOG.md)
 [![Target](https://img.shields.io/badge/target-ESP32--WROOM%20(no%20PSRAM)-orange)](#hardware)
 [![Framework](https://img.shields.io/badge/ESP--IDF-v5.5-e7352c)](docs/BUILDING.md)
 [![Host tests](https://img.shields.io/badge/host%20KATs-546%20%C2%B7%200%20fail-brightgreen)](#testing)
@@ -113,6 +113,7 @@ What works today, verified on real hardware:
 | 14 | Audit + optimization round (2026-09-04) | done — endpoint-push stack overflow fixed (task removed, −12.6 KiB BSS), headscale `/key` capver gate, TSMP proto-99 drop, DERP close race, Xtensa-tuned ChaCha20/Poly1305 (XOR 19 → 7 instr/word), backoff consolidation, provisioning contract fixed, ASan CI |
 | 15 | Road-to-100 round (2026-09-04, part 2) | done — netmap parsed one value at a time (−30 KiB BSS, no tailnet-size ceiling), task WDT for app tasks, capver 142, connect-path stack diet, DERP live relay switch, IP-change recycle + WiFi backoff, conn kept after register, flash trims, 3 new KAT suites, firmware 1.2.0 (even minor = Tailscale "stable" track) |
 | 16 | To-95 round (2026-09-04, part 3) | done — NTP-synced certificate date validation, `PeersRemoved` + delta merge, WG handshake lock + roam on authenticated packets, `/stats` over UDP, AEAD placement measured cold. Declared scope ≈ 95 %; the last 5 % is the owner checklist in `docs/ROADMAP.md` |
+| 17 | Upstream sync 1.3.0 (2026-10-28) | code done, hardware smoke pending — capver 148 (TSMP disco-key advert, upstream's exact Retry-After), headscale delta frames (expired/deleted node re-registers, peer key rotation applied, patches by NodeID), ESP-IDF v5.5.6, `docs/esp32/` vendor reference, firmware 1.3.0 (work line toward 1.4.0) |
 
 Two further 2026-05-12 rounds — sdkconfig perf-trim (#76–#80) and DERP
 outbound (#82–#83: supervisor spawn + lossless relay fallback during
@@ -184,15 +185,17 @@ Three properties that are non-obvious from a casual read of the code:
    OmitPeers=true), the only shape modern Tailscale.com persists at
    CapVer ≥ 68. The long-poll Stream=true is read-only — it streams
    netmap updates but ignores any Hostinfo/Endpoints in the request.
-   The advertised CapabilityVersion is `TINYLINK_CAPVER = 142`
-   (= Tailscale v1.98), set once in `components/tinylink/include/
-   tinylink.h` and derived into the Noise prologue, RegisterRequest,
-   and MapRequest. It clears headscale's earlyNoise
-   `MinSupportedCapabilityVersion` floor (115 = Tailscale v1.82 as of
-   2026-09; it tracks the latest ten minor releases), which the server
-   enforces before any JSON is read — and, since headscale `5b6e1e17`,
-   on the legacy `GET /key?v=` TOFU fetch as well, so `control_key.c`
-   sends the same macro. The value is 142 (= v1.102) since round 15.
+   The advertised CapabilityVersion is `TINYLINK_CAPVER = 148`
+   (= Tailscale v1.104, an even-minor stable release), set once in
+   `components/tinylink/include/tinylink.h` and derived into the Noise
+   prologue, RegisterRequest, MapRequest and `GET /key?v=`. Every step
+   143–148 is honoured — notably 144 (a TSMP disco-key advertisement
+   after every WireGuard handshake) and 147 (upstream's exact
+   Retry-After rules). It clears headscale's earlyNoise
+   `MinSupportedCapabilityVersion` floor (116 = Tailscale v1.84 as of
+   2026-10; it tracks the latest ten minor releases), which the server
+   enforces before any JSON is read and on the legacy `GET /key?v=`
+   TOFU fetch. 148 since round 1.3.0 (was 142 from round 15).
 
 ## Quick start
 
@@ -201,7 +204,7 @@ Full walkthrough (prerequisites, flash, monitor, serial capture) in
 
 ```bash
 source "$VENV/bin/activate"     # the python venv ESP-IDF was installed into
-. "$IDF_PATH/export.sh"         # ESP-IDF v5.5.4 checkout
+. "$IDF_PATH/export.sh"         # ESP-IDF v5.5.6 checkout
 idf.py set-target esp32
 idf.py build
 ```
@@ -234,7 +237,7 @@ make asan          # same suite under ASan + UBSan
 
 CI ([`.github/workflows/build.yml`](.github/workflows/build.yml)) runs
 the host suite **and** builds the firmware against the pinned ESP-IDF
-v5.5.4 on every push/PR.
+v5.5.6 on every push/PR.
 
 On-device AEAD micro-bench: opt-in via `CONFIG_TINYLINK_BENCH_AEAD=y`
 (off by default — see
@@ -319,10 +322,11 @@ None of these block the current sensor-→-collector path:
   time. See `tl_time.h`.
 - **CapabilityVersion has a shelf life against headscale** — its
   `MinSupportedCapabilityVersion` tracks the latest ten minor releases
-  (113 in 2026-07, 115 in 2026-09) and rejects both `/key` and `/ts2021`
-  below it. tinylink advertises 142 (= v1.102) since round 15, ~8
-  headscale releases of headroom; each bump needs a hardware A/B smoke
-  (it changes the Noise prologue). Upstream is at 145.
+  (113 in 2026-07, 115 in 2026-09, 116 in 2026-10) and rejects both
+  `/key` and `/ts2021` below it. tinylink advertises 148 (= v1.104)
+  since round 1.3.0, ~10 headscale minor releases of headroom; each bump
+  needs a hardware A/B smoke (it changes the Noise prologue). Upstream
+  is at 149 (a 1.105-pre sentinel, deliberately not claimed).
 - **The 32 KiB MapResponse body buffer is the last big static object**
   (static DRAM 59 %). The token table went 40 → 10 KiB in round 15 by
   parsing one value at a time; the body buffer needs a streaming

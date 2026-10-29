@@ -7,6 +7,144 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Upstream sync round 1.3.0 (2026-10-28, branch `feat/upstream-sync-2026-10`)
+
+Inputs: a two-sided upstream audit — tailscale `31d8badb3..f7c1b8e52`
+(329 commits, v1.105.0-pre, `CurrentCapabilityVersion` 145 → 149) and
+headscale `89fa72e0..2d220b2e` (330 commits, 0.29.6,
+`MinSupportedCapabilityVersion` 115 → **116**, capver table up to 148) —
+plus the owner's decisions: capver **148**, firmware **1.3.0** (1.3.x is
+the work line, 1.4.0 the next stable), ESP-IDF **v5.5.6**. Every
+finding, decision and constraint is kept in
+`docs/rounds/2026-10-upstream-sync.md`. Host suite **623 strict OK, 0
+FAIL** (+53), ASan + UBSan clean. Flash 946 037 → 958 013 B (+6 088 B
+from IDF 5.5.6, +5 888 B from the round's code); BSS 93 048 → 94 320 B
+(+128 IDF, +1 144 code). Compiler warnings: 0. **Hardware smoke still
+pending owner approval** — capver changes the Noise prologue.
+
+#### 1 — Capver 148 (= Tailscale v1.104), every step honoured
+
+The owner's rule: only claim a capver that maps to an even-minor (stable)
+release; 149 is a sentinel on the odd 1.105-pre line and is not claimed.
+143 (control drops conn25 attrs below it), 145 (macOS quad-100), 146
+(`debug-conn-reject`: a local aggregator, nothing to enforce) and 148
+(`Node.StableTailnetID`) need no client behaviour. Peers gate on a
+remote's capver only at ≥ 121 (relay) and ≥ 26 (DNS proxy); headscale
+only checks its floor. The two that do need behaviour:
+
+- **144 — TSMP disco-key advertisement.** `tsmp.h` builds the 53-byte
+  packet upstream marshals (`net/packet` `IP4Header` +
+  `TSMPDiscoKeyAdvertisement`: IHL 5, TTL 64, proto 99, `'a'` + raw
+  disco key, RFC 1071 checksum); `wg_netif.c::send_disco_advert` sends it
+  through the tunnel after every accepted handshake response — cold or
+  rekey, direct or DERP-relayed — which is every new keypair for an
+  initiator-only node (wireguard-go `receive.go` → magicsock). Src/dst
+  are the self / peer tailnet /32s (new `wg_netif_peer_config` fields);
+  skipped without a peer DiscoKey. Being the first transport packet
+  under the new keys it also makes the peer confirm them at once after a
+  rekey. `/stats` gained `wg.disco_adverts`. Inbound adverts are still
+  dropped before lwIP (applying them needs X25519 off wg_rx — deferred).
+- **147 — Retry-After, upstream's exact rules** (`direct.go`
+  `isRateLimitedResponse` + `parseRateLimitError`, `auto.go`
+  `waitRetryAfter`): rate-limited iff 429, or 503 with a non-empty
+  Retry-After; the value is Atoi-clean seconds or an IMF-fixdate (only
+  once NTP is synced); ≤ 0, > 1 h or junk → uniform 5–10 s; capped at
+  5 min; the backoff is neither advanced nor reset while waiting; scope
+  `/machine/register` + `/machine/map`. Before: `10abc` parsed as 10,
+  > 300 clamped to 300 instead of 5–10 s, a 503 without the header was
+  treated like a rate limit, an HTTP-date was ignored, and a throttled
+  in-loop re-register did not pace the next cycle. `tl_date.h` (new,
+  libc-free) holds the IMF-fixdate and RFC 3339 parsers. Public API:
+  `tinylink_last_retry_after_s()` → `tinylink_last_rate_limit_ms()`.
+
+#### 2 — headscale delta frames (real bugs the current server triggers)
+
+- **Deleted / expired node never recovered (HIGH).** Since 0.29.4
+  headscale answers a deleted node's `Stream=true` map with **HTTP 200**
+  and one frame — `{"Node":{"Key","KeyExpiry":"1970-01-01T00:00:01Z",
+  "Expired":true},"Debug":…}` — then ends the stream (`noise.go`,
+  juanfont/headscale#3410); an expired node keeps streaming with
+  `Expired` set. No 4xx ever reached the M13 re-register path and every
+  byte fed the wedge clock: an endless ~30-s reconnect loop until power
+  cycle. `parse_node_obj` now reads `Expired` and `KeyExpiry`; an expired
+  self (explicit, or KeyExpiry ≤ `time(NULL)`, which is never ahead of
+  real time) ends the stream (`MAPREQ_STREAM_RECYCLE`) and re-registers
+  on the first frame (a bare 4xx still waits for the second). A node that
+  comes back with a new tailnet address restarts into the boot path.
+  Re-registering after delete/expiry needs a reusable or tagged key
+  (PROVISIONING.md).
+- **Peer key rotation never reached the data plane (HIGH).** The session
+  peer was matched by its boot NodeKey and wg_netif had no key setter:
+  after every peer tailscaled restart (a new DiscoKey each start) the
+  DISCO pre-filter and the relayed-DISCO gate dropped everything from the
+  peer until our reboot, and a peer re-login left WireGuard dead. The
+  "recycle the stream on a Key/DiscoKey patch" refetch (M13) fetched the
+  keys — and then nothing applied them. Now: the peer table is keyed by
+  NodeID and merged in upstream's order (`map.go`: `Peers` replace and
+  stop; else `PeersRemoved` → `PeersChanged` → `PeersChangedPatch`);
+  patches apply Key / DiscoKey / Endpoints / DERPRegion in place (headscale
+  sends endpoint moves only as patches since 59f3ff12); the data plane
+  tracks its peer by NodeID; `wg_netif_update_peer_keys()` swaps the
+  DiscoKey + NaCl shared key under the locks (X25519 runs first, in the
+  long-poll task — `curve25519_donna` alone is a 2.7 KiB frame wg_rx
+  cannot absorb) and restarts the session with a cold handshake on a new
+  static key. DISCO readers snapshot the key under `g.lock`.
+- **Removal-only and DERPMap-only frames were dropped as KeepAlives**
+  (`!have_self && n_peers == 0`); headscale sends both alone. Any frame
+  with self, peers, removals, patches or a DERPMap is now dispatched.
+- **Combined frames** (headscale 7a2335dc folds a tick into one response:
+  `PeersChanged` for A + a patch for B) lost B's patch; fixed by the
+  above. Delta lists over the per-frame caps (`TL_MAX_PEER_PATCHES` 4,
+  `TL_MAX_PEERS_REMOVED` 8) now recycle the stream for a full map instead
+  of applying part of a delta.
+- `wg_dataplane_start` takes the merged table (self addresses + peers)
+  instead of one frame; dead `wg_dataplane_update_peer()` removed.
+
+#### 3 — ESP-IDF v5.5.4 → v5.5.6, tooling, docs
+
+- **IDF v5.5.6** (2026-10-16; Wi-Fi supplicant security fixes; same
+  toolchain). Both `idf-patches/` still apply and are still needed; the
+  crt-bundle verify callback `tl_time.c` relies on and the mbedTLS
+  `_ALT` hooks are unchanged. v6.x rejected for now (mbedTLS 4 / PSA
+  drops `mbedtls_chachapoly_*`, +27–41 KB flash, +800 B stack per HTTPS
+  conn, deprecated CAs removed, FreeRTOS forced into flash, patches to
+  re-validate). CI pins v5.5.6; host floor 623.
+- **`docs/esp32/`**: the deployed part read from eFuses —
+  ESP32-WROOM-32E-N4, ESP32-D0WD-V3 **rev v3.1**, 40 MHz XTAL, XMC
+  (0x46) 4 MB flash — plus `fetch-docs.sh` and a page-cited
+  `REFERENCE.md` digest (TRM v5.9, datasheet v5.3, WROOM-32E v2.1,
+  errata v3.1, Xtensa ISA RM). PDFs are not committed.
+- `nvs_provision.py` accepts headscale `hskey-` keys
+  (`--allow-legacy-key` for pre-0.28 plaintext keys).
+- `/stats` buffer 640 → 768 B: with a 63-char hostname the reply could
+  exceed 640 B and was then silently not sent.
+- Docs: capver / floor / prologue mentions, `ARCHITECTURE.md`
+  re-register paragraph, stale `http2.Server.ServeConn` comments,
+  `wg_dataplane.h` (still described trombik/esp_wireguard).
+
+#### Upstream drift audit — verified no-impact items
+
+controlbase / controlhttp / ts2021 framing (fuzz tests only; client-side
+1 MiB body cap), `disco/` (unchanged; heartbeat 3 s, trust 6.5 s,
+session-active 45 s unchanged), `net/stun` (tests only; derper now
+replies from the request's address), DERP frames (`derp.go` unchanged;
+keepalive 60 s + re-jittered, unknown frames > 65 568 B close the conn —
+tinylink sends none), `/machine/register` + `/machine/map` JSON (only
+`StableTailnetID`), `watchdogTimeout` 120 s, map 404 = node deleted
+(already re-registers on 4xx), `types/key` NL→TL rename (wire prefixes
+`nlpub:` kept), wireguard-go bump (perf/metrics only, no per-peer PSK on
+the wire), peer relay (CallMeMaybeVia ignored as before), packet-parser
+hardening (constrains the advert: IHL 5, exact length — satisfied).
+headscale: net/http h2c front end (`62714564`: identical SETTINGS,
+MAX_FRAME 1 MiB, MCS 250, IWS 1 MiB, no idle timeout / server PING /
+idle GOAWAY; the server now waits for the client preface before its
+SETTINGS — nghttp2 sends the preface first), floor 116 checked before
+the register handler, same-NodeKey re-register still skips key
+validation, stopped sessions reset after 5 s only if we stop reading,
+`/machine/set-dns` (never called), CertDomains / https cap / logtail
+`Debug` (skipped), SSH policy changes (skipped), DERP admission still
+by NodeKey, no Retry-After on any path tinylink uses.
+
 ### To-95 round (2026-09-04, part 3, branch `feat/to-95`)
 
 Closes every improvement-list item that needs neither router/admin

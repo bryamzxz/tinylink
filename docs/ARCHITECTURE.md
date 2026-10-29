@@ -48,8 +48,8 @@ primitives we did, see [`SECURITY-MODEL.md`](SECURITY-MODEL.md).
 |                                                               |
 |  control plane (one Noise+H/2 channel reused for everything): |
 |     ts2021_client.c   Noise IK over TLS Upgrade               |
-|        │   prologue "Tailscale Control Protocol v138"         |
-|        │   (TINYLINK_CAPVER=138, clears headscale floor 113); |
+|        │   prologue "Tailscale Control Protocol v148"         |
+|        │   (TINYLINK_CAPVER=148, clears headscale floor 116); |
 |        │   consume_early_payload reads EarlyNoise as a byte   |
 |        │   STREAM across Noise records (5B magic|BE32|JSON)   |
 |        ↑                                                      |
@@ -209,7 +209,7 @@ Inbound RX uses `tcpip_input(p, s_lwn)` directly — the no-op netstack's
 ### REQUIRED: `idf-patches/`
 
 The above only works because two patches in `idf-patches/` are applied
-to ESP-IDF v5.5.4. Without them, the boot panics in `dhcp_state.c:52`
+to ESP-IDF v5.5.6. Without them, the boot panics in `dhcp_state.c:52`
 from the lwIP task as soon as `wg_lwip_attach()` triggers a
 `netif_set_addr()` ext-callback that reaches
 `esp_netif_internal_dhcpc_cb()` → `dhcp_ip_addr_store(NULL)`.
@@ -393,9 +393,12 @@ control channel:
    Upstream never resumes a dead Noise session either.
 3. **In-place re-register on persistent 4xx** (M13): the reconnect
    loop can spin forever if the server *actively rejects* the node
-   (headscale: 404 on unknown node / machine-key mismatch — e.g. node
-   deleted in the admin, control DB migrated). After 2 consecutive
-   non-429 4xx cycles (then 4, 8, … — power-of-two schedule) the task
+   (tailscale.com: 404 = node deleted; headscale: machine-key mismatch,
+   control DB migrated — since 0.29.4 headscale answers a *deleted*
+   node's stream with HTTP 200 + a self node marked `Expired`, handled
+   like a rejection, see round 1.3.0). After 2 consecutive non-429 4xx
+   cycles — or the first expired/deleted self node — (then 4, 8, … —
+   power-of-two schedule) the task
    re-runs `tinylink_register()` with the NVS authkey — the same code
    every boot exercises — and on success signals the endpoint-updater
    so the fresh node record learns the current public endpoint.

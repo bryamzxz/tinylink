@@ -77,10 +77,10 @@ authenticated under the Noise transport keys. `maxMessageSize=4096`,
 giving a plaintext cap of `4096 − 3 − 16 = 4077`.
 
 The Noise IK prologue is the **string**
-`"Tailscale Control Protocol v138"` (prefix `"Tailscale Control Protocol v"`
+`"Tailscale Control Protocol v148"` (prefix `"Tailscale Control Protocol v"`
 + decimal protocol version, per `controlbase/handshake.go:protocolVersionPrologue`).
 The decimal suffix is `TINYLINK_CAPVER` (the single source of truth in
-`components/tinylink/include/tinylink.h`, currently `138`); `ts2021_client.c`
+`components/tinylink/include/tinylink.h`, currently `148`); `ts2021_client.c`
 builds the prologue with `snprintf(prologue, …, TS2021_PROLOGUE_PREFIX,
 TS2021_PROTOCOL_VERSION)` where `TS2021_PROTOCOL_VERSION = TINYLINK_CAPVER`,
 and writes the same value into the cleartext BE16 header of the initiation
@@ -129,7 +129,7 @@ JSON body, fields used today:
 
 | Field               | Notes                                              |
 |---------------------|----------------------------------------------------|
-| `Version`           | `TINYLINK_CAPVER` (currently `142` = Tailscale v1.102; was 138 until M15) — the Tailscale `CapabilityVersion`, same value as the ts2021 Noise prologue/header (`register.c` adds `cJSON_AddNumberToObject(root, "Version", TINYLINK_CAPVER)`). M1 hardcoded `1`, which sits below headscale's `earlyNoise` floor `MinSupportedCapabilityVersion` (`hscontrol/capver/capver_generated.go`; 113 in 2026-07, **115** as of 2026-09 — it tracks the latest 10 minor releases and keeps climbing) and aborts the `/ts2021` upgrade before any JSON is read. Since 2026-09 the legacy `GET /key?v=<n>` bootstrap sends the same value: headscale `5b6e1e17` gates `/key` on the same floor. Feature gating is keyed on `Hostinfo`, not `Version`. |
+| `Version`           | `TINYLINK_CAPVER` (currently `148` = Tailscale v1.104 since round 1.3.0; 142 in M15–M16, 138 before) — the Tailscale `CapabilityVersion`, same value as the ts2021 Noise prologue/header (`register.c` adds `cJSON_AddNumberToObject(root, "Version", TINYLINK_CAPVER)`). M1 hardcoded `1`, which sits below headscale's `earlyNoise` floor `MinSupportedCapabilityVersion` (`hscontrol/capver/capver_generated.go`; 113 in 2026-07, 115 in 2026-09, **116** as of 2026-10 — it tracks the latest 10 minor releases and keeps climbing) and aborts the `/ts2021` upgrade before any JSON is read. Since 2026-09 the legacy `GET /key?v=<n>` bootstrap sends the same value: headscale `5b6e1e17` gates `/key` on the same floor. Feature gating is keyed on `Hostinfo`, not `Version`. |
 | `NodeKey`           | `"nodekey:" + 64-hex` of NodeKey public.           |
 | `OldNodeKey`        | `"nodekey:" + 64 zeros` on first registration.     |
 | `NLKey`             | `"nlpub:" + 64 zeros` for M1 (TKA disabled). Real Ed25519 NLPrivate generation lands in M7 hardening. The field has no `omitempty` upstream, so it must be present. |
