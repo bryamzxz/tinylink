@@ -297,7 +297,16 @@ threat-model record; the commit-level detail lives in `CHANGELOG.md`.
   `(recv_key, replay-window)` state — the classic `(key, nonce)`-reuse /
   replay-window corruption. With both the writer lock (#105) and this
   reader lock, the WGN-1 window is closed; the rx path is **no longer
-  unlocked**.
+  unlocked**. Since 1.3.3 (C2) the AEAD itself runs outside `g.lock`
+  and the same guarantee comes from tickets: under the lock,
+  `wg_transport_rx_begin` copies the receive key and the keypair
+  generation after the replay pre-check, the AEAD runs on that copy, and
+  `wg_transport_rx_commit` (locked again) refuses the ticket if a session
+  swap or scrub happened meanwhile, re-checks the window and only then
+  records the counter; TX reserves its counter together with a copy of
+  the send key from the same keypair (`wg_transport_tx_reserve`). No
+  AEAD reads `g.transport` while another task may rewrite it, and a
+  sealed frame never pairs a new key with an old counter.
 - **Relayed-DISCO sender gate (`knownPeerDiscoKey`).**
   `handle_disco_relayed` (`tinylink.c`) now drops a DERP-relayed
   `PING` / `PONG` / `CallMeMaybe` whose decrypted sender `DiscoKey` does

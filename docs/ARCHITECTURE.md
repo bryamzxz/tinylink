@@ -73,21 +73,24 @@ primitives we did, see [`SECURITY-MODEL.md`](SECURITY-MODEL.md).
 |       │     wg_demux_classify(buf[0])                         |
 |       │       ├── HANDSHAKE_RESP  → handle_handshake_response |
 |       │       ├── TRANSPORT       → handle_transport →        |
-|       │       │                     decrypt → rx_cb           |
-|       │       │                     (decrypt + replay-window  |
-|       │       │                      under g.lock — WGN-1 rx, |
-|       │       │                      racing wg_rx + derp task)|
+|       │       │                     decrypt into pbuf → rx_cb |
+|       │       │                     (replay check + key copy, |
+|       │       │                      AEAD unlocked, commit    |
+|       │       │                      under g.lock — C2, 1.3.3)|
 |       │       │                       │                       |
 |       │       │                       ▼                       |
 |       │       │                 wg_lwip::wg_rx_inject →       |
-|       │       │                 tcpip_input (custom netstack |
-|       │       │                 has no Ethernet/PPP framing)  |
+|       │       │                 LOCK_TCPIP_CORE + ip_input in |
+|       │       │                 the caller's task, no hop to  |
+|       │       │                 tiT (C1-S, 1.3.3; custom      |
+|       │       │                 netstack: no Eth/PPP framing) |
 |       │       └── DISCO          → handle_disco_direct →      |
 |       │                            decrypt + sealed Pong via  |
 |       │                            sendto on the same socket  |
 |       └── tx_task                                             |
 |             drains the TX ring (slot indices) → sendto / DERP |
-|             (encrypt happens inline in TCPIP context;         |
+|             (encrypt happens inline in TCPIP context, on a    |
+|              counter reserved under g.lock — C2, 1.3.3;       |
 |              sendto must run OUTSIDE TCPIP to avoid lwIP      |
 |              re-entrancy deadlock — see PR #41)               |
 |                                                               |
@@ -151,6 +154,25 @@ RX task's timer blocks, the DISCO-pong INIT re-send, the DERP task's
 kicks (`wg_netif_handshake_kick`) and the DERP-relayed response path;
 lock order is always `g.hs_lock` → `g.lock`, and no wg lock is held
 across a DERP/TLS call (DERP copies go through the `wg_tx` worker).
+
+Round 1.3.3 (C2) — `g.lock` no longer covers the transport AEAD
+(~400 µs per MTU), so an RX decrypt (wg_rx / DERP task) and a TX encrypt
+(tiT / telemetry) run on both cores at once. TX reserves its counter and
+copies the send key under the lock (`wg_transport_tx_reserve`) and seals
+outside it; RX copies the receive key after the header / index / replay
+pre-check (`wg_transport_rx_begin`), opens outside the lock and commits
+under it (`wg_transport_rx_commit`: refuses a ticket whose keypair
+generation is gone — rekey or stop since begin — re-checks the window,
+then records the counter). The AEAD never reads `g.transport`'s key
+bytes, so a rekey or a scrub cannot pull them from under it.
+
+Round 1.3.3 (C1-S) — the AEAD decrypts straight into the PBUF_RAM pbuf
+lwIP receives, and `wg_rx_inject` runs `ip_input` under
+`LOCK_TCPIP_CORE()` in the decrypting task (wg_rx or the DERP task)
+instead of posting to tiT with `tcpip_input`: one copy and one task hop
+less per inbound packet; replies the input triggers (ICMP echo) are
+encrypted on that task's stack. Full lock order: `g.hs_lock` → lwIP core
+lock → `g.lock`.
 
 Round 1.3.2 (B7) — the first INIT of a boot used to be lost (sent
 direct at netmap time, before the peer punched its side and before the
