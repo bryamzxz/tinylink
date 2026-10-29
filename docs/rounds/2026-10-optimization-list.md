@@ -120,7 +120,7 @@ broke one-INIT-per-REKEY_TIMEOUT. Per-item details in the CHANGELOG.
 | B19 | `/stats`: min-ever free heap, largest block, reset reason, BOD/WDT counters in RTC memory | observability for every item | L |
 | B20 | NVS time floor daily (or on >1-day move) instead of hourly: every 4 KB erase stalls both CPUs 70 ms typ / 500 ms max (ESP32 cannot suspend flash ops) | fewer stalls | L |
 | B21 | Small: `now_us()` once per loop (12 esp_timer reads), WDT feed 1/s, deadline wakeups (wg_rx 1 s, wg_tx 500 ms → 3 wakes/s from light sleep), demux switch on `buf[0]`, word-wise `ct_memeq`, WG AEAD entry without memcpy/memset of a public nonce | µs each | L |
-| B22 | **Register a known node without Auth** (1.3.3; found in the 1.3.2 soak): a restarted tailscaled sends `Auth=nil` and control returns the node state as is; tinylink re-sent the auth key on every boot → a full auth-key login (node-record write) server-side. Suspected cause of the early map-stream FIN (3 of 8 boots, only ever on the register + push + netmap connection) | −1 server-side login per boot; key not read or sent; FIN test | L |
+| B22 | **Register a known node without Auth** (1.3.3; found in the 1.3.2 soak): a restarted tailscaled sends `Auth=nil` and control returns the node state as is; tinylink re-sent the auth key on every boot → a full auth-key login (node-record write) server-side. Was the suspected cause of the early map-stream FIN (3 of 8 boots, only ever on the register + push + netmap connection) — **tested in 1.3.3: not the cause** (FIN at 352 s after a register without Auth) | −1 server-side login per boot; key not read or sent | L |
 
 ## Round C — data-plane & crypto engineering → 1.3.3+
 
