@@ -224,8 +224,8 @@ static uint32_t poll_ms(const ts2021_conn_t *c)
 static void note_req_expired(ts2021_conn_t *c)
 {
     if (!c->req_expired) {
-        ESP_LOGW(TAG, "control request: no answer within %d ms — dropping the conn",
-                 TS2021_REQ_TIMEOUT_MS);
+        ESP_LOGW(TAG, "control request: no answer within %u ms — dropping the conn",
+                 (unsigned)c->req_ms);
     }
     c->req_expired = true;
 }
@@ -949,6 +949,7 @@ esp_err_t ts2021_request_deadline(ts2021_conn_t *c, uint32_t ms)
     }
     const uint32_t polls = (ms + TS2021_REQ_POLL_MS - 1) / TS2021_REQ_POLL_MS;
     c->req_idle = (uint8_t)(polls > 0 && polls < 255 ? polls : 255);
+    c->req_ms = ms;
     c->req_expired = false;
     c->req_deadline_us = esp_timer_get_time() + (int64_t)ms * 1000;
     return ESP_OK;

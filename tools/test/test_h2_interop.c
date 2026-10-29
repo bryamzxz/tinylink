@@ -441,6 +441,9 @@ int esp_tls_conn_destroy(esp_tls_t *t) { (void)t; return 0; }
  * read records the poll it ran under. */
 static int s_sock_fd = -1;
 static int s_reads_short, s_reads_stream, s_reads_other;
+/* A server that went silent: every read is a socket timeout. */
+static bool s_silent;
+static int  s_silent_polls;
 static long sock_poll_ms(void)
 {
     struct timeval tv = { 0 };
@@ -503,6 +506,10 @@ ssize_t esp_tls_conn_read(esp_tls_t *t, void *data, size_t len)
     if (poll == TS2021_REQ_POLL_MS) s_reads_short++;
     else if (poll == 30000) s_reads_stream++;
     else s_reads_other++;
+    if (s_silent) {
+        s_silent_polls++;
+        return MBEDTLS_ERR_SSL_WANT_READ;     /* SO_RCVTIMEO fired */
+    }
     if (t->s2c_off == t->s2c_len) {
         t->s2c_off = t->s2c_len = 0;
         size_t n = srv_output();
@@ -809,6 +816,56 @@ static void sc_goaway_refuse_and_rst(void)
     conn_down();
 }
 
+#ifndef H2_REF
+/* Round 1.3.5: a one-shot request to a silent server fails after its
+ * deadline's polls; each expiry doubles the next request's deadline up
+ * to TS2021_REQ_TIMEOUT_MAX_MS, and an answered request resets it. */
+static int silent_post(void)
+{
+    srv_new(0);
+    conn_up(true);
+    s_silent = true;
+    s_silent_polls = 0;
+    res_t r = post("/machine/map", kRegBody, sizeof(kRegBody) - 1, 256);
+    s_silent = false;
+    const bool failed = r.err == ESP_FAIL && s_conn.req_expired && s_conn.io_failed &&
+                        s_conn.req_deadline_us == 0 && sock_poll_ms() == 30000;
+    const int polls = s_silent_polls;
+    conn_down();
+    return failed ? polls : -1;
+}
+
+static void sc_deadline_backoff(void)
+{
+    const int base = (TS2021_REQ_TIMEOUT_MS + TS2021_REQ_POLL_MS - 1) / TS2021_REQ_POLL_MS;
+    const int cap = (TS2021_REQ_TIMEOUT_MAX_MS + TS2021_REQ_POLL_MS - 1) / TS2021_REQ_POLL_MS;
+    const int p1 = silent_post(), p2 = silent_post(), p3 = silent_post();
+    int pn = 0;
+    for (int i = 0; i < 4; i++) pn = silent_post();
+    check("deadline_backoff_doubles_to_the_cap",
+          p1 == base && p2 == 2 * base && p3 == 4 * base && pn == cap && cap < 255);
+    /* an answer resets it */
+    srv_new(0);
+    conn_up(true);
+    S.sc = SC_OK;
+    S.resp_len = 2;
+    memcpy(S.resp, "{}", 2);
+    res_t r = post("/machine/map", kRegBody, sizeof(kRegBody) - 1, 256);
+    conn_down();
+    const int after = silent_post();
+    check("deadline_backoff_reset_by_an_answer", r.err == ESP_OK && r.status == 200 &&
+                                                 after == base);
+    /* leave it reset for whatever runs next */
+    srv_new(0);
+    conn_up(true);
+    S.sc = SC_OK;
+    S.resp_len = 2;
+    memcpy(S.resp, "{}", 2);
+    (void)post("/machine/map", kRegBody, sizeof(kRegBody) - 1, 256);
+    conn_down();
+}
+#endif
+
 static void sc_sequence(void)
 {
     /* the boot sequence: register, endpoint push, map stream — one conn */
@@ -1004,6 +1061,9 @@ int main(void)
     sc_small_server_window();
     sc_large_body();
     sc_misc();
+#ifndef H2_REF
+    sc_deadline_backoff();
+#endif
     if (s_fails == 0) printf("\nALL OK\n");
     return s_fails ? 1 : 0;
 }

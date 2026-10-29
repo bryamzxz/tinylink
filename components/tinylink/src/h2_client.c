@@ -284,9 +284,15 @@ static esp_err_t h2_drive_request(ts2021_conn_t *conn,
         conn->h2_rx_off = got;
         if (rc == H2C_OK) rc = h2c_pump(h);
         if (rc != H2C_OK) {
-            ESP_LOGE(TAG, "%s (stream %d)", rc == H2C_ERR_PROTO
-                         ? "protocol error from the server — GOAWAY sent"
-                         : "send failed", (int)conn->h2_stream_id);
+            if (rc != H2C_ERR_PROTO && conn->req_expired) {
+                /* an ACK / WINDOW_UPDATE past the deadline: ts2021 has
+                 * the line */
+                ESP_LOGD(TAG, "stream %d left: request deadline", (int)conn->h2_stream_id);
+            } else {
+                ESP_LOGE(TAG, "%s (stream %d)", rc == H2C_ERR_PROTO
+                             ? "protocol error from the server — GOAWAY sent"
+                             : "send failed", (int)conn->h2_stream_id);
+            }
             return ESP_FAIL;
         }
         if (conn->h2_goaway && !h->s.closed) {
@@ -308,6 +314,18 @@ static esp_err_t h2_drive_request(ts2021_conn_t *conn,
     return ESP_OK;
 }
 
+/* The one-shot deadline in force (round 1.3.5): TS2021_REQ_TIMEOUT_MS,
+ * doubled after each request that ran out of it, up to
+ * TS2021_REQ_TIMEOUT_MAX_MS — the budget a one-shot request had before
+ * — and back to TS2021_REQ_TIMEOUT_MS once a request is answered. A
+ * dead conn is still cut after 10 s; a control plane that is slow for a
+ * while rather than gone (a push answered after 52 s, say) still gets
+ * an answer within four tries, where a fixed 10 s would fail every
+ * retry of the register loop and of the long-poll's push. Register and
+ * the pushes run one at a time on the one control conn; a word-sized
+ * value, so no lock. */
+static uint32_t s_req_ms = TS2021_REQ_TIMEOUT_MS;
+
 esp_err_t h2_post_json(ts2021_conn_t *conn,
                        const char *path,
                        const char *authority,
@@ -328,14 +346,20 @@ esp_err_t h2_post_json(ts2021_conn_t *conn,
     conn->h2_resp_buf     = response_buf;
     conn->h2_resp_cap     = response_buf_size;
 
-    /* A one-shot request has TS2021_REQ_TIMEOUT_MS from here to its last
-     * response byte (round 1.3.5), not the map stream's 120-s budget: on
-     * expiry it fails like a dropped conn — the callers (register,
-     * endpoint push) drop the conn and the next dial is fresh. */
-    esp_err_t err = ts2021_request_deadline(conn, TS2021_REQ_TIMEOUT_MS);
+    /* A one-shot request has s_req_ms from here to its last response
+     * byte (round 1.3.5), not the map stream's 120-s budget: on expiry it
+     * fails like a dropped conn — the callers (register, endpoint push)
+     * drop the conn and the next dial is fresh. */
+    const uint32_t ms = s_req_ms;
+    esp_err_t err = ts2021_request_deadline(conn, ms);
     if (err == ESP_OK) err = h2_drive_request(conn, path, authority, body_len);
     const esp_err_t derr = ts2021_request_deadline(conn, 0);
     if (err == ESP_OK) err = derr;   /* not usable for a stream at 2-s polls */
+    if (conn->req_expired) {
+        s_req_ms = ms < TS2021_REQ_TIMEOUT_MAX_MS / 2 ? 2 * ms : TS2021_REQ_TIMEOUT_MAX_MS;
+    } else if (err == ESP_OK) {
+        s_req_ms = TS2021_REQ_TIMEOUT_MS;
+    }
 
     *status_out   = conn->h2_status;
     *response_len = conn->h2_resp_len;

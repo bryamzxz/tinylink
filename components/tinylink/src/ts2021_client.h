@@ -69,12 +69,19 @@
  * push ("pushing endpoint" 9.77 s → "HTTP 200" 61.94 s, nothing logged
  * in between). 10 s still covers a slow answer many times over; a poll
  * of 2 s lets the deadline bite within 2 s of its time (a blocked read
- * notices it only when its poll ends). */
+ * notices it only when its poll ends). After an expiry the next request
+ * gets twice as long (h2_post_json), so a slow control plane is waited
+ * out instead of cut on every retry. */
 #ifndef TS2021_REQ_TIMEOUT_MS
 #define TS2021_REQ_TIMEOUT_MS   10000
 #endif
 #ifndef TS2021_REQ_POLL_MS
 #define TS2021_REQ_POLL_MS      2000
+#endif
+/* The ceiling h2_post_json doubles the deadline towards after expiries:
+ * the 4 × 30-s budget one-shot requests had before. */
+#ifndef TS2021_REQ_TIMEOUT_MAX_MS
+#define TS2021_REQ_TIMEOUT_MAX_MS 120000
 #endif
 #define TS2021_RECORD_PLAINTEXT_MAX (TS2021_MAX_MESSAGE - TS2021_HEADER_LEN - NOISE_TAGLEN)
 /* The records we send (round 1.3.4, D4): header + ciphertext ≤ 2 048 B,
@@ -135,6 +142,7 @@ typedef struct {
      * requested recycle, not a failure); `req_expired` — a one-shot
      * request ran out of its deadline (logged once, here). */
     uint8_t           req_idle;
+    uint32_t          req_ms;
     bool              aborted;
     bool              req_expired;
     int64_t           req_deadline_us;
