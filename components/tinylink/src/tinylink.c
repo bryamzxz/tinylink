@@ -610,8 +610,8 @@ static void prepunch_pings_to_peers(const tl_peer_t *peers, size_t n_peers)
             ssize_t n = sendto(sock, wire, wire_len, 0,
                                (struct sockaddr *)&dst, sizeof(dst));
             if (n < 0) {
-                ESP_LOGW(TAG, "prepunch sendto: errno=%d (peer=%zu ep=%s)",
-                         errno, pi, ep);
+                ESP_LOGW(TAG, "prepunch sendto: errno=%d (peer=%u ep=%s)",
+                         errno, (unsigned)pi, ep);
                 continue;
             }
             /* Record the outbound probe so handle_disco_direct can
@@ -626,8 +626,9 @@ static void prepunch_pings_to_peers(const tl_peer_t *peers, size_t n_peers)
         }
     }
     if (total_sent > 0) {
-        ESP_LOGI(TAG, "prepunch on netmap-receive: sent %zu pings across %zu peers",
-                 total_sent, n_peers);
+        /* %u + casts: newlib-nano printf has no %zu (it printed "zu"). */
+        ESP_LOGI(TAG, "prepunch on netmap-receive: sent %u pings across %u peers",
+                 (unsigned)total_sent, (unsigned)n_peers);
     }
 }
 
@@ -956,8 +957,8 @@ static void derp_supervised_task(void *arg)
             ESP_LOGW(TAG, "derp supervisor: server restarting — backoff");
         } else {
             ESP_LOGW(TAG, "derp supervisor: stream ended 0x%x — "
-                          "stats recv=%lu disco_pongs=%lu "
-                          "disco_pings_seen=%lu disco_cmms=%lu "
+                          "stats recv=%lu disco_pings_answered=%lu "
+                          "disco_pongs_seen=%lu disco_cmms=%lu "
                           "send_err=%lu keepalives=%lu wg_tx_drops=%lu",
                      err,
                      (unsigned long)stats.recv_packets,
