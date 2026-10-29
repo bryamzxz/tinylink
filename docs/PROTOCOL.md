@@ -95,7 +95,11 @@ After the upgrade and the optional EarlyPayload, the inner protocol is
 component) in `components/tinylink/src/h2_client.c`. SETTINGS sent by
 the client disable HPACK dynamic-table indexing
 (`SETTINGS_HEADER_TABLE_SIZE = 0`) and server push
-(`SETTINGS_ENABLE_PUSH = 0`) for one-shot request semantics.
+(`SETTINGS_ENABLE_PUSH = 0`) for one-shot request semantics. Since 1.3.2
+the client preface + SETTINGS go out and the first request follows
+immediately, like the upstream Go client — the server's SETTINGS and its
+ACK of ours are processed by that request's receive loop (one RTT less
+per control connect than the old wait-for-ACK pump).
 
 After `read_msg2` the connection optionally carries an EarlyPayload
 sentinel — `"\xff\xff\xffTS"` (5 B magic) + `BE32 length` + JSON-encoded

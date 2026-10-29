@@ -71,13 +71,6 @@ extern "C" {
  * h2_client.h aliases this as `h2_data_callback` for the public API. */
 typedef int (*h2_stream_fn_t)(const uint8_t *buf, size_t len, void *ctx);
 
-/* Cap on the SETTINGS handshake pump in h2_session_init(). The exchange
- * we drive is: client SETTINGS → server SETTINGS+ACK → our ACK. Each
- * iteration of the pump is one nghttp2_session_send + one
- * nghttp2_session_recv; in practice 3 iterations suffice but we cap
- * at 20 as a safety bound against an unresponsive peer. */
-#define H2_SETTINGS_PUMP_MAX 20
-
 typedef struct {
     esp_tls_t        *tls;
     noise_ik_state_t  noise;
@@ -105,7 +98,6 @@ typedef struct {
      * persist state across requests without heap allocs. */
     nghttp2_session *h2;
     bool             h2_goaway;          /* server sent GOAWAY → reconnect */
-    bool             h2_settings_acked;  /* both initial SETTINGS pumped */
 
     /* Decrypted-Noise plaintext ring fed into nghttp2's recv_cb. Lives
      * in BSS via the file-scope ts2021_conn_t in tinylink.c — sized at

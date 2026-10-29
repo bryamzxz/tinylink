@@ -462,9 +462,8 @@ esp_err_t ts2021_connect(ts2021_conn_t *out,
         return ESP_FAIL;
     }
 
-    /* Mark connected BEFORE h2_session_init so its initial SETTINGS
-     * pump can ride ts2021_send/ts2021_recv (those guard on
-     * c->connected). */
+    /* Mark connected BEFORE h2_session_init so its preface + SETTINGS
+     * flush can ride ts2021_send (which guards on c->connected). */
     out->connected = true;
 
     /* Allocate the persistent nghttp2 session NOW, while only this
