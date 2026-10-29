@@ -232,7 +232,10 @@ void wg_netif_set_relay_callback(wg_netif_relay_fn cb, void *user);
 
 /* Cumulative count of WG transport frames that the TX worker shipped
  * via the relay callback (DERP fallback) instead of — or in addition
- * to — direct sendto. Two-counter split:
+ * to — direct sendto. Not counted (round 1.3.2, B7): DERP copies of
+ * handshake INITs and the DERP half of the dual send after a
+ * DERP-completed handshake; a failed dual-send relay does count in
+ * relay_errors (it is a relay failure). Two-counter split:
  *
  *   _stale: relay used because path-stale watchdog said direct
  *           transport hadn't decrypted in WG_RX_STALE_THRESHOLD_MS.

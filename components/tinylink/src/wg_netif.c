@@ -14,7 +14,9 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 
+#include "esp_event.h"
 #include "esp_log.h"
+#include "esp_netif_types.h"
 #include "esp_random.h"
 #include "esp_timer.h"
 
@@ -338,10 +340,13 @@ static struct {
     TaskHandle_t            rx_task;
     SemaphoreHandle_t       lock;
     /* Serializes the handshake state machine (g.handshake, state,
-     * rekey flags, attempt counters): rx_task's timer blocks, the DISCO
-     * pong fast-INIT and the DERP-relayed response path
-     * (wg_netif_inject_packet, another task) all mutate it. Never held
-     * while g.lock is taken, and never across rx_cb. (M16, 2026-09) */
+     * rekey flags, attempt counters, the pending INIT): rx_task's timer
+     * blocks, the DISCO-pong INIT re-send, the DERP task's
+     * wg_netif_handshake_kick and DERP-relayed response path
+     * (wg_netif_inject_packet), and wg_netif_update_peer_keys (long-poll
+     * task) all mutate it. Never taken while g.lock is held (order
+     * hs_lock → g.lock), never held across rx_cb or a DERP/TLS call.
+     * (M16, 2026-09; 1.3.2) */
     SemaphoreHandle_t       hs_lock;
     /* /stats counters (since boot). */
     uint32_t                stat_rekeys;
@@ -413,6 +418,9 @@ static struct {
      * sends every frame on both paths (magicsock: UDP + DERP while
      * bestAddr is untrusted). Under hs_lock, read unlocked by wg_tx. */
     bool                     session_via_relay;
+    /* Wi-Fi came back (IP_EVENT_STA_GOT_IP): rx_task re-sends a pending
+     * INIT at its next wake. Set by the event task. */
+    volatile bool            link_up_pending;
 
     bool                    stop_requested;
 } g;
@@ -481,8 +489,10 @@ static int send_to_peer(const uint8_t *buf, size_t len,
          * g.peer.peer_endpoint is dead; the existing 30 s
          * WG_RX_STALE_THRESHOLD_MS wait is wasted. Backdate
          * last_transport_recv_us and zero the path-probe cooldown so
-         * rx_task fires path_stale_cb on its next iteration (≤1 s),
-         * triggering DISCO probes of the peer's alternate endpoints.
+         * rx_task fires path_stale_cb on its next wake (at once when
+         * this send ran on wg_rx, within WG_RX_MAX_WAIT_MS from another
+         * task), triggering DISCO probes of the peer's alternate
+         * endpoints.
          * Models upstream tailscale magicsock noteBadEndpoint
          * (endpoint.go:1634-1641). */
         if (errno == ENETUNREACH || errno == EHOSTUNREACH) {
@@ -1110,6 +1120,28 @@ static int64_t rx_next_deadline_us(void)
     return d;
 }
 
+/* Wi-Fi is back. While it was down every INIT copy failed in sendto
+ * and still counted as an attempt (build_and_send_init), so a long
+ * outage ends in the 30-s budget backoff; without this the tunnel would
+ * wait for the next burst. Re-send the pending INIT — it never left the
+ * device, so this is still not a new attempt — direct and via DERP.
+ * 1.3.1 rebuilt an INIT on every 1-s tick while sends failed (~60 ms of
+ * X25519 a second) and so recovered within a tick; this recovers within
+ * one RX wait (≤ WG_RX_MAX_WAIT_MS) without the rebuilds. */
+static __attribute__((noinline)) void rx_link_up_resend(void)
+{
+    xSemaphoreTake(g.hs_lock, portMAX_DELAY);
+    init_resend(true, true, true, "link up");
+    xSemaphoreGive(g.hs_lock);
+}
+
+static void on_sta_got_ip(void *arg, esp_event_base_t base, int32_t id,
+                          void *data)
+{
+    (void)arg; (void)base; (void)id; (void)data;
+    g.link_up_pending = true;
+}
+
 /* The next RX wait in ms. Planned from a fresh clock read, not the
  * iteration's `now`: the iteration may have spent ~0.3 s in a path-stale
  * prepunch (one X25519 per ping) since. noinline keeps its locals off
@@ -1153,6 +1185,10 @@ static void rx_task(void *arg)
          * stale `now` only makes a timer fire that much later. */
         const int64_t now = now_us();
         wdt_feed_throttled(now, &last_feed_us);
+        if (g.link_up_pending) {
+            g.link_up_pending = false;
+            rx_link_up_resend();
+        }
         if (n < 0) {
             /* EAGAIN/EWOULDBLOCK on timeout — fall through to retry
              * timer below. Other errors get logged but don't kill the
@@ -1352,13 +1388,15 @@ retry_timer:;
                      WG_RX_STALE_THRESHOLD_MS / 1000);
             g.stat_rx_stale++;
             g.rekey_attempt = 0;
-            start_rekey();
             /* Reset the watchdog clock so the rekey-in-flight has its
              * own grace window (the rekey-retry block below handles
              * rekey-itself-failed). Without this, if rekey INIT also
              * doesn't get a response, we'd keep tripping this branch on
-             * every rx_task wake. */
+             * every rx_task wake. Reset BEFORE the send: an ENETUNREACH
+             * from it backdates the clock again (send_to_peer) so the
+             * path probe still fires at the next wake. */
             g.last_transport_recv_us = now;
+            start_rekey();
         }
 
         /* Rekey retry timer. Mirrors the cold-path retry but does NOT
@@ -1644,6 +1682,13 @@ esp_err_t wg_netif_init(const struct wg_netif_local_config *local)
         return ESP_ERR_NO_MEM;
     }
 
+    /* Best effort: without it a long Wi-Fi outage recovers at the next
+     * handshake burst instead of at the next RX wake. */
+    if (esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
+                                   on_sta_got_ip, NULL) != ESP_OK) {
+        ESP_LOGW(TAG, "GOT_IP handler not registered");
+    }
+
     g.state       = WG_NETIF_IDLE;
     g.initialized = true;
     return ESP_OK;
@@ -1917,12 +1962,21 @@ void wg_netif_stop(void)
         const uint8_t stop = WG_TX_SLOT_STOP;
         (void)xQueueSend(g.tx_ready_q, &stop, 0);
     }
+    (void)esp_event_handler_unregister(IP_EVENT, IP_EVENT_STA_GOT_IP,
+                                       on_sta_got_ip);
+    bool tx_exited = true;
     if (g.tx_done_sem != NULL) {
         if (xSemaphoreTake(g.tx_done_sem, pdMS_TO_TICKS(2000)) != pdTRUE) {
             ESP_LOGW(TAG, "tx task did not exit within 2s — forcing teardown");
+            tx_exited = false;
         }
     }
-    tx_ring_destroy();
+    /* A worker still inside tx_send_item (e.g. a blocked DERP TLS write)
+     * would touch a freed slot and deleted queues: leak the ring (~6 KB,
+     * start-failure path only) rather than risk a use-after-free. */
+    if (tx_exited) {
+        tx_ring_destroy();
+    }
     g.init_valid = false;
     if (g.tx_done_sem != NULL) {
         vSemaphoreDelete(g.tx_done_sem);
