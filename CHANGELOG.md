@@ -81,6 +81,15 @@ for after the 1.3.2 soak.
   "fast INIT" that built a new INIT 500 ms apart is gone. RX/TX waits
   run to the next timer deadline. Expected WG-up − netmap ≈ 2.0–2.3 s
   (was 5.4 s).
+- **B7b (found on the sensor, first 1.3.2 smoke)** — re-sending the same
+  INIT did not help at boot: the first INIT reaches the peer, which
+  answers via DERP before our DERP login (dropped) and direct to our
+  previous NAT mapping (the router hands out a new port per boot), and
+  every later copy of that INIT is a TAI64N replay to the peer — only
+  the REKEY_TIMEOUT retry got through (INIT 8.1 s, copies 9.8 s / 11.2 s
+  unanswered, new INIT 13.0 s answered in 70 ms). On DERP login and on a
+  solicited pong, an INIT older than 1 s is now replaced by a new one;
+  CallMeMaybe and link-up still re-send the same bytes.
 - **B10** — the direct-path DISCO pong is sealed with the cached shared
   key: ~20 ms → ~50 µs per ping; deepest direct-DISCO wg_rx chain
   5 696 → ~3 250 B.

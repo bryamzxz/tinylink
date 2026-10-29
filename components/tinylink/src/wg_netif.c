@@ -110,6 +110,20 @@ static const char *TAG = "wg_netif";
  * coalesces pong bursts (one per probed endpoint). */
 #define WG_INIT_RESEND_MIN_MS 500
 
+/* …except when the path that just became usable is the DERP relay
+ * coming up or a solicited pong, and the pending INIT is older than
+ * this: then a NEW INIT replaces it (B7b, found on the sensor
+ * 2026-10-28). At boot the first INIT does reach the peer, which
+ * answers via DERP before our DERP login (dropped, "peer gone") and
+ * direct to our previous NAT mapping (the router hands out a new port
+ * per boot); every copy of that same INIT is then a TAI64N replay to
+ * the peer, and only the REKEY_TIMEOUT retry got through. A new INIT
+ * carries a new timestamp. Responders only rate-limit initiations
+ * (wireguard-go HandshakeInitationRate = 50/s), and these two events
+ * are one-offs per path change, so this stays far below any flood.
+ * Younger than this, a response may still be in flight — re-send. */
+#define WG_INIT_FRESH_AFTER_MS 1000
+
 /* Upper bound on one RX wait. The RX task sleeps until its next timer
  * deadline (wg_timers.h) but no longer than this, so a deadline another
  * task moves earlier is honoured at most this late. Equal to
@@ -664,6 +678,30 @@ static int kick_off_handshake(void)
     return rc;
 }
 
+/* Path just became usable (DERP login, solicited pong) while a handshake
+ * is pending: past WG_INIT_FRESH_AFTER_MS build a new INIT — a new
+ * attempt of the cold handshake or of the rekey — else re-send the one
+ * in flight. Caller holds hs_lock. */
+static void init_refresh_or_resend(bool direct, bool relay, bool force_relay,
+                                   const char *why)
+{
+    if (!g.init_valid || !handshake_pending()) return;
+    if (!wg_timer_due(now_us(), g.last_handshake_us,
+                      (int64_t)WG_INIT_FRESH_AFTER_MS * 1000LL)) {
+        init_resend(direct, relay, force_relay, why);
+        return;
+    }
+    const bool rekey = (g.state == WG_NETIF_UP);
+    const int rc = build_and_send_init();
+    if (rekey) g.rekey_attempt++; else g.handshake_attempt++;
+    if (rc == 0) {
+        ESP_LOGI(TAG, "%s init sent (attempt %d, idx=0x%08x, fresh: %s)",
+                 rekey ? "rekey" : "handshake",
+                 rekey ? g.rekey_attempt : g.handshake_attempt,
+                 (unsigned)g.local_index, why);
+    }
+}
+
 /* Proactive rekey: send a fresh INIT while keeping g.state == UP and
  * the existing g.transport session live. The new keys land only when
  * handle_handshake_response sees the matching reply and calls
@@ -1058,7 +1096,7 @@ static void handle_disco_direct_snap(const uint8_t *buf, size_t len,
              * the boot case (peer endpoint right, just not punched yet)
              * never roams. */
             xSemaphoreTake(g.hs_lock, portMAX_DELAY);
-            init_resend(true, false, false, "pong");
+            init_refresh_or_resend(true, false, false, "pong");
             xSemaphoreGive(g.hs_lock);
         }
         return;
@@ -1861,8 +1899,10 @@ void wg_netif_handshake_kick(wg_netif_kick_t why)
     switch (why) {
     case WG_NETIF_KICK_RELAY_UP:
         /* The INIT's own DERP copy (if any) was declined while the relay
-         * was down: re-queue it now, past the per-path gate. */
-        init_resend(false, true, true, "DERP relay up");
+         * was down: re-queue it now, past the per-path gate — or, if it
+         * is older than WG_INIT_FRESH_AFTER_MS, replace it: the peer may
+         * have consumed it and answered into the relay that was down. */
+        init_refresh_or_resend(false, true, true, "DERP relay up");
         break;
     case WG_NETIF_KICK_CALL_ME_MAYBE:
         /* The peer is punching towards our endpoints right now: its NAT
