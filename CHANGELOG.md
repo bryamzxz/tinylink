@@ -142,6 +142,40 @@ Hardware section at the end of this entry.
 - `tools/stack_worst.py`: `esp_timer` budget 6 144 → 4 608 (B18's
   value), derp 10 → 8 KiB, wg_tx 7 → 5 KiB in its task table.
 
+#### Hardware (deployed sensor, app partition only; `ota_0` + `otadata` read back to `~/tinylink-backups/` before each flash)
+
+Two images: `817c484` (ctl + boot branches) and `6dc9d83` (+ DNS);
+each backup byte-identical to the image it replaced, otadata seq 1 /
+CRC OK. Times below are from got-ip (the AP's association after a
+serial reset took 3–9 s and is not ours).
+
+- **`817c484` smoke + 10 × 5 min:** register without Auth 10 / 10;
+  control conn on :80 in 440–590 ms (1.57 s behind a DNS retry), register
+  0.66–1.94 s (1.3.4 series 2.62–11.49 s, median 4.7); with DNS
+  answering at once WG up **2.04 s** (1.3.4 median 8.7 s). It also
+  showed what was left: DNS answers lost on the now-parallel lookups
+  (STUN abandoned once, DERP TLS 1.8–6.4 s), one endpoint push that sat
+  52 s on the control conn (→ the request deadline), and three ~3.5-s
+  stalls on both TCP conns at once right after association (the AP; in
+  1.3.4 the netmap showed the same +1 / +3 s steps). Two boot-connection
+  FINs: one on :80 at 230 s → reconnect on :80 in 1.8 s (3.3 s over TLS
+  on 1.3.4); one at 27 s → the "< 120 s" rule sent the next dial to
+  :443 (TLS, 2.35 s), as designed. From ~15:07 to ~16:12 the peer
+  answered from another public address (a different WAN link on its
+  side): DERP `peer-gone`, unanswered handshakes, direct paths dying —
+  the RX-drop counters showed `seen direct=0 derp=0` every time, nothing
+  dropped on the sensor; it recovered by itself each time.
+- **`6dc9d83` (+ DNS), first boot (nothing stored):** everything by
+  name; `address cache: … stored` once at 64 s. Warm boots: STUN to the
+  home DERP node (`stun probe: home DERP node at …:3478 (no DNS)`),
+  control and DERP at the stored addresses. **10 × 2 min:** register
+  without Auth 10 / 10, 0 crashes, 0 E lines, no NVS write after the
+  first; medians register **0.70 s**, DERP login **2.2 s**, netmap
+  **2.4 s**, WG up ~4 s (boots 3–10; the peer was still settling in
+  boots 1–2); 19 / 20 connects at the stored address, one DERP attempt
+  failed there during an association stall and went by name (+2.7 s).
+  Heap 161 100–161 380 B free (158 968 on 1.3.4).
+
 ### Optimization round D 1.3.4 (in progress, branch `feat/opt-1.3.4`)
 
 Round D of `docs/rounds/2026-10-optimization-list.md` (memory), built in
