@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Bryam (bryamzxz)
 //
-// ts2021 client: TLS to controlplane.tailscale.com, HTTP/1.1 Upgrade,
-// Noise IK handshake, then ChaCha20-Poly1305 framed records carrying the
-// inner control-plane traffic (HTTP/2 in the canonical Tailscale client).
+// ts2021 client: HTTP/1.1 Upgrade to controlplane.tailscale.com — over
+// plain TCP :80 when the control key is pinned (round 1.3.5), else or as
+// the fallback over TLS :443 — Noise IK handshake, then ChaCha20-Poly1305
+// framed records carrying the inner control-plane traffic (HTTP/2 in the
+// canonical Tailscale client).
 //
 // Wire format constants come from upstream
 // `tailscale/control/controlbase/messages.go` and
@@ -51,6 +53,9 @@
  * ts2021_abort_reads() was requested. Outside the 16-bit mbedtls error
  * space and distinct from TLS_IO_ERR_IDLE_TIMEOUT (-0x10000). */
 #define TS2021_ERR_READ_ABORTED (-0x10001)
+/* The read adapter's answer once a :80 handshake overran its deadline
+ * (TS2021_PLAIN_TIMEOUT_MS after the TCP connect). */
+#define TS2021_ERR_HS_DEADLINE  (-0x10003)
 #define TS2021_RECORD_PLAINTEXT_MAX (TS2021_MAX_MESSAGE - TS2021_HEADER_LEN - NOISE_TAGLEN)
 /* The records we send (round 1.3.4, D4): header + ciphertext ≤ 2 048 B,
  * CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN, so each one is one TLS record. */
@@ -78,9 +83,22 @@ extern "C" {
 typedef int (*h2_stream_fn_t)(const uint8_t *buf, size_t len, void *ctx);
 
 typedef struct {
-    esp_tls_t        *tls;
+    esp_tls_t        *tls;        /* :443 transport (NULL on :80) */
     noise_ik_state_t  noise;
     bool              connected;
+
+    /* :80 transport (round 1.3.5, D10a): the connected socket while
+     * `plain` — no TLS under the Noise records. hs_idle / hs_deadline_us
+     * bound the unauthenticated part of a :80 handshake (until Noise IK
+     * completes: 0 = the stream budgets). io_failed: a transport failure
+     * (not an abort) was seen; up_us: when Noise IK completed —
+     * ts2021_close uses both for the early-drop heuristic. */
+    bool              plain;
+    bool              io_failed;
+    uint8_t           hs_idle;
+    int               sock;
+    int64_t           hs_deadline_us;
+    int64_t           up_us;
 
     /* (Round 1.3.4, D5: the 4 077-B `rx_residual` copy is gone. The
      * HTTP/2 bytes that follow the Noise handshake — after the optional
@@ -146,11 +164,20 @@ typedef struct {
 } ts2021_conn_t;
 
 /* Connect, perform Noise IK, swallow optional EarlyPayload. The Noise
- * channel is then ready for HTTP/2 framing via h2_client. */
+ * channel is then ready for HTTP/2 framing via h2_client.
+ *
+ * Transport (round 1.3.5, D10a, as upstream controlhttp): plain HTTP :80
+ * first when key_pinned — control_pub was pinned before this boot (NVS
+ * pin or compile-in fallback), so the Noise IK handshake alone
+ * authenticates the server — with CONFIG_TINYLINK_CONTROL_PLAIN_HTTP and
+ * the default control port 443; TLS :443 otherwise, and as the fallback
+ * on any :80 failure (no 101, a redirect, timeout, Noise refused). A :80
+ * failure that :443 then gets past keeps the rest of the boot on :443. */
 esp_err_t ts2021_connect(ts2021_conn_t *out,
                          const uint8_t machine_priv[NOISE_DHLEN],
                          const uint8_t machine_pub[NOISE_DHLEN],
-                         const uint8_t control_pub[NOISE_DHLEN]);
+                         const uint8_t control_pub[NOISE_DHLEN],
+                         bool key_pinned);
 
 /* Encrypt and write `data` as Noise transport records (msg type 4) of
  * ≤ TS2021_SMALL_PLAINTEXT_MAX bytes, sealed in a small stack record:

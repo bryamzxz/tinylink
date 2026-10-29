@@ -16,6 +16,26 @@ menu "tinylink core"
             debugging with a debugger attached (breakpoints would trip
             it).
 
+    config TINYLINK_CONTROL_PLAIN_HTTP
+        bool "ts2021 over plain HTTP :80 first, TLS :443 as the fallback"
+        default y
+        help
+            Open the control connection (POST /ts2021, Noise IK) over
+            plain TCP port 80 before TLS port 443, as the upstream client
+            does (control/controlhttp): the Noise IK handshake
+            authenticates the server by its pinned public key, so TLS
+            only adds a second cipher and ~2 s of handshake (chain
+            verify + ECDHE) to the boot and every reconnect. Only when
+            the control key was pinned before the boot (NVS pin or
+            CONFIG_TINYLINK_CONTROL_PUB_FALLBACK_HEX — a first-boot TOFU
+            fetch keeps that boot on TLS) and with the default control
+            port 443. Any :80 failure (refused, no answer within 3 s, a
+            redirect from a reverse proxy, a failed Noise handshake)
+            falls back to :443 in the same connect, and a :80 failure
+            that :443 then gets past keeps the rest of the boot on :443.
+            Disable for networks that silently drop port 80: they pay a
+            3-s connect timeout once per boot.
+
     config TINYLINK_CRYPTO_IN_IRAM
         bool "Place the ChaCha20-Poly1305 hot path in IRAM"
         default y
