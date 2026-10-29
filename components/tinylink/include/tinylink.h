@@ -109,11 +109,20 @@ esp_err_t tinylink_time_start(void);
 
 /* Read-only runtime snapshot, served as JSON by the telemetry task's
  * /stats responder (CONFIG_TINYLINK_STATS_PORT) and usable from any
- * task. All counters are since boot. */
+ * task. All counters are since boot, except boots*. */
 typedef struct {
     uint32_t uptime_s;
     int      reset_reason;           /* esp_reset_reason_t of this boot */
+    /* Boot counters (RTC no-init memory, tl_bootstat.h): boots since the
+     * record last restarted — normally the last power-on — this one
+     * included, and how many followed each kind of reset. */
+    uint32_t boots;
+    uint32_t boots_brownout;
+    uint32_t boots_panic;
+    uint32_t boots_task_wdt;
+    uint32_t boots_int_wdt;
     uint32_t heap_free;
+    uint32_t heap_min;               /* lowest heap_free since boot */
     uint32_t heap_largest;
     bool     ntp_synced;
     /* control plane */
@@ -142,6 +151,12 @@ typedef struct {
 } tinylink_stats_t;
 
 void tinylink_get_stats(tinylink_stats_t *out);
+
+/* Count this boot in the RTC boot counters (by esp_reset_reason()) and
+ * log them. Call first thing in app_main, before anything that can
+ * reset again, so a boot that dies early still records why the previous
+ * one ended. Idempotent; tinylink_get_stats calls it too. */
+void tinylink_bootstat_record(void);
 
 /* Load the persisted TAI64N floor from NVS namespace "tl_state" key
  * "tai_floor" (default 0 on first ever boot), pre-reserve a 1-day
@@ -315,15 +330,18 @@ esp_err_t tinylink_wg_socket_init(void);
  * WG socket's bound port. */
 esp_err_t tinylink_stun_probe(void);
 
-/* Spawn a low-priority FreeRTOS task that re-runs the STUN probe every
- * CONFIG_TINYLINK_STUN_REPROBE_MS milliseconds, refreshing the cached
- * public AddrPort so subsequent MapRequests advertise the current
- * NAT mapping (which can drift when the NAT rebinds an idle port or
- * the WAN address changes). A failed re-probe leaves the previously
- * cached endpoint untouched — losing the cache only on confirmed
- * change would require explicit "this is invalid" signaling we don't
- * have a way to receive. Best-effort, no return-value contract for
- * the task itself; callers get ESP_OK if the task spawned. */
+/* Re-run the STUN probe every CONFIG_TINYLINK_STUN_REPROBE_MS
+ * milliseconds — and at once when IP_EVENT_STA_GOT_IP reports a new
+ * local address — refreshing the cached public AddrPort so subsequent
+ * MapRequests advertise the current NAT mapping (which can drift when
+ * the NAT rebinds an idle port or the WAN address changes). A changed
+ * endpoint queues a control-plane push. A failed re-probe leaves the
+ * previously cached endpoint untouched — losing the cache only on
+ * confirmed change would require explicit "this is invalid" signaling
+ * we don't have a way to receive. The probes run on the telemetry task
+ * (since 1.3.2; it had its own task before), which this call spawns if
+ * needed in every build. Best-effort; ESP_OK means the re-probe loop
+ * runs or will (a NO_MEM spawn retries every 30 s). */
 esp_err_t tinylink_stun_reprobe_start(void);
 
 /* Endpoint changes found by the STUN re-probe are pushed to the control
@@ -363,7 +381,8 @@ const char *tinylink_version_string(void);
  *
  * Cost: ~1.2 KiB static BSS for the TaskStatus_t snapshot buffer +
  * one ESP_LOGI line per task per call. Called every 60 s from
- * telemetry_task (every 12th tx at the default 5 s telemetry period).
+ * telemetry_task (its own deadline since 1.3.2; every 12th sample
+ * before), with or without CONFIG_TINYLINK_TELEMETRY_ENABLE.
  *
  * Intended audience: this is the data source for the deferred audit
  * items "task stack trim" and (via correlation with the mapresp parse

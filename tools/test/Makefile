@@ -30,9 +30,15 @@ TARGETS := test_blake2s test_curve25519 test_mapresp \
            test_wg_demux test_disco test_stun test_tls_io test_derp \
            test_disco_handler test_disco_prober test_retry_after \
            test_backoff test_keys_regen test_skip_value test_jsmn_split \
-           test_tai64n test_nacl_box test_tsmp test_tl_date
+           test_tai64n test_nacl_box test_tsmp test_tl_date test_stats
 
 all: $(TARGETS)
+
+# /stats: RTC boot-counter record + worst-case JSON line. Header-only;
+# host_include/esp_err.h stands in for ESP-IDF's under tinylink.h.
+test_stats: test_stats.c $(TL_SRC)/tl_bootstat.h $(TL_SRC)/stats_json.h $(TL_INC)/tinylink.h \
+            $(TL_SRC)/jsmn.h host_include/esp_err.h
+	$(CC) $(CFLAGS) -I$(TL_SRC) -I$(TL_INC) -Ihost_include -o $@ test_stats.c
 
 # RFC 3339 / IMF-fixdate parsers (KeyExpiry, Retry-After). Header-only.
 test_tl_date: test_tl_date.c $(TL_SRC)/tl_date.h
@@ -241,7 +247,7 @@ test: test_blake2s.run test_curve25519.run test_mapresp.run \
       test_derp.run test_disco_handler.run test_disco_prober.run \
       test_retry_after.run test_backoff.run test_keys_regen.run \
       test_skip_value.run test_jsmn_split.run test_tai64n.run \
-      test_nacl_box.run test_tsmp.run test_tl_date.run
+      test_nacl_box.run test_tsmp.run test_tl_date.run test_stats.run
 
 test_blake2s.run: test_blake2s
 	$(RUNNER) ./test_blake2s
@@ -257,6 +263,9 @@ test_chacha20.run: test_chacha20
 
 test_tl_date.run: test_tl_date
 	$(RUNNER) ./test_tl_date
+
+test_stats.run: test_stats
+	$(RUNNER) ./test_stats
 
 test_tsmp.run: test_tsmp
 	$(RUNNER) ./test_tsmp

@@ -12,6 +12,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 
+#include "esp_attr.h"
 #include "esp_event.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
@@ -44,6 +45,7 @@
 #include "stun.h"
 #include "stun_probe.h"
 #include "telemetry.h"
+#include "tl_bootstat.h"
 #include "ts2021_client.h"
 #include "wg_dataplane.h"
 #include "wg_netif.h"
@@ -1108,8 +1110,8 @@ static void update_derp_host_from_netmap(const tl_netmap_t *nm)
 #endif
 
 /* Cache the latest netmap PEERS for path-stale active probing.
- * tl_peer_t[TL_MAX_PEERS] is ~1 KiB; the full tl_netmap_t is ~7.5 KiB
- * (derp_regions[28] dominates). Caching just the peers BSS keeps the
+ * tl_peer_t[TL_MAX_PEERS] is ~1 KiB; the full tl_netmap_t was ~7.5 KiB
+ * (derp_regions[28]; one region since 1.3.2). Caching just the peers BSS keeps the
  * total static-allocation footprint inside the DRAM budget WiFi init
  * needs contiguous (verified: caching the full netmap pushed boot
  * into vApplicationGetTimerTaskMemory pvPortMalloc-NULL asserts).
@@ -1639,14 +1641,44 @@ esp_err_t tinylink_time_start(void)
     return (err != ESP_OK) ? err : serr;
 }
 
+/* Boot counters (/stats, 1.3.2). RTC slow memory survives every reset
+ * but a power loss and is never cleared by the startup code; the record
+ * validates itself (tl_bootstat.h). Light sleep keeps RTC slow memory
+ * powered because it is in use (.rtc.force_slow already was). */
+static RTC_NOINIT_ATTR tl_bootstat_t s_bootstat;
+static bool                          s_bootstat_done;
+
+_Static_assert(TL_RST_PANIC == ESP_RST_PANIC && TL_RST_INT_WDT == ESP_RST_INT_WDT &&
+               TL_RST_TASK_WDT == ESP_RST_TASK_WDT && TL_RST_BROWNOUT == ESP_RST_BROWNOUT,
+               "tl_bootstat.h reset-reason values drifted from esp_reset_reason_t");
+
+void tinylink_bootstat_record(void)
+{
+    if (s_bootstat_done) return;
+    s_bootstat_done = true;
+    const bool kept = tl_bootstat_count(&s_bootstat, (int)esp_reset_reason());
+    ESP_LOGI(TAG, "boots=%u (brown-out %u, panic %u, task WDT %u, int WDT %u)%s",
+             (unsigned)s_bootstat.boots, (unsigned)s_bootstat.brownout,
+             (unsigned)s_bootstat.panic, (unsigned)s_bootstat.task_wdt,
+             (unsigned)s_bootstat.int_wdt,
+             kept ? "" : " — RTC record restarted");
+}
+
 void tinylink_get_stats(tinylink_stats_t *out)
 {
     if (out == NULL) return;
+    tinylink_bootstat_record();
     memset(out, 0, sizeof(*out));
     const int64_t now = esp_timer_get_time();
     out->uptime_s     = (uint32_t)(now / 1000000LL);
     out->reset_reason = (int)esp_reset_reason();
+    out->boots          = s_bootstat.boots;
+    out->boots_brownout = s_bootstat.brownout;
+    out->boots_panic    = s_bootstat.panic;
+    out->boots_task_wdt = s_bootstat.task_wdt;
+    out->boots_int_wdt  = s_bootstat.int_wdt;
     out->heap_free    = (uint32_t)esp_get_free_heap_size();
+    out->heap_min     = (uint32_t)esp_get_minimum_free_heap_size();
     out->heap_largest = (uint32_t)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT);
     out->ntp_synced   = tl_time_synced();
     out->control_open = s_conn_open;
@@ -1750,7 +1782,7 @@ esp_err_t tinylink_wg_socket_init(void)
  * h2_client is one stream per conn, so the recycle is the equivalent. */
 
 /* Signal that the public endpoint changed. Idempotent; callable from
- * any task (STUN re-probe task, event handlers). */
+ * any task (STUN re-probe on the telemetry task, event handlers). */
 static void tinylink_endpoint_push_async(void)
 {
     s_ep_push_pending = true;
@@ -1770,21 +1802,22 @@ static void tinylink_endpoint_push_async(void)
  * AddrPort the STUN server learns can't be advertised back to peers.
  *
  * Option B: split send/receive across the existing tasks.
- *   - The reprobe task `sendto`s the STUN binding request directly on
- *     g.sock (sendto is thread-safe in lwIP, no ownership transfer).
+ *   - The re-probe (telemetry task) `sendto`s the STUN binding request
+ *     directly on g.sock (sendto is thread-safe in lwIP, no ownership
+ *     transfer).
  *   - rx_task already classifies WG_DEMUX_STUN; we hook it via
  *     wg_netif_set_stun_callback() to a parser that matches the
  *     in-flight txid and signals a semaphore.
- *   - The reprobe task waits on that semaphore with a 3 s timeout.
+ *   - The re-probe waits on that semaphore with a 3 s timeout.
  *
  * No race: rx_task remains the only recvfrom-er. No data loss: rx_task
  * keeps dispatching DISCO/transport packets normally; STUN is just
  * routed to a new arm.
  *
- * The pending-probe slot (s_stun_pending) is single-writer (the reprobe
- * task) and single-reader (the rx_task callback runs on rx_task);
- * concurrent probes are not possible because the reprobe task takes
- * a mutex around the entire build/sendto/wait sequence. */
+ * The pending-probe slot (s_stun_pending) is single-writer (the re-probe
+ * on the telemetry task) and single-reader (the rx_task callback runs on
+ * rx_task); concurrent probes are not possible because the re-probe
+ * takes a mutex around the entire build/sendto/wait sequence. */
 static struct {
     SemaphoreHandle_t   mutex;        /* serializes concurrent reprobes */
     SemaphoreHandle_t   done_sem;     /* given by handler on txid match */
@@ -1806,7 +1839,7 @@ static void stun_response_handler(const uint8_t *buf, size_t len, void *user)
     int rc = stun_parse_response(buf, len, got_txid, &addr);
     if (rc != 0) {
         /* Malformed / not-success / no-mapped-addr — let it slide;
-         * the reprobe task will time out and try again next cycle. */
+         * the re-probe will time out and try again next cycle. */
         return;
     }
     if (memcmp(got_txid, s_stun_pending.txid, STUN_TXID_LEN) != 0) {
@@ -1861,8 +1894,8 @@ static esp_err_t stun_reprobe_via_wg_socket(uint32_t timeout_ms,
     }
 
     /* DNS-resolve the STUN server. lwIP getaddrinfo can block briefly
-     * — the reprobe task is the only caller and runs at IDLE+1, so a
-     * synchronous DNS lookup here is safe. */
+     * — the re-probe on the telemetry task (IDLE+2) is the only caller,
+     * so a synchronous DNS lookup here is safe. */
     struct addrinfo hints = {
         .ai_family   = AF_INET,
         .ai_socktype = SOCK_DGRAM,
@@ -1995,11 +2028,9 @@ esp_err_t tinylink_stun_probe(void)
                      local.addr_v4[2], local.addr_v4[3],
                      (unsigned)local.port);
             s_stun_result = local;
-            /* Push the new endpoint to the control plane. The push runs
-             * in the reprobe task's context (4 KiB stack — too small
-             * for a TLS handshake) so we spawn a one-shot task with
-             * adequate stack instead. Best-effort: a failed push just
-             * means the next reprobe will retry. */
+            /* Push the new endpoint to the control plane. Only flagged
+             * here: the push itself runs on the long-poll task after its
+             * next (re)connect (tinylink_endpoint_push_async). */
             tinylink_endpoint_push_async();
         }
     } else {
@@ -2019,30 +2050,44 @@ bool tinylink_get_public_endpoint(uint8_t addr_v4[4], uint16_t *port)
     return true;
 }
 
-/* ROAM-2: wake source for the reprobe task. Given by the periodic timeout
- * (the take below) OR immediately by the IP_EVENT_STA_GOT_IP handler when
- * the device's own L3 identity changes (WiFi (re)connect / DHCP renew).
- * Without this, a local network change left the STUN-learned public
- * AddrPort — and the endpoint advertised to peers — stale for up to
- * CONFIG_TINYLINK_STUN_REPROBE_MS (5 min). Mirrors magicsock's netmon
- * linkChange → Rebind+ReSTUN. */
-static SemaphoreHandle_t s_stun_reprobe_wake;
+/* Periodic STUN re-probe (since 1.3.2 on the telemetry task — telemetry.c
+ * calls tinylink_stun_reprobe_poll once per loop; it had its own 3 KiB
+ * task, "tinylink_stun_re", before). Armed by tinylink_stun_reprobe_start;
+ * the first re-probe is due one period later, because the boot-time probe
+ * ran in tinylink_stun_probe() just before. Volatile: the long-poll can
+ * spawn the telemetry task (first netmap) before main arms this, so the
+ * task may poll concurrently; due_us is stored before armed. */
+static volatile bool    s_stun_reprobe_armed;
+static volatile int64_t s_stun_reprobe_due_us;
+/* ROAM-2: set by the IP_EVENT_STA_GOT_IP handler when the device's own
+ * L3 identity changes (WiFi (re)connect / DHCP renew) so the next poll
+ * re-probes at once instead of at the period. Without it a local network
+ * change left the STUN-learned public AddrPort — and the endpoint
+ * advertised to peers — stale for up to CONFIG_TINYLINK_STUN_REPROBE_MS
+ * (5 min). Mirrors magicsock's netmon linkChange → Rebind+ReSTUN. */
+static volatile bool    s_stun_reprobe_now;
 
 static void stun_reprobe_on_got_ip(void *arg, esp_event_base_t base,
                                    int32_t id, void *data)
 {
     (void)arg; (void)base; (void)id;
-    /* Binary give coalesces: several GOT_IP events before the task runs
-     * collapse to a single immediate reprobe. */
-    if (s_stun_reprobe_wake != NULL) {
-        xSemaphoreGive(s_stun_reprobe_wake);
-    }
+    /* Several GOT_IP events before the poll runs collapse into one
+     * immediate re-probe. The kick wakes the telemetry task right away
+     * while it is not serving /stats (before the WG netif is up, or a
+     * build without it); a /stats select() takes it within one ≤ 5-s
+     * wait slice. */
+    s_stun_reprobe_now = true;
+    telemetry_kick();
     /* A new L3 identity (DHCP handed us a different address after a
      * re-association) leaves the control and DERP TCP conns half-open:
      * their packets now leave from an address the servers never saw, so
      * nothing comes back and they only die on the 120-s idle budget.
-     * Recycle both right away (2026-09); the endpoint push that the
-     * re-probe queues rides the same reconnect. */
+     * Recycle both right away (2026-09). The endpoint push that the
+     * re-probe queues normally rides the same reconnect: the control
+     * read only sees the abort at its next 30-s SO_RCVTIMEO boundary,
+     * and the reconnect adds ~1 s backoff + the TLS/Noise handshake on
+     * top. If that boundary falls in the first second or so, the push
+     * costs one more recycle — still correct, just later. */
     const ip_event_got_ip_t *ev = (const ip_event_got_ip_t *)data;
     if (ev != NULL && ev->ip_changed) {
         ESP_LOGI(TAG, "ip changed — recycling control + DERP conns");
@@ -2053,105 +2098,40 @@ static void stun_reprobe_on_got_ip(void *arg, esp_event_base_t base,
     }
 }
 
-static void stun_reprobe_task(void *arg)
+int64_t tinylink_stun_reprobe_poll(int64_t now_us)
 {
-    (void)arg;
-    /* Sleep before the first iteration: the boot-time probe ran in
-     * tinylink_stun_probe() before this task was even spawned, so
-     * doing a second probe immediately would just burn bandwidth. The
-     * wait returns early (before the period elapses) when a local network
-     * change signals s_stun_reprobe_wake — re-discovering the public
-     * endpoint within one STUN RTT instead of up to one reprobe period. */
-    for (;;) {
-        if (s_stun_reprobe_wake != NULL) {
-            xSemaphoreTake(s_stun_reprobe_wake,
-                           pdMS_TO_TICKS(CONFIG_TINYLINK_STUN_REPROBE_MS));
-        } else {
-            vTaskDelay(pdMS_TO_TICKS(CONFIG_TINYLINK_STUN_REPROBE_MS));
-        }
-        esp_err_t err = tinylink_stun_probe();
-        if (err != ESP_OK) {
-            /* Don't escalate: the cached value (if any) is still in
-             * use. ESP_LOGD instead of W to avoid spamming the log
-             * when, e.g., the user briefly loses internet. */
-            ESP_LOGD(TAG, "stun re-probe transient failure: 0x%x", err);
-        }
+    if (!s_stun_reprobe_armed) return INT64_MAX;
+    if (!s_stun_reprobe_now && now_us < s_stun_reprobe_due_us) {
+        return s_stun_reprobe_due_us;
     }
-}
-
-/* Retry-spawn shape for stun_reprobe_task. Boot-time heap pressure
- * (TLS handshake transient + supervisor connect peak still settling)
- * can fail the initial xTaskCreate with ESP_ERR_NO_MEM, and the prior
- * handler logged "continuing static" and gave up — leaving the
- * boot-pushed endpoint permanently stale if the NAT later rebound,
- * which manifested as "direct connection not established" on the peer
- * side. The retry timer fires every 30 s and tries again; once spawn
- * succeeds the timer is one-shot-stopped and the task takes over. */
-#define STUN_RE_SPAWN_RETRY_US (30 * 1000 * 1000)
-
-static esp_timer_handle_t s_reprobe_retry_timer = NULL;
-
-static BaseType_t stun_reprobe_try_spawn(void)
-{
-    /* 3 KiB stack — sized from the 420 s soak instrumentation
-     * (PR #97 + #98 + #99) which captured the first actual
-     * stun_probe execution at t≈611 s post-boot and measured
-     * the lifetime peak at 1 808 B used. The probe path is
-     * DNS lookup (getaddrinfo) + sendto + recvfrom; no TLS or
-     * crypto. 3 KiB leaves 1 264 B margin (≈ 70 %) over peak,
-     * matching the safety ratio adopted for tinylink_derp (#98)
-     * and tinylink_lp (#99).
-     *
-     * The earlier 4 KiB budget was sized symmetrically with
-     * wg_rx (8 KiB) "same as the WG RX task" — but wg_rx does
-     * NaCl box open + sealed pong build on the RX path (DISCO
-     * direct handler), much heavier than this task's plain UDP
-     * probe. The 4 KiB never had a measurement behind it; the
-     * audit just inherited it from the WG sizing.
-     *
-     * Priority IDLE+1 unchanged — explicitly below the long-poll
-     * (IDLE+4) and the WG dataplane so neither gets preempted
-     * by a background probe. */
-    return xTaskCreate(stun_reprobe_task, "tinylink_stun_re",
-                       3072, NULL, tskIDLE_PRIORITY + 1, NULL);
-}
-
-static void stun_reprobe_retry_cb(void *arg)
-{
-    (void)arg;
-    if (stun_reprobe_try_spawn() == pdPASS) {
-        ESP_LOGI(TAG, "stun_reprobe spawn OK on retry "
-                      "(heap_free=%u largest=%u)",
-                 (unsigned)esp_get_free_heap_size(),
-                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
-        /* Timer is one-shot — do not rearm. */
-        return;
-    }
-    ESP_LOGW(TAG, "stun_reprobe spawn retry still failing "
-                  "(heap_free=%u largest=%u) — retry in %d s",
-             (unsigned)esp_get_free_heap_size(),
-             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT),
-             STUN_RE_SPAWN_RETRY_US / 1000000);
-    esp_err_t err = esp_timer_start_once(s_reprobe_retry_timer,
-                                         STUN_RE_SPAWN_RETRY_US);
+    s_stun_reprobe_now = false;
+    /* Blocks for one STUN round trip normally; worst case ≈ 24 s (lwIP
+     * DNS: 1+1+2+3 s × 3 servers, then the 3-s response wait) — inside
+     * the 60-s task-WDT budget with a feed on each side. */
+    tl_wdt_feed();
+    esp_err_t err = tinylink_stun_probe();
+    tl_wdt_feed();
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "esp_timer_start_once(retry) failed: 0x%x — giving up",
-                 err);
+        /* Don't escalate: the cached value (if any) is still in
+         * use. ESP_LOGD instead of W to avoid spamming the log
+         * when, e.g., the user briefly loses internet. */
+        ESP_LOGD(TAG, "stun re-probe transient failure: 0x%x", err);
     }
+    /* Next one a full period after this probe ended, like the old task's
+     * take-with-timeout loop. */
+    s_stun_reprobe_due_us = esp_timer_get_time() +
+                            (int64_t)CONFIG_TINYLINK_STUN_REPROBE_MS * 1000LL;
+    return s_stun_reprobe_due_us;
 }
 
 esp_err_t tinylink_stun_reprobe_start(void)
 {
-    /* ROAM-2: create the wake semaphore and subscribe to local IP changes
-     * before spawning, so the task can be signalled the moment it exists.
-     * The esp_event default loop is already created by app_wifi_start().
-     * Idempotent — guarded so a retry-timer respawn doesn't re-register. */
-    if (s_stun_reprobe_wake == NULL) {
-        s_stun_reprobe_wake = xSemaphoreCreateBinary();
-        if (s_stun_reprobe_wake == NULL) {
-            ESP_LOGE(TAG, "stun_reprobe: wake-sem alloc failed");
-            return ESP_ERR_NO_MEM;
-        }
+    /* ROAM-2: subscribe to local IP changes. The esp_event default loop
+     * is already created by app_wifi_start(). Idempotent. */
+    if (!s_stun_reprobe_armed) {
+        s_stun_reprobe_due_us = esp_timer_get_time() +
+                                (int64_t)CONFIG_TINYLINK_STUN_REPROBE_MS * 1000LL;
+        s_stun_reprobe_armed = true;
         esp_err_t eerr = esp_event_handler_instance_register(
             IP_EVENT, IP_EVENT_STA_GOT_IP, &stun_reprobe_on_got_ip, NULL, NULL);
         if (eerr != ESP_OK) {
@@ -2159,37 +2139,10 @@ esp_err_t tinylink_stun_reprobe_start(void)
                           "— falling back to periodic-only reprobe", eerr);
         }
     }
-
-    if (stun_reprobe_try_spawn() == pdPASS) return ESP_OK;
-
-    /* Boot-time spawn failed. Schedule a retry via esp_timer (which
-     * runs on the system esp_timer task — no per-call xTaskCreate
-     * required, sidesteps the chicken-and-egg of "we have no heap to
-     * spawn the worker that watches for heap"). Returning ESP_OK
-     * tells the caller the re-probe loop *will* run; it just hasn't
-     * spawned yet. */
-    ESP_LOGW(TAG, "xTaskCreate(stun_reprobe) failed at boot "
-                  "(heap_free=%u largest=%u) — scheduling retry in %d s",
-             (unsigned)esp_get_free_heap_size(),
-             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT),
-             STUN_RE_SPAWN_RETRY_US / 1000000);
-
-    if (s_reprobe_retry_timer == NULL) {
-        const esp_timer_create_args_t targs = {
-            .callback = stun_reprobe_retry_cb,
-            .name     = "stun_re_retry",
-        };
-        esp_err_t terr = esp_timer_create(&targs, &s_reprobe_retry_timer);
-        if (terr != ESP_OK) {
-            ESP_LOGE(TAG, "esp_timer_create(retry) failed: 0x%x", terr);
-            return terr;
-        }
-    }
-    esp_err_t terr = esp_timer_start_once(s_reprobe_retry_timer,
-                                          STUN_RE_SPAWN_RETRY_US);
-    if (terr != ESP_OK) {
-        ESP_LOGE(TAG, "esp_timer_start_once(retry) failed: 0x%x", terr);
-        return terr;
-    }
-    return ESP_OK;
+    /* The probes run on the telemetry task, which exists in every build
+     * (with CONFIG_TINYLINK_TELEMETRY_ENABLE=n it only does this and the
+     * 60-s housekeeping). Spawn it now, where the re-probe task used to
+     * be spawned; a NO_MEM spawn is retried every 30 s inside, and
+     * ESP_OK means the re-probe loop *will* run. */
+    return telemetry_task_start();
 }

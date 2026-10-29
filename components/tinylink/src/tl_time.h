@@ -17,8 +17,12 @@
 //      issued after the floor may look "not yet valid".
 //   2. tl_time_start_sntp() runs SNTP (lwIP) once WiFi has an address;
 //      the sync callback flips s_synced and the telemetry task persists
-//      the time to NVS (tl_state:time_floor) via tl_time_poll_persist(),
-//      at most hourly, so the floor advances across reboots.
+//      the time to NVS (tl_state:time_floor) via tl_time_poll_persist()
+//      once it is a day past the stored floor (daily, or at the first
+//      sync after a long power-off), so the floor advances across
+//      reboots. Not hourly (pre-1.3.2): every NVS write may erase a
+//      4 KB sector, stalling both CPUs; tl_time.c explains why a day
+//      keeps the floor safe.
 //   3. tl_crt_bundle_attach() wraps esp_crt_bundle_attach(): while the
 //      clock is NOT NTP-synced, BADCERT_FUTURE / BADCERT_EXPIRED are
 //      cleared before the bundle's own callback runs (which only acts on
@@ -49,7 +53,7 @@ esp_err_t tl_time_start_sntp(void);
 /* True once at least one SNTP sync landed this boot. */
 bool tl_time_synced(void);
 
-/* Persist the synced time as the next boot's floor when due (hourly).
+/* Persist the synced time as the next boot's floor when due (daily).
  * Cheap when nothing is pending; call from a task with stack to spare
  * (the telemetry task), never from the SNTP callback (lwIP context). */
 void tl_time_poll_persist(void);

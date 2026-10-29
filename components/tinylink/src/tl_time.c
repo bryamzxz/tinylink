@@ -27,8 +27,28 @@ static const char *TAG = "tl_time";
 #define NVS_NS   "tl_state"
 #define NVS_KEY  "time_floor"
 
-/* Persist at most this often (NVS wear; one write per hour is nothing). */
-#define PERSIST_MIN_INTERVAL_S 3600ULL
+/* Persist when a sync lands at least this far past the stored floor:
+ * daily in steady state (SNTP syncs hourly), and at the first sync of a
+ * boot that follows more than a day of downtime. Was hourly until
+ * 1.3.2. Wear was never the issue; stalls are: an NVS write can trigger
+ * a 4 KB sector erase, and the ESP32 cannot suspend a flash operation,
+ * so both CPUs (wg_rx, the WiFi task) stall for it — 70 ms typical,
+ * 500 ms worst case (docs/esp32/REFERENCE.md).
+ *
+ * Why a day is still safe. The floor has two properties, and neither
+ * depends on how often it is written: it never exceeds real time
+ * (every persisted value is an NTP time that was already in the past
+ * when written) and it never moves backwards (it is written only when
+ * it exceeds the stored floor). Writing less often only makes it
+ * older: a reboot without NTP starts the clock up to a day (plus the
+ * downtime) behind instead of up to an hour. Behind is the safe side
+ * for every reader of the unsynced clock — certificate dates are not
+ * enforced until this boot's first sync (tl_verify_cb), KeyExpiry can
+ * be reported late but never early (tinylink.c::self_node_expired),
+ * Retry-After dates are read only when synced (h2_client.c), and the
+ * WireGuard TAI64N timestamps have their own NVS reservation that
+ * keeps them monotonic across reboots (wg_proto.c). */
+#define PERSIST_MIN_INTERVAL_S 86400ULL
 
 static volatile bool s_synced;
 static volatile bool s_persist_pending;

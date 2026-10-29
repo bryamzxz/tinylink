@@ -44,11 +44,120 @@ static const char *kStub =
         "\"Nodes\":["
           "{\"Name\":\"13a\",\"RegionID\":13,\"HostName\":\"derp13.tailscale.com\",\"DERPPort\":443}"
         "]"
+      "},"
+      "\"16\":{"
+        "\"RegionID\":16,"
+        "\"RegionCode\":\"mia\","
+        "\"Nodes\":["
+          "{\"Name\":\"16b\",\"RegionID\":16,\"HostName\":\"derp16b.tailscale.com\",\"DERPPort\":443}"
+        "]"
       "}"
     "}"
   "},"
   "\"DomainDataPlaneAuditLogID\":\"ignored\""
 "}";
+
+/* --- Real-shaped DERPMap (1.3.2: keep only the region in use) -------
+ * Tailscale's default map: 28 regions, each with RegionCode/Name,
+ * coordinates and 2–4 nodes carrying IPv4/IPv6/CanPort80. Go's
+ * encoding/json writes the map[int] keys as sorted STRINGS, so region
+ * 16 is the 8th object, not the first — and the parser must keep it by
+ * RegionID whatever the order (the 2026-05 cap=4 build kept the first
+ * four and lost it). */
+static const int kGoKeyOrder[28] = {
+    1, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 2, 20, 21,
+    22, 23, 24, 25, 26, 27, 28, 3, 4, 5, 6, 7, 8, 9,
+};
+static const char *const kRegionCode[29] = {
+    "", "nyc", "sfo", "sin", "fra", "syd", "blr", "tok", "lhr", "dfw",
+    "sea", "sao", "ord", "den", "ams", "jnb", "mia", "lax", "par", "mad",
+    "hkg", "tor", "waw", "dbi", "hnl", "nai", "iad", "sjc", "bom",
+};
+
+/* order: 0 = Go key order, 1 = reversed (16 near the end), 2 = Go order
+ * without region 16. */
+static size_t build_derpmap(char *out, size_t cap, int order)
+{
+    size_t o = 0;
+    o += (size_t)snprintf(out + o, cap - o, "{\"DERPMap\":{\"Regions\":{");
+    int first = 1;
+    for (int k = 0; k < 28; k++) {
+        const int id = kGoKeyOrder[order == 1 ? 27 - k : k];
+        if (order == 2 && id == 16) continue;
+        const int nodes = (id == 16) ? 4 : 2 + (id % 2);
+        o += (size_t)snprintf(out + o, cap - o,
+            "%s\"%d\":{\"RegionID\":%d,\"RegionCode\":\"%s\","
+            "\"RegionName\":\"Region %s\",\"Latitude\":%d.25,\"Longitude\":-%d.5,"
+            "\"Nodes\":[",
+            first ? "" : ",", id, id, kRegionCode[id], kRegionCode[id], id, id + 40);
+        first = 0;
+        for (int n = 0; n < nodes; n++) {
+            o += (size_t)snprintf(out + o, cap - o,
+                "%s{\"Name\":\"%d%c\",\"RegionID\":%d,"
+                "\"HostName\":\"derp%d%c.tailscale.com\","
+                "\"IPv4\":\"198.51.%d.%d\",\"IPv6\":\"2001:db8:%x::%x\","
+                "\"CanPort80\":true}",
+                n ? "," : "", id, 'b' + n, id, id, 'b' + n, id, n + 1, id, n + 1);
+        }
+        o += (size_t)snprintf(out + o, cap - o, "]}");
+    }
+    o += (size_t)snprintf(out + o, cap - o,
+        "},\"HomeParams\":{\"RegionScore\":{\"16\":0.8}}},"
+        "\"KeepAlive\":false}");
+    return o < cap ? o : 0;
+}
+
+static int test_derpmap_real_shaped(void)
+{
+    static char js[24000];
+    static tl_netmap_t nm;
+    static const char *const names[3] = {
+        "derp/real-map-go-order", "derp/real-map-reversed", "derp/real-map-without-16",
+    };
+    for (int order = 0; order < 3; order++) {
+        size_t len = build_derpmap(js, sizeof(js), order);
+        memset(&nm, 0xA5, sizeof(nm));   /* stale garbage must not leak through */
+        if (len == 0 || mapresp_parse(js, len, &nm) != ESP_OK || !nm.have_derp_map) {
+            printf("[%s] FAIL parse len=%zu\n", names[order], len);
+            return 1;
+        }
+        if (order == 2) {
+            if (nm.n_derp_regions != 0 || nm.derp_regions[0].region_id != 0) {
+                printf("[%s] FAIL n=%zu\n", names[order], nm.n_derp_regions);
+                return 1;
+            }
+            printf("[%s] OK\n", names[order]);
+            continue;
+        }
+        const tl_derp_region_t *r = &nm.derp_regions[0];
+        if (nm.n_derp_regions != 1 || r->region_id != 16 ||
+            r->n_nodes != TL_MAX_DERP_NODES ||          /* 4 nodes, capped at 3 */
+            strcmp(r->nodes[0].hostname, "derp16b.tailscale.com") != 0 ||
+            strcmp(r->nodes[2].hostname, "derp16d.tailscale.com") != 0 ||
+            r->nodes[0].region_id != 16 || r->nodes[0].port != 0) {
+            printf("[%s] FAIL n=%zu id=%d nodes=%zu host=%s\n", names[order],
+                   nm.n_derp_regions, r->region_id, r->n_nodes, r->nodes[0].hostname);
+            return 1;
+        }
+        printf("[%s] OK\n", names[order]);
+    }
+
+    /* Selection is by the RegionID inside the object, not by its key. */
+    static const char *kKeyMismatch =
+        "{\"DERPMap\":{\"Regions\":{"
+        "\"16\":{\"RegionID\":61,\"Nodes\":[{\"RegionID\":61,\"HostName\":\"derp61.example\"}]},"
+        "\"x\":{\"RegionID\":16,\"Nodes\":[{\"RegionID\":16,\"HostName\":\"derp16.example\","
+        "\"DERPPort\":8443}]}}}}";
+    if (mapresp_parse(kKeyMismatch, strlen(kKeyMismatch), &nm) != ESP_OK ||
+        nm.n_derp_regions != 1 || nm.derp_regions[0].region_id != 16 ||
+        strcmp(nm.derp_regions[0].nodes[0].hostname, "derp16.example") != 0 ||
+        nm.derp_regions[0].nodes[0].port != 8443) {
+        printf("[derp/selected-by-region-id] FAIL\n");
+        return 1;
+    }
+    printf("[derp/selected-by-region-id] OK\n");
+    return 0;
+}
 
 int main(void)
 {
@@ -109,14 +218,16 @@ int main(void)
         return 1;
     }
 
+    /* Only the PreferredDERP region (16) is stored; the peer's HomeDERP
+     * region 13 is not. */
     if (!nm.have_derp_map || nm.n_derp_regions != 1) {
         printf("[derp.regions] FAIL n=%zu\n", nm.n_derp_regions);
         return 1;
     }
-    if (nm.derp_regions[0].region_id != 13 ||
+    if (nm.derp_regions[0].region_id != 16 ||
         nm.derp_regions[0].n_nodes != 1 ||
         strcmp(nm.derp_regions[0].nodes[0].hostname,
-               "derp13.tailscale.com") != 0 ||
+               "derp16b.tailscale.com") != 0 ||
         nm.derp_regions[0].nodes[0].port != 443) {
         printf("[derp.node] FAIL\n");
         return 1;
@@ -299,12 +410,18 @@ int main(void)
     static const char *kDerpOnly =
         "{\"DERPMap\":{\"Regions\":{\"1\":{\"RegionID\":1,\"Nodes\":["
         "{\"RegionID\":1,\"HostName\":\"derp1.example\"}]}}}}";
+    /* Region 1 is not the preferred one: the frame still counts as data
+     * (have_derp_map) but stores nothing — "preferred region absent". */
     if (mapresp_parse(kDerpOnly, strlen(kDerpOnly), &nm) != ESP_OK ||
-        !nm.have_derp_map || nm.n_derp_regions != 1 || nm.have_self || nm.n_peers != 0) {
+        !nm.have_derp_map || nm.n_derp_regions != 0 ||
+        nm.derp_regions[0].region_id != 0 || nm.derp_regions[0].n_nodes != 0 ||
+        nm.have_self || nm.n_peers != 0) {
         printf("[derp-only-frame] FAIL\n");
         return 1;
     }
     printf("[derp-only-frame] OK\n");
+
+    if (test_derpmap_real_shaped() != 0) return 1;
 
     /* --- Peers vs PeersChanged vs PeersRemoved (M16 merge contract) --- */
     static const char *kFull = "{\"Peers\":[{\"ID\":1},{\"ID\":2}]}";

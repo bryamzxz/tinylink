@@ -133,7 +133,10 @@ three TLS clients attach the IDF certificate bundle through
 then defers to the bundle's own callback. Result: offline boots and the
 first handshakes of a boot behave as before (no date check); every
 handshake after the first sync validates `notBefore`/`notAfter`. The
-telemetry task persists the synced time hourly.
+telemetry task persists the synced time once it is a day past the
+stored floor (hourly until 1.3.2 — each NVS write may erase a 4 KB
+sector, which stalls both CPUs); the floor only has to stay ≤ real time
+and never decrease, which holds at any write interval.
 
 ## WireGuard roaming and the handshake lock (M16, 2026-09)
 
@@ -151,9 +154,31 @@ blocks, the DISCO-pong fast-INIT and the DERP-relayed response path.
 The telemetry task's UDP socket also listens on
 `CONFIG_TINYLINK_STATS_PORT` (27822) and answers any datagram from a
 100.64.0.0/10 source with one JSON line built from
-`tinylink_get_stats()` (uptime, reset reason, heap, NTP, control/DERP state, public
-endpoint, WG counters: rekeys, cold handshakes, RX-stale events, roams,
-TX drops, relay). `echo | nc -u -w1 <tailnet-ip> 27822`.
+`tinylink_get_stats()` (`stats_json.h`): uptime, reset reason, boot
+counters, heap (`heap_free`, `heap_min` = lowest free heap since boot
+from `esp_get_minimum_free_heap_size()`, `heap_largest` = largest free
+block), NTP, control/DERP state, public endpoint, WG counters (rekeys,
+cold handshakes, RX-stale events, roams, TX drops, relay).
+`echo | nc -u -w1 <tailnet-ip> 27822`.
+
+`boots` (1.3.2) = `{total, brownout, panic, task_wdt, int_wdt}`: a
+28-byte record in RTC no-init memory (`RTC_NOINIT_ATTR`,
+`tl_bootstat.h`), counted once per boot from `esp_reset_reason()` by
+`tinylink_bootstat_record()` (first thing in `bringup()`). RTC slow
+memory survives every reset except a power loss, so the counters span
+boots since the last power-on; a magic + FNV-1a checksum restarts the
+record from zero when it holds power-on garbage, a torn write or another
+layout (the boot log then says "RTC record restarted"). `total` counts
+every boot, this one included; the other four count the boots that
+followed that kind of reset (software restarts, RTC WDT and other
+reasons only add to `total`).
+
+The reply is formatted into a static `TL_STATS_JSON_CAP` (896 B) buffer
+and is not sent at all if it would be truncated. Worst case 862 B —
+every counter at its type's widest value, a 63-char hostname and a
+63-char DERP host — checked by `tools/test/test_stats.c`; 1.3.1's line
+peaked at 721 B in 768 B, which the new fields (+135 B) no longer fit.
+About 600 B on the sensor.
 
 ## MapResponse parsing (M15, 2026-09)
 
@@ -666,12 +691,25 @@ or a stack size changes.
 | `tinylink_derp`    | 10 KiB   | IDLE+3  | `tinylink.c::tinylink_derp_supervised_start` | DERP TLS session: relayed DISCO / WG inject, CMM punch |
 | `wg_rx`            | 8 KiB    | IDLE+3  | `wg_netif.c::wg_netif_start`       | UDP recv, demux (WG/DISCO/STUN), handshake, decrypt → lwIP  |
 | `wg_tx`            | 7 KiB    | IDLE+2  | `wg_netif.c::wg_netif_start`       | encrypted-frame queue → `sendto` (direct) or DERP relay     |
-| `tinylink_tlm`     | 4.5 KiB  | IDLE+2  | `telemetry.c`                      | TMP117 sample → JSON → UDP over the tunnel; 60 s stack diag |
-| `tinylink_stun_re` | 3 KiB    | IDLE+1  | `tinylink.c::tinylink_stun_reprobe_start` | periodic / GOT_IP-triggered STUN re-probe, flags endpoint push |
+| `tinylink_tlm`     | 4.5 KiB  | IDLE+2  | `telemetry.c::telemetry_task_start` | TMP117 sample → JSON → UDP over the tunnel; `/stats`; periodic / GOT_IP-triggered STUN re-probe (flags endpoint push); 60 s stack diag + NVS time floor |
 | `tiT` (lwIP)       | 4.5 KiB  | 18      | `CONFIG_LWIP_TCPIP_TASK_STACK_SIZE`| TCP/IP thread (raised 3 → 4.5 KiB in #104)                 |
 
-Application task stacks total ≈ 57 KiB (the 24 KiB `main` stack is
-returned to the heap when `app_main` returns). The long-poll's 24 KiB is
+Application task stacks total ≈ 54 KiB (the 24 KiB `main` stack is
+returned to the heap when `app_main` returns). The STUN re-probe had its
+own 3 KiB task, `tinylink_stun_re`, until 1.3.2; it now runs on
+`tinylink_tlm` (−3.4 KiB heap: stack + TCB + wake semaphore), which
+exists in every build — with `CONFIG_TINYLINK_TELEMETRY_ENABLE=n` it
+only re-probes and does the 60-s housekeeping. `tinylink_tlm` is spawned
+by `tinylink_stun_reprobe_start` at the end of bringup (retried every
+30 s on NO_MEM) and starts sampling on the first netmap. Its stack,
+from the `entry` frames: `telemetry_task` 80 B, then `tlm_wait` 464 B
+(`/stats` reply), `tlm_sample` 224 B (telemetry datagram) or
+`tinylink_stun_reprobe_poll` 32 B + `tinylink_stun_probe` 176 B; every
+path stands ≥ 176 B shallower than in 1.3.1 (one 688-B frame then), and
+the STUN path (~1.8 KB on its own task) ≈ 1.9 KB here, well under the
+`/stats`/sample paths (≈ 3.3 KB, ≤ 1.3.1's measured 3.5 KB peak). A
+GOT_IP wakes the loop at once, except while `select()` serves `/stats`:
+then the ≤ 5-s wait slice bounds the delay. The long-poll's 24 KiB is
 the one to watch: its measured lifetime peak is 20 KiB, dominated by
 `ts2021_connect` (9 888 B frame) → `recv_record_plaintext` (4 176 B) →
 mbedTLS handshake; see `docs/ROADMAP.md` § "Buffer diet" for the
@@ -682,14 +720,17 @@ runs on `tinylink_lp` — see item 9 below.
 
 ### Task watchdog (M15, 2026-09)
 
-Every task in the table except `tinylink_stun_re` subscribes to the ESP
-task WDT at entry (`tl_wdt.h`, `CONFIG_TINYLINK_APP_TASK_WDT`, default
+Every application task in the table (`tinylink_*`, `wg_*`) subscribes
+to the ESP task WDT at entry (`tl_wdt.h`, `CONFIG_TINYLINK_APP_TASK_WDT`, default
 y) and feeds once per loop iteration. Blocking TLS reads feed through
 the `tls_io` poll hook on every WANT_READ/WRITE poll — one 30-s
 `SO_RCVTIMEO` period — so the long-poll and the DERP supervisor feed
 at least every 30 s while idle; long sleeps (Retry-After, reconnect
 ladders, the DERP dataplane wait) go through `tl_wdt_sleep_ms` in 10-s
-slices. Budget: `CONFIG_ESP_TASK_WDT_TIMEOUT_S=60`, the Kconfig maximum
+slices. `tinylink_tlm` waits in ≤ 5-s slices and feeds on both sides of
+a STUN re-probe, whose worst case (lwIP DNS 7 s × 3 servers + the 3-s
+response wait ≈ 24 s) fits the budget; the re-probe ran on an
+unsubscribed task before 1.3.2. Budget: `CONFIG_ESP_TASK_WDT_TIMEOUT_S=60`, the Kconfig maximum
 (a larger value is silently dropped back to the 5-s default — that
 exact mistake tripped the long-poll on the first M15 flash, since its
 30-s poll cannot feed a 5-s budget). `CONFIG_ESP_TASK_WDT_PANIC=y`: a
