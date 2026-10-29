@@ -9,17 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Optimization round 1.3.5 — boot and reconnect latency (in progress, branch `feat/opt-1.3.5`)
 
-The rest of round D's latency items (D9, D10, a D11 slice), built in two
-parallel branches — control transport (`feat/r135-ctl`) and bringup
-order (`feat/r135-boot`) — on top of 1.3.4. The 1.3.4 boot spent got-ip
-→ WG session up 6.7 s in the smoke and 9.9–20.3 s over the 10-boot
-series: a serial STUN probe (0.04–7.09 s), the control TLS handshake
-(2.4–3 s), and a DERP connect that waited for the netmap. Image
-707 088 → **711 408 B (+4 320)**; static DRAM 57 140 → 57 188 B (+48),
-IRAM ±0. Host suite 1 330 → **1 474 OK** (CI floor 1 474), ASan + UBSan
-clean, 0 warnings. `tools/stack_worst.py` static worst cases: `main`
-5 312 / 8 192, `tinylink_lp` 4 864 / 7 168, `tinylink_derp` 5 440 /
-8 192, `tinylink_stun` (new) 3 616 / 5 120. Not yet on the sensor.
+The rest of round D's latency items (D9, D10, a D11 slice), built in three
+parallel branches — control transport (`feat/r135-ctl`), bringup order
+(`feat/r135-boot`) and DNS (`feat/r135-dns`, added after the first
+hardware series) — on top of 1.3.4. The 1.3.4 boot spent got-ip → WG
+session up 6.7 s in the smoke and 6.0–20.3 s over the 10-boot series: a
+serial STUN probe (0.04–7.09 s), the control TLS handshake (2.4–3 s), a
+DERP connect that waited for the netmap, and DNS answers lost in 12 of
+30 boots. Image 707 088 → **716 688 B (+9 600)**; static DRAM 57 140 →
+57 412 B (+272), IRAM ±0. Host suite 1 330 → **1 592 OK** (CI floor
+1 592), ASan + UBSan clean, 0 warnings. `tools/stack_worst.py` static
+worst cases: `main` 5 312 / 8 192, `tinylink_lp` 4 960 / 7 168,
+`tinylink_derp` 5 136 / 8 192, `tinylink_stun` (new) 3 648 / 5 120.
+Hardware section at the end of this entry.
 
 #### Control transport (`feat/r135-ctl`)
 
@@ -90,6 +92,42 @@ clean, 0 warnings. `tools/stack_worst.py` static worst cases: `main`
   the supervisor at the next DERP frame). Before the first netmap,
   relayed DISCO is dropped unopened; `wg_netif_start` writes the peer
   config under `g.lock`. `tinylink_wait_dataplane_ms` removed.
+
+#### DNS and request deadlines (`feat/r135-dns`)
+
+- **DNS off the boot path — servers at their last-known address.** The
+  sensor's lookups lost answers in 12 of 30 boots (lwIP resends after
+  1, 2, 4, 7 s), on the control, DERP and STUN names. The DERP map's
+  node `IPv4` / `STUNPort` are parsed (`tl_derp_node_t`); the home node
+  and the last good control address are kept in NVS `tl_state`
+  (`derp_node`, `ctl_addr`; `tl_addr.h`, written on change only, from
+  the 60-s housekeeping). The DERP supervisor dials the node's address
+  and the boot / re-probe STUN goes to its STUN service (UDP 3478) —
+  `CONFIG_TINYLINK_STUN_HOST` stays the fallback; the control connect
+  dials its last address first, for 10 min after the boot or the
+  by-name conn that reached it. The server is authenticated as by name
+  (Noise IK on :80; on :443 / DERP the chain against the host name via
+  esp-tls `common_name` → SNI + hostname check; TLS sessions keyed by
+  name); any failure at the address — 3 s per step up to Noise msg2 /
+  the DERP login — is retried by name in the same connect, never turns
+  :80 off, and a conn there that fails within 120 s sends the next dial
+  to the name. Logs: `address cache: …`, `stun probe: home DERP node at
+  a.b.c.d:3478 (no DNS)`, `control conn up on :80 (…) at a.b.c.d
+  (cached | resolved)`, `TLS up to <host>:443 at a.b.c.d`. Tests:
+  `test_addr` (48), `test_ts2021` +44 (`dns_*`), `test_mapresp` +19,
+  `test_tls_io` +3.
+- **One-shot control requests get a deadline.** Register and the
+  endpoint push had the stream's 4 × 30-s budget — one sensor boot sat
+  52 s in a push. Now 10 s in 2-s polls (`TS2021_REQ_TIMEOUT_MS`), one W
+  line `control request: no answer within N ms — dropping the conn`, an
+  io failure (a :80 conn → next dial on :443); doubled after each expiry
+  up to 120 s and reset by an answer, so a slow control plane is waited
+  out. The map stream is not under it. A boot push that got no answer
+  is retried by the long-poll before the stream. A requested recycle
+  logs one I line (no E from h2 / mapreq / register). Tests:
+  `test_ts2021` `deadline_*`, `test_h2_interop` +4.
+- SNTP stays at got-ip: lwIP already delays its start 0–5 s at random,
+  and a later start would leave the boot TLS handshakes date-unchecked.
 
 #### Fixes
 
