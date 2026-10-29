@@ -164,9 +164,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the Noise record buffers `ct[4096]` / `rec[4096]` on the LP stack
   (~4 KB) and `rx_task`'s `buf[1536]`.
 
-Round 1.3.3 so far: image 763 792 (B22) → **762 864 B** (−928 B);
-host suite 899 → **1 006 OK** (CI floor 1 006), ASan + UBSan clean,
-0 warnings. Not yet on the sensor.
+- **RX drops by cause at RX-stale** (observability, found on the
+  sensor): transport packets seen per path and refused per cause (old
+  keypair index, other index, replay, tag, C2 commit race, pbuf) since
+  the last good decrypt, printed with the current / previous receiver
+  index when the 30-s watchdog fires — so a silent window says whether
+  nothing arrived or what was dropped. +464 B.
+
+Round 1.3.3: image 763 792 (B22) → **763 328 B** (`b58273f`); host
+suite 899 → **1 006 OK** (CI floor 1 006), ASan + UBSan clean,
+0 warnings; QEMU crypto run clean.
+
+#### Hardware (deployed sensor, app partition only; the 1.3.2 `ota_0` + `otadata` read back to `~/tinylink-backups/` first)
+
+The `ota_0` read failed twice at 460 800 baud ("serial data stream
+stopped") and went through at 230 400; the backup matches the flashed
+1.3.2 image byte for byte, otadata seq 1 / CRC OK. Flashed a bench build
+first, then 1.3.3 (`85a3b55`, then `b58273f` with the RX-drop counters).
+
+- **Bench on the silicon** (`CONFIG_TINYLINK_BENCH_AEAD`): ChaCha20-
+  Poly1305 RFC 8439 KAT OK (aligned and unaligned), **326.5 µs per
+  1 500-B packet (~385 µs on 1.3.2, −15 %)**, raw ChaCha20 173.6 µs /
+  1 500 B; X25519 RFC 7748 KAT OK — the fiat32 asm on real LX6 silicon —
+  **12.55 ms per scalarmult (~20 ms with donna, −37 %)**; the timing
+  probe's per-input minima spread 2 831 cycles over 8 inputs (0.09 % of
+  2.98 M, about one tick interrupt — no sign of data-dependent timing;
+  same-input jitter up to 153 k cycles is interrupts).
+- **Smoke** (180 s): `register … (known node, no auth)` →
+  `MachineAuthorized=true` — tailscale.com takes a register without Auth
+  for the known node; **heap_free 94 884 B (76 588 on 1.3.2, +18.3 KB),
+  largest block 77 824 B (59 392)**; the B18 stacks within the static
+  prediction (`tinylink_lp` 7 268 used of 12 288, static 7 856;
+  `tinylink_derp` 4 068 / 8 192; `wg_tx` 2 212 / 5 120; `esp_timer`
+  1 572 / 4 608; `wg_rx` 3 696 — 5 380 on 1.3.2, the C6 frame).
+- **Reboot series, 10 × 5 min:** register without Auth in 10 / 10 boots
+  (0.21 s after the Noise handshake), **0 early stream FINs (3 of 8
+  boots on 1.3.0–1.3.2; p ≈ 0.9 % if nothing had changed) — B22 confirmed
+  as the fix**; WG up 1.9–2.3 s after the netmap except two boots where
+  the peer answered only the 4th / 2nd INIT (peer-side propagation of
+  the new boot's endpoint; the sensor retried on schedule); 20 rekeys,
+  0 RX-stale, 0 E-level lines, 0 crashes, heap min 94 404 B. Netmap
+  arrival after the stream request 1.1–5.1 s (server side, as before).
+- **Post-rekey silences:** the smoke and the first series boot each had
+  one (a rekey completes, then no decrypt for 30 s, RX-stale, re-keyed
+  at once) — the same pattern as 1.3.2's 03:13 event. All three fell
+  between 03:13 and 03:26, across two firmware versions, and none in the
+  20 rekeys after 03:32: an environmental window (the collector after
+  its 02:00 reboot, or the path), not a 1.3.3 regression. The RX-drop
+  counters above were added to name the cause next time. 6-h soak
+  running.
 
 ### Optimization round B 1.3.2 (2026-10-28, branch `feat/opt-1.3.2`)
 
