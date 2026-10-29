@@ -636,8 +636,11 @@ void tinylink_addr_persist_poll(void)
  * (s_derp_host_gen; derp_sup_event_cb leaves the stream at the next
  * DERP frame); a new address or STUN port only applies from the next
  * connect / probe — the live stream to that host is fine. The NVS copy
- * follows in tinylink_addr_persist_poll. */
-static void update_derp_host_from_netmap(const tl_netmap_t *nm)
+ * follows in tinylink_addr_persist_poll. Not inlined: its ~130-B frame
+ * (the record, a log buffer) would otherwise sit in long_poll_handler's,
+ * under wg_dataplane_start — the long-poll's static worst case
+ * (tools/stack_worst.py: 4 864 → 4 992 B inlined). */
+static __attribute__((noinline)) void update_derp_host_from_netmap(const tl_netmap_t *nm)
 {
     tl_derp_addr_t next;
     if (!tl_derp_addr_from_netmap(nm, CONFIG_TINYLINK_PREFERRED_DERP, &next)) return;
@@ -2071,7 +2074,10 @@ static esp_err_t stun_server_pick(struct sockaddr_in *out, bool *derp)
 
 static void stun_server_note(bool derp, bool answered)
 {
-    if (!answered) s_stun_use_kconfig = derp;
+    /* answered: stay on this server; unanswered: the other one next. A
+     * first boot thus stays on the Kconfig server after its boot probe
+     * answered, even once the netmap gives the DERP node's address. */
+    s_stun_use_kconfig = answered ? !derp : derp;
 }
 
 /* --- STUN reprobe via the live WG socket -------------------------------
