@@ -5,7 +5,7 @@
 **A clean-room, single-peer Tailscale-compatible node for the bare ESP32 — no PSRAM, ~916 KiB of flash, pure C.**
 
 [![CI](https://github.com/bryamzxz/tinylink/actions/workflows/build.yml/badge.svg)](https://github.com/bryamzxz/tinylink/actions/workflows/build.yml)
-[![Firmware](https://img.shields.io/badge/firmware-1.3.4-yellow)](CHANGELOG.md)
+[![Firmware](https://img.shields.io/badge/firmware-1.3.5-yellow)](CHANGELOG.md)
 [![Target](https://img.shields.io/badge/target-ESP32--WROOM%20(no%20PSRAM)-orange)](#hardware)
 [![Framework](https://img.shields.io/badge/ESP--IDF-v5.5-e7352c)](docs/BUILDING.md)
 [![Host tests](https://img.shields.io/badge/host%20KATs-546%20%C2%B7%200%20fail-brightgreen)](#testing)

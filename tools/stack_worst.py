@@ -1769,7 +1769,8 @@ def project_config():
             {'name': 'tinylink_stun', 'alloc': 5120, 'entry': ['stun_boot_task'],
              'cut': UDP_ONLY},
             {'name': TIT, 'alloc': 4608, 'entry': ['tcpip_thread']},
-            {'name': TMR, 'alloc': 6144, 'entry': ['timer_task']},
+            # CONFIG_ESP_TIMER_TASK_STACK_SIZE (round 1.3.3, B18)
+            {'name': TMR, 'alloc': 4608, 'entry': ['timer_task']},
             # bringup (app_main): register, dataplane start, spawns; exits.
             # CONFIG_ESP_MAIN_TASK_STACK_SIZE (round 1.3.4, D4)
             {'name': 'main', 'alloc': 8192, 'entry': ['main_task']},

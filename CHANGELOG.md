@@ -7,6 +7,103 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Optimization round 1.3.5 — boot and reconnect latency (in progress, branch `feat/opt-1.3.5`)
+
+The rest of round D's latency items (D9, D10, a D11 slice), built in two
+parallel branches — control transport (`feat/r135-ctl`) and bringup
+order (`feat/r135-boot`) — on top of 1.3.4. The 1.3.4 boot spent got-ip
+→ WG session up 6.7 s in the smoke and 9.9–20.3 s over the 10-boot
+series: a serial STUN probe (0.04–7.09 s), the control TLS handshake
+(2.4–3 s), and a DERP connect that waited for the netmap. Image
+707 088 → **711 408 B (+4 320)**; static DRAM 57 140 → 57 188 B (+48),
+IRAM ±0. Host suite 1 330 → **1 474 OK** (CI floor 1 474), ASan + UBSan
+clean, 0 warnings. `tools/stack_worst.py` static worst cases: `main`
+5 312 / 8 192, `tinylink_lp` 4 864 / 7 168, `tinylink_derp` 5 440 /
+8 192, `tinylink_stun` (new) 3 616 / 5 120. Not yet on the sensor.
+
+#### Control transport (`feat/r135-ctl`)
+
+- **D10a — ts2021 over plain HTTP :80, TLS :443 as the fallback.** As
+  upstream `controlhttp`: `POST /ts2021` to `controlplane:80` first,
+  since Noise IK authenticates the server by its pinned key, and TLS
+  :443 inside the same connect on any :80 failure (refused, the 3-s
+  connect / answer budget, a reverse-proxy redirect, a fake 101, a
+  forged or other-key msg2, an error frame); a :80 failure that :443
+  then gets past keeps the rest of the boot on :443 (RAM). Only with a
+  key pinned before the boot (NVS pin or compile-in fallback; a TOFU
+  boot and `/key` stay on TLS), the default control port 443 and
+  `CONFIG_TINYLINK_CONTROL_PLAIN_HTTP` (new, default y). A key rotation
+  fails both ports as it failed :443 before (no re-fetch); a :80 conn
+  that fails within 120 s of its handshake sends the next dial to :443
+  (upstream's tailscale#13597 workaround). The connection is not up
+  until the first transport record (the EarlyPayload) has been
+  decrypted with the handshake's keys. One line per connect:
+  `control conn up on :80 (plain HTTP, Noise IK) in N ms`. From a
+  desktop the whole :80 connect + Noise took 340–380 ms against
+  tailscale.com (the firmware's `ts2021_client.c`, a throwaway machine
+  key). `tls_io_sock_read/_write`: the esp_tls read/write contract over
+  a plain socket. Tests: `test_ts2021` +50 (`d10_*`), `test_tls_io` +16.
+- **D9 — TLS 1.2 session resumption (control :443, DERP).**
+  `CONFIG_MBEDTLS_CLIENT_SSL_SESSION_TICKETS` /
+  `CONFIG_ESP_TLS_CLIENT_SESSION_TICKETS` on (off since 2026-05; the
+  sdkconfig.defaults history rewritten for ~159 KB free / 110 KB
+  largest block). `tls_resume.c`: one session per server, RAM only,
+  never offered to another host:port, dropped after a failed connect
+  and 24 h after its full handshake. A resumed reconnect skips chain
+  verify + ECDHE; a rejected ticket is a full, verified handshake. Both
+  servers resume TLS 1.2 tickets (openssl, mbedTLS 3.6.7 `ssl_client2`,
+  2026-10-29); controlplane's ticket keys are per address (8 A records,
+  TTL 60 s — resumed 3/3 on the issuing address, 0/7 on the others),
+  derp16b resumed 5/5, still after 300 s. Logs: `(TLS, session resumed
+  | full handshake)`, `derp_client: TLS up to … (resumed | full
+  handshake, N ms)`. `test_tls_resume` (19). The soak re-tests the
+  2026-05 DYNAMIC_BUFFER + tickets suspicion.
+
+#### Bringup order (`feat/r135-boot`)
+
+- **D11 slice — STUN probe off the boot critical path.** The boot probe
+  ran on the main task ahead of the register (got-ip → "public
+  endpoint" 0.04–7.09 s over the 1.3.4 series). `tinylink_stun_probe_start()`
+  now runs it on a short-lived `tinylink_stun` task (5 KiB, IDLE+2)
+  while the register runs; `tinylink_dataplane_start` waits ≤ 300 ms
+  for it. A later probe is abandoned and the push goes without an
+  endpoint (the old failure outcome); the re-probe runs once wg_rx
+  exists and pushes the endpoint through the async path (one
+  control-stream recycle after the first netmap). A failed probe now
+  does the same instead of waiting 5 min. Until wg_rx exists the probe
+  reads the WG socket itself, blocking only in `select()` and reading
+  `MSG_DONTWAIT` under a mutex the give-up also takes (`stun_boot.h`):
+  after the give-up it never reads or publishes. The request is
+  retransmitted at 500 / 1 500 ms inside the 3-s budget (was one send);
+  an early re-probe request waits for wg_rx instead of reading the
+  socket itself. `stun_match_v4()` is shared by both probes. Tests:
+  `test_stun_boot` (every probe / waiter interleaving), `stun_match_v4`
+  vectors.
+- **D10 slice — DERP connects at boot.** The supervisor waited for the
+  first netmap before its TLS connect; its login landed ~1.8 s after
+  the netmap, so the first WG INIT had no relay and the session came up
+  on attempt 2, ~1.9 s after the netmap, every boot. It now connects
+  alongside the register, so the first INIT's DERP copy (B7) is
+  answered. The wait's 2026-05 reasons are gone (~11 KiB free then,
+  ~159 KB / 110 KB largest now; PreferredDERP is compiled in and the
+  Kconfig host is the netmap's node of it; a different node still moves
+  the supervisor at the next DERP frame). Before the first netmap,
+  relayed DISCO is dropped unopened; `wg_netif_start` writes the peer
+  config under `g.lock`. `tinylink_wait_dataplane_ms` removed.
+
+#### Fixes
+
+- **HTTP/2: a 1xx's Retry-After no longer carries over to the final
+  response** (`h2_io_on_status` clears it with each `:status`). Found by
+  an independent review of the in-tree client against Go's x/net/http2
+  server (`ServeConn` with `-tags http2legacy`, net/http h2c, python-h2;
+  ~1.6 GB through Go with random Noise record cuts, 80 000 real Go HPACK
+  blocks at random splits, ~29 M libFuzzer runs under ASan + UBSan — no
+  other defect that Go or headscale can trigger). `test_h2_interop`'s
+  103 now carries a Retry-After.
+- `tools/stack_worst.py`: `esp_timer` budget 6 144 → 4 608 (B18's
+  value), derp 10 → 8 KiB, wg_tx 7 → 5 KiB in its task table.
+
 ### Optimization round D 1.3.4 (in progress, branch `feat/opt-1.3.4`)
 
 Round D of `docs/rounds/2026-10-optimization-list.md` (memory), built in
