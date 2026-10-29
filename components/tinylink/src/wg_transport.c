@@ -14,10 +14,18 @@
  * imply a counter wrap on next increment). Refuse it explicitly. */
 #define WG_COUNTER_REJECT_AT  (UINT64_MAX)
 
-int wg_replay_check_and_update(struct wg_replay_window *w, uint64_t counter)
+int wg_replay_check(const struct wg_replay_window *w, uint64_t counter)
 {
     if (counter == WG_COUNTER_REJECT_AT) return -1;
+    if (counter > w->highest) return 0;
+    /* counter <= highest. Reject if it fell out of the window. */
+    if (counter + WG_REPLAY_WINDOW_BITS <= w->highest) return -1;
+    size_t pos = (size_t)(counter & (WG_REPLAY_WINDOW_BITS - 1));
+    return (w->bitmap[pos / 8] & (1u << (pos % 8))) ? -1 : 0;   /* replay */
+}
 
+void wg_replay_update(struct wg_replay_window *w, uint64_t counter)
+{
     if (counter > w->highest) {
         uint64_t diff = counter - w->highest;
         if (diff >= WG_REPLAY_WINDOW_BITS) {
@@ -34,22 +42,16 @@ int wg_replay_check_and_update(struct wg_replay_window *w, uint64_t counter)
                 w->bitmap[pos / 8] &= (uint8_t)~(1u << (pos % 8));
             }
         }
-        size_t pos = (size_t)(counter & (WG_REPLAY_WINDOW_BITS - 1));
-        w->bitmap[pos / 8] |= (uint8_t)(1u << (pos % 8));
         w->highest = counter;
-        return 0;
     }
-
-    /* counter <= highest. Reject if it fell out of the window. */
-    if (counter + WG_REPLAY_WINDOW_BITS <= w->highest) {
-        return -1;
-    }
-
     size_t pos = (size_t)(counter & (WG_REPLAY_WINDOW_BITS - 1));
-    if (w->bitmap[pos / 8] & (1u << (pos % 8))) {
-        return -1;  /* replay */
-    }
     w->bitmap[pos / 8] |= (uint8_t)(1u << (pos % 8));
+}
+
+int wg_replay_check_and_update(struct wg_replay_window *w, uint64_t counter)
+{
+    if (wg_replay_check(w, counter) != 0) return -1;
+    wg_replay_update(w, counter);
     return 0;
 }
 
@@ -160,15 +162,16 @@ int wg_transport_decrypt(struct wg_transport_session *s,
     if (load_u32_le(wire + HDR_RX_IDX_OFF) != s->local_index) return -1;
 
     const uint64_t counter = load_u64_le(wire + HDR_COUNTER_OFF);
-    /* Replay-window check is cheap; do it before the AEAD decrypt to
-     * shed obvious garbage early. The window is *tentatively* updated
-     * here; on AEAD failure we don't roll it back, which means a
-     * forged packet with a valid counter-not-yet-seen DOES burn that
-     * slot. That matches RFC 6479's "validate replay first, drop
-     * forgeries silently" model — at worst, an attacker who can spoof
-     * source IP can cause us to drop one legitimate counter slot,
-     * which is a 1/(window) probability of a missed real packet. */
-    if (wg_replay_check_and_update(&s->replay, counter) != 0) return -1;
+    /* Replay check first (cheap, sheds replays before the AEAD), but the
+     * window is only UPDATED after the tag verifies — WireGuard
+     * whitepaper §5.4.6 / RFC 6479 §3. Updating it before
+     * authentication (as this did until round 1.3.0) let one forged
+     * packet with a huge counter move `highest` past every legitimate
+     * counter: all inbound transport was dropped until the next rekey,
+     * repeatable at will by anyone who saw our receiver index. The
+     * caller holds g.lock across the whole decrypt, so check → AEAD →
+     * update is atomic against the other decrypting task. */
+    if (wg_replay_check(&s->replay, counter) != 0) return -1;
 
     const size_t cipher_len = wire_len - WG_TRANSPORT_HEADER_LEN;
     const size_t plen       = cipher_len - WG_TAG_LEN;
@@ -183,6 +186,7 @@ int wg_transport_decrypt(struct wg_transport_session *s,
     memset(nonce, 0, sizeof(nonce));
     if (rc != 0) return -1;
 
+    wg_replay_update(&s->replay, counter);
     *out_len = plen;
     return 0;
 }

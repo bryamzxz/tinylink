@@ -69,7 +69,8 @@ int wg_transport_encrypt(struct wg_transport_session *s,
                          const uint8_t *plaintext, size_t plen);
 
 /* Decrypt an on-wire packet. Validates header, runs the replay window
- * check, AEAD-decrypts. On success writes the recovered plaintext to
+ * check, AEAD-decrypts, and only then records the counter in the window
+ * (a forgery never moves it). On success writes the recovered plaintext to
  * `out` (size at most wire_len - 32) and stores its length in
  * *out_len. On failure (header mismatch, replay, bad tag) returns -1
  * and `out` / *out_len are not touched in a way that could leak. */
@@ -78,10 +79,14 @@ int wg_transport_decrypt(struct wg_transport_session *s,
                          uint8_t *out, size_t out_size,
                          size_t *out_len);
 
-/* Test-friendly hook: check + update the replay window for a counter,
- * without doing any AEAD work. Returns 0 if accepted, -1 if rejected
- * (replay, too old, or counter at sentinel). */
-int wg_replay_check_and_update(struct wg_replay_window *w, uint64_t counter);
+/* Anti-replay window, split so the decrypt path can authenticate
+ * between the two steps: wg_replay_check() returns 0 if `counter` would
+ * be accepted and -1 if rejected (replay, too old, or the sentinel)
+ * without touching the window; wg_replay_update() records an accepted
+ * counter. wg_replay_check_and_update() is both, for tests. */
+int  wg_replay_check(const struct wg_replay_window *w, uint64_t counter);
+void wg_replay_update(struct wg_replay_window *w, uint64_t counter);
+int  wg_replay_check_and_update(struct wg_replay_window *w, uint64_t counter);
 
 #ifdef __cplusplus
 }

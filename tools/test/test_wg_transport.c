@@ -201,6 +201,32 @@ static void test_negative_paths(void) {
         fails += check_eq_int("neg/tamper-tag", rc, -1);
     }
 
+    /* Forged packet with a huge counter (bad tag) must NOT move the
+     * replay window: the next legitimate packet still decrypts. Until
+     * round 1.3.0 the window was updated before the AEAD and this
+     * forgery blocked all inbound traffic until the next rekey. */
+    {
+        struct wg_transport_session rst_tmp;
+        wg_transport_session_init(&rst_tmp, 0x22222222, 0x11111111,
+                                  recv_key, send_key);
+        uint8_t forged[sizeof(wire)];
+        memcpy(forged, wire, (size_t)wlen);
+        const uint64_t big = 1000000;      /* far past the 8192-bit window */
+        memcpy(forged + 8, &big, sizeof(big));
+        uint8_t out[32]; size_t ol = 0;
+        int rc = wg_transport_decrypt(&rst_tmp, forged, (size_t)wlen,
+                                      out, sizeof(out), &ol);
+        fails += check_eq_int("neg/forged-high-counter-rejected", rc, -1);
+        fails += check_eq_int("neg/forged-window-untouched",
+                              (int)(rst_tmp.replay.highest == 0), 1);
+        rc = wg_transport_decrypt(&rst_tmp, wire, (size_t)wlen,
+                                  out, sizeof(out), &ol);
+        fails += check_eq_int("neg/legit-after-forgery-accepted", rc, 0);
+        rc = wg_transport_decrypt(&rst_tmp, wire, (size_t)wlen,
+                                  out, sizeof(out), &ol);
+        fails += check_eq_int("neg/legit-replay-still-rejected", rc, -1);
+    }
+
     /* Wrong receiver_index → reject before crypto. */
     {
         uint8_t bad[sizeof(wire)];

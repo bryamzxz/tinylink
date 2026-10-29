@@ -442,6 +442,64 @@ static void test_full_handshake_roundtrip(void) {
         } else { printf("[full/tamper-tag] OK\n"); }
     }
 
+    /* Bad mac1 (tag and everything else intact): rejected before any DH. */
+    {
+        struct wg_handshake_state istm;
+        wg_handshake_init(&istm, init_priv, init_pub, resp_pub, psk);
+        struct wg_msg_initiation init_msgm;
+        wg_handshake_create_initiation(&istm, 0xCAFEBABE, &init_msgm);
+        struct sim_responder rsimm;
+        memcpy(rsimm.static_priv, resp_priv, 32);
+        memcpy(rsimm.static_pub,  resp_pub,  32);
+        struct wg_msg_response resp_m;
+        sim_resp_process_initiation_and_build_response(
+            &rsimm, &init_msgm, &resp_m, 0xFEEDF00D, psk);
+        resp_m.mac1[3] ^= 0x40;
+        uint8_t s[32], r[32]; uint32_t ri;
+        if (wg_handshake_process_response(&istm, &resp_m, s, r, &ri) == 0) {
+            printf("[full/bad-mac1] FAIL: accepted\n"); fails++;
+        } else { printf("[full/bad-mac1] OK\n"); }
+    }
+
+    /* A forged response (right receiver index, valid mac1 — anyone who
+     * knows our public key can compute it — garbage ephemeral) must not
+     * poison the in-flight handshake: the genuine response that arrives
+     * after it is still accepted and yields the same keys. */
+    {
+        struct wg_handshake_state istf;
+        wg_handshake_init(&istf, init_priv, init_pub, resp_pub, psk);
+        struct wg_msg_initiation init_msgf;
+        wg_handshake_create_initiation(&istf, 0xCAFEBABE, &init_msgf);
+        struct sim_responder rsimf;
+        memcpy(rsimf.static_priv, resp_priv, 32);
+        memcpy(rsimf.static_pub,  resp_pub,  32);
+        struct wg_msg_response genuine;
+        sim_resp_process_initiation_and_build_response(
+            &rsimf, &init_msgf, &genuine, 0xFEEDF00D, psk);
+
+        struct wg_msg_response forged = genuine;
+        uint8_t junk_priv[32], junk_pub[32];
+        curve25519_keypair(junk_priv, junk_pub);
+        memcpy(forged.ephemeral, junk_pub, 32);
+        uint8_t mk[32];
+        wg_mac1_key(mk, init_pub);
+        wg_keyed_mac16(forged.mac1, mk, (const uint8_t *)&forged,
+                       offsetof(struct wg_msg_response, mac1));
+
+        uint8_t s[32], r[32]; uint32_t ri;
+        if (wg_handshake_process_response(&istf, &forged, s, r, &ri) == 0) {
+            printf("[full/forged-rejected] FAIL: accepted\n"); fails++;
+        } else { printf("[full/forged-rejected] OK\n"); }
+        ri = 0;
+        if (wg_handshake_process_response(&istf, &genuine, s, r, &ri) != 0 ||
+            ri != 0xFEEDF00D) {
+            printf("[full/genuine-after-forged] FAIL\n"); fails++;
+        } else {
+            printf("[full/genuine-after-forged] OK\n");
+            fails += check("full/genuine-after-forged-keys", s, rsimf.recv_key, 32);
+        }
+    }
+
     /* Tamper detection: wrong receiver_index. Initiator must reject
      * before doing any crypto. */
     {

@@ -152,7 +152,13 @@ int wg_handshake_process_response(struct wg_handshake_state *st,
     uint8_t nonce[CHACHA20POLY1305_NONCE_LEN];
     int rc = -1;
 
+    uint8_t ck[WG_HASH_LEN];         /* working copies: a response that   */
+    uint8_t h[WG_HASH_LEN];          /* fails to authenticate leaves st   */
+    uint8_t mac[WG_MAC_LEN];         /* untouched (see below)             */
+
     memset(nonce, 0, sizeof(nonce));
+    memcpy(ck, st->chain_key, WG_HASH_LEN);
+    memcpy(h,  st->hash,      WG_HASH_LEN);
 
     /* Validate message header before doing any crypto. Reserved bytes
      * must be zero per WireGuard whitepaper §5.4.2; wg_transport_decrypt
@@ -161,22 +167,44 @@ int wg_handshake_process_response(struct wg_handshake_state *st,
     if (msg->reserved[0] | msg->reserved[1] | msg->reserved[2]) goto out_scrub;
     if (msg->receiver_index != st->local_index) goto out_scrub;
 
+    /* mac1 = MAC(HASH(LABEL_MAC1 || S_pub_initiator), msg[..mac1]) — the
+     * responder keys it with OUR static public key. wireguard-go checks it
+     * on every handshake message before any DH; so do we now: one BLAKE2s
+     * pair instead of two X25519 for junk aimed at our receiver index. */
+    {
+        uint8_t mac1_key[WG_HASH_LEN];
+        wg_mac1_key(mac1_key, st->local_static_pub);
+        wg_keyed_mac16(mac, mac1_key, (const uint8_t *)msg,
+                       offsetof(struct wg_msg_response, mac1));
+        tl_secure_zero(mac1_key, sizeof(mac1_key));
+        uint8_t diff = 0;
+        for (size_t i = 0; i < WG_MAC_LEN; i++) diff |= (uint8_t)(mac[i] ^ msg->mac1[i]);
+        if (diff != 0) goto out_scrub;
+    }
+
+    /* Everything below runs on the copies ck / h. Until round 1.3.0 it
+     * mixed straight into st->chain_key / st->hash BEFORE the AEAD tag
+     * was checked, so one forged response carrying our receiver index
+     * (visible in our INIT on the wire) corrupted the in-flight
+     * handshake and the genuine response that followed failed — a
+     * repeatable 5-s (REKEY_TIMEOUT) stall per attempt. */
+
     /* Ci = KDF1(Ci, E_pub_responder).
      * Hi = H(Hi || E_pub_responder). */
-    wg_mix_chain_only(st->chain_key, msg->ephemeral, WG_KEY_LEN);
-    wg_mix_hash(st->hash, msg->ephemeral, WG_KEY_LEN);
+    wg_mix_chain_only(ck, msg->ephemeral, WG_KEY_LEN);
+    wg_mix_hash(h, msg->ephemeral, WG_KEY_LEN);
 
     /* Ci = KDF1(Ci, DH(E_priv_initiator, E_pub_responder)). */
     if (curve25519_dh(dh_e_e, st->ephemeral_priv, msg->ephemeral) != 0) {
         goto out_scrub;
     }
-    wg_mix_chain_only(st->chain_key, dh_e_e, WG_KEY_LEN);
+    wg_mix_chain_only(ck, dh_e_e, WG_KEY_LEN);
 
     /* Ci = KDF1(Ci, DH(S_priv_initiator, E_pub_responder)). */
     if (curve25519_dh(dh_e_s, st->local_static_priv, msg->ephemeral) != 0) {
         goto out_scrub;
     }
-    wg_mix_chain_only(st->chain_key, dh_e_s, WG_KEY_LEN);
+    wg_mix_chain_only(ck, dh_e_s, WG_KEY_LEN);
 
     /* PSK mix: (Ci, Tau, K) = KDF3(Ci, PSK).
      *           Hi = H(Hi || Tau).
@@ -184,12 +212,12 @@ int wg_handshake_process_response(struct wg_handshake_state *st,
      * still mandates the KDF3 step regardless. */
     {
         uint8_t new_ck[WG_HASH_LEN];
-        noise_hkdf3(st->chain_key, st->preshared_key, WG_KEY_LEN,
+        noise_hkdf3(ck, st->preshared_key, WG_KEY_LEN,
                     new_ck, tau, key);
-        memcpy(st->chain_key, new_ck, WG_HASH_LEN);
+        memcpy(ck, new_ck, WG_HASH_LEN);
         tl_secure_zero(new_ck, sizeof(new_ck));
     }
-    wg_mix_hash(st->hash, tau, WG_HASH_LEN);
+    wg_mix_hash(h, tau, WG_HASH_LEN);
 
     /* AEAD-decrypt the empty payload. The on-wire ciphertext is just
      * the 16-byte tag; mlen = 0 after subtracting TAG_LEN. The tag
@@ -197,19 +225,18 @@ int wg_handshake_process_response(struct wg_handshake_state *st,
     if (chacha20poly1305_decrypt(plaintext_zero,
                                  msg->encrypted_nothing,
                                  sizeof(msg->encrypted_nothing),
-                                 st->hash, WG_HASH_LEN,
+                                 h, WG_HASH_LEN,
                                  key, nonce) != 0) {
         goto out_scrub;
     }
-    /* Hi = H(Hi || msg.encrypted_nothing). */
-    wg_mix_hash(st->hash, msg->encrypted_nothing,
-                sizeof(msg->encrypted_nothing));
 
     /* Transport keys: (T_init→resp, T_resp→init) = KDF2(C_final, "").
      * From the initiator's perspective:
      *   send_key = T_init→resp = first slot
-     *   recv_key = T_resp→init = second slot. */
-    if (noise_hkdf2(st->chain_key, NULL, 0, send_key, recv_key) != 0) {
+     *   recv_key = T_resp→init = second slot. The final
+     * Hi = H(Hi || encrypted_nothing) is never used by an initiator (the
+     * caller scrubs st once the keys are installed), so it is not mixed. */
+    if (noise_hkdf2(ck, NULL, 0, send_key, recv_key) != 0) {
         goto out_scrub;
     }
 
@@ -217,6 +244,8 @@ int wg_handshake_process_response(struct wg_handshake_state *st,
     rc = 0;
 
 out_scrub:
+    tl_secure_zero(ck,              sizeof(ck));
+    tl_secure_zero(h,               sizeof(h));
     tl_secure_zero(key,             sizeof(key));
     tl_secure_zero(dh_e_e,          sizeof(dh_e_e));
     tl_secure_zero(dh_e_s,          sizeof(dh_e_s));
