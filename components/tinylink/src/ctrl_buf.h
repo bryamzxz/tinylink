@@ -19,23 +19,43 @@
 //     is the same invariant the unlocked `s_conn` in tinylink.c already
 //     relies on.
 //   * No user nests inside another: the stream's chunk callback runs
-//     mapresp_parse and long_poll_handler (tinylink.c), which only touch
-//     the data plane / telemetry — never register, push or /key.
+//     the MapResponse parser and long_poll_handler (tinylink.c), which
+//     only touch the data plane / telemetry — never register, push or
+//     /key.
 //
 // tl_ctrl_buf_claim() turns any future violation of that into a clean
 // request failure (logged) instead of two users silently corrupting each
 // other's bytes. Every user claims at its entry point and releases on its
 // single exit (wrapper functions), so a claim can never leak.
 //
-// Layout. The map stream keeps its full 32 KiB MapResponse cap
-// (observed peak 25 838 B) at offset 0 and sends its MapRequest from a
-// separate tail region, because nghttp2 may still be reading the request
-// body while response DATA is already being assembled:
+// Layout. The map stream collects MapResponse elements at offset 0 and
+// sends its MapRequest from a separate tail region, because nghttp2 may
+// still be reading the request body while response DATA is already
+// being parsed:
 //
-//   [0, TL_CTRL_MAPRESP_CAP)          response bodies (MapResponse, register,
-//                                     /key, push) — or register's request
+//   [0, TL_CTRL_MAPRESP_CAP)          the MapResponse element being parsed;
+//                                     response bodies (register, /key, push)
+//                                     — or register's request
 //   [TL_CTRL_REQ_OFF, TL_CTRL_BUF_SZ) MapRequest bodies (stream + push), the
 //                                     /key request
+//
+// MapResponse area, round 1.3.4 (D2): 32 → 8 KiB. Until 1.3.3 each
+// long-poll frame was assembled whole here (initial netmap 25 972 B at
+// most over every 1.3.x capture). The stream now splits a frame as it
+// arrives (mapreq.c) and only ever holds ONE element: the self Node, one
+// peer, one DERP region, one PeersChangedPatch / PeersRemoved entry. The
+// largest the sensor has logged is a 179-token element in the initial
+// netmap (`mapresp peak: tokens=179/640`, every boot since 1.3.0; the
+// log has no byte size). Its delta frames run 11–13 B per token (55
+// tokens in 722 B): ≈ 2.3 KB; test_mapresp.c's real-shaped initial
+// netmap (25.5 KB) puts the 179 tokens in a CapMap-heavy self node of
+// 3 154 B (17.6 B per token); even 30 B per token would be 5.4 KB. So
+// 8 KiB is ≥ 2.6× the fixture and 1.5× that pessimistic bound — and
+// about what the 640-token table holds at 12.5 B per token, so neither
+// limit sits far below the other. A larger element is skipped with an
+// error log (mapreq.c ms_element); `stream peak: … elem=` reports the
+// largest one per frame. The register response (4 KiB behind its 2 KiB
+// request) and the /key response (4 KiB) still fit.
 
 #pragma once
 
@@ -46,7 +66,7 @@
 extern "C" {
 #endif
 
-#define TL_CTRL_MAPRESP_CAP 32768u   /* one assembled MapResponse, as before */
+#define TL_CTRL_MAPRESP_CAP 8192u    /* one MapResponse element (D2, see above) */
 /* MapRequest bodies: the largest (Stream=true, 63-char hostname, NetInfo +
  * Endpoints) is < 640 B; this is the size the endpoint push always had. */
 #define TL_CTRL_REQ_CAP     1024u

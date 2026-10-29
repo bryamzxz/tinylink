@@ -12,12 +12,21 @@
  * so we can include it directly here. */
 
 #include <assert.h>
+#include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "../../components/tinylink/src/netmap.h"
 #include "../../components/tinylink/src/mapreq.h"
+#include "../../components/tinylink/src/ctrl_buf.h"
+
+/* The 1.3.3 whole-body parser (ref/mapresp_133.c), the oracle for the
+ * round-1.3.4 streaming splitter (D2). */
+esp_err_t ref_mapresp_parse(const char *json, size_t json_len, tl_netmap_t *out);
+
+static int stream_suite(void);
 
 static const char *kStub =
 "{"
@@ -493,6 +502,790 @@ int main(void)
         printf("[peers/missing-colon-refused] OK\n");
     }
 
+    if (stream_suite() != 0) return 1;
+
     printf("ALL OK\n");
+    return 0;
+}
+
+/* ======================================================================
+ * Streaming splitter (round 1.3.4, D2)
+ *
+ * Oracle: the 1.3.3 parser, which assembled each frame whole. For every
+ * input whose elements fit the element buffer the stream must return the
+ * same status and, on success, a byte-identical tl_netmap_t — whatever
+ * the chunking of the DATA bytes, the length prefix included.
+ * ==================================================================== */
+
+#define FAILF(...) do { printf(__VA_ARGS__); return 1; } while (0)
+
+static uint64_t g_rng = 0x9E3779B97F4A7C15ull;
+static uint32_t rnd(void)
+{
+    g_rng ^= g_rng << 13; g_rng ^= g_rng >> 7; g_rng ^= g_rng << 17;
+    return (uint32_t)(g_rng >> 16);
+}
+
+/* --- fixture builder ---------------------------------------------------- */
+
+typedef struct { char *p; size_t n, cap; size_t elem_max; } sb_t;
+
+static void sb_printf(sb_t *b, const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    int k = vsnprintf(b->p + b->n, b->cap - b->n, fmt, ap);
+    va_end(ap);
+    if (k < 0 || (size_t)k >= b->cap - b->n) { printf("fixture overflow\n"); exit(1); }
+    b->n += (size_t)k;
+}
+
+/* Note the size of an element just written from `start`. */
+static void sb_elem(sb_t *b, size_t start)
+{
+    if (b->n - start > b->elem_max) b->elem_max = b->n - start;
+}
+
+static void sb_key(sb_t *b, const char *name, const char *prefix, unsigned seed)
+{
+    sb_printf(b, "\"%s\":\"%s", name, prefix);
+    for (int i = 0; i < 32; i++) sb_printf(b, "%02x", (seed * 2654435761u + (unsigned)i * 40503u) >> 24);
+    sb_printf(b, "\"");
+}
+
+/* The self node as tailscale.com sends it to a tagged ESP32 (the Hostinfo
+ * is ours echoed back; CapMap / Capabilities as control grants them),
+ * sized to the 179 tokens the sensor logs for its largest element. */
+static size_t put_self(sb_t *b, int ncap)
+{
+    static const char *const caps[] = {
+        "admin", "funnel", "https", "magicdns-aaaa", "probe-udp-lifetime",
+        "store-appc-routes", "ssh-behavior-v1", "ssh-env-vars", "drive:share",
+        "drive:access", "app-connectors", "disable-captive-portal-detection",
+        "https://tailscale.com/cap/file-sharing", "https://tailscale.com/cap/file-send",
+        "https://tailscale.com/cap/funnel-ports?ports=443,8443,10000",
+        "https://tailscale.com/cap/is-admin", "https://tailscale.com/cap/is-owner",
+        "https://tailscale.com/cap/ssh", "https://tailscale.com/cap/tailnet-lock",
+        "https://tailscale.com/cap/web-client", "https://tailscale.com/cap/debug-peer",
+        "https://tailscale.com/cap/data-plane-audit-logs", "https://tailscale.com/cap/ingress",
+        "https://tailscale.com/cap/services-in-desktop-clients",
+        "https://tailscale.com/cap/bind-to-interface-by-route",
+        "https://tailscale.com/cap/file-sharing-target", "https://tailscale.com/cap/ssh-rule-in",
+        "https://tailscale.com/cap/debug-ts-dns-resolution", "https://tailscale.com/cap/mac-ui-v2",
+        "https://tailscale.com/cap/debug", "default-auto-update", "tailnet.display-name",
+        "nextdns-profile", "user-dial-routes", "debug-disable-upnp", "max-key-duration",
+    };
+    const int nc = (int)(sizeof(caps) / sizeof(caps[0]));
+    size_t s0 = b->n;
+    sb_printf(b, "{\"ID\":8150413018412615,\"StableID\":\"nGq4pVdP9611CNTRL\","
+                 "\"Name\":\"sensor-cali.tail1234ab.ts.net.\",\"User\":5271734863091011,");
+    sb_key(b, "Key", "nodekey:", 1);
+    sb_printf(b, ",\"KeyExpiry\":\"0001-01-01T00:00:00Z\",");
+    sb_key(b, "Machine", "mkey:", 2); sb_printf(b, ",");
+    sb_key(b, "DiscoKey", "discokey:", 3);
+    sb_printf(b, ",\"Addresses\":[\"100.67.60.92/32\",\"fd7a:115c:a1e0::8d01:3c5c/128\"],"
+                 "\"AllowedIPs\":[\"100.67.60.92/32\",\"fd7a:115c:a1e0::8d01:3c5c/128\"],"
+                 "\"Endpoints\":[\"203.0.113.157:56828\",\"192.168.1.50:41641\"],\"HomeDERP\":16,"
+                 "\"Hostinfo\":{\"IPNVersion\":\"1.3.3-tinylink\",\"OS\":\"esp32\","
+                 "\"Hostname\":\"sensor-cali\",\"NetInfo\":{\"WorkingUDP\":true,\"PreferredDERP\":16}},"
+                 "\"Created\":\"2026-05-02T14:21:07.123456789Z\",\"Cap\":131,\"Tags\":[\"tag:sensor\",\"tag:iot\"],"
+                 "\"MachineAuthorized\":true,\"Capabilities\":[");
+    for (int i = 0; i < 12; i++) sb_printf(b, "%s\"%s\"", i ? "," : "", caps[12 + i]);
+    sb_printf(b, "],\"CapMap\":{");
+    for (int i = 0; i < ncap; i++) {
+        const char *k = caps[i % nc];
+        if (i >= nc) sb_printf(b, "%s\"%s/%d\":null", i ? "," : "", k, i);
+        else if (strcmp(k, "default-auto-update") == 0) sb_printf(b, ",\"%s\":[true]", k);
+        else if (strcmp(k, "tailnet.display-name") == 0) sb_printf(b, ",\"%s\":[\"bryam's tailnet\"]", k);
+        else sb_printf(b, "%s\"%s\":null", i ? "," : "", k);
+    }
+    sb_printf(b, "},\"ComputedName\":\"sensor-cali\",\"ComputedNameWithHost\":\"sensor-cali\","
+                 "\"StableTailnetID\":\"T1234CNTRL\"}");
+    sb_elem(b, s0);
+    return b->n - s0;
+}
+
+/* Peers in the shapes tailscale.com sends (trimmed Hostinfo; one with a
+ * service list). shape: 0 home Linux server, 1 Windows desktop, 2 phone
+ * (offline), 3 tagged subnet router, 4 DERP-only, 5 shared-in node. */
+static void put_peer(sb_t *b, int i, int shape)
+{
+    size_t s0 = b->n;
+    sb_printf(b, "{\"ID\":%d%06d,\"StableID\":\"n%dCNTRL\",\"Name\":\"peer-%d.tail1234ab.ts.net.\","
+                 "\"User\":5271734863091011,", 7 + i, 4242 + i, i, i);
+    if (shape == 5) sb_printf(b, "\"Sharer\":6271734863091099,");
+    sb_key(b, "Key", "nodekey:", 100u + (unsigned)i);
+    sb_printf(b, ",\"KeyExpiry\":\"2027-04-%02dT12:00:00Z\",", 10 + i);
+    sb_key(b, "Machine", "mkey:", 200u + (unsigned)i); sb_printf(b, ",");
+    sb_key(b, "DiscoKey", "discokey:", 300u + (unsigned)i);
+    sb_printf(b, ",\"Addresses\":[\"100.88.%d.%d/32\",\"fd7a:115c:a1e0::%x/128\"],"
+                 "\"AllowedIPs\":[\"100.88.%d.%d/32\",\"fd7a:115c:a1e0::%x/128\"%s],",
+              250 - i, 54 + i, 0x1000 + i, 250 - i, 54 + i, 0x1000 + i,
+              shape == 3 ? ",\"192.168.10.0/24\",\"10.20.0.0/16\"" : "");
+    if (shape != 4) {
+        sb_printf(b, "\"Endpoints\":[\"191.89.%d.157:%d\",\"[2800:e2:5c80::%x]:41641\",\"192.168.1.%d:41641\"],",
+                  196 + i, 56828 + i, i + 1, 20 + i);
+    }
+    sb_printf(b, "\"HomeDERP\":%d,", (i % 3) ? 16 : 1);
+    sb_printf(b, "\"Hostinfo\":{\"OS\":\"%s\",\"Hostname\":\"peer-%d\"",
+              shape == 1 ? "windows" : shape == 2 ? "iOS" : "linux", i);
+    if (shape == 0) {
+        sb_printf(b, ",\"Services\":[");
+        static const char *const svc[] = { "sshd", "nginx", "postgres", "grafana-server",
+                                            "prometheus", "node_exporter", "smbd", "tailscaled" };
+        for (int k = 0; k < 8; k++)
+            sb_printf(b, "%s{\"Proto\":\"%s\",\"Port\":%d,\"Description\":\"%s\"}",
+                      k ? "," : "", k == 7 ? "peerapi4" : "tcp", 22 + 1000 * k, svc[k]);
+        sb_printf(b, "]");
+    }
+    sb_printf(b, "},\"Created\":\"2025-11-%02dT08:%02d:00Z\",\"Cap\":%d,", 1 + i, 10 + i, 120 + i);
+    if (shape == 3) sb_printf(b, "\"Tags\":[\"tag:router\",\"tag:server\"],\"PrimaryRoutes\":[\"192.168.10.0/24\"],");
+    if (shape == 2) sb_printf(b, "\"LastSeen\":\"2026-10-28T22:%02d:41Z\",\"Online\":false,", 10 + i);
+    else sb_printf(b, "\"Online\":true,");
+    sb_printf(b, "\"MachineAuthorized\":true,\"ComputedName\":\"peer-%d\",\"ComputedNameWithHost\":\"peer-%d\"}", i, i);
+    sb_elem(b, s0);
+}
+
+/* Tailscale's 28-region DERPMap (see build_derpmap) as a member value. */
+static void put_derpmap(sb_t *b, int with16)
+{
+    sb_printf(b, "{\"Regions\":{");
+    int first = 1;
+    for (int k = 0; k < 28; k++) {
+        const int id = kGoKeyOrder[k];
+        if (!with16 && id == 16) continue;
+        const int nodes = (id == 16) ? 4 : 2 + (id % 2);
+        sb_printf(b, "%s\"%d\":", first ? "" : ",", id);
+        first = 0;
+        size_t s0 = b->n;
+        sb_printf(b, "{\"RegionID\":%d,\"RegionCode\":\"%s\",\"RegionName\":\"Region %s\","
+                     "\"Latitude\":%d.25,\"Longitude\":-%d.5,\"Nodes\":[",
+                  id, kRegionCode[id], kRegionCode[id], id, id + 40);
+        for (int n = 0; n < nodes; n++) {
+            sb_printf(b, "%s{\"Name\":\"%d%c\",\"RegionID\":%d,\"HostName\":\"derp%d%c.tailscale.com\","
+                         "\"IPv4\":\"198.51.%d.%d\",\"IPv6\":\"2001:db8:%x::%x\",\"CanPort80\":true}",
+                      n ? "," : "", id, 'b' + n, id, id, 'b' + n, id, n + 1, id, n + 1);
+        }
+        sb_printf(b, "]}");
+        sb_elem(b, s0);
+    }
+    sb_printf(b, "},\"HomeParams\":{\"RegionScore\":{\"16\":0.8}}}");
+}
+
+/* Everything else of an initial map: skipped by the parser, but it is
+ * most of what the stream has to scan past. */
+static void put_misc(sb_t *b)
+{
+    sb_printf(b, "\"DNSConfig\":{\"Resolvers\":[{\"Addr\":\"https://dns.nextdns.io/abc123\"}],"
+                 "\"Routes\":{\"ts.net.\":null,\"tail1234ab.ts.net.\":[]},\"Domains\":[\"tail1234ab.ts.net\"],"
+                 "\"Proxied\":true,\"CertDomains\":[\"sensor-cali.tail1234ab.ts.net\"],"
+                 "\"ExtraRecords\":[{\"Name\":\"peer-0.tail1234ab.ts.net.\",\"Value\":\"100.88.250.54\"}],"
+                 "\"ExitNodeFilteredSet\":[\".ts.net\"],\"TempCorpIssue13969\":\"\"},"
+                 "\"Domain\":\"bryam@example.com\",\"CollectServices\":true,"
+                 "\"PacketFilter\":[");
+    for (int r = 0; r < 18; r++) {
+        sb_printf(b, "%s{\"SrcIPs\":[\"100.64.0.0/10\",\"fd7a:115c:a1e0::/48\",\"100.88.250.%d\"],"
+                     "\"DstPorts\":[{\"IP\":\"*\",\"Ports\":{\"First\":%d,\"Last\":%d}},"
+                     "{\"IP\":\"100.67.60.92\",\"Ports\":{\"First\":0,\"Last\":65535}}],"
+                     "\"IPProto\":[6,17,1,58]}", r ? "," : "", 50 + r, 1000 * r, 1000 * r + 999);
+    }
+    sb_printf(b, "],\"UserProfiles\":[");
+    for (int u = 0; u < 4; u++) {
+        sb_printf(b, "%s{\"ID\":%d,\"LoginName\":\"user%d@example.com\",\"DisplayName\":\"User %d\","
+                     "\"ProfilePicURL\":\"https://lh3.googleusercontent.com/a/ACg8ocJ%08dxyz=s96-c\"}",
+                  u ? "," : "", 5271734863 + u, u, u, 31337 + u);
+    }
+    sb_printf(b, "],\"SSHPolicy\":{\"rules\":[{\"principals\":[{\"any\":true}],\"sshUsers\":{\"root\":\"\","
+                 "\"*\":\"=\"},\"action\":{\"accept\":true,\"allowAgentForwarding\":true}}]},"
+                 "\"ControlTime\":\"2026-10-29T03:32:20.123456789Z\",\"TKAInfo\":null,"
+                 "\"Debug\":{\"DisableLogTail\":true},\"ClientVersion\":{\"RunningLatest\":true}");
+}
+
+/* An initial netmap like the sensor's (≈ 26 KB, 179-token self node). */
+static size_t build_initial(char *out, size_t cap, size_t *elem_max, size_t *self_len)
+{
+    sb_t b = { out, 0, cap, 0 };
+    sb_printf(&b, "{\"KeepAlive\":false,\"Node\":");
+    *self_len = put_self(&b, 50);
+    sb_printf(&b, ",\"DERPMap\":");
+    put_derpmap(&b, 1);
+    sb_printf(&b, ",\"PeersChanged\":[");
+    for (int i = 0; i < 6; i++) { if (i) sb_printf(&b, ","); put_peer(&b, i, i); }
+    sb_printf(&b, "],");
+    put_misc(&b);
+    sb_printf(&b, "}");
+    if (elem_max) *elem_max = b.elem_max;
+    return b.n;
+}
+
+/* The fixtures every stream test runs over. */
+#define NFIX 32
+static char   g_fix_store[NFIX][32768];
+static size_t g_fix_len[NFIX];
+static const char *g_fix_name[NFIX];
+static int    g_nfix;
+
+static void fix_add(const char *name, const char *js, size_t len)
+{
+    if (g_nfix >= NFIX || len > sizeof(g_fix_store[0])) { printf("fixture table full\n"); exit(1); }
+    memcpy(g_fix_store[g_nfix], js, len);
+    g_fix_len[g_nfix] = len;
+    g_fix_name[g_nfix++] = name;
+}
+
+static void fix_add_str(const char *name, const char *js) { fix_add(name, js, strlen(js)); }
+
+static size_t g_initial_elem_max, g_initial_self_len;
+
+static void build_fixtures(void)
+{
+    static char tmp[32768];
+    size_t n = build_initial(tmp, sizeof(tmp), &g_initial_elem_max, &g_initial_self_len);
+    fix_add("initial-netmap", tmp, n);
+    sb_t b = { tmp, 0, sizeof(tmp), 0 };
+    /* Deltas as the soak logs size them: a 722-B one-peer PeersChanged, a
+     * 65-B Online patch, 102/110-B LastSeen patches, the 18-B KeepAlive. */
+    sb_printf(&b, "{\"PeersChanged\":["); put_peer(&b, 7, 1); sb_printf(&b, "]}");
+    fix_add("delta/peers-changed", tmp, b.n);
+    fix_add_str("delta/keepalive", "{\"KeepAlive\":true}");
+    fix_add_str("delta/online", "{\"PeersChangedPatch\":[{\"NodeID\":7004248,\"Online\":true}]}");
+    fix_add_str("delta/lastseen",
+        "{\"PeersChangedPatch\":[{\"NodeID\":7004248,\"LastSeen\":\"2026-10-29T03:40:12Z\",\"Online\":false}]}");
+    fix_add_str("delta/endpoints",
+        "{\"PeersChangedPatch\":[{\"NodeID\":7004242,\"DERPRegion\":16,"
+        "\"Endpoints\":[\"203.0.113.157:56830\",\"[2800:e2:5c80::1]:41641\"]}],"
+        "\"ControlTime\":\"2026-10-29T03:41:00Z\"}");
+    fix_add_str("delta/removed", "{\"PeersRemoved\":[7004249,8004250],\"KeepAlive\":false}");
+    b.n = 0; sb_printf(&b, "{\"DERPMap\":"); put_derpmap(&b, 1); sb_printf(&b, "}");
+    fix_add("delta/derpmap", tmp, b.n);
+    b.n = 0; sb_printf(&b, "{\"DERPMap\":"); put_derpmap(&b, 0); sb_printf(&b, "}");
+    fix_add("delta/derpmap-without-16", tmp, b.n);
+    /* The unit-test stubs above, as frames. */
+    fix_add_str("stub/one-peer", kStub);
+    fix_add_str("stub/expired-self",
+        "{\"Node\":{\"Key\":\"nodekey:0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20\","
+        "\"KeyExpiry\":\"1970-01-01T00:00:01Z\",\"Expired\":true},\"Debug\":{\"DisableLogTail\":true}}");
+    fix_add_str("stub/combined",
+        "{\"PeersChanged\":[{\"ID\":1,"
+        "\"Key\":\"nodekey:0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20\"}],"
+        "\"PeersChangedPatch\":[{\"NodeID\":2,"
+        "\"DiscoKey\":\"discokey:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"}],"
+        "\"PeersRemoved\":[3]}");
+    fix_add_str("stub/patch-dup",
+        "{\"PeersChangedPatch\":[{\"NodeID\":7,\"DERPRegion\":3},"
+        "{\"NodeID\":7,\"Endpoints\":[\"198.51.100.7:41641\"]},{\"NodeID\":7,\"DERPRegion\":9}]}");
+    fix_add_str("stub/patch-many",
+        "{\"PeersChangedPatch\":[{\"NodeID\":1,\"DERPRegion\":1},{\"NodeID\":2,\"DERPRegion\":1},"
+        "{\"NodeID\":3,\"DERPRegion\":1},{\"NodeID\":4,\"DERPRegion\":1},{\"NodeID\":5,\"DERPRegion\":1}]}");
+    fix_add_str("stub/removed-many", "{\"PeersRemoved\":[1,2,3,4,5,6,7,8,9]}");
+    fix_add_str("stub/removed-odd", "{\"PeersRemoved\":[7,123456789012,\"x\",42,123456789012345678901234,{\"a\":1}]}");
+    fix_add_str("stub/region-key-mismatch",
+        "{\"DERPMap\":{\"Regions\":{"
+        "\"16\":{\"RegionID\":61,\"Nodes\":[{\"RegionID\":61,\"HostName\":\"derp61.example\"}]},"
+        "\"x\":{\"RegionID\":16,\"Nodes\":[{\"RegionID\":16,\"HostName\":\"derp16.example\","
+        "\"DERPPort\":8443}]}}}}");
+    /* Repeated members, whitespace, escapes, odd-but-accepted grammar. */
+    fix_add_str("odd/peers-then-changed",
+        "{\"Peers\":[{\"ID\":1},{\"ID\":2}],\"PeersChanged\":[{\"ID\":3}],\"Peers\":[{\"ID\":4}]}");
+    fix_add_str("odd/whitespace",
+        " \r\n{ \"Node\" :\t{\"ID\" : 5 , \"Addresses\" : [ \"100.64.0.5/32\" ] } ,\n"
+        " \"Peers\" : [ { \"ID\" : 1 } , { \"ID\" : 2 } ] , \"DERPMap\" : { \"Regions\" : {"
+        " \"16\" : { \"RegionID\" : 16 , \"Nodes\" : [ { \"HostName\" : \"d16\" } ] } } } }  trailing");
+    fix_add_str("odd/escaped-keys",
+        "{\"Peer\\u0073\":[{\"ID\":1}],\"No\\\"de\":{\"ID\":9},\"Peers\":[{\"ID\":\"\\\"}]\"},{\"ID\":2}]}");
+    fix_add_str("odd/lenient-commas",
+        "{\"Peers\":[{\"ID\":1} {\"ID\":2},],\"DERPMap\":{\"Regions\":{\"a\":{\"RegionID\":16} \"b\":1,}}}");
+    fix_add_str("odd/scalars-in-containers",
+        "{\"Peers\":[1,\"x\",null,{\"ID\":3}],\"PeersChangedPatch\":[1,\"s\",[2],{\"NodeID\":4,\"DERPRegion\":2}],"
+        "\"DERPMap\":{\"Regions\":{\"1\":\"no\",\"2\":[1],\"3\":{\"RegionID\":16}},\"Regions\":5}}");
+    fix_add_str("odd/wrong-kinds",
+        "{\"Node\":[1],\"Peers\":{\"a\":1},\"PeersChanged\":\"x\",\"DERPMap\":[],\"PeersRemoved\":{}}");
+    fix_add_str("odd/scalar-with-quote", "{\"PeersRemoved\":[1\"x\"],\"Peers\":[{\"ID\":1}]}");
+    fix_add_str("odd/extent-mismatch", "{\"Peers\":[1\"],\"x\":\"y\"]}");
+    fix_add_str("bad/unterminated", "{\"Peers\":[{\"ID\":1}");
+    fix_add_str("bad/not-object", "[{\"Peers\":[]}]");
+    fix_add_str("bad/empty", "");
+    fix_add_str("bad/kind-mismatch", "{\"Peers\":[{\"ID\":1}}");
+}
+
+/* --- harnesses ----------------------------------------------------------- */
+
+static char g_big_elem[65536];   /* no element of any fixture is cut */
+static char g_elem[TL_CTRL_MAPRESP_CAP];
+
+/* Whole body through mapresp_json_* with a given element buffer. */
+static esp_err_t stream_parse(const char *js, size_t len, char *elem, size_t cap,
+                              tl_netmap_t *out, mapresp_json_t *st)
+{
+    mapresp_json_begin(st, elem, cap, out);
+    mapresp_json_feed(st, js, len);
+    return mapresp_json_end(st);
+}
+
+static int same_result(esp_err_t ea, const tl_netmap_t *a, esp_err_t eb, const tl_netmap_t *b)
+{
+    if ((ea == ESP_OK) != (eb == ESP_OK)) return 0;
+    return ea != ESP_OK || memcmp(a, b, sizeof(*a)) == 0;
+}
+
+/* Stream (big buffer) vs the 1.3.3 parser on one body. */
+static int diff_one(const char *js, size_t len, esp_err_t *ref_err)
+{
+    static tl_netmap_t want, got;
+    mapresp_json_t st;
+    esp_err_t ew = ref_mapresp_parse(js, len, &want);
+    esp_err_t eg = stream_parse(js, len, g_big_elem, sizeof(g_big_elem), &got, &st);
+    *ref_err = ew;
+    return same_result(ew, &want, eg, &got);
+}
+
+/* Frames recorded by on_frame. */
+#define MAXF 64
+typedef struct {
+    int         n;
+    int         stop_at;     /* return non-zero at this frame (-1: never) */
+    esp_err_t   err[MAXF];
+    tl_netmap_t nm[MAXF];
+    size_t      elem_peak[MAXF];
+    unsigned    oversized[MAXF];
+} frames_t;
+
+static int on_frame(const mapresp_stream_t *ms, esp_err_t pe, void *ctx)
+{
+    frames_t *f = (frames_t *)ctx;
+    if (f->n < MAXF) {
+        f->err[f->n] = pe;
+        f->nm[f->n] = *ms->json.out;
+        f->elem_peak[f->n] = ms->json.elem_peak;
+        f->oversized[f->n] = ms->json.n_oversized;
+    }
+    return f->n++ == f->stop_at;
+}
+
+static size_t put_frame(uint8_t *out, const char *js, size_t len)
+{
+    out[0] = (uint8_t)len; out[1] = (uint8_t)(len >> 8);
+    out[2] = (uint8_t)(len >> 16); out[3] = (uint8_t)(len >> 24);
+    memcpy(out + 4, js, len);
+    return len + 4;
+}
+
+/* Feed `wire` cut at the given points (chunk sizes from `next_chunk`). */
+static int feed_chunked(mapresp_stream_t *ms, const uint8_t *wire, size_t n,
+                        size_t (*next_chunk)(void))
+{
+    size_t off = 0;
+    while (off < n) {
+        size_t c = next_chunk();
+        if (c > n - off) c = n - off;
+        if (mapresp_stream_feed(ms, wire + off, c) != 0) return -1;
+        off += c;
+    }
+    return 0;
+}
+
+static size_t chunk_1(void)      { return 1; }
+static size_t chunk_tiny(void)   { return 1 + rnd() % 7; }
+static size_t chunk_small(void)  { return 1 + rnd() % 64; }
+static size_t chunk_large(void)  { return 1 + rnd() % 4096; }
+static size_t chunk_mixed(void)
+{
+    uint32_t r = rnd() % 10;
+    return r < 5 ? 1 + rnd() % 3 : r < 8 ? 1 + rnd() % 100 : 1 + rnd() % 9000;
+}
+static size_t g_split_at;   /* two chunks: [0, g_split_at), rest */
+static int    g_split_first;
+static size_t chunk_split(void)
+{
+    if (g_split_first) { g_split_first = 0; return g_split_at ? g_split_at : (size_t)-1; }
+    return (size_t)-1;
+}
+
+/* --- tests ---------------------------------------------------------------- */
+
+static frames_t g_frames;
+static uint8_t  g_wire[NFIX * (32768 + 4) + 64];
+static tl_netmap_t g_want[NFIX];
+static esp_err_t   g_want_err[NFIX];
+
+static int test_fixture_sizes(void)
+{
+    static tl_netmap_t nm;
+    mapresp_json_t st;
+    const char *js = g_fix_store[0];
+    size_t len = g_fix_len[0];
+    if (stream_parse(js, len, g_elem, sizeof(g_elem), &nm, &st) != ESP_OK ||
+        !nm.have_self || nm.n_peers != TL_MAX_PEERS || nm.n_derp_regions != 1 ||
+        !nm.peers_is_delta || st.n_oversized != 0)
+        FAILF("[stream/initial-netmap] FAIL\n");
+    /* Calibrated to the device: 179 tokens for the largest element, the
+     * self node, which is also the largest in bytes. */
+    if (st.tok_peak != 179 || st.elem_peak != g_initial_self_len ||
+        g_initial_elem_max != g_initial_self_len)
+        FAILF("[stream/initial-netmap] FAIL tokens=%d elem=%zu (self %zu, max %zu)\n",
+              st.tok_peak, st.elem_peak, g_initial_self_len, g_initial_elem_max);
+    printf("  initial netmap: body=%zu B, largest element %zu B / %d tokens, buffer %u B\n",
+           len, st.elem_peak, st.tok_peak, (unsigned)TL_CTRL_MAPRESP_CAP);
+    if (len < 24000 || len > 28000 || 2 * st.elem_peak > TL_CTRL_MAPRESP_CAP)
+        FAILF("[stream/initial-netmap] FAIL body %zu, element %zu: below 2x headroom\n",
+              len, st.elem_peak);
+    printf("[stream/initial-netmap-real-shaped] OK\n");
+    return 0;
+}
+
+static int test_differential(void)
+{
+    /* Whole bodies: stream (both buffers) == 1.3.3 parser. */
+    for (int i = 0; i < g_nfix; i++) {
+        static tl_netmap_t a, b;
+        mapresp_json_t st;
+        esp_err_t ew = ref_mapresp_parse(g_fix_store[i], g_fix_len[i], &a);
+        esp_err_t eg = stream_parse(g_fix_store[i], g_fix_len[i], g_elem, sizeof(g_elem), &b, &st);
+        if (!same_result(ew, &a, eg, &b) || st.n_oversized != 0)
+            FAILF("[stream/same-as-1.3.3 %s] FAIL ref=%d stream=%d\n", g_fix_name[i], ew, eg);
+        g_want[i] = a;
+        g_want_err[i] = ew;
+    }
+    printf("[stream/same-as-1.3.3-whole-body] OK\n");
+    /* The mapresp_parse wrapper is the same parser. */
+    for (int i = 0; i < g_nfix; i++) {
+        static tl_netmap_t a;
+        esp_err_t e = mapresp_parse(g_fix_store[i], g_fix_len[i], &a);
+        if (!same_result(e, &a, g_want_err[i], &g_want[i]))
+            FAILF("[stream/mapresp-parse-wrapper %s] FAIL\n", g_fix_name[i]);
+    }
+    printf("[stream/mapresp-parse-wrapper] OK\n");
+    return 0;
+}
+
+/* Every fixture as one frame of a stream, cut in every way. */
+static int check_frames(const char *what)
+{
+    if (g_frames.n != g_nfix) FAILF("[%s] FAIL frames=%d\n", what, g_frames.n);
+    for (int i = 0; i < g_nfix; i++) {
+        if (!same_result(g_frames.err[i], &g_frames.nm[i], g_want_err[i], &g_want[i]))
+            FAILF("[%s] FAIL frame %d (%s)\n", what, i, g_fix_name[i]);
+    }
+    return 0;
+}
+
+static size_t build_wire(void)
+{
+    size_t n = 0;
+    for (int i = 0; i < g_nfix; i++) n += put_frame(g_wire + n, g_fix_store[i], g_fix_len[i]);
+    return n;
+}
+
+static int test_chunking(void)
+{
+    const size_t n = build_wire();
+    static size_t (*const modes[])(void) = { chunk_1, chunk_tiny, chunk_small, chunk_large, chunk_mixed };
+    static mapresp_stream_t ms;
+    static tl_netmap_t nm;
+    for (int run = 0; run < 100; run++) {
+        memset(&g_frames, 0, sizeof(g_frames));
+        g_frames.stop_at = -1;
+        mapresp_stream_init(&ms, g_elem, sizeof(g_elem), &nm, on_frame, &g_frames);
+        if (feed_chunked(&ms, g_wire, n, modes[run % 5]) != 0) FAILF("[stream/chunking] FAIL stop\n");
+        if (check_frames("stream/chunking")) return 1;
+    }
+    printf("[stream/random-chunks-1B-to-9KB-100-runs] OK\n");
+    /* Two chunks, cut at every byte of every frame under 2 KB and of the
+     * first 64 of the others, inside every length prefix, and every 211th
+     * byte elsewhere (the random runs above cover the rest). */
+    static size_t cuts[40000]; size_t nc = 0;
+    for (int i = 0, off = 0; i < g_nfix; off += (int)g_fix_len[i] + 4, i++) {
+        const size_t fl = g_fix_len[i] + 4;
+        for (size_t k = 0; k < fl; k++)
+            if (fl < 2048 || k < 64 || k % 211 == 0) cuts[nc++] = (size_t)off + k;
+    }
+    for (size_t c = 0; c < nc; c++) {
+        memset(&g_frames, 0, sizeof(g_frames));
+        g_frames.stop_at = -1;
+        mapresp_stream_init(&ms, g_elem, sizeof(g_elem), &nm, on_frame, &g_frames);
+        g_split_at = cuts[c]; g_split_first = 1;
+        if (feed_chunked(&ms, g_wire, n, chunk_split) != 0) FAILF("[stream/split] FAIL stop\n");
+        if (check_frames("stream/split-every-byte")) return 1;
+    }
+    printf("[stream/two-chunks-every-cut-and-every-prefix-byte] OK\n");
+    return 0;
+}
+
+/* Truncated at every byte: the same failure as the 1.3.3 parser (which
+ * only succeeds once the top-level object is complete), and the stream
+ * is back in sync for the frame after it. */
+static int test_truncation(void)
+{
+    for (int i = 0; i < g_nfix; i++) {
+        const char *js = g_fix_store[i];
+        const size_t len = g_fix_len[i];
+        static tl_netmap_t got, want;
+        mapresp_json_t st, end;
+        mapresp_json_begin(&st, g_big_elem, sizeof(g_big_elem), &got);
+        for (size_t l = 0; l <= len; l++) {
+            if (l > 0) mapresp_json_feed(&st, js + l - 1, 1);
+            end = st;                          /* end a copy: every prefix in one pass */
+            esp_err_t eg = mapresp_json_end(&end);
+            /* The oracle on every prefix of the small fixtures, every
+             * 61st of the big ones (it is quadratic). */
+            if (len < 2048 || l % 61 == 0 || l + 64 > len) {
+                esp_err_t ew = ref_mapresp_parse(js, l, &want);
+                if (!same_result(ew, &want, eg, &got))
+                    FAILF("[stream/truncation] FAIL %s at %zu of %zu\n", g_fix_name[i], l, len);
+            } else if (eg == ESP_OK && !st.done) {
+                FAILF("[stream/truncation] FAIL %s accepted at %zu\n", g_fix_name[i], l);
+            }
+        }
+    }
+    printf("[stream/truncated-at-every-byte-same-as-1.3.3] OK\n");
+
+    /* Resync: a truncated frame followed by the full one, through the
+     * framing layer with tiny chunks. */
+    static mapresp_stream_t ms;
+    static tl_netmap_t nm;
+    static uint8_t wire[2 * 32768 + 8];
+    for (int i = 0; i < g_nfix; i++) {
+        const size_t len = g_fix_len[i];
+        const size_t step = len < 2048 ? 1 : 97;
+        for (size_t l = 0; l < len; l += step) {
+            size_t n = put_frame(wire, g_fix_store[i], l);
+            n += put_frame(wire + n, g_fix_store[i], len);
+            memset(&g_frames, 0, sizeof(g_frames));
+            g_frames.stop_at = -1;
+            mapresp_stream_init(&ms, g_elem, sizeof(g_elem), &nm, on_frame, &g_frames);
+            if (feed_chunked(&ms, wire, n, chunk_tiny) != 0 || g_frames.n != 2 ||
+                !same_result(g_frames.err[1], &g_frames.nm[1], g_want_err[i], &g_want[i]))
+                FAILF("[stream/resync] FAIL %s at %zu\n", g_fix_name[i], l);
+            static tl_netmap_t want;
+            esp_err_t ew = ref_mapresp_parse(g_fix_store[i], l, &want);
+            if (!same_result(ew, &want, g_frames.err[0], &g_frames.nm[0]))
+                FAILF("[stream/resync] FAIL %s prefix %zu\n", g_fix_name[i], l);
+        }
+    }
+    printf("[stream/truncated-frame-then-resync] OK\n");
+    return 0;
+}
+
+/* Random edits (structural characters, deletions, insertions): the stream
+ * still returns exactly what the 1.3.3 parser returns. */
+static int test_mutations(void)
+{
+    static const char alpha[] = "{}[]\",:\\ \t\n0a-";
+    static char buf[32768 + 16];
+    long n_ok = 0, n_err = 0;
+    for (int i = 0; i < g_nfix; i++) {
+        const int iters = g_fix_len[i] > 4096 ? 400 : 1500;
+        for (int t = 0; t < iters; t++) {
+            size_t len = g_fix_len[i];
+            memcpy(buf, g_fix_store[i], len);
+            const int edits = 1 + (int)(rnd() % 3);
+            for (int e = 0; e < edits && len > 0; e++) {
+                size_t p = rnd() % len;
+                const uint32_t op = rnd() % 4;
+                char c = (rnd() % 4) ? alpha[rnd() % (sizeof(alpha) - 1)] : (char)(32 + rnd() % 95);
+                if (op <= 1) {
+                    buf[p] = c;
+                } else if (op == 2) {
+                    memmove(buf + p, buf + p + 1, len - p - 1); len--;
+                } else if (len < sizeof(buf) - 1) {
+                    memmove(buf + p + 1, buf + p, len - p); buf[p] = c; len++;
+                }
+            }
+            esp_err_t ew;
+            if (!diff_one(buf, len, &ew))
+                FAILF("[stream/mutations] FAIL %s iter %d: %.*s\n", g_fix_name[i], t,
+                      (int)(len < 300 ? len : 300), buf);
+            if (ew == ESP_OK) n_ok++; else n_err++;
+        }
+    }
+    printf("  mutations: %ld parsed, %ld rejected, all as 1.3.3\n", n_ok, n_err);
+    printf("[stream/random-mutations-same-as-1.3.3] OK\n");
+    return 0;
+}
+
+/* --- elements larger than the buffer -------------------------------------- */
+
+/* A peer of exactly `total` bytes: a long Hostinfo string, few tokens. */
+static size_t put_big_peer(char *out, size_t total, int id)
+{
+    int k = snprintf(out, total + 1, "{\"ID\":%d,\"Hostinfo\":{\"Hostname\":\"", id);
+    size_t fill = total - (size_t)k - 3;
+    memset(out + k, 'h', fill);
+    memcpy(out + k + fill, "\"}}", 4);   /* and the NUL */
+    return total;
+}
+
+static int expect_frame(const char *name, const char *with, size_t with_len,
+                        const char *without, size_t without_len,
+                        unsigned want_oversized, int patch_overflow)
+{
+    static tl_netmap_t got, want;
+    mapresp_json_t st;
+    esp_err_t eg = stream_parse(with, with_len, g_elem, sizeof(g_elem), &got, &st);
+    esp_err_t ew = ref_mapresp_parse(without, without_len, &want);
+    if (patch_overflow) want.patches_overflow = true;
+    if (eg != ESP_OK || !same_result(eg, &got, ew, &want) || st.n_oversized != want_oversized)
+        FAILF("[%s] FAIL err=%d oversized=%u\n", name, eg, st.n_oversized);
+    /* Same through the framing layer, byte by byte, then a frame after it. */
+    static mapresp_stream_t ms;
+    static tl_netmap_t nm;
+    static uint8_t wire[2 * 32768 + 16];
+    size_t n = put_frame(wire, with, with_len);
+    n += put_frame(wire + n, kStub, strlen(kStub));
+    memset(&g_frames, 0, sizeof(g_frames));
+    g_frames.stop_at = -1;
+    mapresp_stream_init(&ms, g_elem, sizeof(g_elem), &nm, on_frame, &g_frames);
+    static tl_netmap_t stub;
+    esp_err_t es = ref_mapresp_parse(kStub, strlen(kStub), &stub);
+    if (feed_chunked(&ms, wire, n, chunk_1) != 0 || g_frames.n != 2 ||
+        !same_result(g_frames.err[0], &g_frames.nm[0], ew, &want) ||
+        !same_result(g_frames.err[1], &g_frames.nm[1], es, &stub) ||
+        g_frames.elem_peak[0] < TL_CTRL_MAPRESP_CAP)
+        FAILF("[%s] FAIL through the stream\n", name);
+    printf("[%s] OK\n", name);
+    return 0;
+}
+
+static int test_oversized(void)
+{
+    static char with[32768], without[32768], big[20000];
+    const size_t cap = TL_CTRL_MAPRESP_CAP;
+    size_t bl, wl, ol;
+
+    /* Peer of cap + 1 bytes between two normal ones: skipped, the rest of
+     * the map (the DERPMap after it) parsed, the stream in sync. */
+    bl = put_big_peer(big, cap + 1, 77);
+    wl = (size_t)snprintf(with, sizeof(with),
+        "{\"Peers\":[{\"ID\":1},%.*s,{\"ID\":2}],\"DERPMap\":{\"Regions\":{\"16\":"
+        "{\"RegionID\":16,\"Nodes\":[{\"HostName\":\"d16\"}]}}}}", (int)bl, big);
+    ol = (size_t)snprintf(without, sizeof(without),
+        "{\"Peers\":[{\"ID\":1},{\"ID\":2}],\"DERPMap\":{\"Regions\":{\"16\":"
+        "{\"RegionID\":16,\"Nodes\":[{\"HostName\":\"d16\"}]}}}}");
+    if (expect_frame("stream/oversized-peer-skipped", with, wl, without, ol, 1, 0)) return 1;
+
+    /* Exactly the buffer: parsed like 1.3.3 does. */
+    bl = put_big_peer(big, cap, 77);
+    wl = (size_t)snprintf(with, sizeof(with), "{\"Peers\":[{\"ID\":1},%.*s]}", (int)bl, big);
+    if (expect_frame("stream/element-of-exactly-the-buffer-parsed", with, wl, with, wl, 0, 0)) return 1;
+
+    /* Self node over the buffer: no self (as 1.3.3 without the member). */
+    bl = put_big_peer(big, cap + 500, 5);
+    wl = (size_t)snprintf(with, sizeof(with), "{\"Node\":%.*s,\"Peers\":[{\"ID\":1}]}", (int)bl, big);
+    ol = (size_t)snprintf(without, sizeof(without), "{\"Peers\":[{\"ID\":1}]}");
+    if (expect_frame("stream/oversized-node-skipped", with, wl, without, ol, 1, 0)) return 1;
+
+    /* The kept DERP region over the buffer: no region, have_derp_map set. */
+    {
+        size_t o = (size_t)snprintf(big, sizeof(big), "{\"RegionID\":16,\"RegionName\":\"");
+        memset(big + o, 'r', cap); o += cap;
+        o += (size_t)snprintf(big + o, sizeof(big) - o, "\",\"Nodes\":[{\"HostName\":\"d16\"}]}");
+        wl = (size_t)snprintf(with, sizeof(with),
+            "{\"DERPMap\":{\"Regions\":{\"1\":{\"RegionID\":1},\"16\":%.*s}}}", (int)o, big);
+        ol = (size_t)snprintf(without, sizeof(without),
+            "{\"DERPMap\":{\"Regions\":{\"1\":{\"RegionID\":1}}}}");
+        if (expect_frame("stream/oversized-region-skipped", with, wl, without, ol, 1, 0)) return 1;
+    }
+
+    /* A patch over the buffer may hide a key change: patches_overflow
+     * (the stream recycles for a full map), the other patch kept. */
+    {
+        size_t o = (size_t)snprintf(big, sizeof(big), "{\"NodeID\":9,\"Cap\":\"");
+        memset(big + o, 'c', cap); o += cap;
+        o += (size_t)snprintf(big + o, sizeof(big) - o, "\"}");
+        wl = (size_t)snprintf(with, sizeof(with),
+            "{\"PeersChangedPatch\":[%.*s,{\"NodeID\":4,\"DERPRegion\":2}]}", (int)o, big);
+        ol = (size_t)snprintf(without, sizeof(without),
+            "{\"PeersChangedPatch\":[{\"NodeID\":4,\"DERPRegion\":2}]}");
+        if (expect_frame("stream/oversized-patch-overflows", with, wl, without, ol, 1, 1)) return 1;
+    }
+
+    /* PeersRemoved: an element of ≥ 24 bytes was never a NodeID — skipped
+     * silently, exactly as before (no oversize count, same result). */
+    {
+        size_t o = 0;
+        big[o++] = '"'; memset(big + o, 'x', cap * 2); o += cap * 2; big[o++] = '"';
+        wl = (size_t)snprintf(with, sizeof(with), "{\"PeersRemoved\":[5,%.*s,6]}", (int)o, big);
+        static tl_netmap_t got, want;
+        mapresp_json_t st;
+        if (stream_parse(with, wl, g_elem, sizeof(g_elem), &got, &st) != ESP_OK ||
+            ref_mapresp_parse(with, wl, &want) != ESP_OK || memcmp(&got, &want, sizeof(got)) != 0 ||
+            got.n_removed != 2 || st.n_oversized != 0)
+            FAILF("[stream/long-removed-entry-skipped] FAIL\n");
+        printf("[stream/long-removed-entry-skipped] OK\n");
+    }
+    return 0;
+}
+
+/* --- framing --------------------------------------------------------------- */
+
+static int test_framing(void)
+{
+    static mapresp_stream_t ms;
+    static tl_netmap_t nm;
+    uint8_t wire[64];
+
+    /* A zero-length frame is a malformed MapResponse, not a stop; the
+     * next frame parses. */
+    size_t n = put_frame(wire, "", 0);
+    n += put_frame(wire + n, "{\"KeepAlive\":true}", 18);
+    memset(&g_frames, 0, sizeof(g_frames)); g_frames.stop_at = -1;
+    mapresp_stream_init(&ms, g_elem, sizeof(g_elem), &nm, on_frame, &g_frames);
+    if (mapresp_stream_feed(&ms, wire, n) != 0 || g_frames.n != 2 ||
+        g_frames.err[0] == ESP_OK || g_frames.err[1] != ESP_OK)
+        FAILF("[stream/zero-length-frame] FAIL\n");
+    printf("[stream/zero-length-frame] OK\n");
+
+    /* Over MAPRESP_FRAME_MAX: stop (long-poll reconnects), no frame. */
+    const uint32_t big = MAPRESP_FRAME_MAX + 1u;
+    uint8_t hdr[5] = { (uint8_t)big, (uint8_t)(big >> 8), (uint8_t)(big >> 16), (uint8_t)(big >> 24), '{' };
+    memset(&g_frames, 0, sizeof(g_frames)); g_frames.stop_at = -1;
+    mapresp_stream_init(&ms, g_elem, sizeof(g_elem), &nm, on_frame, &g_frames);
+    if (mapresp_stream_feed(&ms, hdr, 2) != 0 || mapresp_stream_feed(&ms, hdr + 2, 3) != -1 ||
+        g_frames.n != 0)
+        FAILF("[stream/frame-over-cap-stops] FAIL\n");
+    /* A desynchronised stream reading JSON as a length stops at once. */
+    mapresp_stream_init(&ms, g_elem, sizeof(g_elem), &nm, on_frame, &g_frames);
+    if (mapresp_stream_feed(&ms, (const uint8_t *)"{\"Pe", 4) != -1)
+        FAILF("[stream/frame-over-cap-stops] FAIL desync\n");
+    /* Exactly at the cap is accepted (the header alone, no body yet). */
+    const uint32_t at = MAPRESP_FRAME_MAX;
+    uint8_t hdr2[4] = { (uint8_t)at, (uint8_t)(at >> 8), (uint8_t)(at >> 16), (uint8_t)(at >> 24) };
+    mapresp_stream_init(&ms, g_elem, sizeof(g_elem), &nm, on_frame, &g_frames);
+    if (mapresp_stream_feed(&ms, hdr2, 4) != 0) FAILF("[stream/frame-over-cap-stops] FAIL at cap\n");
+    printf("[stream/frame-over-cap-stops] OK\n");
+
+    /* on_frame asking to stop (recycle) ends the feed in that chunk; the
+     * bytes after it are not parsed. */
+    n = put_frame(wire, "{\"KeepAlive\":true}", 18);
+    n += put_frame(wire + n, "{\"KeepAlive\":true}", 18);
+    memset(&g_frames, 0, sizeof(g_frames)); g_frames.stop_at = 0;
+    mapresp_stream_init(&ms, g_elem, sizeof(g_elem), &nm, on_frame, &g_frames);
+    if (mapresp_stream_feed(&ms, wire, n) != -1 || g_frames.n != 1)
+        FAILF("[stream/handler-stop] FAIL\n");
+    printf("[stream/handler-stop] OK\n");
+
+    /* Several frames in one chunk, a frame split over three. */
+    n = put_frame(wire, "{\"KeepAlive\":true}", 18);
+    n += put_frame(wire + n, "{\"PeersRemoved\":[7]}", 20);
+    memset(&g_frames, 0, sizeof(g_frames)); g_frames.stop_at = -1;
+    mapresp_stream_init(&ms, g_elem, sizeof(g_elem), &nm, on_frame, &g_frames);
+    if (mapresp_stream_feed(&ms, wire, 3) != 0 || mapresp_stream_feed(&ms, wire + 3, 20) != 0 ||
+        mapresp_stream_feed(&ms, wire + 23, n - 23) != 0 || g_frames.n != 2 ||
+        g_frames.err[1] != ESP_OK || g_frames.nm[1].n_removed != 1 || g_frames.nm[1].removed_ids[0] != 7)
+        FAILF("[stream/frames-across-chunks] FAIL\n");
+    printf("[stream/frames-across-chunks] OK\n");
+    return 0;
+}
+
+static int stream_suite(void)
+{
+    build_fixtures();
+    if (test_fixture_sizes()) return 1;
+    if (test_differential()) return 1;
+    if (test_chunking()) return 1;
+    if (test_truncation()) return 1;
+    if (test_mutations()) return 1;
+    if (test_oversized()) return 1;
+    if (test_framing()) return 1;
     return 0;
 }

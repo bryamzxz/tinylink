@@ -14,15 +14,15 @@
 #include "esp_system.h"
 #include "freertos/FreeRTOS.h"
 #include "sdkconfig.h"
-#include "ctrl_buf.h"
 #include "h2_client.h"
 #include "tinylink.h"   /* tinylink_get_public_endpoint */
 #endif
 
+#include "ctrl_buf.h"
+
 #define JSMN_STATIC
 #include "jsmn.h"
 #include "jsmn_skip.h"
-#include "jsmn_split.h"
 #include "tl_date.h"
 
 #ifdef ESP_PLATFORM
@@ -31,15 +31,17 @@ static const char *TAG = "mapreq";
 
 /* Real Tailscale MapResponse for a small tailnet (sensor + home peer)
  * comfortably exceeds 16 KiB once DERP map + DNSConfig + the peer's
- * Hostinfo are folded in. Observed 16383-byte truncation on first HW
- * boot 2026-05-02. The stream assembles one MapResponse at a time in the
- * shared control buffer (ctrl_buf.h): TL_CTRL_MAPRESP_CAP = 32 KiB
- * (soak peak 25 838 B); its MapRequest goes out of the buffer's tail
- * (TL_CTRL_REQ_CAP). */
+ * Hostinfo are folded in (soak peak 25 972 B). Observed 16383-byte
+ * truncation on first HW boot 2026-05-02. Since 1.3.4 (D2) no frame is
+ * assembled whole: the stream splits it as it arrives and collects one
+ * element at a time in the MapResponse area of the shared control buffer
+ * (ctrl_buf.h, TL_CTRL_MAPRESP_CAP = 8 KiB); its MapRequest goes out of
+ * the buffer's tail (TL_CTRL_REQ_CAP). */
 /* jsmn token budget for ONE sub-document. Since 2026-09 the MapResponse
- * is not tokenized as a whole: jsmn_split.h cuts it into its top-level
- * values and this table only ever holds the self Node object, one peer
- * object, one DERP region object or one patch entry at a time. The
+ * is not tokenized as a whole: it is cut into its top-level values (since
+ * 1.3.4 on the stream, below) and this table only ever holds the self
+ * Node object, one peer object, one DERP region object or one patch
+ * entry at a time. The
  * largest of those in the wild is a peer with a full Hostinfo (a few
  * hundred tokens); 640 leaves ~2× headroom, and an oversized element is
  * skipped with a log instead of failing the whole map. Was 2 500 tokens
@@ -327,21 +329,14 @@ static int sub_parse(const char *js, size_t len, int *peak)
     return n;
 }
 
-/* Peers / PeersChanged: array of Node objects, one sub-parse each. */
-static esp_err_t parse_peers_split(const char *js, size_t len,
-                                   tl_netmap_t *out, int *peak)
+/* Peers / PeersChanged element: one Node object, one sub-parse. The
+ * caller stops storing at TL_MAX_PEERS (the rest are drained unparsed). */
+static void elem_peer(const char *v, size_t vlen, tl_netmap_t *out, int *peak)
 {
-    size_t pos = 0;
-    const char *v; size_t vlen; int rc;
-    out->n_peers = 0;
-    while ((rc = tl_jsplit_arr_next(js, len, &pos, &v, &vlen)) == 1) {
-        if (out->n_peers >= TL_MAX_PEERS) continue;   /* keep draining; cap like before */
-        int n = sub_parse(v, vlen, peak);
-        if (n < 1 || !tok_is_obj(&s_toks[0])) continue;
-        parse_one_peer(v, s_toks, 0, &out->peers[out->n_peers]);
-        out->n_peers++;
-    }
-    return (rc < 0) ? ESP_ERR_INVALID_RESPONSE : ESP_OK;
+    int n = sub_parse(v, vlen, peak);
+    if (n < 1 || !tok_is_obj(&s_toks[0])) return;
+    parse_one_peer(v, s_toks, 0, &out->peers[out->n_peers]);
+    out->n_peers++;
 }
 
 static esp_err_t parse_one_derp_region(const char *js, const jsmntok_t *toks,
@@ -431,65 +426,47 @@ static bool derp_region_wanted(int region_id)
 }
 
 /* DERPMap: {"Regions": {"<id>": {...region...}, ...}} — one sub-parse per
- * region object until the wanted region is stored; the rest are drained
- * by byte range. The key (region id as string) is ignored: RegionID is
+ * region value until the wanted region is stored; the caller drains the
+ * rest unparsed. The key (region id as string) is ignored: RegionID is
  * inside the value too. */
-static esp_err_t parse_derp_map_split(const char *js, size_t len,
-                                      tl_netmap_t *out, int *peak)
+static void elem_region(const char *v, size_t vlen, tl_netmap_t *out, int *peak)
 {
-    size_t pos = 0;
-    tl_jsplit_kv_t kv; int rc;
-    out->n_derp_regions = 0;
-    while ((rc = tl_jsplit_obj_next(js, len, &pos, &kv)) == 1) {
-        if (!tl_jsplit_key_is(&kv, "Regions") || kv.val[0] != '{') continue;
-        size_t rp = 0;
-        unsigned seen = 0;
-        tl_jsplit_kv_t rkv; int rrc;
-        while ((rrc = tl_jsplit_obj_next(kv.val, kv.val_len, &rp, &rkv)) == 1) {
-            seen++;
-            if (out->n_derp_regions >= TL_MAX_DERP_REGIONS) continue;
-            int n = sub_parse(rkv.val, rkv.val_len, peak);
-            if (n < 1 || !tok_is_obj(&s_toks[0])) continue;
-            tl_derp_region_t *r = &out->derp_regions[out->n_derp_regions];
-            parse_one_derp_region(rkv.val, s_toks, 0, r);
-            if (derp_region_wanted(r->region_id)) {
-                out->n_derp_regions++;
-            } else {
-                memset(r, 0, sizeof(*r));   /* slot reused by the next one */
-            }
-        }
-        if (rrc < 0) return ESP_ERR_INVALID_RESPONSE;
-        out->have_derp_map = true;
-#ifdef ESP_PLATFORM
-        if (out->n_derp_regions == 0 && DERP_KEEP_REGION > 0) {
-            ESP_LOGW(TAG, "DERPMap (%u regions) has no region %d — "
-                          "keeping the current DERP host",
-                     seen, DERP_KEEP_REGION);
-        }
-#else
-        (void)seen;
-#endif
+    int n = sub_parse(v, vlen, peak);
+    if (n < 1 || !tok_is_obj(&s_toks[0])) return;
+    tl_derp_region_t *r = &out->derp_regions[out->n_derp_regions];
+    parse_one_derp_region(v, s_toks, 0, r);
+    if (derp_region_wanted(r->region_id)) {
+        out->n_derp_regions++;
+    } else {
+        memset(r, 0, sizeof(*r));   /* slot reused by the next one */
     }
-    return (rc < 0) ? ESP_ERR_INVALID_RESPONSE : ESP_OK;
 }
 
-/* PeersRemoved: array of NodeIDs (JSON numbers). */
-static esp_err_t parse_removed_split(const char *js, size_t len, tl_netmap_t *out)
+/* End of one DERPMap.Regions object. */
+static void regions_done(tl_netmap_t *out, unsigned seen)
 {
-    size_t pos = 0;
-    const char *v; size_t vlen; int rc;
-    while ((rc = tl_jsplit_arr_next(js, len, &pos, &v, &vlen)) == 1) {
-        if (out->n_removed >= TL_MAX_PEERS_REMOVED) {
-            out->removed_overflow = true;
-            continue;
-        }
-        char buf[24];
-        if (vlen == 0 || vlen >= sizeof(buf) || v[0] < '0' || v[0] > '9') continue;
-        memcpy(buf, v, vlen);
-        buf[vlen] = '\0';
-        out->removed_ids[out->n_removed++] = strtoull(buf, NULL, 10);
+    out->have_derp_map = true;
+#ifdef ESP_PLATFORM
+    if (out->n_derp_regions == 0 && DERP_KEEP_REGION > 0) {
+        ESP_LOGW(TAG, "DERPMap (%u regions) has no region %d — "
+                      "keeping the current DERP host",
+                 seen, DERP_KEEP_REGION);
     }
-    return (rc < 0) ? ESP_ERR_INVALID_RESPONSE : ESP_OK;
+#else
+    (void)seen;
+#endif
+}
+
+/* PeersRemoved element: a NodeID (JSON number). Anything of 24 bytes or
+ * more is no NodeID — the caller does not even store it (REMOVED_LIM). */
+#define REMOVED_LIM 23u
+static void elem_removed(const char *v, size_t vlen, tl_netmap_t *out)
+{
+    char buf[REMOVED_LIM + 1];
+    if (vlen == 0 || vlen >= sizeof(buf) || v[0] < '0' || v[0] > '9') return;
+    memcpy(buf, v, vlen);
+    buf[vlen] = '\0';
+    out->removed_ids[out->n_removed++] = strtoull(buf, NULL, 10);
 }
 
 /* One tailcfg.PeerChange object → tl_peer_patch_t. Fields tinylink does
@@ -533,114 +510,494 @@ static void parse_one_patch(const char *js, const jsmntok_t *toks,
     }
 }
 
-/* PeersChangedPatch: array of tailcfg.PeerChange objects, one sub-parse
- * each. Only entries touching Key / DiscoKey / Endpoints / DERPRegion
- * are kept (one per NodeID); they are applied in tinylink.c merge_peers.
- * More than TL_MAX_PEER_PATCHES distinct relevant NodeIDs raise
- * patches_overflow → the caller recycles the stream for a full map
+/* PeersChangedPatch element: one tailcfg.PeerChange object, one
+ * sub-parse. Only entries touching Key / DiscoKey / Endpoints /
+ * DERPRegion are kept (one per NodeID); they are applied in tinylink.c
+ * merge_peers. More than TL_MAX_PEER_PATCHES distinct relevant NodeIDs
+ * raise patches_overflow → the caller recycles the stream for a full map
  * instead of applying a partial delta. */
-static esp_err_t parse_patch_split(const char *js, size_t len,
-                                   tl_netmap_t *out, int *peak)
+static void elem_patch(const char *v, size_t vlen, tl_netmap_t *out, int *peak)
 {
-    size_t pos = 0;
-    const char *v; size_t vlen; int rc;
-    while ((rc = tl_jsplit_arr_next(js, len, &pos, &v, &vlen)) == 1) {
-        if (v[0] != '{') continue;
-        int n = sub_parse(v, vlen, peak);
-        if (n < 1 || !tok_is_obj(&s_toks[0])) {
-            out->patches_overflow = true;   /* unparseable: don't guess */
-            continue;
-        }
-        tl_peer_patch_t pc;
-        parse_one_patch(v, s_toks, 0, &pc);
-        /* Online / LastSeen / KeyExpiry / Cap-only entries carry nothing
-         * the data plane uses — headscale sends one per peer (dis)connect
-         * and folds a tick's worth into one frame, so counting them would
-         * overflow the cap and recycle the stream for nothing. */
-        if (pc.id == 0 ||
-            !(pc.has_key || pc.has_disco || pc.has_endpoints || pc.derp_region != 0)) {
-            continue;
-        }
-        /* Same NodeID twice in one frame: fold into the first entry, later
-         * fields winning, as applying both in order would. */
-        size_t j = 0;
-        while (j < out->n_patches && out->patches[j].id != pc.id) j++;
-        if (j < out->n_patches) {
-            tl_peer_patch_t *d = &out->patches[j];
-            if (pc.has_key) { d->has_key = true; memcpy(d->node_pub, pc.node_pub, sizeof(d->node_pub)); }
-            if (pc.has_disco) { d->has_disco = true; memcpy(d->disco_pub, pc.disco_pub, sizeof(d->disco_pub)); }
-            if (pc.has_endpoints) {
-                d->has_endpoints = true;
-                d->n_endpoints = pc.n_endpoints;
-                memcpy(d->endpoints, pc.endpoints, sizeof(d->endpoints));
-            }
-            if (pc.derp_region != 0) d->derp_region = pc.derp_region;
-            continue;
-        }
-        if (out->n_patches >= TL_MAX_PEER_PATCHES) {
-            out->patches_overflow = true;
-            continue;
-        }
-        out->patches[out->n_patches++] = pc;
+    int n = sub_parse(v, vlen, peak);
+    if (n < 1 || !tok_is_obj(&s_toks[0])) {
+        out->patches_overflow = true;   /* unparseable: don't guess */
+        return;
     }
-    return (rc < 0) ? ESP_ERR_INVALID_RESPONSE : ESP_OK;
+    tl_peer_patch_t pc;
+    parse_one_patch(v, s_toks, 0, &pc);
+    /* Online / LastSeen / KeyExpiry / Cap-only entries carry nothing
+     * the data plane uses — headscale sends one per peer (dis)connect
+     * and folds a tick's worth into one frame, so counting them would
+     * overflow the cap and recycle the stream for nothing. */
+    if (pc.id == 0 ||
+        !(pc.has_key || pc.has_disco || pc.has_endpoints || pc.derp_region != 0)) {
+        return;
+    }
+    /* Same NodeID twice in one frame: fold into the first entry, later
+     * fields winning, as applying both in order would. */
+    size_t j = 0;
+    while (j < out->n_patches && out->patches[j].id != pc.id) j++;
+    if (j < out->n_patches) {
+        tl_peer_patch_t *d = &out->patches[j];
+        if (pc.has_key) { d->has_key = true; memcpy(d->node_pub, pc.node_pub, sizeof(d->node_pub)); }
+        if (pc.has_disco) { d->has_disco = true; memcpy(d->disco_pub, pc.disco_pub, sizeof(d->disco_pub)); }
+        if (pc.has_endpoints) {
+            d->has_endpoints = true;
+            d->n_endpoints = pc.n_endpoints;
+            memcpy(d->endpoints, pc.endpoints, sizeof(d->endpoints));
+        }
+        if (pc.derp_region != 0) d->derp_region = pc.derp_region;
+        return;
+    }
+    if (out->n_patches >= TL_MAX_PEER_PATCHES) {
+        out->patches_overflow = true;
+        return;
+    }
+    out->patches[out->n_patches++] = pc;
 }
 
+/* ------------------------- streaming splitter ----------------------------
+ *
+ * Round 1.3.4 (D2). Until 1.3.3 each long-poll frame was assembled whole
+ * in the 32 KiB MapResponse area of the shared control buffer (initial
+ * netmap 25.9 KB) and then split with jsmn_split.h's iterators: the top
+ * object member by member, Peers* / PeersRemoved / PeersChangedPatch
+ * element by element, DERPMap → Regions value by value, each element
+ * tokenized on its own. This does the same split while the bytes arrive:
+ * only the element being collected is stored (mapreq.h), so the buffer
+ * shrinks to the largest element — 8 KiB (ctrl_buf.h has the sizing).
+ *
+ * The old results for any input whose elements fit the buffer, malformed
+ * input included. The old split bounded each container by a
+ * depth-counting scan of its text from its opening bracket
+ * (tl_jsplit_value) BEFORE iterating it, so its members were read from
+ * that extent only: an iteration that closed early left the rest of the
+ * extent unread, one that ran past it failed. A one-pass grammar only
+ * disagrees with that on invalid JSON (a scalar element holding a quote
+ * or bracket), but the per-container scan (`ext`, levels ≥ 1) is a few
+ * instructions per byte and lets the host test demand identical output
+ * for arbitrary input (test_mapresp.c: chunking, every truncation, 40 000
+ * random edits against the whole-body parser). */
+
+/* Containers descended into (mapresp_level_t.role). Objects: TOP,
+ * DERPMAP, REGIONS; the rest are arrays. */
+enum { MS_TOP, MS_PEERS, MS_PEERS_CHANGED, MS_REMOVED, MS_PATCH, MS_DERPMAP, MS_REGIONS };
+/* What a value is collected for (mapresp_json_t.vact). */
+enum { MV_SKIP, MV_NODE, MV_PEER, MV_REMOVED, MV_PATCH, MV_REGION };
+/* Member grammar of tl_jsplit_obj_next / _arr_next, one byte at a time:
+ * after a value an object takes `,` or (leniently) the next key at once,
+ * a `,` may precede the closing bracket, and nothing may precede the first
+ * member. G_VALUE: a member value is being scanned (mapresp_json_t.val).
+ * G_CLOSED: closed by the grammar, waiting for the end of its extent. */
+enum { G_PRE, G_OBJ_FIRST, G_OBJ_AFTER_VAL, G_OBJ_AFTER_COMMA, G_KEY, G_KEY_ESC,
+       G_COLON, G_OBJ_VAL, G_ARR_FIRST, G_ARR_AFTER_VAL, G_ARR_AFTER_COMMA,
+       G_VALUE, G_CLOSED };
+
+_Static_assert(TL_JSPLIT_MAX_DEPTH < 255, "tl_jsplit_scan_t counts depth in a byte");
+_Static_assert(MS_REGIONS < 8 && MAPRESP_LEVELS <= 8, "fits mapresp_level_t / the ended mask");
+
+static bool ms_is_obj(uint8_t role)
+{
+    return role == MS_TOP || role == MS_DERPMAP || role == MS_REGIONS;
+}
+
+static void ms_fail(mapresp_json_t *m)
+{
+    if (m->err == ESP_OK) {
+        m->err = ESP_ERR_INVALID_RESPONSE;
+        m->err_pos = m->pos;
+    }
+}
+
+static bool ms_key_is(const mapresp_json_t *m, const char *name)
+{
+    const size_t n = strlen(name);
+    return m->key_len == n && memcmp(m->key, name, n) == 0;
+}
+
+static void ms_key_add(mapresp_json_t *m, char c)
+{
+    if (m->key_len < sizeof(m->key)) m->key[m->key_len] = c;
+    if (m->key_len < 255) m->key_len++;
+}
+
+#ifdef ESP_PLATFORM
+static const char *ms_what(uint8_t act)
+{
+    switch (act) {
+    case MV_NODE:  return "Node";
+    case MV_PEER:  return "peer";
+    case MV_PATCH: return "PeersChangedPatch";
+    default:       return "DERP region";
+    }
+}
+#endif
+
+/* A collected value is complete: hand it to its parser. */
+static void ms_element(mapresp_json_t *m)
+{
+    tl_netmap_t *out = m->out;
+    if (m->vlen > m->vlim) {
+        if (m->vact == MV_REMOVED) return;   /* > REMOVED_LIM: no NodeID, skipped as before */
+        /* Larger than the element buffer (round 1.3.4, D2): only its
+         * first bytes are stored, so it cannot be parsed. Skipped — the
+         * scan has followed it to its end, so the frame goes on in sync;
+         * a lost patch could hide a key change, so it recycles the stream
+         * for a full map like an unparseable one does. */
+        m->n_oversized++;
+        if (m->vact == MV_PATCH) out->patches_overflow = true;
+#ifdef ESP_PLATFORM
+        ESP_LOGE(TAG, "MapResponse %s element of %u B exceeds the %u-B buffer — skipped",
+                 ms_what(m->vact), (unsigned)m->vlen, (unsigned)m->elem_cap);
+#endif
+        return;
+    }
+    const char *v = m->elem;
+    switch (m->vact) {
+    case MV_NODE: {
+        int n = sub_parse(v, m->vlen, &m->tok_peak);
+        if (n >= 1 && tok_is_obj(&s_toks[0])) parse_node_obj(v, s_toks, 0, out);
+        break;
+    }
+    case MV_PEER:    elem_peer(v, m->vlen, out, &m->tok_peak); break;
+    case MV_REMOVED: elem_removed(v, m->vlen, out); break;
+    case MV_PATCH:   elem_patch(v, m->vlen, out, &m->tok_peak); break;
+    case MV_REGION:  elem_region(v, m->vlen, out, &m->tok_peak); break;
+    default: break;
+    }
+}
+
+static void ms_store(mapresp_json_t *m, char c)
+{
+    if (m->vlen < m->vlim) m->elem[m->vlen] = c;
+    m->vlen++;
+}
+
+static void ms_value_end(mapresp_json_t *m)
+{
+    mapresp_level_t *L = &m->lvl[m->n - 1];
+    L->g = ms_is_obj(L->role) ? G_OBJ_AFTER_VAL : G_ARR_AFTER_VAL;
+    if (m->vact == MV_SKIP) return;
+    if (m->vact != MV_REMOVED && m->vlen > m->elem_peak) m->elem_peak = m->vlen;
+    ms_element(m);
+}
+
+/* First byte of a member value (`c`, not whitespace) in the innermost
+ * container: descend into it, collect it or skip it — the old
+ * mapresp_parse / *_split dispatch. */
+static void ms_value_start(mapresp_json_t *m, char c)
+{
+    mapresp_level_t *L = &m->lvl[m->n - 1];
+    tl_netmap_t *out = m->out;
+    uint8_t act = MV_SKIP;
+    int sub = -1;
+    switch (L->role) {
+    case MS_TOP:
+        if (c == '{' && ms_key_is(m, "Node")) act = MV_NODE;
+        /* Peers: the full list, the caller replaces its table.
+         * PeersChanged: a stream-mode delta, upserted. The control plane
+         * sends the whole list this way on the first MapResponse
+         * (observed 2026-05-02), which merges into an empty table
+         * identically to a full list. */
+        else if (c == '[' && ms_key_is(m, "Peers"))             sub = MS_PEERS;
+        else if (c == '[' && ms_key_is(m, "PeersChanged"))      sub = MS_PEERS_CHANGED;
+        else if (c == '[' && ms_key_is(m, "PeersRemoved"))      sub = MS_REMOVED;
+        else if (c == '[' && ms_key_is(m, "PeersChangedPatch")) sub = MS_PATCH;
+        else if (c == '{' && ms_key_is(m, "DERPMap"))           sub = MS_DERPMAP;
+        /* Everything else (DNSConfig, PacketFilter, UserProfiles, ...) is
+         * scanned past without being stored or tokenized. */
+        break;
+    case MS_PEERS:
+    case MS_PEERS_CHANGED:
+        if (out->n_peers < TL_MAX_PEERS) act = MV_PEER;   /* keep draining; cap like before */
+        break;
+    case MS_REMOVED:
+        if (out->n_removed >= TL_MAX_PEERS_REMOVED) out->removed_overflow = true;
+        else act = MV_REMOVED;
+        break;
+    case MS_PATCH:
+        if (c == '{') act = MV_PATCH;
+        break;
+    case MS_DERPMAP:
+        if (c == '{' && ms_key_is(m, "Regions")) sub = MS_REGIONS;
+        break;
+    case MS_REGIONS:
+        m->regions_seen++;
+        if (out->n_derp_regions < TL_MAX_DERP_REGIONS) act = MV_REGION;
+        break;
+    default:
+        break;
+    }
+    if (sub >= 0) {
+        /* Only TOP and DERPMAP descend: at most MAPRESP_LEVELS deep. */
+        if (m->n >= MAPRESP_LEVELS) { ms_fail(m); return; }
+        mapresp_level_t *D = &m->lvl[m->n++];
+        D->role = (uint8_t)sub;
+        D->g = (c == '{') ? G_OBJ_FIRST : G_ARR_FIRST;
+        (void)tl_jsplit_scan_begin(&D->ext, c);   /* a bracket: cannot fail */
+        if (sub == MS_PEERS || sub == MS_PEERS_CHANGED) out->n_peers = 0;
+        else if (sub == MS_DERPMAP) out->n_derp_regions = 0;
+        else if (sub == MS_REGIONS) m->regions_seen = 0;
+        return;
+    }
+    if (tl_jsplit_scan_begin(&m->val, c) != TL_JSCAN_MORE) { ms_fail(m); return; }
+    L->g = G_VALUE;
+    m->vact = act;
+    m->vlen = 0;
+    m->vlim = (act == MV_SKIP) ? 0 : (act == MV_REMOVED) ? REMOVED_LIM : m->elem_cap;
+    ms_store(m, c);
+}
+
+/* The innermost container's closing bracket, as its grammar sees it. */
+static void ms_close(mapresp_json_t *m)
+{
+    mapresp_level_t *L = &m->lvl[m->n - 1];
+    if (m->n == 1) { m->done = true; return; }   /* trailing bytes are ignored, as before */
+    if (L->role == MS_PEERS) m->out->peers_is_delta = false;
+    else if (L->role == MS_PEERS_CHANGED) m->out->peers_is_delta = true;
+    else if (L->role == MS_REGIONS) regions_done(m->out, m->regions_seen);
+    L->g = G_CLOSED;   /* popped when its extent ends — normally at this byte */
+}
+
+/* One byte of member grammar in the innermost container. */
+static void ms_grammar(mapresp_json_t *m, char c)
+{
+    mapresp_level_t *L = &m->lvl[m->n - 1];
+again:
+    switch (L->g) {
+    case G_PRE:
+        if (tl_jsplit_is_ws(c)) return;
+        if (c == '{') { L->g = G_OBJ_FIRST; return; }
+        break;
+    case G_OBJ_AFTER_VAL:
+        if (c == ',') { L->g = G_OBJ_AFTER_COMMA; return; }
+        /* fall through */
+    case G_OBJ_FIRST:
+    case G_OBJ_AFTER_COMMA:
+        if (tl_jsplit_is_ws(c)) return;
+        if (c == '}') { ms_close(m); return; }
+        if (c == '"') { L->g = G_KEY; m->key_len = 0; return; }
+        break;
+    case G_KEY:
+        if (c == '"') { L->g = G_COLON; return; }
+        if (c == '\\') L->g = G_KEY_ESC;
+        ms_key_add(m, c);          /* raw bytes, escapes intact (tl_jsplit_key_is) */
+        return;
+    case G_KEY_ESC:
+        L->g = G_KEY;
+        ms_key_add(m, c);
+        return;
+    case G_COLON:
+        if (tl_jsplit_is_ws(c)) return;
+        if (c == ':') { L->g = G_OBJ_VAL; return; }
+        break;
+    case G_OBJ_VAL:
+        if (tl_jsplit_is_ws(c)) return;
+        ms_value_start(m, c);
+        return;
+    case G_ARR_AFTER_VAL:
+        if (c == ',') { L->g = G_ARR_AFTER_COMMA; return; }
+        /* fall through */
+    case G_ARR_FIRST:
+    case G_ARR_AFTER_COMMA:
+        if (tl_jsplit_is_ws(c)) return;
+        if (c == ']') { ms_close(m); return; }
+        ms_value_start(m, c);      /* a misplaced `}` / `,` fails there */
+        return;
+    case G_VALUE: {
+        int r = tl_jsplit_scan_byte(&m->val, c);
+        if (r == TL_JSCAN_ERR) break;
+        if (r == TL_JSCAN_END_BEFORE) {     /* a scalar's delimiter: the container's byte */
+            ms_value_end(m);                /* L->g is an AFTER_VAL state now */
+            goto again;
+        }
+        ms_store(m, c);
+        if (r == TL_JSCAN_END) ms_value_end(m);
+        return;
+    }
+    default:   /* G_CLOSED: the rest of its extent is not read */
+        return;
+    }
+    ms_fail(m);
+}
+
+static void ms_byte(mapresp_json_t *m, char c)
+{
+    /* The extents of the open containers below the top object (each scan
+     * started at its opening bracket), fed before the grammar so a
+     * container pushed at this byte is not fed it twice. */
+    unsigned ended = 0;
+    const unsigned n_before = m->n;
+    for (unsigned k = 1; k < n_before; k++) {
+        int r = tl_jsplit_scan_byte(&m->lvl[k].ext, c);
+        if (r == TL_JSCAN_ERR) { ms_fail(m); return; }   /* deeper than TL_JSPLIT_MAX_DEPTH */
+        if (r == TL_JSCAN_END) ended |= 1u << k;
+    }
+    ms_grammar(m, c);
+    if (m->err != ESP_OK) return;
+    /* A closed container is popped where its extent ends; an extent that
+     * ends inside a still-open container is the old iteration running off
+     * the end of its text. */
+    while (m->n > 1 && m->n <= n_before) {
+        const unsigned k = m->n - 1u;
+        if (m->lvl[k].g != G_CLOSED || !(ended & (1u << k))) break;
+        ended &= ~(1u << k);
+        m->n--;
+        mapresp_level_t *P = &m->lvl[m->n - 1];
+        P->g = ms_is_obj(P->role) ? G_OBJ_AFTER_VAL : G_ARR_AFTER_VAL;
+    }
+    if (ended != 0) ms_fail(m);
+}
+
+void mapresp_json_begin(mapresp_json_t *m, char *elem, size_t elem_cap,
+                        tl_netmap_t *out)
+{
+    memset(m, 0, sizeof(*m));
+    m->out = out;
+    m->elem = elem;
+    m->elem_cap = elem_cap;
+    m->n = 1;
+    m->lvl[0].role = MS_TOP;
+    m->lvl[0].g = G_PRE;
+    tl_netmap_clear(out);
+}
+
+/* Bytes some scanner reacts to inside a value: quotes, escapes, brackets,
+ * the scalar delimiters `,` / whitespace (and control bytes, harmlessly).
+ * A 256-bit set. */
+static const uint8_t k_ms_special[32] = {
+    0xff, 0xff, 0xff, 0xff,   /* 0x00-0x1f */
+    0x05,                     /* 0x20 ' ', 0x22 '"' */
+    0x10,                     /* 0x2c ',' */
+    0, 0, 0, 0, 0,
+    0x38,                     /* 0x5b '[', 0x5c '\\', 0x5d ']' */
+    0, 0, 0,
+    0x28,                     /* 0x7b '{', 0x7d '}' */
+};
+
+static bool ms_special(unsigned char c)
+{
+    return (k_ms_special[c >> 3] >> (c & 7)) & 1;
+}
+
+/* How many bytes from `p` change no scanner state: inside a member value,
+ * the content of a string (when every extent scan is inside it too) or a
+ * run of letters / digits. Most of a MapResponse — and of every skipped
+ * member — is that, so the per-byte machinery only runs on structure. */
+static size_t ms_inert_run(const mapresp_json_t *m, const char *p, size_t n)
+{
+    if (m->lvl[m->n - 1].g != G_VALUE || m->val.mode == TL_JSCAN_ESC) return 0;
+    bool in_str = (m->val.mode == TL_JSCAN_STR);
+    for (unsigned k = 1; k < m->n; k++) {
+        const unsigned char mode = m->lvl[k].ext.mode;
+        if (mode == TL_JSCAN_ESC) return 0;
+        if (mode != TL_JSCAN_STR) in_str = false;
+    }
+    size_t r = 0;
+    if (in_str) {
+        while (r < n && p[r] != '"' && p[r] != '\\') r++;
+    } else {
+        while (r < n && !ms_special((unsigned char)p[r])) r++;
+    }
+    return r;
+}
+
+void mapresp_json_feed(mapresp_json_t *m, const char *data, size_t len)
+{
+    size_t i = 0;
+    while (i < len && m->err == ESP_OK && !m->done) {
+        const size_t run = ms_inert_run(m, data + i, len - i);
+        if (run > 0) {
+            if (m->vlen < m->vlim) {
+                const size_t room = m->vlim - m->vlen;
+                memcpy(m->elem + m->vlen, data + i, run < room ? run : room);
+            }
+            m->vlen += run;
+            m->pos += run;
+            i += run;
+            continue;
+        }
+        ms_byte(m, data[i]);
+        m->pos++;
+        i++;
+    }
+}
+
+esp_err_t mapresp_json_end(mapresp_json_t *m)
+{
+    if (!m->done) ms_fail(m);   /* the old split ran off the end of the body */
+    return m->err;
+}
+
+/* ------------------------------ framing ---------------------------------- */
+
+/* The control plane frames each MapResponse as `LE32 size || body`
+ * (tailscale/control/controlclient/direct.go readMapResponseMessage).
+ * With the body parsed on the fly a frame no longer has to fit a buffer;
+ * the cap only keeps a desynchronised stream from waiting forever (four
+ * JSON bytes read as a size are ≥ 512 MiB). Upstream allows 256 MiB of
+ * zstd; 4 MiB is 160× today's initial netmap. Over the cap the stream
+ * stops and long-poll reconnects, as an over-32-KiB frame did before. */
+void mapresp_stream_init(mapresp_stream_t *ms, char *elem, size_t elem_cap,
+                         tl_netmap_t *nm, mapresp_frame_fn on_frame, void *ctx)
+{
+    memset(ms, 0, sizeof(*ms));
+    ms->elem = elem;
+    ms->elem_cap = elem_cap;
+    ms->nm = nm;
+    ms->on_frame = on_frame;
+    ms->ctx = ctx;
+}
+
+int mapresp_stream_feed(mapresp_stream_t *ms, const uint8_t *data, size_t len)
+{
+    size_t off = 0;
+    while (off < len) {
+        if (!ms->in_body) {
+            ms->hdr[ms->hdr_have++] = data[off++];
+            if (ms->hdr_have < 4) continue;
+            ms->hdr_have = 0;
+            ms->body_size = ((uint32_t)ms->hdr[0])       |
+                            ((uint32_t)ms->hdr[1] <<  8) |
+                            ((uint32_t)ms->hdr[2] << 16) |
+                            ((uint32_t)ms->hdr[3] << 24);
+            if (ms->body_size > MAPRESP_FRAME_MAX) {
+#ifdef ESP_PLATFORM
+                ESP_LOGE(TAG, "MapResponse too large: %u > %u",
+                         (unsigned)ms->body_size, (unsigned)MAPRESP_FRAME_MAX);
+#endif
+                return -1;
+            }
+            ms->body_have = 0;
+            ms->in_body = true;
+            mapresp_json_begin(&ms->json, ms->elem, ms->elem_cap, ms->nm);
+        } else {
+            size_t take = len - off;
+            if (take > ms->body_size - ms->body_have) take = ms->body_size - ms->body_have;
+            mapresp_json_feed(&ms->json, (const char *)data + off, take);
+            ms->body_have += (uint32_t)take;
+            off += take;
+        }
+        if (ms->in_body && ms->body_have == ms->body_size) {
+            ms->in_body = false;
+            esp_err_t pe = mapresp_json_end(&ms->json);
+            if (ms->on_frame != NULL && ms->on_frame(ms, pe, ms->ctx) != 0) return -1;
+        }
+    }
+    return 0;
+}
+
+#ifndef ESP_PLATFORM
 esp_err_t mapresp_parse(const char *json, size_t json_len, tl_netmap_t *out)
 {
+    static char elem[TL_CTRL_MAPRESP_CAP];
     if (json == NULL || out == NULL) return ESP_ERR_INVALID_ARG;
-    tl_netmap_clear(out);
-
-    /* Shallow split of the top-level object (jsmn_split.h), then one
-     * bounded jsmn parse per value we care about. Every other key
-     * (DNSConfig, PacketFilter, UserProfiles, ...) is skipped by byte
-     * range without being tokenized at all. */
-    int peak = 0;
-    size_t pos = 0;
-    tl_jsplit_kv_t kv;
-    int rc;
-    esp_err_t err = ESP_OK;
-    while ((rc = tl_jsplit_obj_next(json, json_len, &pos, &kv)) == 1) {
-        if (tl_jsplit_key_is(&kv, "Node") && kv.val[0] == '{') {
-            int n = sub_parse(kv.val, kv.val_len, &peak);
-            if (n >= 1 && tok_is_obj(&s_toks[0])) {
-                parse_node_obj(kv.val, s_toks, 0, out);
-            }
-        } else if (tl_jsplit_key_is(&kv, "Peers") && kv.val[0] == '[') {
-            /* Full peer list: the caller replaces its table. */
-            err = parse_peers_split(kv.val, kv.val_len, out, &peak);
-            out->peers_is_delta = false;
-        } else if (tl_jsplit_key_is(&kv, "PeersChanged") && kv.val[0] == '[') {
-            /* Stream-mode delta: upsert into the caller's table. The
-             * control plane sends the whole list this way on the first
-             * MapResponse (observed 2026-05-02), which merges into an
-             * empty table identically to a full list. */
-            err = parse_peers_split(kv.val, kv.val_len, out, &peak);
-            out->peers_is_delta = true;
-        } else if (tl_jsplit_key_is(&kv, "PeersRemoved") && kv.val[0] == '[') {
-            err = parse_removed_split(kv.val, kv.val_len, out);
-        } else if (tl_jsplit_key_is(&kv, "PeersChangedPatch") && kv.val[0] == '[') {
-            err = parse_patch_split(kv.val, kv.val_len, out, &peak);
-        } else if (tl_jsplit_key_is(&kv, "DERPMap") && kv.val[0] == '{') {
-            err = parse_derp_map_split(kv.val, kv.val_len, out, &peak);
-        }
-        if (err != ESP_OK) break;
-    }
-    if (rc < 0 || err != ESP_OK) {
-#ifdef ESP_PLATFORM
-        ESP_LOGE(TAG, "MapResponse malformed at byte %u of %u",
-                 (unsigned)pos, (unsigned)json_len);
-#endif
-        return ESP_ERR_INVALID_RESPONSE;
-    }
-
-    /* Soak observability: largest single sub-parse this message. */
-#ifdef ESP_PLATFORM
-    ESP_LOGI(TAG, "mapresp peak: tokens=%d/%d body=%u",
-             peak, SUB_MAX_TOKENS, (unsigned)json_len);
-#endif
-    return ESP_OK;
+    mapresp_json_t m;
+    mapresp_json_begin(&m, elem, sizeof(elem), out);
+    mapresp_json_feed(&m, json, json_len);
+    return mapresp_json_end(&m);
 }
+#endif
 
 /* ------------------------------ MapRequest -------------------------------- */
 
@@ -866,31 +1223,16 @@ esp_err_t mapreq_push_endpoints(ts2021_conn_t *conn,
 
 /* ---- streaming reader ----------------------------------------------------
  *
- * The control plane frames each MapResponse as `LE32 size || body`
- * (verified against `tailscale/control/controlclient/direct.go:~1248`).
- * We accumulate header bytes, then `size` body bytes, dispatch, repeat.
- * The body buffer is in BSS (large enough for one MapResponse plus
- * slack); it is reused across messages.
- *
- * The chunk callback feeds bytes into this state machine; nghttp2 may
- * deliver partial / multiple messages per DATA frame.
+ * The chunk callback feeds the DATA bytes, split anywhere (nghttp2 may
+ * deliver partial / multiple frames per DATA frame), into the framing +
+ * splitter above (round 1.3.4, D2); each complete frame lands in
+ * stream_frame. Until 1.3.3 every frame was first assembled whole in
+ * the shared control buffer's 32 KiB MapResponse area.
  */
 
-typedef enum {
-    STREAM_WANT_HDR,
-    STREAM_WANT_BODY,
-} stream_phase_t;
-
 typedef struct {
-    stream_phase_t phase;
-    uint8_t        hdr[4];
-    size_t         hdr_have;
-    uint32_t       body_size;
-    size_t         body_have;
-    /* `body_buf` / `body_cap`: the shared control buffer (BSS). */
-    uint8_t       *body_buf;
-    size_t         body_cap;
-    /* Higher-level callback fired once per assembled MapResponse. */
+    mapresp_stream_t ms;
+    /* Higher-level callback fired once per parsed MapResponse. */
     mapreq_handler_t on_netmap;
     void            *handler_ctx;
 } stream_state_t;
@@ -899,60 +1241,66 @@ typedef struct {
  * chunk callback propagates the stop through nghttp2 so the long-poll
  * task tears the conn down and reconnects — used when a frame demands
  * a full-netmap refetch we can't satisfy in-stream). */
-static int stream_dispatch(stream_state_t *s)
+static int stream_frame(const mapresp_stream_t *ms, esp_err_t pe, void *ctx)
 {
-    /* Parse the assembled body and hand every frame that carries
-     * something the data plane consumes — self node, Peers /
-     * PeersChanged, PeersRemoved, PeersChangedPatch, DERPMap — to the
-     * handler, which merges deltas (tinylink.c merge_peers). KeepAlive
-     * frames parse to none of those and are absorbed here. */
+    /* Hand every frame that carries something the data plane consumes —
+     * self node, Peers / PeersChanged, PeersRemoved, PeersChangedPatch,
+     * DERPMap — to the handler, which merges deltas (tinylink.c
+     * merge_peers). KeepAlive frames parse to none of those and are
+     * absorbed here. */
     /* The 2026-05-02 framing diagnostic (hex dump of the first 16 bytes
      * + six memcmp-per-byte substring scans over the whole body, three
      * INFO lines per frame) was removed 2026-09: the framing question it
      * answered (plain JSON vs zstd) has been settled since M2, and it
      * cost up to 6 × 32 KiB comparisons plus ~250 B of UART output on
-     * every frame of the long-poll hot path. mapresp_parse below reports
-     * the same field presence (n_peers, keepalive, patch flags) from the
-     * real parse. */
+     * every frame of the long-poll hot path. The parse reports the same
+     * field presence (n_peers, keepalive, patch flags). */
+    stream_state_t *s = (stream_state_t *)ctx;
+    const mapresp_json_t *j = &ms->json;
+    const tl_netmap_t *nm = j->out;
 
-    /* Soak observability: per-dispatch assembled body size. Grep
-     * `stream peak: body` over a multi-hour log and take the max to
-     * size TL_CTRL_MAPRESP_CAP (32 KiB of the shared control buffer,
-     * ctrl_buf.h) against. */
-    ESP_LOGI(TAG, "stream peak: body=%u (cap=%u)",
-             (unsigned)s->body_have, (unsigned)s->body_cap);
-
-    static tl_netmap_t nm;  /* ~2.5 KiB BSS (peers + patches); reused */
-    esp_err_t pe = mapresp_parse((const char *)s->body_buf, s->body_have, &nm);
+    /* Soak observability, per frame: its size, and the largest element
+     * the splitter had to hold against the element buffer — grep
+     * `stream peak:` over a multi-hour log and take the max of `elem` to
+     * size TL_CTRL_MAPRESP_CAP (ctrl_buf.h) against. Since 1.3.4 the
+     * body no longer has a buffer to fit. */
+    ESP_LOGI(TAG, "stream peak: body=%u elem=%u (cap=%u)",
+             (unsigned)ms->body_size, (unsigned)j->elem_peak,
+             (unsigned)ms->elem_cap);
     if (pe != ESP_OK) {
+        ESP_LOGE(TAG, "MapResponse malformed at byte %u of %u",
+                 (unsigned)j->err_pos, (unsigned)ms->body_size);
         ESP_LOGW(TAG, "MapResponse parse failed (size=%u err=0x%x free_heap=%u largest_block=%u)",
-                 (unsigned)s->body_have, (unsigned)pe,
+                 (unsigned)ms->body_size, (unsigned)pe,
                  (unsigned)esp_get_free_heap_size(),
                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
         return 0;
     }
-    if (nm.patches_overflow || nm.removed_overflow) {
+    /* Largest single sub-parse this message. */
+    ESP_LOGI(TAG, "mapresp peak: tokens=%d/%d body=%u",
+             j->tok_peak, SUB_MAX_TOKENS, (unsigned)ms->body_size);
+    if (nm->patches_overflow || nm->removed_overflow) {
         /* More deltas than the per-frame caps (netmap.h): applying a
          * partial delta could leave a peer with stale keys or endpoints.
          * Recycle — the reconnect's first frame is a full netmap
          * (headscale f4eeb94b; tailscale.com always did). */
         ESP_LOGW(TAG, "delta frame over caps (patches%s removed%s) — "
                       "recycling stream for a full netmap",
-                 nm.patches_overflow ? "+" : "", nm.removed_overflow ? "+" : "");
+                 nm->patches_overflow ? "+" : "", nm->removed_overflow ? "+" : "");
         return -1;
     }
-    if (!nm.have_self && nm.n_peers == 0 && nm.n_removed == 0 &&
-        nm.n_patches == 0 && !nm.have_derp_map) {
+    if (!nm->have_self && nm->n_peers == 0 && nm->n_removed == 0 &&
+        nm->n_patches == 0 && !nm->have_derp_map) {
         /* KeepAlive, or a frame carrying only fields tinylink does not
          * consume (DNSConfig, SSHPolicy, PacketFilter, Debug, ...).
          * headscale sends removals and DERPMap updates as frames of their
          * own (batcher withRemovals, change.go), so those must NOT be
          * folded in here. */
-        ESP_LOGD(TAG, "KeepAlive (%u bytes)", (unsigned)s->body_have);
+        ESP_LOGD(TAG, "KeepAlive (%u bytes)", (unsigned)ms->body_size);
         return 0;
     }
     if (s->on_netmap != NULL &&
-        s->on_netmap(&nm, s->handler_ctx) == MAPREQ_STREAM_RECYCLE) {
+        s->on_netmap(nm, s->handler_ctx) == MAPREQ_STREAM_RECYCLE) {
         return -1;
     }
     return 0;
@@ -965,50 +1313,11 @@ static int stream_chunk_cb(const uint8_t *data, size_t len, void *ctx)
      * the wedge-restart last resort in tinylink.c. */
     tinylink_control_mark_alive();
 
+    /* -1 (a frame over MAPRESP_FRAME_MAX, or stream_frame asking for a
+     * recycle) propagates through data_chunk_cb → h2_cb_stop →
+     * h2_drive_request unwinds; long-poll reconnects. */
     stream_state_t *s = (stream_state_t *)ctx;
-    size_t off = 0;
-    while (off < len) {
-        if (s->phase == STREAM_WANT_HDR) {
-            size_t need = 4 - s->hdr_have;
-            size_t take = (len - off < need) ? (len - off) : need;
-            memcpy(s->hdr + s->hdr_have, data + off, take);
-            s->hdr_have += take;
-            off += take;
-            if (s->hdr_have == 4) {
-                /* LE32 size — see `direct.go` watchdog loop. */
-                s->body_size = ((uint32_t)s->hdr[0])       |
-                               ((uint32_t)s->hdr[1] <<  8) |
-                               ((uint32_t)s->hdr[2] << 16) |
-                               ((uint32_t)s->hdr[3] << 24);
-                if (s->body_size > s->body_cap) {
-                    ESP_LOGE(TAG, "MapResponse too large: %u > %u",
-                             (unsigned)s->body_size, (unsigned)s->body_cap);
-                    return -1;
-                }
-                s->body_have = 0;
-                s->phase = STREAM_WANT_BODY;
-            }
-        } else { /* STREAM_WANT_BODY */
-            size_t need = s->body_size - s->body_have;
-            size_t take = (len - off < need) ? (len - off) : need;
-            memcpy(s->body_buf + s->body_have, data + off, take);
-            s->body_have += take;
-            off += take;
-            if (s->body_have == s->body_size) {
-                int stop = stream_dispatch(s);
-                s->phase = STREAM_WANT_HDR;
-                s->hdr_have = 0;
-                s->body_size = 0;
-                s->body_have = 0;
-                if (stop != 0) {
-                    /* Propagates through data_chunk_cb → h2_cb_stop →
-                     * h2_drive_request unwinds; long-poll reconnects. */
-                    return -1;
-                }
-            }
-        }
-    }
-    return 0;
+    return mapresp_stream_feed(&s->ms, data, len);
 }
 
 static esp_err_t run_stream_in(ts2021_conn_t *conn,
@@ -1016,22 +1325,22 @@ static esp_err_t run_stream_in(ts2021_conn_t *conn,
                                mapreq_handler_t on_netmap, void *ctx,
                                uint8_t *buf)
 {
-    /* MapRequest from the buffer's tail, MapResponses assembled at offset
-     * 0 — disjoint, because nghttp2 may still be reading the request
-     * body (data_provider_read) while response DATA arrives. */
+    /* MapRequest from the buffer's tail, MapResponse elements collected at
+     * offset 0 — disjoint, because nghttp2 may still be reading the
+     * request body (data_provider_read) while response DATA arrives. */
     char *body = (char *)buf + TL_CTRL_REQ_OFF;
     int body_len = build_request_body(keys, true, false, body, TL_CTRL_REQ_CAP);
     if (body_len < 0) return ESP_ERR_INVALID_SIZE;
 
-    /* One assembled MapResponse at a time, in BSS (the shared buffer) so
-     * the stream task stack stays small. */
-    stream_state_t s = {
-        .phase       = STREAM_WANT_HDR,
-        .body_buf    = buf,
-        .body_cap    = TL_CTRL_MAPRESP_CAP,
-        .on_netmap   = on_netmap,
-        .handler_ctx = ctx,
-    };
+    /* The parse state lives in BSS like the element buffer (the shared
+     * control buffer) and the netmap, so the stream task stack stays
+     * small; one stream at a time (the buffer claim). */
+    static tl_netmap_t    nm;   /* ~2.5 KiB (peers + patches); reused */
+    static stream_state_t s;
+    mapresp_stream_init(&s.ms, (char *)buf, TL_CTRL_MAPRESP_CAP, &nm,
+                        stream_frame, &s);
+    s.on_netmap   = on_netmap;
+    s.handler_ctx = ctx;
 
     int status = 0;
     esp_err_t err = h2_post_json_stream(conn, "/machine/map",

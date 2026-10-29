@@ -104,10 +104,14 @@ test_x25519: test_x25519.c $(CRYPTO)/curve25519_fiat32.c $(CRYPTO)/curve25519.c 
 	$(CC) $(CFLAGS) -I$(CRYPTO) -o $@ test_x25519.c $(CRYPTO)/curve25519.c ref/curve25519_donna.c
 
 # mapreq.c builds on host because its ESP-IDF-specific code is guarded
-# by #ifdef ESP_PLATFORM; the mapresp_parse() entry point we test here
-# is platform-independent and depends only on the vendored jsmn.h.
-test_mapresp: test_mapresp.c $(TL_SRC)/mapreq.c $(TL_SRC)/netmap.h $(TL_SRC)/jsmn.h $(TL_SRC)/jsmn_split.h
-	$(CC) $(CFLAGS) -I$(TL_SRC) -o $@ test_mapresp.c $(TL_SRC)/mapreq.c
+# by #ifdef ESP_PLATFORM; the MapResponse parser (the round-1.3.4
+# streaming splitter and its framing) is platform-independent. Linked
+# next to the 1.3.3 whole-body parser (ref/mapresp_133.c, as ref_*), the
+# oracle for chunking / truncation / mutation tests.
+test_mapresp: test_mapresp.c $(TL_SRC)/mapreq.c $(TL_SRC)/mapreq.h $(TL_SRC)/netmap.h \
+              $(TL_SRC)/jsmn.h $(TL_SRC)/jsmn_split.h $(TL_SRC)/jsmn_skip.h $(TL_SRC)/ctrl_buf.h \
+              ref/mapresp_ref.c ref/mapresp_133.c
+	$(CC) $(CFLAGS) -I$(TL_SRC) -o $@ test_mapresp.c $(TL_SRC)/mapreq.c ref/mapresp_ref.c
 
 # RFC 8439 §2.3.2 / §2.4.2 / A.1 / A.2 + HChaCha20 KATs, and a
 # differential test against the 1.3.2 ChaCha20 (ref/chacha20_132.c,
