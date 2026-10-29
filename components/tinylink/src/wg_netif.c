@@ -233,22 +233,23 @@ static const char *TAG = "wg_netif";
  *
  * The post-outage cascade IS the deepest path, and the passive
  * 420 s soak did NOT exercise it. So the actual post-outage peak
- * under -O2 is still UNKNOWN, only bounded:
+ * under -O2 was UNKNOWN, only bounded:
  *   lower: > 4 096 B (the historical overflow at 4 KiB stack)
  *   upper: < 8 192 B (8 months stable operation at this size)
  *
- * 7 KiB sits 75 % above the lower bound while still leaving 2 KiB
- * heap headroom vs the 8 KiB baseline. Further tightening (6 KiB,
- * 5 KiB) requires a forced-flap soak — iptables-DROP on Servidor1
- * per the CHANGELOG.md:107-117 recipe — that exercises the post-
- * outage recovery + first-telemetry-after-handshake cascade
- * directly and produces a measured peak from `stack diag:` dumps
- * during the recovery window.
+ * 7 KiB sat 75 % above the lower bound. Round 1.3.3 (B18) replaces the
+ * bound with a static worst case (tools/stack_worst.py, every path
+ * incl. the post-outage cascade and the DERP relay write): 3 200 B,
+ * tx_task_fn → sendto → UDP/IP/ARP → Wi-Fi TX → pbuf free → the Wi-Fi
+ * blob's log tail. No AEAD runs on this task any more
+ * (wg_netif_send_plaintext seals in the caller, into the slot). 5 KiB =
+ * 1.9 KB over the static worst case; 2 380 B measured over the 6-h
+ * 1.3.2 soak.
  *
  * The queue length (WG_TX_QUEUE_LEN=3) makes a real flood
  * impossible — a frame is dropped when no TX slot is free. The
  * 1.5 KiB slots live on the heap (g.tx_slots), never on this stack. */
-#define WG_TX_TASK_STACK_BYTES 7168
+#define WG_TX_TASK_STACK_BYTES 5120
 #define WG_TX_TASK_PRIO        (tskIDLE_PRIORITY + 2)
 
 /* Outbound TX queue depth: frames that may wait while the worker is

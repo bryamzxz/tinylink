@@ -135,6 +135,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in QEMU. It is the first check of the asm on an ISA implementation
   nobody on this project wrote.
 
+#### Stacks (`feat/r133-stack`, B18)
+
+- **`tools/stack_worst.py` — static worst-case stack per task.** Builds
+  the call graph from GCC's `-fcallgraph-info=su` (frames = the `entry
+  a1, N` immediates), the precompiled blobs' and libc's disassembly with
+  relocations (2 900 Wi-Fi blob indirect calls resolved through the
+  `g_wifi_osi_funcs` table) and the ROM ELF; hand-resolved indirect calls
+  (nghttp2 / esp_tls / mbedTLS / wg_netif / lwIP netif callbacks);
+  bounded recursion; runtime-infeasible edges cut with a stated reason;
+  +368 B fixed overhead (alignment, coprocessor area, one interrupt
+  frame, canary). Validated: static ≥ measured on all seven tasks of
+  1.3.2, and on the May build that overflowed it gives 20 528 B against
+  the 20 004 B measured. **Verdict on the `tinylink_lp` 20 KB burst:**
+  the LP task's first ts2021 re-connect (9.9 KB `ts2021_connect` frame
+  → `nghttp2_session_recv` with a 4 KiB inbound buffer → record
+  decrypt), never seen by the boot smoke because boot connects on the
+  main task; removed by `92c09dd` and 1.3.1's 512-B nghttp2 buffer. No
+  task's static worst case exceeds its allocation.
+- **B18 — trims from the static worst case** (static / measured over
+  the 6-h 1.3.2 soak → new size): `tinylink_lp` 7 856 / 7 284 B →
+  24 → **12 KiB**; `tinylink_derp` 5 424 / 5 028 B (an RSA-PSS chain
+  verify covered too) → 10 → **8 KiB**; `wg_tx` 3 200 / 2 380 B → 7 →
+  **5 KiB**; `esp_timer` 3 248 / 1 580 B → 6 → **4.5 KiB**. Kept:
+  `wg_rx` (C1-S / C6 changed its paths — re-measure on 1.3.3 first),
+  `tinylink_tlm` (688 B over its static worst case), tiT. **−17.5 KiB of
+  heap**; `TL_DIAG_MAX_TASKS` 32 → 20 (−432 B BSS). Next cut found:
+  the Noise record buffers `ct[4096]` / `rec[4096]` on the LP stack
+  (~4 KB) and `rx_task`'s `buf[1536]`.
+
 Round 1.3.3 so far: image 763 792 (B22) → **762 864 B** (−928 B);
 host suite 899 → **1 006 OK** (CI floor 1 006), ASan + UBSan clean,
 0 warnings. Not yet on the sensor.

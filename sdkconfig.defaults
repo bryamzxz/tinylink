@@ -635,8 +635,12 @@ CONFIG_ESP_MAIN_TASK_STACK_SIZE=24576
 # blow past the 3584-byte default once TLS to controlplane.tailscale.com
 # is up. Observed on first HW boot 2026-05-02: panic with EXCCAUSE 0x1c
 # (LoadStoreError) immediately after the control-key fetch path,
-# classic stack-overflow corruption. 6144 gives ~2x headroom.
-CONFIG_ESP_TIMER_TASK_STACK_SIZE=6144
+# classic stack-overflow corruption. 6144 gave ~2x headroom. Round 1.3.3
+# (B18): tools/stack_worst.py puts the static worst case at 3 248 B (a
+# Wi-Fi blob timer → pm chain → an unresolved blob call bounded by the
+# whole Wi-Fi OS adapter → nvs_open → flash read → log); 1 580 B measured
+# over the 6-h 1.3.2 soak. 4608 = 1.3 KB over the static worst case.
+CONFIG_ESP_TIMER_TASK_STACK_SIZE=4608
 
 # ---- Production: silent error paths ------------------------------------------
 # newlib-nano printf/scanf — drops %lld/%llu/%lf support, recovers the

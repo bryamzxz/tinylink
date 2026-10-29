@@ -130,7 +130,7 @@ void tinylink_diag_dump_stacks(void)
      * gives slack. If uxTaskGetSystemState returns 0 the buffer was
      * too small — log a warning so we know to bump this constant
      * rather than silently truncating the dump. */
-    enum { TL_DIAG_MAX_TASKS = 32 };
+    enum { TL_DIAG_MAX_TASKS = 20 };   /* 13 tasks live (round 1.3.3, B18) */
     static TaskStatus_t snap[TL_DIAG_MAX_TASKS];
     UBaseType_t n = uxTaskGetSystemState(snap, TL_DIAG_MAX_TASKS, NULL);
     if (n == 0) {
@@ -1138,25 +1138,20 @@ esp_err_t tinylink_derp_supervised_start(void)
         return ESP_OK;
     }
 
-    /* Spawn the task. 10 KiB stack: sized from the soak-instrumentation
-     * dump (PR #97) which measured the lifetime peak at 4920 B used
-     * (out of the prior 12 KiB allocation) across the full handshake
-     * + recv-loop cycle to derp16b.tailscale.com on 2026-05-12. The
-     * dominant frame is the mbedtls handshake against the
-     * LE E8 → ISRG Root X2 P-384 cert chain plus ECDHE-RSA-AES128-
-     * GCM key agreement; the cert chain and suite are deterministic
-     * across reconnects, so the peak is structural rather than
-     * load-dependent. 10 KiB leaves 5 KiB margin (≈ 100 % over the
-     * measured peak), enough to absorb any small drift between
-     * IDF mbedtls versions without re-tightening here. Anything
-     * tighter than 10 KiB should be backed by a multi-hour soak
-     * that includes server-restart-driven reconnects, which the
-     * 100 s smoke did not exercise.
+    /* Spawn the task. 8 KiB stack (round 1.3.3, B18; 10 KiB before):
+     * tools/stack_worst.py puts the static worst case at 5 424 B — the
+     * TLS handshake's certificate verify through esp_crt_verify_callback
+     * into an RSA-PSS signature check (mbedtls_rsa_rsassa_pss_verify_ext
+     * → mpi_exp_mod), i.e. covering an RSA chain as well as the
+     * ECDSA one the measurements saw (PR #97: 4 920 B peak on
+     * 2026-05-12; 5 028 B over the 6-h 1.3.2 soak). C1-S's relayed-packet
+     * input on this task is shallower (5 024 B). 8 KiB = 2.8 KB over the
+     * static worst case.
      *
      * This start function MUST be called pre-TLS-bringup (i.e.
      * BEFORE tinylink_register / dataplane_start / long_poll_start in
      * main.c::bringup) so the heap arena is still pristine when
-     * xTaskCreate looks for 10 KiB contiguous. The task body itself
+     * xTaskCreate looks for 8 KiB contiguous. The task body itself
      * waits internally for the first netmap before doing any TLS
      * work, so this re-ordering does not regress the previous
      * "DERP handshake after long-poll netmap" invariant — it only
@@ -1166,7 +1161,7 @@ esp_err_t tinylink_derp_supervised_start(void)
      * arena and ALL DERP-dependent features stay dead (observed
      * across 3 soaks pre-PR). */
     BaseType_t ok = xTaskCreate(derp_supervised_task, "tinylink_derp",
-                                10240, NULL, tskIDLE_PRIORITY + 3, NULL);
+                                8192, NULL, tskIDLE_PRIORITY + 3, NULL);
     if (ok != pdPASS) {
         ESP_LOGE(TAG, "xTaskCreate(derp supervisor) failed — "
                       "heap_free=%u largest=%u (need 10 KiB contiguous)",
@@ -1672,42 +1667,29 @@ static void long_poll_task(void *arg)
 esp_err_t tinylink_long_poll_start(void)
 {
     if (!s_initialized) return ESP_ERR_INVALID_STATE;
-    /* 24 KiB stack — reverted from a 20 KiB trim attempt (#99) that was
-     * sized off a 100 s smoke measurement (peak 11 040 B = 45 % used).
+    /* 12 KiB stack (round 1.3.3, B18; 24 KiB since #99 was reverted).
      *
-     * Extended 420 s soak with ~18 min device uptime captured the
-     * tinylink_lp lifetime peak at 20 004 B used — i.e. the 100 s
-     * smoke missed a path that fires only after extended operation.
-     * The 20 KiB trim left just 476 B (2.3 %) margin against that
-     * peak, dangerously close to overflow. Reverting to 24 KiB
-     * restores the original ~4.5 KiB (23 %) margin, which is what
-     * the historical author chose with "~14 KiB handshake estimate
-     * + safety" reasoning.
+     * History: a 20 KiB trim (#99, sized off a 100 s smoke that peaked
+     * at 11 040 B) met a 20 004-B lifetime peak ~18 min into a soak and
+     * was reverted; the path was never pinpointed and every later trim
+     * attempt was blocked on it. tools/stack_worst.py (round 1.3.3, static
+     * worst case per task from GCC's -fcallgraph-info=su, the blobs' and
+     * the ROM's disassembly, plus 368 B of fixed overhead) found it on
+     * that May build: 20 528 B static against 20 004 measured — the LP
+     * task's first ts2021 RE-connect (ts2021_connect's 9.9 KB frame →
+     * nghttp2_session_recv with a 4 KiB inbound buffer → the Noise record
+     * decrypt), which the boot smoke never ran on this task (boot connects
+     * on the main task). 92c09dd (connect reuses the idle h2_rx buffer)
+     * and 1.3.1's 512-B nghttp2 inbound buffer removed both frames.
      *
-     * The path that bursts to 20 KiB has not been pinpointed in
-     * source — it fires in the first 13 min between boot and the
-     * follow-up soak's first stack-diag dump. Likely candidates:
-     *   - Long-poll stream-error + ts2021_connect RE-handshake after
-     *     heap has fragmented (mbedtls allocation patterns shift)
-     *   - mapresp_parse path on a NON-KeepAlive incremental update
-     *     not exercised by the original boot-time netmap
-     *   - Retry-After backoff + reconnect under unusual heap state
-     *
-     * Static body_buf (32 KiB) and static jsmntok_t toks[2500]
-     * (40 KiB) both live in BSS, so the heavy data structures stay
-     * off this task's stack. The 20 KiB jump must therefore come
-     * from a stack-local allocation pattern in mbedtls / esp_tls /
-     * the streaming parser itself.
-     *
-     * Trim retry policy: anything tighter than 24 KiB requires a
-     * multi-hour soak with stack-diag dumps every 60 s to validate
-     * the worst-case lifetime hwm across heap fragmentation states.
-     * The 100 s post-boot smoke pattern that worked for the other
-     * stack trims (DERP #98, stun_r #100, wg_tx #101, ep_up #102)
-     * is INSUFFICIENT for tasks that do TLS reconnects long after
-     * the initial boot path settles. */
+     * Today: static worst case 7 856 B (map stream → nghttp2_session_recv
+     * → the Noise record decrypt's ct[4096] → mbedtls_ssl_read → an
+     * AES-GCM error log), 7 284 B measured over the 6-h 1.3.2 soak (the
+     * tool is ≥ measured on every task of 1.3.2). 12 KiB = 4.4 KB over
+     * the static worst case; the 1.3.3 soak's stack-diag dumps confirm
+     * it. Moving ct[4096] / rec[4096] off this stack would cut ~4 KB more. */
     BaseType_t ok = xTaskCreate(long_poll_task, "tinylink_lp",
-                                24576, NULL, tskIDLE_PRIORITY + 4, NULL);
+                                12288, NULL, tskIDLE_PRIORITY + 4, NULL);
     if (ok != pdPASS) {
         ESP_LOGE(TAG, "xTaskCreate(long_poll) failed");
         return ESP_ERR_NO_MEM;

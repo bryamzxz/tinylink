@@ -116,7 +116,7 @@ broke one-INIT-per-REKEY_TIMEOUT. Per-item details in the CHANGELOG.
 | B15 | One shared control buffer (register `resp[4096]`, mapreq `body[2048]`, stack bodies) carved from `body_buf`; cap frames 30 KB (peak 25 838 B) | −6 KB static, −2…3 KB stack | L |
 | B16 | Keep only DERP regions in use (by ID, not order — region-16 lesson) | −5.2 KB static | L |
 | B17 | Fold the STUN re-probe task into telemetry | −3.4 KB heap | L |
-| B18 | Stack trims from soak data: esp_timer 6 → 3.5 KB, DERP 10 → 8 KB, diag `snap[32]` → 20 | −5 KB heap | M: soak |
+| B18 | Stack trims from soak data: esp_timer 6 → 3.5 KB, DERP 10 → 8 KB, diag `snap[32]` → 20. **Done in 1.3.3 from a static worst case (`tools/stack_worst.py`) instead:** LP 24 → 12, DERP 10 → 8, wg_tx 7 → 5, esp_timer 6 → 4.5 KiB (3.5 would sit 336 B over the static bound) | −17.5 KiB heap | M: soak |
 | B19 | `/stats`: min-ever free heap, largest block, reset reason, BOD/WDT counters in RTC memory | observability for every item | L |
 | B20 | NVS time floor daily (or on >1-day move) instead of hourly: every 4 KB erase stalls both CPUs 70 ms typ / 500 ms max (ESP32 cannot suspend flash ops) | fewer stalls | L |
 | B21 | Small: `now_us()` once per loop (12 esp_timer reads), WDT feed 1/s, deadline wakeups (wg_rx 1 s, wg_tx 500 ms → 3 wakes/s from light sleep), demux switch on `buf[0]`, word-wise `ct_memeq`, WG AEAD entry without memcpy/memset of a public nonce | µs each | L |
