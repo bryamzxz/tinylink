@@ -101,6 +101,24 @@ esp_err_t wg_netif_update_peer_endpoint(uint32_t v4_be, uint16_t port);
 esp_err_t wg_netif_update_peer_keys(const uint8_t static_pub[WG_KEY_LEN],
                                     const uint8_t *disco_pub);
 
+/* Path events that can unblock a pending handshake (round 1.3.2, B7).
+ * While an INIT is unanswered (cold handshake or rekey), the SAME INIT
+ * is re-sent — not a new attempt, so REKEY_TIMEOUT pacing is untouched:
+ *   RELAY_UP        — the DERP relay just logged in: send it via DERP
+ *                     (its copy queued at build time was declined).
+ *   CALL_ME_MAYBE   — the WG peer sent a CallMeMaybe: it is punching
+ *                     towards us, so send it direct (and via DERP while
+ *                     no direct path is confirmed).
+ * A solicited DISCO pong does the same direct re-send inside wg_netif.
+ * No-op when nothing is pending. Takes hs_lock and g.lock briefly; the
+ * DERP copy goes through the TX worker, so it is safe to call from the
+ * DERP task (it never holds a DERP lock into wg_netif). */
+typedef enum {
+    WG_NETIF_KICK_RELAY_UP,
+    WG_NETIF_KICK_CALL_ME_MAYBE,
+} wg_netif_kick_t;
+void wg_netif_handshake_kick(wg_netif_kick_t why);
+
 /* Encrypt and send a plaintext IP packet through the tunnel. Returns
  * ESP_ERR_INVALID_STATE if no transport session is up yet. */
 esp_err_t wg_netif_send_plaintext(const uint8_t *pkt, size_t len);
@@ -177,10 +195,14 @@ uint64_t wg_netif_get_tx_drops(void);
  * UDP path looks broken. Invoked by the TX worker BEFORE sendto if
  * the RX-stale watchdog says no transport packet has decrypted in
  * WG_RX_STALE_THRESHOLD_MS, AND ALSO after sendto if it returns
- * errno != 0. The relay is responsible for shipping the bytes to the
- * peer via an alternate transport (e.g. DERP); the WG transport bytes
- * are already encrypted with the session keys, so the relay just
- * carries opaque ciphertext.
+ * errno != 0. Since round 1.3.2 (B7) also for handshake INITs while no
+ * direct path is confirmed (`packet` is then a 148-B MessageInitiation),
+ * and after sendto for every frame while a session that came up over
+ * DERP has no confirmed direct path. The relay is responsible for
+ * shipping the bytes to the peer via an alternate transport (e.g.
+ * DERP); the WG bytes are already encrypted with the session keys (or
+ * are a public handshake message), so the relay just carries opaque
+ * ciphertext.
  *
  * Arguments:
  *   dst_node_pub:  the peer's WG static public key (also their NodeKey

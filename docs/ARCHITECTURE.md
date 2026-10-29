@@ -86,7 +86,7 @@ primitives we did, see [`SECURITY-MODEL.md`](SECURITY-MODEL.md).
 |       │                            decrypt + sealed Pong via  |
 |       │                            sendto on the same socket  |
 |       └── tx_task                                             |
-|             drains tx_queue → sendto                          |
+|             drains the TX ring (slot indices) → sendto / DERP |
 |             (encrypt happens inline in TCPIP context;         |
 |              sendto must run OUTSIDE TCPIP to avoid lwIP      |
 |              re-entrancy deadlock — see PR #41)               |
@@ -143,8 +143,27 @@ verification) and, on success, moves the peer endpoint to that source
 (`roam_to`, under `g.lock` like every other endpoint write) — the
 whitepaper's roaming rule. INIT/COOKIE from unknown sources are dropped
 unauthenticated. The handshake state machine (`g.handshake`, `g.state`,
-rekey flags) is serialized by `g.hs_lock` between the RX task's timer
-blocks, the DISCO-pong fast-INIT and the DERP-relayed response path.
+rekey flags, the pending INIT) is serialized by `g.hs_lock` between the
+RX task's timer blocks, the DISCO-pong INIT re-send, the DERP task's
+kicks (`wg_netif_handshake_kick`) and the DERP-relayed response path;
+lock order is always `g.hs_lock` → `g.lock`, and no wg lock is held
+across a DERP/TLS call (DERP copies go through the `wg_tx` worker).
+
+Round 1.3.2 (B7) — the first INIT of a boot used to be lost (sent
+direct at netmap time, before the peer punched its side and before the
+DERP login) and retried only after `REKEY_TIMEOUT` + the old 1-s RX
+tick. Now: the RX wait is deadline-based (`wg_timers.h`), every new
+INIT also goes via DERP while no direct path is confirmed (an
+authenticated datagram on the UDP socket within the RX-stale window),
+and while a handshake is pending the INIT *of the attempt in flight* is
+re-sent on DERP login, on a CallMeMaybe from the peer (direct, + DERP)
+and on a solicited pong (direct). The re-sends are the same 148 bytes,
+not new attempts — the responder takes the first copy and drops the rest
+as a TAI64N replay — so new INITs stay one per `REKEY_TIMEOUT`
+(wireguard-go / kernel rule; magicsock queues the INIT on DERP and sends
+to both paths while `bestAddr` is untrusted). A session that came up on
+a DERP-relayed response sends every frame on both paths until something
+authenticates on the UDP socket ("direct path confirmed").
 
 ## `/stats` (M16, 2026-09)
 

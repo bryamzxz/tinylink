@@ -39,6 +39,7 @@ coverage without restating the base flags.
 | `test_wg_handshake`      | `wg_proto.c`, `wg_handshake.c` (Noise IKpsk2 initiator) | upstream-derived transcript |
 | `test_wg_transport`      | `wg_transport.c` (RFC 6479 replay window, AEAD framing) | synthetic |
 | `test_wg_demux`          | `wg_demux.c` first-byte classification                | synthetic |
+| `test_wg_timers`         | `wg_timers.h` RX-task deadline wait (never 0 / early / past the cap) | FreeRTOS tick model |
 | `test_disco`             | `disco.c` codec + NaCl box (`salsa20.c`, `nacl_box.c`) | upstream `disco_test.go` + round-trip |
 | `test_disco_handler`     | `disco_handler.c` ping → sealed pong                  | synthetic |
 | `test_disco_prober`      | `disco_prober.c` tx-id table (ROAM-3)                 | synthetic |
