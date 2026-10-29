@@ -13,7 +13,7 @@ Round D of `docs/rounds/2026-10-optimization-list.md` (memory), built in
 two parallel branches — control transport (`feat/r134-ctl`) and map
 parsing (`feat/r134-map`) — on top of 1.3.3. Image 763 328 → **707 088 B
 (−56 240 B; −252 161 B / −26.3 % since 1.3.0)**; static DRAM
-95 516 → ~56 800 B (−38.7 KB); static IRAM +10 240 B (NOLOAD token
+95 516 → 57 140 B (−38 376 B); static IRAM +10 240 B (NOLOAD token
 table); no nghttp2 session per connect; `tinylink_lp` 12 → 7 KiB and the
 main task 24 → 8 KiB of stack. Host suite 1 006 → **1 330 OK** (CI floor
 1 330; CI now installs libnghttp2 as the HTTP/2 interop peer), ASan +
