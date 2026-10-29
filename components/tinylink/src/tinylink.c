@@ -2054,9 +2054,11 @@ bool tinylink_get_public_endpoint(uint8_t addr_v4[4], uint16_t *port)
  * calls tinylink_stun_reprobe_poll once per loop; it had its own 3 KiB
  * task, "tinylink_stun_re", before). Armed by tinylink_stun_reprobe_start;
  * the first re-probe is due one period later, because the boot-time probe
- * ran in tinylink_stun_probe() just before. */
-static bool             s_stun_reprobe_armed;
-static int64_t          s_stun_reprobe_due_us;
+ * ran in tinylink_stun_probe() just before. Volatile: the long-poll can
+ * spawn the telemetry task (first netmap) before main arms this, so the
+ * task may poll concurrently; due_us is stored before armed. */
+static volatile bool    s_stun_reprobe_armed;
+static volatile int64_t s_stun_reprobe_due_us;
 /* ROAM-2: set by the IP_EVENT_STA_GOT_IP handler when the device's own
  * L3 identity changes (WiFi (re)connect / DHCP renew) so the next poll
  * re-probes at once instead of at the period. Without it a local network
