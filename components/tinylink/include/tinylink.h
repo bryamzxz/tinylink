@@ -226,22 +226,6 @@ esp_err_t tinylink_dataplane_start(void);
  */
 esp_err_t tinylink_long_poll_start(void);
 
-/* Block until the long-poll task has received its first MapResponse
- * and called wg_dataplane_start(), or until timeout_ms elapses.
- *
- * Used by main.c bringup to sequence the DERP supervisor AFTER the
- * long-poll has its TLS conn + HTTP/2 session in steady state — if
- * supervised goes first, its alive TLS conn fragments the heap below
- * the contiguous block long-poll's mbedtls cert verify needs, and
- * long-poll repeatedly fails. Waiting for s_dataplane_started=true
- * means: TLS up, Noise IK done, h2 session started, first
- * MapRequest fired, first netmap parsed, WG netif up, our HostInfo
- * (with PreferredDERP region) advertised to the control plane.
- *
- * Returns ESP_OK if dataplane came up within timeout, ESP_ERR_TIMEOUT
- * otherwise. */
-esp_err_t tinylink_wait_dataplane_ms(uint32_t timeout_ms);
-
 /* True once the WG session has transport keys (a handshake response
  * was accepted). Non-blocking, callable from any task or an esp_timer
  * callback; app_wifi.c polls it to end the modem-awake boot window. */
@@ -264,23 +248,22 @@ bool tinylink_session_up(void);
  * the pre-M5 baseline. */
 esp_err_t tinylink_derp_smoke(void);
 
-/* M5 step 2b — spawn the supervised DERP recv-loop task. The task:
- *   1. Connects to CONFIG_TINYLINK_DERP_SMOKE_HOST:443 and runs the
- *      login handshake (same as derp_smoke).
+/* M5 step 2b — spawn the supervised DERP recv-loop task. Call before
+ * the register (the stack wants a pristine heap). The task:
+ *   1. Connects to CONFIG_TINYLINK_DERP_SMOKE_HOST:443 (the netmap's
+ *      node of CONFIG_TINYLINK_PREFERRED_DERP once known) and runs the
+ *      login handshake (same as derp_smoke) — at once, alongside the
+ *      register, since round 1.3.5 (it waited for the first netmap
+ *      before), so the relay is up for the first WG handshake INIT.
  *   2. Drives derp_client_run() until the stream errors or the server
  *      sends FrameRestarting.
  *   3. Sleeps the configured backoff and reconnects.
  *
  * Opt-in: callable only when CONFIG_TINYLINK_DERP_SUPERVISED=y. When
  * disabled, returns ESP_OK without doing anything (so main.c can call
- * unconditionally). The supervised conn coexists with the long-poll's
- * TLS conn at steady state but the second handshake competes for
- * mbedtls cert-chain-verify heap (~12 KiB), so connect failures will
- * be retried with backoff rather than treated as fatal.
- *
- * Recv events are currently logged only — wiring received WireGuard
- * packets back into the data plane lands with M5 step 3 (magicsock
- * fallback) once DISCO peer-pub bookkeeping exists. */
+ * unconditionally). Connect failures are retried with backoff rather
+ * than treated as fatal. Relayed DISCO is answered / acted on in the
+ * task, relayed WireGuard goes to the data plane (wg_netif inject). */
 esp_err_t tinylink_derp_supervised_start(void);
 
 /* Ship an opaque encrypted packet to `dst_node_pub` via the DERP
@@ -312,8 +295,8 @@ esp_err_t tinylink_relay_via_derp(const uint8_t *dst_node_pub,
 
 /* Bring up the WireGuard UDP socket early — bind only, no handshake.
  * Must be called after tinylink_init (so the local node identity is
- * loaded from NVS) and before tinylink_stun_probe (so STUN can probe
- * through the same socket). Without this prologue, STUN runs on its
+ * loaded from NVS) and before tinylink_stun_probe_start (so STUN can
+ * probe through the same socket). Without this prologue, STUN runs on its
  * own ephemeral socket and the public AddrPort the control plane
  * advertises to peers does NOT match the WG socket's NAT mapping, so
  * inbound DISCO/transport from peers never reaches the device.
@@ -324,17 +307,27 @@ esp_err_t tinylink_wg_socket_init(void);
 
 /* M4 — best-effort STUN binding probe to discover the device's public
  * AddrPort. Result is cached and uploaded to the control plane via
- * Hostinfo.Endpoints on the next MapRequest, so peers learn an address
- * they can try to dial directly even before DERP-mediated CallMeMaybe
- * (M5) is wired up. Failure is non-fatal; the device just operates
- * without a reflexive endpoint advertised, exactly like the pre-M4
- * baseline. Safe to call only after WiFi is up.
+ * Hostinfo.Endpoints by the endpoint push, so peers learn an address
+ * they can try to dial directly. Failure is non-fatal; the device just
+ * operates without a reflexive endpoint advertised, exactly like the
+ * pre-M4 baseline. Call after tinylink_wg_socket_init, before the
+ * register.
  *
- * Probes through the WireGuard socket if it has been brought up
- * (tinylink_wg_socket_init) and the RX task hasn't started yet. Else
- * falls back to an ephemeral socket — useful only for re-probes that
- * detect WAN-IP changes; the port they discover does NOT match the
- * WG socket's bound port. */
+ * Since round 1.3.5 the probe runs on its own short-lived task
+ * (`tinylink_stun`) while the register runs, through the WireGuard
+ * socket, which it reads itself until wg_rx exists: it used to cost the
+ * boot its whole duration (0.04–7.1 s on the sensor) ahead of the
+ * register. tinylink_dataplane_start waits for it ≤ 300 ms and then
+ * pushes without it; the STUN re-probe pushes the endpoint once the
+ * data plane is up. ESP_OK when the probe runs (inline on this task if
+ * the spawn fails — the 1.3.4 order); once per boot. */
+esp_err_t tinylink_stun_probe_start(void);
+
+/* One STUN re-probe through the running WireGuard socket: the request is
+ * sent on it and wg_rx hands the answer back (ESP_ERR_INVALID_STATE
+ * before the first netmap has started wg_rx — the boot probe is
+ * tinylink_stun_probe_start). A changed endpoint (or the first one)
+ * queues a control-plane push. The STUN re-probe loop calls this. */
 esp_err_t tinylink_stun_probe(void);
 
 /* Re-run the STUN probe every CONFIG_TINYLINK_STUN_REPROBE_MS

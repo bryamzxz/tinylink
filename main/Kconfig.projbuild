@@ -163,18 +163,20 @@ menu "tinylink application"
         range 1 65535
 
     config TINYLINK_DERP_SMOKE_HOST
-        string "DERP fallback hostname (before the first netmap)"
+        string "DERP hostname before the first netmap"
         default "derp16b.tailscale.com"
         help
-            Relay the DERP supervisor dials if the first netmap has not
-            arrived within its 30-s wait (and the host used by the
-            SUPERVISED=n boot smoke). Keep it in the same region as
-            TINYLINK_PREFERRED_DERP — the netmap-driven host replaces
-            it as soon as the DERPMap is parsed, but until then peers
-            relay to us through the preferred region, so a fallback in
-            another region (the old default was derp1, region 1) leaves
-            relayed DISCO/CallMeMaybe unreachable. Set to empty to skip
-            the SUPERVISED=n smoke entirely.
+            Relay the DERP supervisor dials at boot — since round 1.3.5
+            it connects alongside the register, before the first netmap
+            names the node of TINYLINK_PREFERRED_DERP — and the host
+            used by the SUPERVISED=n boot smoke. Keep it a node of the
+            TINYLINK_PREFERRED_DERP region: peers relay to us through
+            that region, so a host in another region (the old default
+            was derp1, region 1) leaves relayed DISCO/CallMeMaybe and
+            the first WG handshake unreachable until the netmap-driven
+            host replaces it (the supervisor moves at the next DERP
+            frame after the DERPMap names another node). Set to empty
+            to skip the SUPERVISED=n smoke entirely.
 
     config TINYLINK_PREFERRED_DERP
         int "Preferred DERP region ID advertised in MapRequest"

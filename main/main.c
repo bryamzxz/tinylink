@@ -7,6 +7,8 @@
 //      control plane public key.
 //   3. tinylink_register() — POST /machine/register; retry slow on
 //      MachineAuthorized=false until the operator approves the node.
+//      The DERP relay connect and the STUN probe run alongside it on
+//      their own tasks (round 1.3.5).
 //   4. tinylink_dataplane_start() — fetch one MapResponse and bring up
 //      the WireGuard netif against the home peer it announces. The
 //      long-lived `Stream:true` MapRequest loop and DISCO/STUN follow
@@ -159,20 +161,20 @@ static esp_err_t bringup(void)
 
 #if CONFIG_TINYLINK_DERP_SUPERVISED
     /* Spawn the DERP supervisor task NOW — before any TLS handshake
-     * (register, long-poll, supervisor's own DERP TLS) lands and
-     * fragments the heap below the 12 KiB contiguous needed for the
-     * task stack. Without this move the spawn fails with
+     * (register, the supervisor's own DERP TLS) lands. In the 2026-05
+     * tree, with the spawn after the long-poll, it failed with
      * `heap_free=~11.7K largest=~11.2K need 12K contiguous` (observed
      * across 3 soaks) and ALL DERP-dependent features (CMM ingestion,
-     * relayed DISCO, future DERP outbound fallback) stay dead.
+     * relayed DISCO, DERP outbound fallback) stayed dead.
      *
-     * The task body itself waits internally for the first netmap
-     * (tinylink_wait_dataplane_ms) before opening its TLS conn to the
-     * DERP relay, so we still respect the "long-poll handshake gets a
-     * pristine arena" + "PreferredDERP region known before connecting"
-     * invariants documented in the previous wait-then-spawn shape.
-     * Spawn-now-connect-later separates the two concerns cleanly:
-     * xTaskCreate gets a clean heap, TLS handshake gets a known region. */
+     * Since round 1.3.5 the task also connects NOW, its TLS handshake
+     * overlapping the register's, instead of waiting for the first
+     * netmap: the relay is then up when the first WG handshake INIT
+     * goes out, whose DERP copy reaches the peer — 1.3.4 had the
+     * session up only on attempt 2, ~1.9 s after the netmap, after the
+     * DERP login. The old wait's two invariants (a pristine arena for
+     * the long-poll's handshake; the PreferredDERP region known before
+     * connecting) no longer hold — derp_supervised_task has why. */
     esp_err_t derp_sup_err = tinylink_derp_supervised_start();
     if (derp_sup_err != ESP_OK) {
         ESP_LOGW(TAG, "derp supervised start failed: 0x%x — continuing",
@@ -180,14 +182,17 @@ static esp_err_t bringup(void)
     }
 #endif
 
-    /* M4 — best-effort STUN probe. Runs once before the first
-     * MapRequest so HostInfo.Endpoints can advertise our reflexive
-     * AddrPort to the control plane (which forwards it to peers).
-     * Non-load-bearing: a probe failure leaves us with no endpoint
-     * advertised, identical to the pre-M4 baseline. */
-    esp_err_t serr = tinylink_stun_probe();
+    /* M4 — best-effort STUN probe, so HostInfo.Endpoints can advertise
+     * our reflexive AddrPort to the control plane (which forwards it to
+     * peers). Since round 1.3.5 it runs on its own task WHILE the
+     * register runs — it cost the boot 0.04–7.1 s here before — and
+     * tinylink_dataplane_start's endpoint push waits ≤ 300 ms for it.
+     * Non-load-bearing: no result in time = the push goes without an
+     * endpoint, and the re-probe pushes it once the data plane is up. */
+    esp_err_t serr = tinylink_stun_probe_start();
     if (serr != ESP_OK) {
-        ESP_LOGW(TAG, "stun probe failed: 0x%x — continuing without endpoint", serr);
+        ESP_LOGW(TAG, "stun probe start failed: 0x%x — continuing without endpoint",
+                 serr);
     }
 
     /* Register loop: control plane may answer MachineAuthorized=false until
@@ -226,10 +231,11 @@ static esp_err_t bringup(void)
     }
 #endif
 
-    /* Long-poll FIRST so its TLS conn lands on a fresh heap (the
-     * HTTP/2 session needs none since 1.3.4). The long-poll task runs
-     * at priority IDLE+4 (higher than this bringup task) so it preempts
-     * here and starts its handshake immediately. */
+    /* The long-poll's first stream rides the register's control conn
+     * (kept open by tinylink_dataplane_start) — no handshake at boot.
+     * The long-poll task runs at priority IDLE+4 (higher than this
+     * bringup task) so it preempts here and sends its MapRequest
+     * immediately. */
     err = tinylink_long_poll_start();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "long-poll start failed: 0x%x", err);

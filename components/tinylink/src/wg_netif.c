@@ -48,13 +48,16 @@ static const char *TAG = "wg_netif";
 /* First retry of a cold handshake burst (B7c, 1.3.2). At boot the first
  * INIT goes out right after the netmap, before the peer has validated a
  * direct path to our (per-boot, new) NAT mapping, so it answers via
- * DERP — and our DERP is usually not logged in yet: the response is
- * lost and the peer then treats copies of that INIT as replays (see
+ * DERP — and until 1.3.4 our DERP was not logged in yet: the response
+ * was lost and the peer then treated copies of that INIT as replays (see
  * WG_INIT_FRESH_AFTER_MS). Seen on the sensor: WG up 5 s after the
  * netmap, every boot. The netmap-time prepunch pings validate the
  * direct path within ~0.3 s, so a NEW INIT 2 s later is answered
  * directly. One extra INIT per burst — responders accept 50/s — and
- * every later retry, rekeys included, keeps REKEY_TIMEOUT. */
+ * every later retry, rekeys included, keeps REKEY_TIMEOUT. Since 1.3.5
+ * the relay connects alongside the register and is normally up by the
+ * netmap, so the first INIT's own DERP copy is answered; this retry
+ * stays for a slower DERP login or a lost answer. */
 #define WG_FIRST_RETRY_MS 2000
 
 /* Proactive rekey threshold. WG spec: the *responder* hits
@@ -1703,8 +1706,9 @@ static void tx_send_item(const wg_tx_item_t *it, int64_t now)
     if (it->relay_only) {
         /* DERP copy of a handshake INIT (B7). The direct copy already
          * went out from the task that built or re-sent it. A relay that
-         * is not up yet (boot: INIT at netmap time, DERP login ~2 s
-         * later) declines — dropped silently, the login kick re-sends. */
+         * is not up yet (a reconnect; at boot a login slower than the
+         * register + netmap — 1.3.4: every boot, ~2 s after the INIT)
+         * declines — dropped silently, the login kick re-sends. */
         if (g.relay_cb != NULL) {
             peer_static_snapshot(dst_pub);
             (void)g.relay_cb(dst_pub, it->buf, it->len, true, g.relay_cb_user);
@@ -1926,35 +1930,45 @@ esp_err_t wg_netif_start(const struct wg_netif_peer_config *peer)
     if (!g.initialized) return ESP_ERR_INVALID_STATE;
     if (peer == NULL) return ESP_ERR_INVALID_ARG;
 
-    memcpy(&g.peer, peer, sizeof(*peer));
-    rebuild_peer_sockaddr();
-
     /* Precompute the NaCl-box shared key for the direct DISCO RX hot
      * path. Done here (not at init time) because the peer DiscoKey is
      * peer config, not local config. If the X25519 yields zero (peer
      * pub is low-order) we mark the cache invalid and fall through to
      * the per-frame compute path — the same path also handles bringups
-     * that don't pass a DiscoKey at all (has_peer_disco_pub == false). */
-    g.peer_disco_shared_k_valid = false;
-    if (g.peer.has_peer_disco_pub) {
-        if (nacl_box_compute_shared(g.peer_disco_shared_k,
-                                    g.peer.peer_disco_pub,
-                                    g.local.disco_priv) == 0) {
-            g.peer_disco_shared_k_valid = true;
-        } else {
+     * that don't pass a DiscoKey at all (has_peer_disco_pub == false).
+     * Computed outside g.lock, like wg_netif_update_peer_keys. */
+    uint8_t k[WG_KEY_LEN];
+    bool    k_ok = false;
+    if (peer->has_peer_disco_pub) {
+        k_ok = nacl_box_compute_shared(k, peer->peer_disco_pub,
+                                       g.local.disco_priv) == 0;
+        if (!k_ok) {
             ESP_LOGW(TAG,
                 "peer_disco_pub low-order; shared-K cache disabled");
         }
     }
+
+    /* Under g.lock (round 1.3.5): the DERP supervisor connects at boot
+     * now, so its task is live while this runs and reads g.peer under
+     * g.lock (wg_netif_inject_packet's source check, the relayed-DISCO
+     * gate) — a relayed frame from the peer's pre-reboot session can
+     * arrive just then. */
+    xSemaphoreTake(g.lock, portMAX_DELAY);
+    memcpy(&g.peer, peer, sizeof(*peer));
+    rebuild_peer_sockaddr();
+    if (k_ok) memcpy(g.peer_disco_shared_k, k, WG_KEY_LEN);
+    g.peer_disco_shared_k_valid = k_ok;
+    xSemaphoreGive(g.lock);
+    tl_secure_zero(k, sizeof(k));
 
     g.handshake_attempt = 0;
     g.rekey_attempt = 0;
     g.rekey_in_flight = false;
     g.last_handshake_completed_us = 0;
     g.last_transport_recv_us = 0;  /* watchdog disarmed until session up */
-    /* Under hs_lock like every other INIT build: when the first netmap
-     * is late the DERP supervisor is already up, and its B7 kicks
-     * (init_resend) read g.init_msg while this writes it. */
+    /* Under hs_lock like every other INIT build: the DERP supervisor is
+     * normally logged in by now (it connects at boot since 1.3.5), and
+     * its B7 kicks (init_resend) read g.init_msg while this writes it. */
     xSemaphoreTake(g.hs_lock, portMAX_DELAY);
     const int kick_rc = kick_off_handshake();
     xSemaphoreGive(g.hs_lock);
