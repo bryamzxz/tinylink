@@ -118,8 +118,13 @@ Evidence, on the 1.3.3 firmware ELF:
   reports the cycle spread over eight inputs on the device.
 
 3.51 M → 2.43 M instructions per scalarmult, frame 2.7 → 0.85 KiB, and
-the stack temporaries are scrubbed with `tl_secure_zero` (donna left
-them). API unchanged: `curve25519_scalarmult`, `curve25519_keypair`,
+the named stack temporaries are scrubbed with `tl_secure_zero` (donna
+left its whole 2.7 KiB frame). Not every byte, though: compiler spills
+in `fe_tobytes`, the `fe_mul_impl` frame and `fe_sqr_impl`'s `e[10]` sit
+below the caller's stack pointer afterwards — the 1.3.3 review counted
+54 nonzero words after one scalarmult, one of them bytes 22..25 of the
+DH output, no scalar bits. Those bytes are overwritten by the task's
+next calls; scrubbing them would take a stack burn after every DH. API unchanged: `curve25519_scalarmult`, `curve25519_keypair`,
 `curve25519_dh`, `curve25519_derive_pub`. RFC 7748 §5.2 (two vectors,
 iterated 1 / 1 000 times; 1 000 000 on demand) and §6.1, 4 000 random
 cross-checks against donna (kept as the test oracle,
@@ -396,7 +401,13 @@ Distilled from the protocol research artifact §L.
   `wg_proto.c`), the Noise IK chaining key / k / DH outputs
   (`noise_ik.c`), the NaCl-box shared key / keystream / Poly1305 state
   (`nacl_box.c`), and the AEAD/KDF scratch in `salsa20.c`,
-  `hkdf_blake2s.c`, `blake2s.c` and `chacha20poly1305.c`. Public, non-secret values
+  `hkdf_blake2s.c`, `blake2s.c` and `chacha20poly1305.c`. Known residue:
+  a `chacha20()` call longer than one block leaves its 208-B frame
+  below the caller's stack pointer with the 8 key words GCC spilled for
+  the feed-forward add (as 1.3.2 left key-derivable state there too);
+  the round-1.3.3 RX/TX tickets scrub their key copy but cannot reach
+  that callee frame. The same key lives in `g.transport` for the whole
+  session, so the extra exposure is nil against a RAM reader. Public, non-secret values
   (nonces, timestamps, on-wire message buffers) deliberately keep plain
   `memset` — scrubbing them buys nothing. The earlier state where WG
   session/handshake keys were torn down with a dead-code-eliminable

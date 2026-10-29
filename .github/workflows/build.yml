@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 Bryam (bryamzxz)
 #
-# CI for tinylink: host KAT suite (plain + sanitized), a check that the
-# two required ESP-IDF patches still apply, and the firmware build
-# against the pinned ESP-IDF release.
+# CI for tinylink: host KAT suite (plain + sanitized), the crypto suites
+# on Espressif's QEMU (the Xtensa asm paths), a check that the two
+# required ESP-IDF patches still apply, and the firmware build against
+# the pinned ESP-IDF release.
 
 name: build
 
@@ -25,7 +26,7 @@ concurrency:
 env:
   # Strict per-case count of `[name] OK` lines the suite must reach.
   # Bump when tests are added (see CHANGELOG for the running number).
-  HOST_TESTS_MIN_OK: 899
+  HOST_TESTS_MIN_OK: 1006
 
 jobs:
   host-tests:
@@ -62,6 +63,29 @@ jobs:
           set -o pipefail
           make -C tools/test asan 2>&1 | tee /tmp/host-tests-asan.log
           test "$(grep -c 'FAIL' /tmp/host-tests-asan.log || true)" -eq 0
+
+  # The host suites only run the crypto C fallbacks. The Xtensa inline asm
+  # (X25519 field multiply, ChaCha20 / BLAKE2s / Salsa20 rotates) depends
+  # on SAR, which GCC cannot be told about — an edit or a toolchain bump
+  # that breaks it would otherwise surface as failed handshakes on a
+  # device. tools/qemu_crypto runs the compiled LX6 code on Espressif's
+  # QEMU (esp32 machine); see tools/test/README.md.
+  qemu-crypto:
+    name: crypto suites on QEMU (esp32, ESP-IDF v5.5.6)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build and run on QEMU
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: v5.5.6
+          target: esp32
+          path: "."
+          command: |
+            python "$IDF_PATH/tools/idf_tools.py" --non-interactive install qemu-xtensa && \
+            tools/qemu_crypto/run.sh
 
   idf-patches:
     name: idf-patches apply cleanly

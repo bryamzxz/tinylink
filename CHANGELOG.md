@@ -33,6 +33,112 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mattered. Image +720 B; host suite 881 → **899 OK** (CI floor 899):
   no-Auth body KAT, exact-fit / one-short, and the fallback table.
 
+#### Data plane (`feat/r133-dp`)
+
+- **C2 — RX and TX AEAD outside `g.lock`.** Until 1.3.2 `g.lock` was
+  held across every transport AEAD (~400 µs per MTU), so a decrypt
+  (wg_rx / DERP task) and an encrypt (tiT / telemetry) never ran on both
+  cores at once. Each direction now works on a ticket holding a copy of
+  the key taken under the lock: TX reserves the counter together with
+  the send key of the same keypair, then seals unlocked; RX copies the
+  receive key and the keypair generation after the replay pre-check,
+  opens unlocked, and commits under the lock. The commit refuses a
+  ticket whose keypair was replaced or scrubbed in between, re-checks
+  the window (the DERP and direct copies of one packet can now be in
+  flight together), then records the counter. S1 holds, no AEAD reads
+  key bytes a rekey or stop may rewrite, and a packet straddling a
+  rekey is dropped (`keypair replaced during decrypt`). The window
+  update clears whole bytes (an 8 191-counter jump: 2.3 → 0.15 MTU
+  AEADs). Image +632 B; +77 host checks, including a pthread test of the
+  lock protocol with the races forced at fixed points (TSan-clean on 1,
+  2 and 16 CPUs).
+- **C1, intermediate steps — decrypt into the lwIP pbuf, core-locked
+  `ip_input`.** The AEAD writes the plaintext straight into the pbuf
+  lwIP receives (was: a 1 536-B stack buffer, a memcpy and a scrub), and
+  `wg_rx_inject` runs `ip_input` under `LOCK_TCPIP_CORE()` in the
+  decrypting task instead of posting to tiT (core locking was already
+  on). Per inbound packet, passes over the payload 4 → 2 and task hops
+  3 → 2; no tiT message alloc, no ERR_MEM on a full mbox. The direct-path
+  note and endpoint roaming now happen before delivery, since replies are
+  built on the same task. `handle_transport` frame 1 616 → 96 B. Lock
+  order is now `hs_lock` → lwIP core lock → `g.lock`. Image +120 B. The
+  full C1 (raw `udp_recv` endpoint in tiT, wg_tx removed) is deferred: it
+  would put the RX AEAD under the core lock with the TX encrypt, undoing
+  C2, and needs C7 and an unaligned-fast AEAD first.
+- **Fixes found on the way:** the tunnel netif is brought up under the
+  lwIP core lock (`netifapi_*`; pre-existing, every boot);
+  `wg_netif_stop` wipes the handshake and DISCO state under their locks
+  (pre-existing, bringup-failure path). +104 B.
+- **C10 — task layout analysed, not changed:** recommendation is wg_rx
+  at IDLE+5 pinned to CPU1 and wg_tx at IDLE+5, together with a flood
+  budget in wg_rx (without it a pinned priority-5 task can starve IDLE1
+  into a watchdog reboot).
+
+#### Crypto (`feat/r133-crypto`)
+
+- **C4 — ChaCha20 in pair-wise rounds with a fused feed-forward XOR.**
+  The 20 rounds run on 16 scalar locals, two quarter-rounds in lockstep
+  (one `ssai` per step, a bare `src` per rotate); aligned full blocks
+  write `out = in ^ (rounds + state)` straight from the registers
+  instead of storing the keystream, re-reading it and copying the state
+  in with a ROM memcpy. Measured on the firmware's compiled code
+  (instruction-level simulation): double round 141 → 130 instructions
+  (spills 34 → 15), `chacha20()` over 1 500 B 43 289 → 35 412 (−18 %),
+  AEAD encrypt per MTU 73 833 → 65 691 (−11 %), frame 240 → 208 B; same
+  instruction trace and addresses for any key and plaintext. IRAM
+  +852 B (two inlined copies of the rounds). Tests: RFC 8439 §2.3.2 /
+  A.1 / A.2 at all alignments and in place, HChaCha20, 5 000 random
+  trials against the 1.3.2 code (`tools/test/ref/chacha20_132.c`).
+- **C6 — constant-time X25519 (closes S3).** Donna's int64 limb sums
+  compiled on the LX6 to 162 `bgeu` carry branches, executed 342 266
+  times per scalarmult. Replaced by fiat-crypto's verified 32-bit
+  Curve25519 (Linux `curve25519-fiat32.c`, taken under MIT) with
+  `fe_mul` / `fe_sqr` / `fe_mul121666` rewritten carry-free: each
+  product split at bit 28 into two 32-bit column accumulators (`mull`,
+  `muluh`, `src`, `and`, `add`, `add` in one asm statement). 3.51 M →
+  2.43 M instructions per scalarmult (−31 %, ~14 ms est. vs 20 ms); no
+  data-dependent branch or address left (static listing + identical
+  traces for any scalar and point); frame 2.7 → 0.85 KiB; flash −1.4 KB.
+  Tests: `test_x25519` (RFC 7748 iterated 1 / 1 000, 1 000 000 on
+  demand; 4 000 cross-checks against donna, kept as the host-only
+  oracle; the field operations against an independent mod-p reference
+  at their bounds; low-order rejection).
+- **C9 — BLAKE2s / Salsa20 with one SAR write per step; KDF3 reuses its
+  extract.** BLAKE2s compression 2 051 → 1 656 instructions (−19 %),
+  Salsa20 20 rounds 1 904 → 1 413 (−26 %); `noise_hkdf3` 20 → 16
+  compressions (one per WireGuard handshake), KDF2 / KDF3 −17 % / −33 %
+  instructions. Outputs pinned against Python hashlib / hmac. Image
+  −1.2 KB.
+- The boot bench (`CONFIG_TINYLINK_BENCH_AEAD`) gains an X25519 KAT,
+  time per scalarmult and a CCOUNT spread probe, and its AEAD KAT now
+  covers the aligned and unaligned paths.
+- **Verification beyond the host suite.** An independent read-only
+  review ran the compiled firmware code through its own Xtensa
+  interpreter: asm vs C fallback bit-identical on 40 000 field cases,
+  the accumulator bounds re-derived (worst case L ≤ 1.375·2^31,
+  H ≤ 1.246·2^30; nothing overflows below ~4.5·2^w) and asserted on
+  27.6 M field operations of 3 000 ladders, KDF3 equal to WireGuard's
+  Kdf3 on 3 000 random inputs, 8 of 9 deliberately injected carry bugs
+  caught (the ninth is unreachable). Its three low findings: the
+  SECURITY-MODEL scrub claim was too strong (fixed: compiler spills
+  remain, no scalar bits), a ChaCha20 call leaves key words in its
+  callee frame (pre-existing, documented), and nothing in the tree ran
+  the SAR-dependent asm — fixed by:
+- **`tools/qemu_crypto` + CI job `qemu-crypto`.** The crypto suites
+  built for the ESP32 with the firmware's -O2 islands and run on
+  Espressif's QEMU (`-machine esp32`, `idf_tools.py install
+  qemu-xtensa`): ChaCha20, ChaCha20-Poly1305, Poly1305, BLAKE2s, HKDF,
+  NaCl box, plus the field operations asm vs the C fallback (both built
+  for the LX6) bit for bit on 200 000 inputs at the loose bounds,
+  X25519 asm vs C vs donna on 3 000 pairs (u ≥ p, u = p, small u,
+  all-ones scalars) and RFC 7748 iterated 1 / 1 000 — all pass, ~2 min
+  in QEMU. It is the first check of the asm on an ISA implementation
+  nobody on this project wrote.
+
+Round 1.3.3 so far: image 763 792 (B22) → **762 864 B** (−928 B);
+host suite 899 → **1 006 OK** (CI floor 1 006), ASan + UBSan clean,
+0 warnings. Not yet on the sensor.
+
 ### Optimization round B 1.3.2 (2026-10-28, branch `feat/opt-1.3.2`)
 
 Round B of `docs/rounds/2026-10-optimization-list.md` — the code items,

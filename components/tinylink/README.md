@@ -12,7 +12,7 @@ the TMP117 telemetry app.
 | register / MapRequest / netmap| `register.c`, `mapreq.c`, `netmap.h`, `jsmn*.h`    | done (M1–M2, patch-refetch M13) |
 | WireGuard                     | `wg_proto.c`, `wg_handshake.c`, `wg_transport.c`, `wg_netif.c`, `wg_demux.c`, `wg_lwip.c` | done (M2, M6) |
 | DISCO / STUN / DERP           | `disco*.c`, `stun*.c`, `derp*.c`                   | done (M3–M5) |
-| crypto (BLAKE2s, ChaCha20-Poly1305, X25519-donna, Salsa20/NaCl box, HKDF) | `src/crypto/` | done, host-KAT'd |
+| crypto (BLAKE2s, ChaCha20-Poly1305, X25519 (fiat-crypto field, constant time), Salsa20/NaCl box, HKDF) | `src/crypto/` | done, host-KAT'd |
 | telemetry (TMP117 → JSON/UDP) | `tmp117.c`, `telemetry.c`                          | done (M3) |
 
 The public header is [`include/tinylink.h`](include/tinylink.h); the
