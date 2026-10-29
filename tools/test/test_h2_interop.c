@@ -790,8 +790,9 @@ static void sc_sequence(void)
     check("sequence_stream_ids_1_3_5", S.nreq == 3 && S.sid[0] == 1 && S.sid[1] == 3 &&
           S.sid[2] == 5 && strcmp(S.path[1], "/machine/map") == 0 && S.bad == 0);
 #ifndef H2_REF
-    /* new client: HEADERS + DATA of a request share one record */
-    check("sequence_records", s_c2s_records <= 1 + 3 + 3 && s_c2s_max_record <= 3 + 4077 + 16);
+    /* new client: HEADERS + DATA of a request share one record, and no
+     * record is over 2 048 B — one TLS record each (D4) */
+    check("sequence_records", s_c2s_records <= 1 + 3 + 3 && s_c2s_max_record <= 2048);
 #endif
     conn_down();
 }
@@ -812,6 +813,25 @@ static void sc_small_server_window(void)
           r1.err == ESP_OK && r1.status == 200 && r2.err == ESP_OK && r2.status == 200 &&
           S.body_len[1] == sizeof(body) && memcmp(S.body[1], body, sizeof(body)) == 0 &&
           S.bad == 0);
+    conn_down();
+}
+
+static void sc_large_body(void)
+{
+    /* A body bigger than one record: the request goes out in ≤ 2 048-B
+     * records cut from the ring (D4), in order, whatever the frames. */
+    static char body[4000];
+    for (size_t i = 0; i < sizeof(body); i++) body[i] = (char)('a' + i % 23);
+    srv_new(0);
+    conn_up(true);
+    S.sc = SC_HEADERS_ONLY;
+    res_t r = post("/machine/register", body, sizeof(body), 256);
+    check("large_body_complete",
+          r.err == ESP_OK && r.status == 200 && S.body_len[0] == sizeof(body) &&
+          memcmp(S.body[0], body, sizeof(body)) == 0 && S.bad == 0);
+#ifndef H2_REF
+    check("large_body_2k_records", s_c2s_records >= 1 + 2 && s_c2s_max_record <= 2048);
+#endif
     conn_down();
 }
 
@@ -918,6 +938,7 @@ int main(void)
     sc_goaway_refuse_and_rst();
     sc_sequence();
     sc_small_server_window();
+    sc_large_body();
     sc_misc();
     if (s_fails == 0) printf("\nALL OK\n");
     return s_fails ? 1 : 0;

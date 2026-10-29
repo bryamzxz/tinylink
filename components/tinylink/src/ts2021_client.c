@@ -203,27 +203,37 @@ static esp_err_t read_record_frame(esp_tls_t *tls, uint8_t *type_out,
     return ESP_OK;
 }
 
-/* Decrypt one record into a caller buffer. */
-static esp_err_t recv_record_plaintext(ts2021_conn_t *c,
-                                       uint8_t *out, size_t out_max,
-                                       size_t *out_len)
+/* Read the next transport record into the conn's record ring and
+ * decrypt it there (round 1.3.4, D4): the ciphertext goes straight into
+ * h2_rx and is opened in place, where it used to land in a 4 096-B `ct`
+ * stack array on every task that reads the control conn (the deepest
+ * frame of the long-poll). The plaintext is h2_rx[0..*len); a failed
+ * tag leaves ciphertext only, never plaintext. Every caller has drained
+ * the ring before it asks for the next record. */
+static esp_err_t recv_record(ts2021_conn_t *c, size_t *len)
 {
     uint8_t  type;
-    uint8_t  ct[TS2021_MAX_MESSAGE];
     size_t   ct_len = 0;
-    if (read_record_frame(c->tls, &type, ct, sizeof(ct), &ct_len) != ESP_OK) {
+    c->h2_rx_off = 0;
+    c->h2_rx_len = 0;
+    if (read_record_frame(c->tls, &type, c->h2_rx, sizeof(c->h2_rx), &ct_len) != ESP_OK) {
         return ESP_FAIL;
     }
     if (type == TS2021_MSG_ERROR) {
         ESP_LOGE(TAG, "control plane error: %.*s",
-                 (int)(ct_len > 200 ? 200 : ct_len), (const char *)ct);
+                 (int)(ct_len > 200 ? 200 : ct_len), (const char *)c->h2_rx);
         return ESP_FAIL;
     }
     if (type != TS2021_MSG_RECORD) {
         ESP_LOGE(TAG, "unexpected post-handshake frame type 0x%02x", type);
         return ESP_FAIL;
     }
-    return noise_ik_decrypt(&c->noise, out, out_max, ct, ct_len, out_len);
+    if (noise_ik_decrypt(&c->noise, c->h2_rx, sizeof(c->h2_rx), c->h2_rx, ct_len,
+                         len) != ESP_OK) {
+        return ESP_FAIL;
+    }
+    c->h2_rx_len = *len;
+    return ESP_OK;
 }
 
 /* After the Noise handshake the server may send an optional
@@ -274,12 +284,11 @@ static void keep_http2_start(ts2021_conn_t *c, size_t off, size_t len,
 
 static esp_err_t consume_early_payload(ts2021_conn_t *c)
 {
-    /* Record scratch: the conn's h2_rx ring. It is idle until
-     * h2_session_init runs at the very end of ts2021_connect, and it is
-     * one record long. Saves 4 077 B of stack on the connect path (this
-     * function is inlined into ts2021_connect, whose frame was 9 888 B). */
+    /* Record scratch: the conn's h2_rx ring, where recv_record reads
+     * and decrypts each record. It is idle until h2_session_init runs at
+     * the very end of ts2021_connect. Saves 4 077 B of stack on the
+     * connect path (this function is inlined into ts2021_connect). */
     uint8_t *rec = c->h2_rx;
-    const size_t rec_cap = sizeof(c->h2_rx);
     size_t  rec_len = 0, rec_off = 0;
 
     /* 1) Read up to the 9-byte early-payload header from the record stream.
@@ -292,8 +301,7 @@ static esp_err_t consume_early_payload(ts2021_conn_t *c)
 
     while (hdr_have < TS2021_EARLY_PAYLOAD_HDR_LEN) {
         if (rec_off == rec_len) {
-            if (recv_record_plaintext(c, rec, rec_cap, &rec_len) != ESP_OK)
-                return ESP_FAIL;
+            if (recv_record(c, &rec_len) != ESP_OK) return ESP_FAIL;
             rec_off = 0;
             if (rec_len == 0) continue;  /* empty record: pull the next one */
         }
@@ -325,8 +333,7 @@ static esp_err_t consume_early_payload(ts2021_conn_t *c)
     size_t to_skip = ep_len;
     while (to_skip > 0) {
         if (rec_off == rec_len) {
-            if (recv_record_plaintext(c, rec, rec_cap, &rec_len) != ESP_OK)
-                return ESP_FAIL;
+            if (recv_record(c, &rec_len) != ESP_OK) return ESP_FAIL;
             rec_off = 0;
             if (rec_len == 0) continue;
         }
@@ -502,39 +509,76 @@ esp_err_t ts2021_connect(ts2021_conn_t *out,
     return ESP_OK;
 }
 
+/* Seal rec[4..4 + len) in place (the tag lands right behind it) and
+ * write rec[1..4) header + ciphertext in ONE esp_tls write (round 1.3.2,
+ * B8): one TLS record per Noise record, since both senders below keep a
+ * record ≤ MBEDTLS_SSL_OUT_CONTENT_LEN (TS2021_TX_RECORD_MAX, round
+ * 1.3.4, D4). The separate 3-byte header write used to be a TLS record
+ * and a TCP segment of its own, held by Nagle until the previous one was
+ * ACKed. rec + 4 is word-aligned when rec is: the AEAD's aligned path. */
+#ifdef CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN
+_Static_assert(TS2021_TX_RECORD_MAX <= CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN,
+               "a sent Noise record must fit one TLS record");
+#endif
+
+static esp_err_t seal_and_write(ts2021_conn_t *c, uint8_t *rec, size_t len)
+{
+    size_t ct_len = 0;
+    if (noise_ik_encrypt(&c->noise, rec + 4, len + NOISE_TAGLEN, rec + 4, len,
+                         &ct_len) != ESP_OK) {
+        return ESP_FAIL;
+    }
+    rec[1] = TS2021_MSG_RECORD;
+    rec[2] = (uint8_t)((ct_len >> 8) & 0xFF);
+    rec[3] = (uint8_t)( ct_len       & 0xFF);
+    return tls_write_full(c->tls, rec + 1, TS2021_HEADER_LEN + ct_len);
+}
+
 esp_err_t ts2021_send(ts2021_conn_t *c,
                       const uint8_t *data, size_t data_len)
 {
     if (c == NULL || !c->connected) return ESP_ERR_INVALID_STATE;
-    if (data_len > TS2021_RECORD_PLAINTEXT_MAX) return ESP_ERR_INVALID_SIZE;
-
-    /* Header + ciphertext built back to back and written ONCE (round
-     * 1.3.2, B8): one esp_tls write = one TLS record per Noise record
-     * (two only for a > 2 KiB record — MBEDTLS_SSL_OUT_CONTENT_LEN),
-     * where the separate 3-byte header write used to be a TLS record and
-     * a TCP segment of its own, held by Nagle until the previous one was
-     * ACKed. Same stack array as before plus the 3 header bytes. */
-    uint8_t  rec[TS2021_HEADER_LEN + TS2021_RECORD_PLAINTEXT_MAX + NOISE_TAGLEN];
-    size_t   ct_len = 0;
-    if (noise_ik_encrypt(&c->noise, rec + TS2021_HEADER_LEN,
-                         sizeof(rec) - TS2021_HEADER_LEN,
-                         data, data_len, &ct_len) != ESP_OK) {
-        return ESP_FAIL;
-    }
-    if (ct_len > 0xFFFF) return ESP_ERR_INVALID_SIZE;
-
-    rec[0] = TS2021_MSG_RECORD;
-    rec[1] = (uint8_t)((ct_len >> 8) & 0xFF);
-    rec[2] = (uint8_t)( ct_len       & 0xFF);
-    return tls_write_full(c->tls, rec, TS2021_HEADER_LEN + ct_len);
+    if (data == NULL && data_len != 0) return ESP_ERR_INVALID_ARG;
+    /* The HTTP/2 control frames (≤ H2_CTL_CAP = 64 B) go through this
+     * small stack record, so they can go out while the ring still holds
+     * a record being parsed; a longer write is split. Until round 1.3.4
+     * (D4) every write was sealed into a 4 096-B stack array; requests
+     * now take ts2021_tx_buf / ts2021_tx_send. */
+    uint8_t rec[4 + TS2021_SMALL_PLAINTEXT_MAX + NOISE_TAGLEN] __attribute__((aligned(4)));
+    size_t off = 0;
+    do {
+        size_t n = data_len - off;
+        if (n > TS2021_SMALL_PLAINTEXT_MAX) n = TS2021_SMALL_PLAINTEXT_MAX;
+        if (n) memcpy(rec + 4, data + off, n);
+        const esp_err_t err = seal_and_write(c, rec, n);
+        if (err != ESP_OK) return err;
+        off += n;
+    } while (off < data_len);
+    return ESP_OK;
 }
 
-esp_err_t ts2021_recv(ts2021_conn_t *c,
-                      uint8_t *out, size_t out_max, size_t *out_len)
+uint8_t *ts2021_tx_buf(ts2021_conn_t *c, size_t *cap)
+{
+    _Static_assert(sizeof(c->h2_rx) >= 1 + TS2021_TX_RECORD_MAX,
+                   "h2_rx must hold a TX record at offset 1");
+    c->h2_rx_off = 0;
+    c->h2_rx_len = 0;
+    *cap = TS2021_TX_PLAINTEXT_MAX;
+    return c->h2_rx + 4;
+}
+
+esp_err_t ts2021_tx_send(ts2021_conn_t *c, size_t len)
 {
     if (c == NULL || !c->connected) return ESP_ERR_INVALID_STATE;
-    if (out == NULL || out_len == NULL) return ESP_ERR_INVALID_ARG;
-    return recv_record_plaintext(c, out, out_max, out_len);
+    if (len > TS2021_TX_PLAINTEXT_MAX) return ESP_ERR_INVALID_SIZE;
+    return seal_and_write(c, c->h2_rx, len);
+}
+
+esp_err_t ts2021_recv_record(ts2021_conn_t *c, size_t *len)
+{
+    if (c == NULL || !c->connected) return ESP_ERR_INVALID_STATE;
+    if (len == NULL) return ESP_ERR_INVALID_ARG;
+    return recv_record(c, len);
 }
 
 void ts2021_close(ts2021_conn_t *c)

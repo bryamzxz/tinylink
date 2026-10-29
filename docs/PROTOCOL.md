@@ -91,9 +91,12 @@ that byte appears in the cleartext init header, not in the Noise prologue.
 
 After the upgrade and the optional EarlyPayload, the inner protocol is
 **HTTP/2** (per `tailscale/control/ts2021/`). tinylink runs its own
-client over `ts2021_send` / `ts2021_recv`: `components/tinylink/src/h2_core.c`
+client over the ts2021 records: `components/tinylink/src/h2_core.c`
 (frames, flow control, the stream) + `hpack.c`, bound to the conn by
-`h2_client.c` (round 1.3.4; nghttp2 until then). SETTINGS sent by
+`h2_client.c` (round 1.3.4; nghttp2 until then). Each received record is
+decrypted in place in the conn's 4 KiB record buffer and parsed there;
+requests are sealed in the same buffer and sent as records of ≤ 2 048 B
+(header + ciphertext), one TLS record each (D4). SETTINGS sent by
 the client disable HPACK dynamic-table indexing
 (`SETTINGS_HEADER_TABLE_SIZE = 0`) and server push
 (`SETTINGS_ENABLE_PUSH = 0`) for one-shot request semantics. Since 1.3.2

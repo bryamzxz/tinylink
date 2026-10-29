@@ -51,7 +51,7 @@ static esp_timer_handle_t s_reconnect_timer;
  * PS_AWAKE_CAP_MS after Wi-Fi start whatever happened (register waiting
  * for approval, control down) — the modem never stays awake unbounded.
  * A timer rather than a wait in bringup(): app_main must return to free
- * its 24 KiB stack before the DERP TLS handshake. */
+ * its stack to the heap before the DERP TLS handshake. */
 #define PS_POLL_MS       500u
 #define PS_AWAKE_CAP_MS  60000u
 static esp_timer_handle_t s_ps_timer;

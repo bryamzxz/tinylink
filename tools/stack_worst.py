@@ -1158,6 +1158,11 @@ def main():
     ap.add_argument('--no-cut', action='store_true',
                     help='keep the runtime-infeasible edges listed in CUT')
     args = ap.parse_args()
+    # linked_members tells compiled-here archives (graph from .ci) from
+    # precompiled ones by path prefix: a relative --build made every
+    # project archive "precompiled", duplicating each function and losing
+    # the task entries (round 1.3.4, D4).
+    args.build = os.path.abspath(args.build)
     args.elf = args.elf or os.path.join(args.build, 'tinylink.elf')
     args.map = args.map or os.path.join(args.build, 'tinylink.map')
     args.objdump = os.path.join(args.toolchain, 'xtensa-esp32-elf-objdump')
@@ -1737,7 +1742,7 @@ def project_config():
         'RULES': rules,
         'CUT': cut,
         'TASKS': [
-            {'name': LP, 'alloc': 24576, 'entry': ['long_poll_task'],
+            {'name': LP, 'alloc': 7168, 'entry': ['long_poll_task'],
              'variants': [
                  # the map stream: ensure_control_conn (TLS + Noise connect),
                  # mapreq_run_stream (h2 stream, netmap handler, data plane
@@ -1757,6 +1762,9 @@ def project_config():
              'cut': UDP_ONLY},
             {'name': TIT, 'alloc': 4608, 'entry': ['tcpip_thread']},
             {'name': TMR, 'alloc': 6144, 'entry': ['timer_task']},
+            # bringup (app_main): register, dataplane start, spawns; exits.
+            # CONFIG_ESP_MAIN_TASK_STACK_SIZE (round 1.3.4, D4)
+            {'name': 'main', 'alloc': 8192, 'entry': ['main_task']},
         ],
     }
 

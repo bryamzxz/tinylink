@@ -8,9 +8,10 @@
 // Wire format constants come from upstream
 // `tailscale/control/controlbase/messages.go` and
 // `tailscale/control/controlhttp/{client,controlhttpcommon}.go`.
-// h2_client.c sits on top of ts2021_send / ts2021_recv to carry HTTP/2
-// frames; do not call ts2021_send with raw HTTP/1.1 bytes — the control
-// plane serves HTTP/2 (prior knowledge) after the Upgrade.
+// h2_client.c sits on top of ts2021_send / ts2021_tx_send /
+// ts2021_recv_record to carry HTTP/2 frames; do not send raw HTTP/1.1
+// bytes — the control plane serves HTTP/2 (prior knowledge) after the
+// Upgrade.
 
 #pragma once
 
@@ -51,6 +52,12 @@
  * space and distinct from TLS_IO_ERR_IDLE_TIMEOUT (-0x10000). */
 #define TS2021_ERR_READ_ABORTED (-0x10001)
 #define TS2021_RECORD_PLAINTEXT_MAX (TS2021_MAX_MESSAGE - TS2021_HEADER_LEN - NOISE_TAGLEN)
+/* The records we send (round 1.3.4, D4): header + ciphertext ≤ 2 048 B,
+ * CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN, so each one is one TLS record. */
+#define TS2021_TX_RECORD_MAX        2048
+#define TS2021_TX_PLAINTEXT_MAX     (TS2021_TX_RECORD_MAX - TS2021_HEADER_LEN - NOISE_TAGLEN)
+/* ts2021_send's stack record: the HTTP/2 control frames (H2_CTL_CAP). */
+#define TS2021_SMALL_PLAINTEXT_MAX  64
 
 /* EarlyPayload sentinel sent (optionally) by the server before HTTP/2
  * begins: 5-byte magic || BE32 length || JSON-encoded tailcfg.EarlyNoise.
@@ -93,14 +100,16 @@ typedef struct {
     h2_core_t        h2;
     bool             h2_goaway;          /* server sent GOAWAY → reconnect */
 
-    /* The record ring: each Noise record is decrypted into it and the
-     * engine parses it where it lies; a request is built in it between
-     * records (h2_io_tx_buf). Lives in BSS via the file-scope
-     * ts2021_conn_t in tinylink.c — one Noise record plus the up-to-4
-     * EarlyPayload magic bytes that consume_early_payload may have to
-     * put back in front of a record (round 1.3.4, D5):
-     * TS2021_MAX_MESSAGE ≥ 4 080 + 4. */
-    uint8_t  h2_rx[TS2021_MAX_MESSAGE];
+    /* The record ring: each Noise record's ciphertext is read into it
+     * and decrypted in place, and the engine parses it where it lies;
+     * between records a request is built and sealed in it, ≤ 2 KiB per
+     * record (round 1.3.4, D4: no record buffer on any stack). Lives in
+     * BSS via the file-scope ts2021_conn_t in tinylink.c. One ciphertext
+     * long, which also covers a plaintext plus the up-to-4 EarlyPayload
+     * magic bytes that consume_early_payload may have to put back in
+     * front of it (D5): TS2021_MAX_MESSAGE ≥ 4 080 + 4. Word-aligned so
+     * the AEAD runs its aligned loops. */
+    uint8_t  h2_rx[TS2021_MAX_MESSAGE] __attribute__((aligned(4)));
     size_t   h2_rx_len;
     size_t   h2_rx_off;
 
@@ -143,16 +152,26 @@ esp_err_t ts2021_connect(ts2021_conn_t *out,
                          const uint8_t machine_pub[NOISE_DHLEN],
                          const uint8_t control_pub[NOISE_DHLEN]);
 
-/* Encrypt and write `data` as one Noise transport record (msg type 4). */
+/* Encrypt and write `data` as Noise transport records (msg type 4) of
+ * ≤ TS2021_SMALL_PLAINTEXT_MAX bytes, sealed in a small stack record:
+ * for the HTTP/2 control frames, which may go out while h2_rx still
+ * holds a record being parsed. */
 esp_err_t ts2021_send(ts2021_conn_t *c,
                       const uint8_t *data, size_t data_len);
 
-/* Read + decrypt the next record into out (out_max ≥ the record's
- * plaintext). Returns ESP_OK with *out_len set. Bytes left over from
- * the connect (the start of the HTTP/2 stream) are in c->h2_rx, not
- * returned here — the caller drains that window first. */
-esp_err_t ts2021_recv(ts2021_conn_t *c,
-                      uint8_t *out, size_t out_max, size_t *out_len);
+/* Bulk send through the ring (round 1.3.4, D4): ts2021_tx_buf lends
+ * h2_rx (cap TS2021_TX_PLAINTEXT_MAX; only while nothing in it is left
+ * to parse — it drops the window), ts2021_tx_send seals its first `len`
+ * bytes in place and writes them as one record. */
+uint8_t  *ts2021_tx_buf(ts2021_conn_t *c, size_t *cap);
+esp_err_t ts2021_tx_send(ts2021_conn_t *c, size_t len);
+
+/* Read the next record into h2_rx and decrypt it in place: on ESP_OK
+ * the plaintext is h2_rx[0..*len), and so is the window (h2_rx_off 0,
+ * h2_rx_len *len). Bytes left over from the connect (the start of the
+ * HTTP/2 stream) are the window ts2021_connect returns with — the
+ * caller drains it before reading a record. */
+esp_err_t ts2021_recv_record(ts2021_conn_t *c, size_t *len);
 
 void ts2021_close(ts2021_conn_t *c);
 

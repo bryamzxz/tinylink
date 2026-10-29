@@ -51,8 +51,10 @@ Needs `pyserial` (ships with the ESP-IDF python environment).
 ## `stack_worst.py`
 
 Static worst-case stack depth per long-lived task (`tinylink_lp`, `derp`,
-`wg_rx`, `wg_tx`, `tlm`, `tiT`, `esp_timer`) — the evidence for stack
-trims, to be compared with the 60-s `stack diag` HWM dumps. It needs a
+`wg_rx`, `wg_tx`, `tlm`, `tiT`, `esp_timer`) and the bringup task `main`
+— the evidence for stack trims, to be compared with the 60-s `stack diag`
+HWM dumps (and, for `main`, the `main stack: hwm=` line app_main logs
+when bringup ends). It needs a
 scratch build with stack-usage and call-graph output (the flags do not
 change code generation, but keep the dir apart from `build/`):
 

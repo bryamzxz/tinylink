@@ -616,15 +616,21 @@ CONFIG_ESP_TLS_INSECURE=n
 # decrypted Noise record where it lies, no inbound buffer at all.)
 
 # ---- App task stacks ---------------------------------------------------------
-# Bigger main stack: TLS + Noise IK + JSON construction is much heavier than
-# the M1-WG bringup that this replaces. Verified on-device 2026-05-02:
-# the boot-time mbedtls cert-chain verification + ECDSA + Noise IK init
-# in tinylink_register peaks at ~14 KiB; bumped from 16 K to 24 K to give
-# margin. The long-poll task in tinylink.c::tinylink_long_poll_start
-# also xTaskCreate's at 24 KiB to absorb the same workload — bug from
-# 8 K manifested as random LoadProhibited / Double exception / fake
-# heap-corruption asserts.
-CONFIG_ESP_MAIN_TASK_STACK_SIZE=24576
+# Main (bringup) task: 8 KiB since round 1.3.4 (D4), 24 KiB before. In
+# 2026-05 the boot-time cert-chain verify + ECDSA + Noise IK init in
+# tinylink_register peaked at ~14 KiB on-device (an 8 K long-poll stack
+# back then showed as random LoadProhibited / Double exception / fake
+# heap-corruption asserts), with 4 KiB stack buffers on the connect and
+# record paths that 92c09dd, D5 and D4 have since removed (D4: the record
+# decrypt's 4 096-B `ct` and the 4 096-B send record). tools/stack_worst.py
+# now gives main a static worst case of 5 312 B (register → h2 → the
+# netmap handler's dataplane start → lwIP → Wi-Fi TX → a driver log; the
+# TLS handshake 4 912 B), 8 KiB = 2.9 KB over it — more than the long-poll
+# task's 2.3 KB because no soak measures main (it exits after bringup and
+# the 60-s stack diag never sees it): app_main logs its high-water mark
+# instead. The long-poll task's size is in tinylink_long_poll_start. An
+# existing build dir keeps its old sdkconfig value; regenerate it.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
 
 # esp_timer dispatch task stack. mbedtls / lwIP timer callbacks (e.g.
 # session ticket lifetime, sntp, peer-cert cleanup) routed through here

@@ -10,9 +10,15 @@
 //    stream turns out not to carry an EarlyPayload after some of the
 //    magic's bytes arrived in earlier records, those bytes are put back
 //    in front of the window (they equal the magic);
+//  - round 1.3.4, D4: records are decrypted in place in the ring
+//    (ts2021_recv_record; a 4 096-B ciphertext is the limit, a bad tag
+//    exposes nothing) and sealed in place there (ts2021_tx_buf /
+//    ts2021_tx_send: one ≤ 2 048-B record per esp_tls write), while
+//    ts2021_send's small stack records leave the ring alone;
 //  - a fixed-seed fuzz: random record segmentation of
 //    [EarlyPayload] || HTTP/2 bytes, empty records included — the window
-//    followed by ts2021_recv must reproduce the HTTP/2 bytes exactly.
+//    followed by ts2021_recv_record must reproduce the HTTP/2 bytes
+//    exactly.
 //
 // ts2021_client.c is #included so its static functions are reachable;
 // esp_tls is faked below, records are sealed with a second Noise state
@@ -31,6 +37,7 @@ struct esp_tls {
     size_t  chunk;            /* max bytes per esp_tls_conn_read, 0 = any */
     uint8_t tx[16 * 1024];
     size_t  tx_len;
+    int     writes;           /* esp_tls_conn_write calls */
 };
 
 static struct esp_tls s_tls;
@@ -57,6 +64,7 @@ ssize_t esp_tls_conn_write(esp_tls_t *tls, const void *data, size_t datalen)
     if (tls->tx_len + datalen > sizeof(tls->tx)) return -1;
     memcpy(tls->tx + tls->tx_len, data, datalen);
     tls->tx_len += datalen;
+    tls->writes++;
     return (ssize_t)datalen;
 }
 int esp_tls_conn_destroy(esp_tls_t *tls) { (void)tls; return 0; }
@@ -135,7 +143,7 @@ static void add_pt(const void *pt, size_t n)
 }
 
 /* Everything the HTTP/2 layer would see after consume_early_payload:
- * the h2_rx window, then whole records from ts2021_recv until the server
+ * the h2_rx window, then whole records from ts2021_recv_record until the server
  * stream ends. Returns the byte count (or -1 on a read error before the
  * end of the scripted stream). */
 static long drain_http2(uint8_t *out, size_t cap)
@@ -149,8 +157,8 @@ static long drain_http2(uint8_t *out, size_t cap)
     n = w;
     while (s_tls.rx_off < s_tls.rx_len) {
         size_t got = 0;
-        if (ts2021_recv(&s_conn, s_conn.h2_rx, sizeof(s_conn.h2_rx), &got) != ESP_OK)
-            return -1;
+        if (ts2021_recv_record(&s_conn, &got) != ESP_OK) return -1;
+        if (s_conn.h2_rx_off != 0 || s_conn.h2_rx_len != got) return -1;
         if (n + got > cap) return -1;
         memcpy(out + n, s_conn.h2_rx, got);
         n += got;
@@ -274,6 +282,153 @@ static void test_rejects(void)
     check("d5_bad_tag_rejected", consume_early_payload(&s_conn) == ESP_FAIL);
 }
 
+/* ---- D4: in-place record I/O ---------------------------------------- */
+
+/* Open what the client wrote (s_tls.tx) with the peer state: records
+ * count, the largest record on the wire, the plaintext. Returns -1 on a
+ * malformed or unauthentic record. */
+static long open_tx(uint8_t *out, size_t cap, int *nrec, size_t *maxrec)
+{
+    size_t off = 0, n = 0;
+    *nrec = 0;
+    *maxrec = 0;
+    while (off < s_tls.tx_len) {
+        if (s_tls.tx_len - off < 3) return -1;
+        const uint8_t *r = s_tls.tx + off;
+        const size_t rl = ((size_t)r[1] << 8) | r[2];
+        if (r[0] != TS2021_MSG_RECORD || s_tls.tx_len - off < 3 + rl) return -1;
+        size_t pl = 0;
+        if (noise_ik_decrypt(&s_peer, out + n, cap - n, r + 3, rl, &pl) != ESP_OK) return -1;
+        n += pl;
+        off += 3 + rl;
+        (*nrec)++;
+        if (3 + rl > *maxrec) *maxrec = 3 + rl;
+    }
+    return (long)n;
+}
+
+static int contains(const uint8_t *h, size_t hn, const char *n, size_t nn)
+{
+    for (size_t i = 0; i + nn <= hn; i++)
+        if (memcmp(h + i, n, nn) == 0) return 1;
+    return 0;
+}
+
+static void test_d4_recv_in_place(void)
+{
+    /* Largest record the reader takes: a 4 096-B ciphertext (4 080 B of
+     * plaintext) fills the ring exactly. */
+    reset();
+    static uint8_t big[4080];
+    for (size_t i = 0; i < sizeof(big); i++) big[i] = (uint8_t)(i * 13 + 5);
+    add_pt(big, sizeof(big));
+    add_pt("x", 1);
+    size_t got = 0;
+    esp_err_t rc = ts2021_recv_record(&s_conn, &got);
+    check("d4_recv_max_record",
+          rc == ESP_OK && got == sizeof(big) && memcmp(s_conn.h2_rx, big, got) == 0 &&
+          s_conn.h2_rx_off == 0 && s_conn.h2_rx_len == got);
+    rc = ts2021_recv_record(&s_conn, &got);
+    check("d4_recv_next_nonce", rc == ESP_OK && got == 1 && s_conn.h2_rx[0] == 'x');
+
+    /* One byte more does not fit the ring: refused before reading it. */
+    /* (the window was drained: off == len, as the h2 loop leaves it) */
+    reset();
+    static uint8_t over[4081];
+    add_pt(over, sizeof(over));
+    s_conn.h2_rx_off = s_conn.h2_rx_len = 7;
+    check("d4_recv_oversize_rejected", ts2021_recv_record(&s_conn, &got) != ESP_OK &&
+          s_conn.h2_rx_off == 0 && s_conn.h2_rx_len == 0);
+
+    /* A forged record leaves an empty window, and no plaintext of it. */
+    reset();
+    static const char secret[] = "plaintext that must not appear";
+    add_pt(secret, sizeof(secret) - 1);
+    s_tls.rx[3] ^= 0x80;                    /* first ciphertext byte */
+    s_conn.h2_rx_off = s_conn.h2_rx_len = 7;
+    rc = ts2021_recv_record(&s_conn, &got);
+    check("d4_recv_bad_tag",
+          rc != ESP_OK && s_conn.h2_rx_off == 0 && s_conn.h2_rx_len == 0 &&
+          !contains(s_conn.h2_rx, sizeof(s_conn.h2_rx), "must not", 8));
+
+    reset();
+    add_record(TS2021_MSG_RESPONSE, (const uint8_t *)"zz", 2);
+    check("d4_recv_wrong_type_rejected", ts2021_recv_record(&s_conn, &got) != ESP_OK);
+
+    reset();
+    s_conn.connected = false;
+    add_pt("x", 1);
+    check("d4_recv_needs_connected", ts2021_recv_record(&s_conn, &got) == ESP_ERR_INVALID_STATE);
+}
+
+static void test_d4_send(void)
+{
+    static uint8_t pt[8192];
+    int nrec;
+    size_t maxrec;
+
+    /* The ring as a TX buffer: 2 029 B of plaintext seal into one
+     * 2 048-B record — one esp_tls write, so one TLS record at
+     * MBEDTLS_SSL_OUT_CONTENT_LEN 2 048. */
+    reset();
+    s_conn.h2_rx_off = 3;
+    s_conn.h2_rx_len = 9;
+    size_t cap = 0;
+    uint8_t *b = ts2021_tx_buf(&s_conn, &cap);
+    check("d4_tx_buf_shape",
+          cap == 2029 && b == s_conn.h2_rx + 4 && ((uintptr_t)b & 3u) == 0 &&
+          s_conn.h2_rx_off == 0 && s_conn.h2_rx_len == 0);
+    for (size_t i = 0; i < cap; i++) b[i] = (uint8_t)(i * 3 + 1);
+    esp_err_t rc = ts2021_tx_send(&s_conn, cap);
+    long n = open_tx(pt, sizeof(pt), &nrec, &maxrec);
+    int ok = rc == ESP_OK && s_tls.writes == 1 && nrec == 1 && maxrec == 2048 && n == 2029;
+    for (size_t i = 0; ok && i < 2029; i++) ok = pt[i] == (uint8_t)(i * 3 + 1);
+    check("d4_tx_full_record_one_write", ok);
+
+    reset();
+    (void)ts2021_tx_buf(&s_conn, &cap);
+    check("d4_tx_oversize_rejected",
+          ts2021_tx_send(&s_conn, cap + 1) == ESP_ERR_INVALID_SIZE && s_tls.tx_len == 0);
+
+    reset();
+    (void)ts2021_tx_buf(&s_conn, &cap);
+    rc = ts2021_tx_send(&s_conn, 0);
+    n = open_tx(pt, sizeof(pt), &nrec, &maxrec);
+    check("d4_tx_empty_record", rc == ESP_OK && nrec == 1 && maxrec == 3 + 16 && n == 0);
+
+    /* ts2021_send: ≤ 64-B records from its own stack record, so a
+     * control frame can go out while the ring holds a record being
+     * parsed — the ring and the window stay as they were. */
+    reset();
+    add_pt(kH2, sizeof(kH2));
+    size_t got = 0;
+    (void)ts2021_recv_record(&s_conn, &got);
+    s_conn.h2_rx_off = 5;
+    static uint8_t data[200];
+    for (size_t i = 0; i < sizeof(data); i++) data[i] = (uint8_t)(0xa0 ^ i);
+    rc = ts2021_send(&s_conn, data, 17);
+    n = open_tx(pt, sizeof(pt), &nrec, &maxrec);
+    check("d4_send_small_one_record",
+          rc == ESP_OK && s_tls.writes == 1 && nrec == 1 && n == 17 &&
+          memcmp(pt, data, 17) == 0);
+    check("d4_send_leaves_ring",
+          got == sizeof(kH2) && s_conn.h2_rx_off == 5 && s_conn.h2_rx_len == sizeof(kH2) &&
+          memcmp(s_conn.h2_rx, kH2, sizeof(kH2)) == 0);
+
+    reset();
+    rc = ts2021_send(&s_conn, data, sizeof(data));
+    n = open_tx(pt, sizeof(pt), &nrec, &maxrec);
+    check("d4_send_long_split_64",
+          rc == ESP_OK && nrec == 4 && maxrec == 3 + 64 + 16 && n == (long)sizeof(data) &&
+          memcmp(pt, data, sizeof(data)) == 0);
+
+    reset();
+    s_conn.connected = false;
+    check("d4_send_needs_connected",
+          ts2021_send(&s_conn, data, 1) == ESP_ERR_INVALID_STATE &&
+          ts2021_tx_send(&s_conn, 1) == ESP_ERR_INVALID_STATE && s_tls.tx_len == 0);
+}
+
 /* ---- segmentation fuzz --------------------------------------------- */
 
 static uint32_t s_rng = 0x2a2a2a2au;
@@ -338,6 +493,8 @@ int main(void)
     test_magic_prefix_put_back();
     test_prefix_before_full_record();
     test_rejects();
+    test_d4_recv_in_place();
+    test_d4_send();
     test_segmentation_fuzz();
     if (s_fails == 0) printf("\nALL OK\n");
     return s_fails ? 1 : 0;

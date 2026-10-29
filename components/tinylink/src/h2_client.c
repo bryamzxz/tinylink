@@ -6,9 +6,10 @@
 // of nghttp2: no heap at all (nghttp2 took a 10–14 KiB session plus a
 // 16 KiB send chunk per connect), 0 B of Huffman tables to speak of
 // (nghttp2: 16 KB), and every received record is parsed where it lies in
-// conn->h2_rx. The engine state lives in ts2021_conn_t (BSS). This file
-// binds the engine's hooks to the conn, and keeps the request loop and
-// the error mapping callers rely on (see h2_drive_request).
+// conn->h2_rx, the buffer it is decrypted in (D4). The engine state lives
+// in ts2021_conn_t (BSS). This file binds the engine's hooks to the conn,
+// and keeps the request loop and the error mapping callers rely on (see
+// h2_drive_request).
 
 #include "h2_client.h"
 
@@ -50,28 +51,27 @@ static void h2_request_reset(ts2021_conn_t *conn)
 /* ---- h2_core hooks ---------------------------------------------------- */
 
 /* Control frames (preface, SETTINGS / ACK, PING ACK, WINDOW_UPDATE,
- * RST_STREAM, GOAWAY): one Noise record. */
+ * RST_STREAM, GOAWAY): one Noise record, sealed off the ring (they can
+ * be sent mid-record). */
 int h2_io_send(void *io, const uint8_t *buf, size_t len)
 {
+    _Static_assert(H2_CTL_CAP <= TS2021_SMALL_PLAINTEXT_MAX,
+                   "a control-frame flush must stay one record");
     return ts2021_send((ts2021_conn_t *)io, buf, len) == ESP_OK ? 0 : -1;
 }
 
 /* A request (pending control frames, HEADERS, DATA) is built in the
- * record ring: the engine only asks between records, when every byte in
- * it has been parsed, and it is one record long. */
+ * record ring and sealed where it lies, ≤ 2 KiB per record (round 1.3.4,
+ * D4): the engine only asks between records, when every byte in the
+ * ring has been parsed. */
 uint8_t *h2_io_tx_buf(void *io, size_t *cap)
 {
-    ts2021_conn_t *c = (ts2021_conn_t *)io;
-    c->h2_rx_off = 0;
-    c->h2_rx_len = 0;
-    *cap = TS2021_RECORD_PLAINTEXT_MAX;
-    return c->h2_rx;
+    return ts2021_tx_buf((ts2021_conn_t *)io, cap);
 }
 
 int h2_io_tx_send(void *io, size_t len)
 {
-    ts2021_conn_t *c = (ts2021_conn_t *)io;
-    return ts2021_send(c, c->h2_rx, len) == ESP_OK ? 0 : -1;
+    return ts2021_tx_send((ts2021_conn_t *)io, len) == ESP_OK ? 0 : -1;
 }
 
 void h2_io_on_status(void *io, int status)
@@ -258,12 +258,10 @@ static esp_err_t h2_drive_request(ts2021_conn_t *conn,
      * push more of the request body if the server opened its window. */
     while (!h->s.closed && !h->s.stop) {
         size_t got = 0;
-        if (ts2021_recv(conn, conn->h2_rx, sizeof(conn->h2_rx), &got) != ESP_OK) {
+        if (ts2021_recv_record(conn, &got) != ESP_OK) {
             ESP_LOGE(TAG, "stream read failed (stream %d)", (int)conn->h2_stream_id);
             return ESP_FAIL;
         }
-        conn->h2_rx_len = got;
-        conn->h2_rx_off = 0;
         rc = h2c_feed(h, conn->h2_rx, got);
         conn->h2_rx_off = got;
         if (rc == H2C_OK) rc = h2c_pump(h);
