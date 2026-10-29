@@ -517,10 +517,14 @@ static bool handle_handshake_response_locked(const uint8_t *buf, size_t len)
     wg_transport_session_init(&g.transport, g.local_index, remote_index,
                               send_key, recv_key);
     xSemaphoreGive(g.lock);
-    /* Scrub once the keys are copied into the session. */
+    /* Scrub once the keys are copied into the session. The live Noise
+     * material goes; the per-peer cache (static-static DH, mac1 keys)
+     * stays for the next rekey (B11) — wg_handshake_init recomputes it
+     * when the peer static key changes (wg_netif_update_peer_keys), and
+     * wg_netif_stop wipes all of it. */
     tl_secure_zero(send_key, sizeof(send_key));
     tl_secure_zero(recv_key, sizeof(recv_key));
-    wg_handshake_scrub(&g.handshake);
+    wg_handshake_scrub_live(&g.handshake);
 
     g.last_handshake_completed_us = now_us();
     /* Reset RX-stale watchdog clock on handshake (cold or rekey).

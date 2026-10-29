@@ -20,12 +20,47 @@ static void zero_nonce(uint8_t out[CHACHA20POLY1305_NONCE_LEN])
     memset(out, 0, CHACHA20POLY1305_NONCE_LEN);
 }
 
+/* Byte difference accumulator: 0 iff a == b. No early exit — one of the
+ * operands is our static private key. */
+static uint8_t diff_bytes(const uint8_t *a, const uint8_t *b, size_t n)
+{
+    uint8_t d = 0;
+    for (size_t i = 0; i < n; i++) d |= (uint8_t)(a[i] ^ b[i]);
+    return d;
+}
+
+/* True when *st already holds this exact identity and its derivations. */
+static int identity_cached(const struct wg_handshake_state *st,
+                           const uint8_t local_static_priv[WG_KEY_LEN],
+                           const uint8_t local_static_pub[WG_KEY_LEN],
+                           const uint8_t peer_static_pub[WG_KEY_LEN],
+                           const uint8_t preshared_key[WG_KEY_LEN])
+{
+    static const uint8_t no_psk[WG_KEY_LEN] = {0};
+    if (!st->identity_valid) return 0;
+    uint8_t d = diff_bytes(st->local_static_priv, local_static_priv, WG_KEY_LEN);
+    d |= diff_bytes(st->local_static_pub, local_static_pub, WG_KEY_LEN);
+    d |= diff_bytes(st->peer_static_pub,  peer_static_pub,  WG_KEY_LEN);
+    d |= diff_bytes(st->preshared_key, preshared_key ? preshared_key : no_psk,
+                    WG_KEY_LEN);
+    return d == 0;
+}
+
 int wg_handshake_init(struct wg_handshake_state *st,
                       const uint8_t local_static_priv[WG_KEY_LEN],
                       const uint8_t local_static_pub[WG_KEY_LEN],
                       const uint8_t peer_static_pub[WG_KEY_LEN],
                       const uint8_t preshared_key[WG_KEY_LEN])
 {
+    /* Same identity as the cached one (every retry and rekey towards the
+     * same peer): reuse mac1 keys + static-static DH, ~20 ms of X25519
+     * saved per INIT. Anything else recomputes from scratch below. */
+    if (identity_cached(st, local_static_priv, local_static_pub,
+                        peer_static_pub, preshared_key)) {
+        wg_handshake_scrub_live(st);
+        return 0;
+    }
+
     memset(st, 0, sizeof(*st));
 
     memcpy(st->local_static_priv, local_static_priv, WG_KEY_LEN);
@@ -37,6 +72,9 @@ int wg_handshake_init(struct wg_handshake_state *st,
 
     /* mac1 key: BLAKE2s(LABEL_MAC1 || peer_static_pub). */
     wg_mac1_key(st->mac1_key, peer_static_pub);
+    /* The responder keys the response's mac1 with OUR static public
+     * (wireguard-go cookieChecker.Init(pk)) — constant for the identity. */
+    wg_mac1_key(st->mac1_key_self, local_static_pub);
 
     /* Long-term static-static DH, computed once and reused per
      * handshake attempt (per WG whitepaper §5.4.3). */
@@ -46,6 +84,7 @@ int wg_handshake_init(struct wg_handshake_state *st,
         memset(st, 0, sizeof(*st));
         return -1;
     }
+    st->identity_valid = 1;
     return 0;
 }
 
@@ -118,6 +157,7 @@ int wg_handshake_create_initiation(struct wg_handshake_state *st,
     msg->reserved[2]   = 0;
     msg->sender_index  = local_index;  /* native LE on ESP32 + x86 hosts */
     st->local_index    = local_index;
+    st->armed          = 1;
 
     /* mac1 covers everything before the mac1 field, i.e. everything
      * except mac1 (16 B) + mac2 (16 B). */
@@ -163,20 +203,21 @@ int wg_handshake_process_response(struct wg_handshake_state *st,
     /* Validate message header before doing any crypto. Reserved bytes
      * must be zero per WireGuard whitepaper §5.4.2; wg_transport_decrypt
      * already enforces this on data frames, so mirror the check here. */
+    /* No INIT in flight (never built, or already answered and scrubbed):
+     * the zeroed chain would let anyone forge an "accepted" response. */
+    if (!st->armed) goto out_scrub;
     if (msg->message_type != WG_MSG_RESPONSE) goto out_scrub;
     if (msg->reserved[0] | msg->reserved[1] | msg->reserved[2]) goto out_scrub;
     if (msg->receiver_index != st->local_index) goto out_scrub;
 
     /* mac1 = MAC(HASH(LABEL_MAC1 || S_pub_initiator), msg[..mac1]) — the
      * responder keys it with OUR static public key. wireguard-go checks it
-     * on every handshake message before any DH; so do we now: one BLAKE2s
-     * pair instead of two X25519 for junk aimed at our receiver index. */
+     * on every handshake message before any DH; so do we now: one keyed
+     * BLAKE2s (key cached by wg_handshake_init) instead of two X25519 for
+     * junk aimed at our receiver index. */
     {
-        uint8_t mac1_key[WG_HASH_LEN];
-        wg_mac1_key(mac1_key, st->local_static_pub);
-        wg_keyed_mac16(mac, mac1_key, (const uint8_t *)msg,
+        wg_keyed_mac16(mac, st->mac1_key_self, (const uint8_t *)msg,
                        offsetof(struct wg_msg_response, mac1));
-        tl_secure_zero(mac1_key, sizeof(mac1_key));
         uint8_t diff = 0;
         for (size_t i = 0; i < WG_MAC_LEN; i++) diff |= (uint8_t)(mac[i] ^ msg->mac1[i]);
         if (diff != 0) goto out_scrub;
@@ -259,6 +300,16 @@ out_scrub:
         tl_secure_zero(recv_key, WG_KEY_LEN);
     }
     return rc;
+}
+
+void wg_handshake_scrub_live(struct wg_handshake_state *st)
+{
+    tl_secure_zero(st->chain_key,      sizeof(st->chain_key));
+    tl_secure_zero(st->hash,           sizeof(st->hash));
+    tl_secure_zero(st->ephemeral_priv, sizeof(st->ephemeral_priv));
+    tl_secure_zero(st->ephemeral_pub,  sizeof(st->ephemeral_pub));
+    st->local_index = 0;
+    st->armed       = 0;
 }
 
 void wg_handshake_scrub(struct wg_handshake_state *st)
