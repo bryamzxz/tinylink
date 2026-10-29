@@ -1377,7 +1377,11 @@ def project_config():
           'derp_client.c:415'),
         R('data_chunk_cb', r'h2_cb', ['mapreq.c:stream_chunk_cb'],
           'h2_post_stream(.., stream_chunk_cb): mapreq_run_stream only'),
-        R('stream_chunk_cb', r'on_netmap', ['long_poll_handler'],
+        # round 1.3.4 (D2): the streaming parser's framing calls the frame
+        # handler back, which calls the netmap handler
+        R('mapresp_stream_feed', r'on_frame', ['mapreq.c:stream_frame'],
+          'mapresp_stream_init(.., stream_frame, ..): run_stream_in only'),
+        R('stream_frame', r'on_netmap', ['long_poll_handler'],
           'mapreq_run_stream(.., long_poll_handler)'),
         # tls_io_write_full is an IPA-ICF thunk of tls_io_read_full, so the
         # `rd` site serves both directions; the adapter depends on the task.

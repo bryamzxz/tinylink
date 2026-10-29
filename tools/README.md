@@ -75,6 +75,30 @@ are cut with a stated reason — `--no-cut` shows the bound without them.
 `--why <fn>` explains how a function is reached, `--residual zero` drops
 the conservative bound for unresolved Wi-Fi blob callbacks.
 
+## `iram_access_check.py`
+
+Proves on the object code that every access through a pointer into an
+IRAM section is 32-bit (round 1.3.4, D6: mapreq.c's jsmn token table is
+in `.iram.bss`, where a byte or half-word load / store is a
+LoadStoreError). A data-flow pass over `objdump -d -r`: the section's
+address enters through code literals and is followed through registers,
+stack spills, calls inside the object and zero-overhead loops; it fails
+on a narrow access, on such a pointer passed out of the object (memcpy,
+string functions, logging, function pointers), stored outside the
+frame or kept in initialised data, on an opcode it does not model, and
+when nothing reaches the section at all (never a vacuous pass).
+`components/tinylink/CMakeLists.txt` runs it after every build of the
+component; `--verbose` lists the functions and spills. Its own test —
+`iram_check_neg.c`, eight planted violations (the realistic one:
+`(type & 0xff) == 4` compiles to an `l8ui`) — must report 8 findings:
+
+```bash
+B=build R=$PWD   # an idf.py build dir, the repo root
+CMD=$(python -c "import json;print([e['command'] for e in json.load(open('$B/compile_commands.json')) if e['file'].endswith('src/mapreq.c')][0])")
+(cd $B && eval "$(echo "$CMD" | sed "s# -o [^ ]*# -o neg.o#; s# -c [^ ]*# -c $R/tools/iram_check_neg.c#") -Wno-strict-aliasing")
+python tools/iram_access_check.py --objdump xtensa-esp32-elf-objdump --section .iram.bss $B/neg.o
+```
+
 ## `credentials.csv.example`
 
 Template consumed by `nvs_provision.py`. **Never** commit a populated copy
