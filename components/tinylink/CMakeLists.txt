@@ -40,6 +40,7 @@ idf_component_register(
         "src/crypto/chacha20poly1305.c"
         "src/tinylink_bench.c"
         "src/tl_time.c"
+        "src/tl_libc_stubs.c"
     INCLUDE_DIRS
         "include"
     PRIV_INCLUDE_DIRS
@@ -50,11 +51,9 @@ idf_component_register(
         esp_event
         esp_netif
         esp-tls
-        esp_http_client
         esp_driver_i2c
         lwip
         mbedtls
-        json
     PRIV_REQUIRES
         espressif__nghttp
         esp_timer
@@ -68,6 +67,14 @@ idf_component_register(
 # note about toolchain hangs on lwIP files at -O2 is stale: all of lwIP
 # builds at -O2 on the v5.5.6 toolchain.)
 target_compile_options(${COMPONENT_LIB} PRIVATE -O2)
+
+# newlib-nano float formatting stubs (round 1.3.2, B3; audit in
+# src/tl_libc_stubs.c). `-u` makes both symbols undefined from the first
+# input on, so this archive — searched before libc — supplies them and
+# libc's float printf/scanf back ends (dtoa, mprec, strtod, gdtoa) never
+# link. A duplicate-definition link error would mean something now pulls
+# that libc object in for another symbol: re-audit before removing this.
+target_link_libraries(${COMPONENT_LIB} INTERFACE "-u _printf_float" "-u _scanf_float")
 
 # Build epoch for tl_time.c's clock floor (see tl_time.h). Evaluated at
 # configure time, so a reconfigure moves it; that is the intent — the

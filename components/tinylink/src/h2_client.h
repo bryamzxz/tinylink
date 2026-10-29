@@ -67,9 +67,10 @@ esp_err_t h2_post_json_stream(ts2021_conn_t *conn,
 /* Build the persistent nghttp2 session bound to `conn`. Called once at
  * the end of ts2021_connect, while the LP TLS conn is the only one
  * alive and the heap has a contiguous ~24 KiB free block for the
- * ~10–14 KiB nghttp2_session struct. Pumps the initial SETTINGS
- * exchange (client → server → ACK) so the first request lands on a
- * synchronized session.
+ * ~10–14 KiB nghttp2_session struct. Sends the client preface + our
+ * SETTINGS and returns without waiting for the server's (round 1.3.2):
+ * the first request follows immediately, and the server's SETTINGS /
+ * ACK are processed by that request's recv loop.
  *
  * Returns ESP_OK on success; on failure the conn must be torn down.
  * Idempotent: calling twice on the same conn frees the prior session

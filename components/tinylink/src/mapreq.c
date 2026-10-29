@@ -12,7 +12,9 @@
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "esp_system.h"
+#include "freertos/FreeRTOS.h"
 #include "sdkconfig.h"
+#include "ctrl_buf.h"
 #include "h2_client.h"
 #include "tinylink.h"   /* tinylink_get_public_endpoint */
 #endif
@@ -27,13 +29,13 @@
 static const char *TAG = "mapreq";
 #endif
 
-#define REQUEST_BUF_SZ   2048
 /* Real Tailscale MapResponse for a small tailnet (sensor + home peer)
  * comfortably exceeds 16 KiB once DERP map + DNSConfig + the peer's
  * Hostinfo are folded in. Observed 16383-byte truncation on first HW
- * boot 2026-05-02. 48 KiB gives us headroom for a handful of peers
- * before we'd need streaming. */
-#define RESPONSE_BUF_SZ  32768
+ * boot 2026-05-02. The stream assembles one MapResponse at a time in the
+ * shared control buffer (ctrl_buf.h): TL_CTRL_MAPRESP_CAP = 32 KiB
+ * (soak peak 25 838 B); its MapRequest goes out of the buffer's tail
+ * (TL_CTRL_REQ_CAP). */
 /* jsmn token budget for ONE sub-document. Since 2026-09 the MapResponse
  * is not tokenized as a whole: jsmn_split.h cuts it into its top-level
  * values and this table only ever holds the self Node object, one peer
@@ -632,6 +634,34 @@ esp_err_t mapresp_parse(const char *json, size_t json_len, tl_netmap_t *out)
 
 #ifdef ESP_PLATFORM
 
+/* The shared control buffer (ctrl_buf.h has the layout and the proof
+ * that its users are never live at the same time). Defined here because
+ * the MapResponse stream is its biggest user. */
+static uint8_t     s_ctrl_buf[TL_CTRL_BUF_SZ] __attribute__((aligned(4)));
+static const char *s_ctrl_owner;
+static portMUX_TYPE s_ctrl_mux = portMUX_INITIALIZER_UNLOCKED;
+
+uint8_t *tl_ctrl_buf_claim(const char *who)
+{
+    const char *prev;
+    taskENTER_CRITICAL(&s_ctrl_mux);
+    prev = s_ctrl_owner;
+    if (prev == NULL) s_ctrl_owner = who;
+    taskEXIT_CRITICAL(&s_ctrl_mux);
+    if (prev != NULL) {
+        ESP_LOGE(TAG, "control buffer busy (%s) — %s refused", prev, who);
+        return NULL;
+    }
+    return s_ctrl_buf;
+}
+
+void tl_ctrl_buf_release(void)
+{
+    taskENTER_CRITICAL(&s_ctrl_mux);
+    s_ctrl_owner = NULL;
+    taskEXIT_CRITICAL(&s_ctrl_mux);
+}
+
 static void hex_encode(const uint8_t *in, size_t len, char *out)
 {
     static const char hex[] = "0123456789abcdef";
@@ -766,32 +796,29 @@ static int build_request_body(const tinylink_keys_t *keys,
     return n;
 }
 
-esp_err_t mapreq_push_endpoints(ts2021_conn_t *conn,
-                                const tinylink_keys_t *keys)
+static esp_err_t push_endpoints_in(ts2021_conn_t *conn,
+                                   const tinylink_keys_t *keys, uint8_t *buf)
 {
-    if (conn == NULL || keys == NULL) return ESP_ERR_INVALID_ARG;
-
-    /* Body fits comfortably in the ~600-byte upper bound of a
-     * minimal Hostinfo + Endpoints request — no need for the
-     * heap-allocated REQUEST_BUF_SZ used by the netmap-fetching
-     * path. Use a stack buffer to avoid heap pressure. */
-    char body[1024];
+    /* Request from the buffer's MapRequest tail (TL_CTRL_REQ_CAP, the
+     * 1 KiB this always had — a minimal Hostinfo + Endpoints body is
+     * ~600 B at most), response at offset 0. */
+    char *body = (char *)buf + TL_CTRL_REQ_OFF;
     int body_len = build_request_body(keys, /*stream=*/false,
                                       /*omit_peers=*/true,
-                                      body, sizeof(body));
+                                      body, TL_CTRL_REQ_CAP);
     if (body_len < 0) return ESP_ERR_INVALID_SIZE;
 
     /* The server is documented to be allowed to omit the response
      * body entirely (tailcfg.go MapRequest.OmitPeers comment). 256 B
      * is plenty whether the body is empty, "{}", or a tiny error
      * message — we only check the HTTP status. */
-    uint8_t resp[256];
+    uint8_t *resp = buf;
     size_t resp_len = 0;
     int status = 0;
     esp_err_t err = h2_post_json(conn, "/machine/map",
                                  CONFIG_TINYLINK_CONTROL_HOST,
                                  (const uint8_t *)body, (size_t)body_len,
-                                 &status, resp, sizeof(resp), &resp_len);
+                                 &status, resp, 256, &resp_len);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "endpoint push h2_post_json failed: 0x%x", err);
         return err;
@@ -811,6 +838,17 @@ esp_err_t mapreq_push_endpoints(ts2021_conn_t *conn,
         return ESP_FAIL;
     }
     return ESP_OK;
+}
+
+esp_err_t mapreq_push_endpoints(ts2021_conn_t *conn,
+                                const tinylink_keys_t *keys)
+{
+    if (conn == NULL || keys == NULL) return ESP_ERR_INVALID_ARG;
+    uint8_t *buf = tl_ctrl_buf_claim("endpoint push");
+    if (buf == NULL) return ESP_ERR_INVALID_STATE;
+    esp_err_t err = push_endpoints_in(conn, keys, buf);
+    tl_ctrl_buf_release();
+    return err;
 }
 
 
@@ -837,7 +875,7 @@ typedef struct {
     size_t         hdr_have;
     uint32_t       body_size;
     size_t         body_have;
-    /* `body_buf` and `body_cap` come from the caller's BSS. */
+    /* `body_buf` / `body_cap`: the shared control buffer (BSS). */
     uint8_t       *body_buf;
     size_t         body_cap;
     /* Higher-level callback fired once per assembled MapResponse. */
@@ -867,10 +905,8 @@ static int stream_dispatch(stream_state_t *s)
 
     /* Soak observability: per-dispatch assembled body size. Grep
      * `stream peak: body` over a multi-hour log and take the max to
-     * size RESPONSE_BUF_SZ (currently 32 KiB BSS for body_buf) down
-     * to (peak + 20 % margin). The frame[] hex line above also carries
-     * this number but as a hex-prefixed string; this is the explicit
-     * grep target. */
+     * size TL_CTRL_MAPRESP_CAP (32 KiB of the shared control buffer,
+     * ctrl_buf.h) against. */
     ESP_LOGI(TAG, "stream peak: body=%u (cap=%u)",
              (unsigned)s->body_have, (unsigned)s->body_cap);
 
@@ -963,27 +999,24 @@ static int stream_chunk_cb(const uint8_t *data, size_t len, void *ctx)
     return 0;
 }
 
-esp_err_t mapreq_run_stream(ts2021_conn_t *conn,
-                            const tinylink_keys_t *keys,
-                            mapreq_handler_t on_netmap, void *ctx)
+static esp_err_t run_stream_in(ts2021_conn_t *conn,
+                               const tinylink_keys_t *keys,
+                               mapreq_handler_t on_netmap, void *ctx,
+                               uint8_t *buf)
 {
-    if (conn == NULL || keys == NULL || on_netmap == NULL) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    static char body[REQUEST_BUF_SZ];
-    int body_len = build_request_body(keys, true, false, body, sizeof(body));
+    /* MapRequest from the buffer's tail, MapResponses assembled at offset
+     * 0 — disjoint, because nghttp2 may still be reading the request
+     * body (data_provider_read) while response DATA arrives. */
+    char *body = (char *)buf + TL_CTRL_REQ_OFF;
+    int body_len = build_request_body(keys, true, false, body, TL_CTRL_REQ_CAP);
     if (body_len < 0) return ESP_ERR_INVALID_SIZE;
 
-    /* Body buffer for one assembled MapResponse. 16 KiB matches the
-     * non-stream RESPONSE_BUF_SZ — enough headroom for a 4-peer netmap
-     * with a few DERP regions. Sized statically so the stream task
-     * stack stays small. */
-    static uint8_t body_buf[RESPONSE_BUF_SZ];
+    /* One assembled MapResponse at a time, in BSS (the shared buffer) so
+     * the stream task stack stays small. */
     stream_state_t s = {
         .phase       = STREAM_WANT_HDR,
-        .body_buf    = body_buf,
-        .body_cap    = sizeof(body_buf),
+        .body_buf    = buf,
+        .body_cap    = TL_CTRL_MAPRESP_CAP,
         .on_netmap   = on_netmap,
         .handler_ctx = ctx,
     };
@@ -1011,6 +1044,20 @@ esp_err_t mapreq_run_stream(ts2021_conn_t *conn,
     }
     ESP_LOGI(TAG, "/machine/map stream closed cleanly");
     return ESP_OK;
+}
+
+esp_err_t mapreq_run_stream(ts2021_conn_t *conn,
+                            const tinylink_keys_t *keys,
+                            mapreq_handler_t on_netmap, void *ctx)
+{
+    if (conn == NULL || keys == NULL || on_netmap == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    uint8_t *buf = tl_ctrl_buf_claim("map stream");
+    if (buf == NULL) return ESP_ERR_INVALID_STATE;
+    esp_err_t err = run_stream_in(conn, keys, on_netmap, ctx, buf);
+    tl_ctrl_buf_release();
+    return err;
 }
 
 #endif /* ESP_PLATFORM */

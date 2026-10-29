@@ -30,7 +30,8 @@ TARGETS := test_blake2s test_curve25519 test_mapresp \
            test_wg_demux test_disco test_stun test_tls_io test_derp \
            test_disco_handler test_disco_prober test_retry_after \
            test_backoff test_keys_regen test_skip_value test_jsmn_split \
-           test_tai64n test_nacl_box test_tsmp test_tl_date test_stats
+           test_tai64n test_nacl_box test_tsmp test_tl_date test_stats \
+           test_http1 test_ctrl_json
 
 all: $(TARGETS)
 
@@ -39,6 +40,16 @@ all: $(TARGETS)
 test_stats: test_stats.c $(TL_SRC)/tl_bootstat.h $(TL_SRC)/stats_json.h $(TL_INC)/tinylink.h \
             $(TL_SRC)/jsmn.h host_include/esp_err.h
 	$(CC) $(CFLAGS) -I$(TL_SRC) -I$(TL_INC) -Ihost_include -o $@ test_stats.c
+
+# HTTP/1.1 response parser behind the TOFU GET /key (round 1.3.2). Header-only.
+test_http1: test_http1.c $(TL_SRC)/tl_http1.h
+	$(CC) $(CFLAGS) -I$(TL_SRC) -o $@ test_http1.c
+
+# cJSON replacement on the control plane (round 1.3.2): top-level JSON
+# reader + escaping writer, RegisterRequest bytes pinned to cJSON's.
+test_ctrl_json: test_ctrl_json.c $(TL_SRC)/json_helpers.c $(TL_SRC)/json_helpers.h \
+                $(TL_SRC)/register_json.h $(TL_SRC)/jsmn_split.h
+	$(CC) $(CFLAGS) -I$(TL_SRC) -o $@ test_ctrl_json.c $(TL_SRC)/json_helpers.c
 
 # RFC 3339 / IMF-fixdate parsers (KeyExpiry, Retry-After). Header-only.
 test_tl_date: test_tl_date.c $(TL_SRC)/tl_date.h
@@ -247,7 +258,14 @@ test: test_blake2s.run test_curve25519.run test_mapresp.run \
       test_derp.run test_disco_handler.run test_disco_prober.run \
       test_retry_after.run test_backoff.run test_keys_regen.run \
       test_skip_value.run test_jsmn_split.run test_tai64n.run \
-      test_nacl_box.run test_tsmp.run test_tl_date.run test_stats.run
+      test_nacl_box.run test_tsmp.run test_tl_date.run test_stats.run \
+      test_http1.run test_ctrl_json.run
+
+test_http1.run: test_http1
+	$(RUNNER) ./test_http1
+
+test_ctrl_json.run: test_ctrl_json
+	$(RUNNER) ./test_ctrl_json
 
 test_blake2s.run: test_blake2s
 	$(RUNNER) ./test_blake2s

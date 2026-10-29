@@ -95,7 +95,11 @@ After the upgrade and the optional EarlyPayload, the inner protocol is
 component) in `components/tinylink/src/h2_client.c`. SETTINGS sent by
 the client disable HPACK dynamic-table indexing
 (`SETTINGS_HEADER_TABLE_SIZE = 0`) and server push
-(`SETTINGS_ENABLE_PUSH = 0`) for one-shot request semantics.
+(`SETTINGS_ENABLE_PUSH = 0`) for one-shot request semantics. Since 1.3.2
+the client preface + SETTINGS go out and the first request follows
+immediately, like the upstream Go client — the server's SETTINGS and its
+ACK of ours are processed by that request's receive loop (one RTT less
+per control connect than the old wait-for-ACK pump).
 
 After `read_msg2` the connection optionally carries an EarlyPayload
 sentinel — `"\xff\xff\xffTS"` (5 B magic) + `BE32 length` + JSON-encoded
@@ -129,7 +133,7 @@ JSON body, fields used today:
 
 | Field               | Notes                                              |
 |---------------------|----------------------------------------------------|
-| `Version`           | `TINYLINK_CAPVER` (currently `148` = Tailscale v1.104 since round 1.3.0; 142 in M15–M16, 138 before) — the Tailscale `CapabilityVersion`, same value as the ts2021 Noise prologue/header (`register.c` adds `cJSON_AddNumberToObject(root, "Version", TINYLINK_CAPVER)`). M1 hardcoded `1`, which sits below headscale's `earlyNoise` floor `MinSupportedCapabilityVersion` (`hscontrol/capver/capver_generated.go`; 113 in 2026-07, 115 in 2026-09, **116** as of 2026-10 — it tracks the latest 10 minor releases and keeps climbing) and aborts the `/ts2021` upgrade before any JSON is read. Since 2026-09 the legacy `GET /key?v=<n>` bootstrap sends the same value: headscale `5b6e1e17` gates `/key` on the same floor. Feature gating is keyed on `Hostinfo`, not `Version`. |
+| `Version`           | `TINYLINK_CAPVER` (currently `148` = Tailscale v1.104 since round 1.3.0; 142 in M15–M16, 138 before) — the Tailscale `CapabilityVersion`, same value as the ts2021 Noise prologue/header (`register_json.h` writes `"Version":<TINYLINK_CAPVER>`). M1 hardcoded `1`, which sits below headscale's `earlyNoise` floor `MinSupportedCapabilityVersion` (`hscontrol/capver/capver_generated.go`; 113 in 2026-07, 115 in 2026-09, **116** as of 2026-10 — it tracks the latest 10 minor releases and keeps climbing) and aborts the `/ts2021` upgrade before any JSON is read. Since 2026-09 the legacy `GET /key?v=<n>` bootstrap sends the same value: headscale `5b6e1e17` gates `/key` on the same floor. Feature gating is keyed on `Hostinfo`, not `Version`. |
 | `NodeKey`           | `"nodekey:" + 64-hex` of NodeKey public.           |
 | `OldNodeKey`        | `"nodekey:" + 64 zeros` on first registration.     |
 | `NLKey`             | `"nlpub:" + 64 zeros` for M1 (TKA disabled). Real Ed25519 NLPrivate generation lands in M7 hardening. The field has no `omitempty` upstream, so it must be present. |

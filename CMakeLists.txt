@@ -25,6 +25,11 @@ cmake_minimum_required(VERSION 3.16)
 #   wifi_provisioning, protocomm, esp_local_ctrl, protobuf-c
 #   (protobuf-c is only pulled by protocomm; safe to drop together)
 #
+#   No HTTP client / JSON library (round 1.3.2): esp_http_client (+ its
+#   tcp_transport) had one user, the TOFU GET /key, now on esp_tls
+#   (control_key.c + tl_http1.h); cJSON (json) is replaced by
+#   jsmn / jsmn_split.h + json_helpers.c
+#
 #   No display / camera / imaging / audio peripherals:
 #   esp_lcd, esp_driver_cam, esp_driver_isp, esp_driver_jpeg,
 #   esp_driver_ppa, esp_driver_i2s, esp_driver_dac
@@ -66,6 +71,10 @@ set(EXCLUDE_COMPONENTS
     protocomm
     esp_local_ctrl
     protobuf-c
+
+    esp_http_client
+    tcp_transport
+    json
 
     esp_lcd
     esp_driver_cam

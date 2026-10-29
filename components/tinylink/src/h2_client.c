@@ -21,7 +21,7 @@
 static const char *TAG = "h2";
 
 /* Reset per-request fields on conn before a new submit_request. Keeps
- * session-wide flags (h2, h2_goaway, h2_settings_acked) intact. */
+ * session-wide state (h2, h2_goaway) intact. */
 static void h2_request_reset(ts2021_conn_t *conn)
 {
     conn->h2_req_body      = NULL;
@@ -201,9 +201,7 @@ static int stream_close_cb(nghttp2_session *session, int32_t stream_id,
 }
 
 /* Frame-level recv hook: catches GOAWAY (server is done with the conn,
- * we must reconnect after the current stream finishes) and SETTINGS
- * with the ACK flag (the server confirmed our initial SETTINGS — only
- * relevant during h2_session_init's pump). */
+ * we must reconnect after the current stream finishes). */
 static int frame_recv_cb(nghttp2_session *session,
                          const nghttp2_frame *frame, void *user_data)
 {
@@ -216,11 +214,6 @@ static int frame_recv_cb(nghttp2_session *session,
             ESP_LOGW(TAG, "received GOAWAY (last_stream=%d, error=0x%x)",
                      frame->goaway.last_stream_id,
                      (unsigned)frame->goaway.error_code);
-            break;
-        case NGHTTP2_SETTINGS:
-            if (frame->hd.flags & NGHTTP2_FLAG_ACK) {
-                conn->h2_settings_acked = true;
-            }
             break;
         default:
             break;
@@ -250,7 +243,6 @@ esp_err_t h2_session_init(ts2021_conn_t *conn)
         conn->h2 = NULL;
     }
     conn->h2_goaway          = false;
-    conn->h2_settings_acked  = false;
     conn->h2_rx_len          = 0;
     conn->h2_rx_off          = 0;
     conn->h2_may_refill      = false;
@@ -300,41 +292,36 @@ esp_err_t h2_session_init(ts2021_conn_t *conn)
         return ESP_FAIL;
     }
 
-    /* Pump the initial SETTINGS exchange so the first request lands on
-     * a synchronized session (client SETTINGS sent → server SETTINGS
-     * received → server's SETTINGS acked by us → our SETTINGS acked by
-     * server). Without this pump the first request would race with the
-     * SETTINGS handshake, which on Tailscale's Go server can result in
-     * the server using HPACK dynamic table for our headers (since it
-     * hasn't processed our HEADER_TABLE_SIZE=0 yet). */
-    for (int i = 0; i < H2_SETTINGS_PUMP_MAX; i++) {
-        if (nghttp2_session_want_write(conn->h2)) {
-            int prc = nghttp2_session_send(conn->h2);
-            if (prc != 0) {
-                ESP_LOGE(TAG, "session_send during init: %d", prc);
-                nghttp2_session_del(conn->h2);
-                conn->h2 = NULL;
-                return ESP_FAIL;
-            }
-        }
-        if (conn->h2_settings_acked &&
-            !nghttp2_session_want_write(conn->h2)) {
-            return ESP_OK;
-        }
-        conn->h2_may_refill = true;
-        int prc = nghttp2_session_recv(conn->h2);
-        if (prc != 0) {
-            ESP_LOGE(TAG, "session_recv during init: %d", prc);
-            nghttp2_session_del(conn->h2);
-            conn->h2 = NULL;
-            return ESP_FAIL;
-        }
+    /* Flush the client preface + our SETTINGS now, and return WITHOUT
+     * waiting for the server's SETTINGS or its ACK of ours (round 1.3.2,
+     * B9 — the old pump spent one full RTT here on every control
+     * connect). RFC 9113 §3.4 lets a client send requests right after
+     * its preface, and the upstream client does exactly that (x/net
+     * http2.Transport writes preface, SETTINGS, WINDOW_UPDATE and then
+     * the first request; it only waits for the server's SETTINGS for
+     * extended CONNECT). Nothing tinylink sends depends on the server's
+     * values: our bodies (< 2 KiB) fit the default 64 KiB windows and
+     * 16 KiB frames, and nghttp2 applies whatever the server announces
+     * as soon as h2_drive_request's first session_recv reads it (and
+     * ACKs it from the same loop). The old worry — "the server might
+     * HPACK-index our response headers before seeing HEADER_TABLE_SIZE
+     * 0" — does not hold: the server reads our SETTINGS before our
+     * HEADERS on the same byte stream, and nghttp2's inflater keeps the
+     * default 4 KiB table until the server's ACK arrives (in order,
+     * before the response HEADERS: Go's write scheduler sends control
+     * frames first), after which the server's encoder must open its next
+     * header block with the size update — exactly as with the pump.
+     * Holds for both control planes: tailscale.com (x/net
+     * http2.Server.ServeConn) and headscale's net/http h2c front end
+     * (62714564), which waits for the client preface, then processes
+     * frames in order. */
+    int prc = nghttp2_session_send(conn->h2);
+    if (prc != 0) {
+        ESP_LOGE(TAG, "session_send during init: %d", prc);
+        nghttp2_session_del(conn->h2);
+        conn->h2 = NULL;
+        return ESP_FAIL;
     }
-
-    ESP_LOGW(TAG, "settings handshake did not complete in %d iters",
-             H2_SETTINGS_PUMP_MAX);
-    /* Don't fail outright — best-effort. The first request might still
-     * succeed; if not, the caller will reconnect. */
     return ESP_OK;
 }
 
@@ -346,7 +333,6 @@ void h2_session_destroy(ts2021_conn_t *conn)
         conn->h2 = NULL;
     }
     conn->h2_goaway          = false;
-    conn->h2_settings_acked  = false;
     conn->h2_rx_len          = 0;
     conn->h2_rx_off          = 0;
 }

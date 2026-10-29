@@ -9,6 +9,7 @@
 #include "esp_crt_bundle.h"
 #include "tl_time.h"
 #include "esp_log.h"
+#include "lwip/sockets.h"
 #include "mbedtls/ssl.h"
 
 #include "h2_client.h"
@@ -116,6 +117,24 @@ static esp_err_t tls_write_full(esp_tls_t *tls, const uint8_t *buf, size_t len)
         return ESP_FAIL;
     }
     return ESP_OK;
+}
+
+/* TCP_NODELAY on the control conn (round 1.3.2, B8). Every write here is
+ * a complete message — one HTTP request, one Noise record — and the next
+ * step waits for the server's answer, so Nagle only ever cost us: a
+ * small record behind an unacknowledged one sat out the server's delayed
+ * ACK (~1 RTT, up to 200 ms) on the upgrade, the Noise handshake and the
+ * h2 request bursts. Set right after the TLS handshake (esp-tls has no
+ * hook before it); a failure only costs latency, so it is logged and
+ * ignored. */
+static void set_tcp_nodelay(esp_tls_t *tls)
+{
+    int fd = -1;
+    int one = 1;
+    if (esp_tls_get_conn_sockfd(tls, &fd) != ESP_OK || fd < 0 ||
+        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one)) != 0) {
+        ESP_LOGW(TAG, "TCP_NODELAY not set (fd=%d)", fd);
+    }
 }
 
 static esp_err_t read_upgrade_response(esp_tls_t *tls,
@@ -353,6 +372,7 @@ esp_err_t ts2021_connect(ts2021_conn_t *out,
         ts2021_close(out);
         return ESP_FAIL;
     }
+    set_tcp_nodelay(out->tls);
 
     /* Noise IK with prologue = "Tailscale Control Protocol v<CAPVER>"
      * (TS2021_PROTOCOL_VERSION = TINYLINK_CAPVER). The same version is
@@ -394,8 +414,12 @@ esp_err_t ts2021_connect(ts2021_conn_t *out,
         return ESP_ERR_INVALID_SIZE;
     }
 
-    char req[1024];
-    int n = snprintf(req, sizeof(req),
+    /* Build the upgrade request in the (still idle) h2_rx ring instead of
+     * a 1 KiB stack buffer: nothing reads the ring before the 101 below,
+     * which overwrites it. −1 KiB on the connect frame (main and
+     * long-poll tasks). */
+    char *req = (char *)out->h2_rx;
+    int n = snprintf(req, sizeof(out->h2_rx),
         "POST /ts2021 HTTP/1.1\r\n"
         "Host: %s\r\n"
         "Upgrade: %s\r\n"
@@ -405,7 +429,7 @@ esp_err_t ts2021_connect(ts2021_conn_t *out,
         "\r\n",
         CONFIG_TINYLINK_CONTROL_HOST, UPGRADE_TOKEN,
         HANDSHAKE_HDR, init_b64);
-    if (n <= 0 || n >= (int)sizeof(req)) {
+    if (n <= 0 || n >= (int)sizeof(out->h2_rx)) {
         ts2021_close(out);
         return ESP_ERR_INVALID_SIZE;
     }
@@ -462,9 +486,8 @@ esp_err_t ts2021_connect(ts2021_conn_t *out,
         return ESP_FAIL;
     }
 
-    /* Mark connected BEFORE h2_session_init so its initial SETTINGS
-     * pump can ride ts2021_send/ts2021_recv (those guard on
-     * c->connected). */
+    /* Mark connected BEFORE h2_session_init so its preface + SETTINGS
+     * flush can ride ts2021_send (which guards on c->connected). */
     out->connected = true;
 
     /* Allocate the persistent nghttp2 session NOW, while only this
@@ -488,21 +511,25 @@ esp_err_t ts2021_send(ts2021_conn_t *c,
     if (c == NULL || !c->connected) return ESP_ERR_INVALID_STATE;
     if (data_len > TS2021_RECORD_PLAINTEXT_MAX) return ESP_ERR_INVALID_SIZE;
 
-    uint8_t  ct[TS2021_RECORD_PLAINTEXT_MAX + NOISE_TAGLEN];
+    /* Header + ciphertext built back to back and written ONCE (round
+     * 1.3.2, B8): one esp_tls write = one TLS record per Noise record
+     * (two only for a > 2 KiB record — MBEDTLS_SSL_OUT_CONTENT_LEN),
+     * where the separate 3-byte header write used to be a TLS record and
+     * a TCP segment of its own, held by Nagle until the previous one was
+     * ACKed. Same stack array as before plus the 3 header bytes. */
+    uint8_t  rec[TS2021_HEADER_LEN + TS2021_RECORD_PLAINTEXT_MAX + NOISE_TAGLEN];
     size_t   ct_len = 0;
-    if (noise_ik_encrypt(&c->noise, ct, sizeof(ct),
+    if (noise_ik_encrypt(&c->noise, rec + TS2021_HEADER_LEN,
+                         sizeof(rec) - TS2021_HEADER_LEN,
                          data, data_len, &ct_len) != ESP_OK) {
         return ESP_FAIL;
     }
     if (ct_len > 0xFFFF) return ESP_ERR_INVALID_SIZE;
 
-    uint8_t hdr[TS2021_HEADER_LEN] = {
-        TS2021_MSG_RECORD,
-        (uint8_t)((ct_len >> 8) & 0xFF),
-        (uint8_t)( ct_len       & 0xFF),
-    };
-    if (tls_write_full(c->tls, hdr, sizeof(hdr)) != ESP_OK) return ESP_FAIL;
-    return tls_write_full(c->tls, ct, ct_len);
+    rec[0] = TS2021_MSG_RECORD;
+    rec[1] = (uint8_t)((ct_len >> 8) & 0xFF);
+    rec[2] = (uint8_t)( ct_len       & 0xFF);
+    return tls_write_full(c->tls, rec, TS2021_HEADER_LEN + ct_len);
 }
 
 esp_err_t ts2021_recv(ts2021_conn_t *c,

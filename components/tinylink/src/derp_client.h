@@ -29,6 +29,12 @@
 extern "C" {
 #endif
 
+/* Largest frame payload staged into ONE write (round 1.3.2, B8): a dst
+ * key plus a packet the size of wg_netif's 1 536-B buffers — every
+ * WireGuard / DISCO packet tinylink relays. Bigger payloads still go out
+ * correctly, as header / key / packet writes under the same lock. */
+#define DERP_TX_STAGE_MAX (DERP_KEY_LEN + 1536)
+
 typedef struct {
     esp_tls_t        *tls;                /* owned: closed by derp_client_close */
     bool              connected;
@@ -46,6 +52,13 @@ typedef struct {
      * and reconnects — used when the device's IP changes. Cleared by
      * derp_client_connect_login. */
     volatile bool     abort_reads;
+    /* One outgoing frame, header + payload back to back, so a send is
+     * ONE esp_tls write = one TLS record (≤ MBEDTLS_SSL_OUT_CONTENT_LEN,
+     * 2 KiB) = one TCP segment with TCP_NODELAY. It used to be three
+     * writes (header, dst key, packet): three records, and Nagle held the
+     * last two until the first was ACKed — ~1 RTT per relayed packet.
+     * Guarded by write_lock, like the wire itself. */
+    uint8_t           tx_stage[DERP_FRAME_HDR_LEN + DERP_TX_STAGE_MAX];
 } derp_client_t;
 
 /* Returned through tls_io by the read adapter when abort_reads is set.
@@ -88,7 +101,8 @@ esp_err_t derp_client_run(derp_client_t *c,
 
 /* Send one DERP FrameSendPacket relaying `packet` to peer `dst_pub`.
  * Atomic on the wire: holds c->write_lock across header + payload, so
- * concurrent calls (and the recv-loop's pongs) cannot interleave.
+ * concurrent calls (and the recv-loop's pongs) cannot interleave; up to
+ * DERP_TX_STAGE_MAX of payload it is a single TLS record.
  *
  * Used by the M5 step 3 magicsock fallback when the direct UDP path
  * to a peer fails (ENETUNREACH, no recent reply). plen must be ≤
