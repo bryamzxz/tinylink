@@ -37,6 +37,7 @@ coverage without restating the base flags.
 | `test_poly1305`          | `crypto/poly1305_donna.c`                             | RFC 8439 §2.5.2 + A.3 #1–#11 |
 | `test_chacha20poly1305`  | AEAD glue (`chacha20poly1305.c`)                      | RFC 8439 §2.8.2 (114 B: exercises the tail path) + A.5 |
 | `test_noise_ik`          | `noise_ik.c` ts2021 Noise IK handshake + transport records (BE64 nonce, tamper / replay / in-place) | OpenSSL-based `gen_noise_vectors.py` + in-file responder |
+| `test_ts2021`            | `ts2021_client.c` record layer after the handshake, over a fake esp_tls: the EarlyPayload skip and the HTTP/2 start kept in the record ring by offset (D5), magic bytes put back across records, rejects | synthetic + 2 000-case record-segmentation fuzz |
 | `test_hkdf_noise`        | `crypto/hkdf_blake2s.c` (HKDF, Noise §4.3 KDFs)       | cross-consistency |
 | `test_wg_handshake`      | `wg_proto.c`, `wg_handshake.c` (Noise IKpsk2 initiator) | upstream-derived transcript |
 | `test_wg_transport`      | `wg_transport.c` (RFC 6479 replay window, AEAD framing; 1.3.3 reserve / begin / open / commit split, every rekey / duplicate interleaving, pthread race test with the races forced) | synthetic + fuzz vs the old bit-wise window |

@@ -243,27 +243,52 @@ static esp_err_t recv_record_plaintext(ts2021_conn_t *c,
  * 5-byte magic record as HTTP/2 data, desyncing the stream so the server
  * closed the connection (h2_session_init -> EOF).
  *
- * We read records into `rec` and consume them byte-wise. Whatever remains
- * unconsumed once the header (and any JSON) is dealt with becomes the
- * HTTP/2 residual replayed to nghttp2. */
+ * Records are read into the conn's h2_rx ring and consumed byte-wise.
+ * Whatever is left once the header (and any JSON) is dealt with stays
+ * there as the window [h2_rx_off, h2_rx_len) — the first HTTP/2 bytes,
+ * which recv_cb hands to nghttp2 before it reads another record. Until
+ * round 1.3.4 (D5) that tail was copied into a second 4 077-B buffer,
+ * `rx_residual`. */
+
+/* The stream turned out to start with HTTP/2 at rec[off] (the first byte
+ * that differs from the magic), after `matched` bytes that equal the
+ * magic's first `matched` bytes. Those may have come from earlier
+ * records (a record boundary inside the magic), so they are not
+ * necessarily in front of rec[off]; but their value is known — the magic
+ * itself — so put them back in front of the tail: the window becomes
+ * magic[0..matched) || rec[off..len). matched ≤ 4 and len ≤ 4 080 (the
+ * plaintext of the largest record read_record_frame accepts), so the
+ * result fits the 4 096-B ring. */
+static void keep_http2_start(ts2021_conn_t *c, size_t off, size_t len,
+                             size_t matched)
+{
+    _Static_assert(sizeof(c->h2_rx) >= TS2021_MAX_MESSAGE - NOISE_TAGLEN +
+                                       TS2021_EARLY_PAYLOAD_MAGIC_LEN - 1,
+                   "h2_rx must hold a record plus a put-back magic prefix");
+    uint8_t *rec = c->h2_rx;
+    memmove(rec + matched, rec + off, len - off);
+    memcpy(rec, TS2021_EARLY_PAYLOAD_MAGIC, matched);
+    c->h2_rx_off = 0;
+    c->h2_rx_len = matched + (len - off);
+}
+
 static esp_err_t consume_early_payload(ts2021_conn_t *c)
 {
-    /* Record scratch: borrow the conn's h2_rx ring. It is unused until
+    /* Record scratch: the conn's h2_rx ring. It is idle until
      * h2_session_init runs at the very end of ts2021_connect, and it is
-     * exactly one record long. Saves 4 077 B of stack on the connect
-     * path (this function is inlined into ts2021_connect, whose frame
-     * was 9 888 B). rx_residual is a different buffer, so the copies
-     * below never overlap. */
+     * one record long. Saves 4 077 B of stack on the connect path (this
+     * function is inlined into ts2021_connect, whose frame was 9 888 B). */
     uint8_t *rec = c->h2_rx;
     const size_t rec_cap = sizeof(c->h2_rx);
     size_t  rec_len = 0, rec_off = 0;
 
     /* 1) Read up to the 9-byte early-payload header from the record stream.
-     *    Bail to the "no early payload" path the instant the first 5 bytes
-     *    fail to match the magic — those bytes are HTTP/2. */
+     *    Bail to the "no early payload" path at the first of the 5 magic
+     *    bytes that does not match — from there on the bytes are HTTP/2
+     *    (a frame header's first byte is 0x00 for any frame we accept, so
+     *    in practice that is the very first byte). */
     uint8_t hdr[TS2021_EARLY_PAYLOAD_HDR_LEN];
     size_t  hdr_have = 0;
-    bool    is_early = true;
 
     while (hdr_have < TS2021_EARLY_PAYLOAD_HDR_LEN) {
         if (rec_off == rec_len) {
@@ -272,40 +297,22 @@ static esp_err_t consume_early_payload(ts2021_conn_t *c)
             rec_off = 0;
             if (rec_len == 0) continue;  /* empty record: pull the next one */
         }
-        size_t avail = rec_len - rec_off;
-        size_t take  = TS2021_EARLY_PAYLOAD_HDR_LEN - hdr_have;
-        if (take > avail) take = avail;
-        memcpy(hdr + hdr_have, rec + rec_off, take);
-        hdr_have += take;
-        rec_off  += take;
-
-        if (hdr_have >= TS2021_EARLY_PAYLOAD_MAGIC_LEN &&
-            memcmp(hdr, TS2021_EARLY_PAYLOAD_MAGIC,
-                   TS2021_EARLY_PAYLOAD_MAGIC_LEN) != 0) {
-            is_early = false;
-            break;
+        const uint8_t b = rec[rec_off];
+        if (hdr_have < TS2021_EARLY_PAYLOAD_MAGIC_LEN &&
+            b != (uint8_t)TS2021_EARLY_PAYLOAD_MAGIC[hdr_have]) {
+            /* No early payload: the bytes taken so far (a magic prefix)
+             * plus the rest of this record are the first HTTP/2 bytes,
+             * in order. */
+            keep_http2_start(c, rec_off, rec_len, hdr_have);
+            return ESP_OK;
         }
-    }
-
-    if (!is_early) {
-        /* No early payload: the header bytes we pulled plus whatever is left
-         * in the current record are the first HTTP/2 bytes, in order. */
-        size_t tail = rec_len - rec_off;
-        if (hdr_have + tail > sizeof(c->rx_residual)) {
-            ESP_LOGE(TAG, "early-payload residual overflow (%u)",
-                     (unsigned)(hdr_have + tail));
-            return ESP_FAIL;
-        }
-        memcpy(c->rx_residual, hdr, hdr_have);
-        if (tail > 0) memcpy(c->rx_residual + hdr_have, rec + rec_off, tail);
-        c->rx_residual_len = hdr_have + tail;
-        c->rx_residual_off = 0;
-        return ESP_OK;
+        hdr[hdr_have++] = b;
+        rec_off++;
     }
 
     /* 2) Magic matched and we have all 9 header bytes — parse the BE32 JSON
      *    length and skip that many bytes (which may span further records),
-     *    leaving anything after the JSON as the HTTP/2 residual. */
+     *    leaving anything after the JSON as the start of HTTP/2. */
     uint32_t ep_len = ((uint32_t)hdr[5] << 24) | ((uint32_t)hdr[6] << 16) |
                       ((uint32_t)hdr[7] <<  8) |  (uint32_t)hdr[8];
     if (ep_len > 64 * 1024) {
@@ -333,16 +340,10 @@ static esp_err_t consume_early_payload(ts2021_conn_t *c)
         }
     }
 
-    /* Residual = whatever is left in the current record after the JSON. */
-    size_t residual = rec_len - rec_off;
-    if (residual > sizeof(c->rx_residual)) {
-        ESP_LOGE(TAG, "early-payload post-JSON residual overflow (%u)",
-                 (unsigned)residual);
-        return ESP_FAIL;
-    }
-    if (residual > 0) memcpy(c->rx_residual, rec + rec_off, residual);
-    c->rx_residual_len = residual;
-    c->rx_residual_off = 0;
+    /* Whatever is left in the current record after the JSON — served by
+     * offset, no copy. */
+    c->h2_rx_off = rec_off;
+    c->h2_rx_len = rec_len;
     return ESP_OK;
 }
 
@@ -479,8 +480,8 @@ esp_err_t ts2021_connect(ts2021_conn_t *out,
     }
     ESP_LOGI(TAG, "ts2021: Noise IK handshake complete");
 
-    /* Skip optional EarlyPayload, leaving rx_residual primed with the
-     * first 0..N HTTP/2 plaintext bytes. */
+    /* Skip optional EarlyPayload, leaving the h2_rx window primed with
+     * the first 0..N HTTP/2 plaintext bytes. */
     if (consume_early_payload(out) != ESP_OK) {
         ts2021_close(out);
         return ESP_FAIL;
@@ -537,17 +538,6 @@ esp_err_t ts2021_recv(ts2021_conn_t *c,
 {
     if (c == NULL || !c->connected) return ESP_ERR_INVALID_STATE;
     if (out == NULL || out_len == NULL) return ESP_ERR_INVALID_ARG;
-
-    /* Drain residual first. */
-    if (c->rx_residual_off < c->rx_residual_len) {
-        size_t avail = c->rx_residual_len - c->rx_residual_off;
-        size_t take  = (out_max < avail) ? out_max : avail;
-        memcpy(out, c->rx_residual + c->rx_residual_off, take);
-        c->rx_residual_off += take;
-        *out_len = take;
-        return ESP_OK;
-    }
-
     return recv_record_plaintext(c, out, out_max, out_len);
 }
 

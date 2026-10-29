@@ -76,12 +76,11 @@ typedef struct {
     noise_ik_state_t  noise;
     bool              connected;
 
-    /* Plaintext that has been decrypted but not yet returned to a
-     * ts2021_recv() caller (e.g. the 9 EarlyPayload bytes that turned out
-     * to be plain HTTP/2). */
-    uint8_t  rx_residual[TS2021_RECORD_PLAINTEXT_MAX];
-    size_t   rx_residual_len;
-    size_t   rx_residual_off;
+    /* (Round 1.3.4, D5: the 4 077-B `rx_residual` copy is gone. The
+     * HTTP/2 bytes that follow the Noise handshake — after the optional
+     * EarlyPayload — stay in h2_rx below as the window
+     * [h2_rx_off, h2_rx_len), which recv_cb drains before it reads the
+     * next record.) */
 
     /* ---- Persistent HTTP/2 session state (M5 step 2c) ----
      *
@@ -100,9 +99,11 @@ typedef struct {
     bool             h2_goaway;          /* server sent GOAWAY → reconnect */
 
     /* Decrypted-Noise plaintext ring fed into nghttp2's recv_cb. Lives
-     * in BSS via the file-scope ts2021_conn_t in tinylink.c — sized at
-     * one Noise record so the codec can stage one frame at a time. */
-    uint8_t  h2_rx[TS2021_RECORD_PLAINTEXT_MAX];
+     * in BSS via the file-scope ts2021_conn_t in tinylink.c — one Noise
+     * record plus the up-to-4 EarlyPayload magic bytes that
+     * consume_early_payload may have to put back in front of a record
+     * (round 1.3.4, D5): TS2021_MAX_MESSAGE ≥ 4 077 + 4. */
+    uint8_t  h2_rx[TS2021_MAX_MESSAGE];
     size_t   h2_rx_len;
     size_t   h2_rx_off;
 
@@ -157,8 +158,10 @@ esp_err_t ts2021_connect(ts2021_conn_t *out,
 esp_err_t ts2021_send(ts2021_conn_t *c,
                       const uint8_t *data, size_t data_len);
 
-/* Read up to out_max plaintext bytes. Drains rx_residual first, then
- * reads + decrypts the next record. Returns ESP_OK with *out_len set. */
+/* Read + decrypt the next record into out (out_max ≥ the record's
+ * plaintext). Returns ESP_OK with *out_len set. Bytes left over from
+ * the connect (the start of the HTTP/2 stream) are in c->h2_rx, not
+ * returned here — the caller drains that window first. */
 esp_err_t ts2021_recv(ts2021_conn_t *c,
                       uint8_t *out, size_t out_max, size_t *out_len);
 

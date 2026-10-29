@@ -31,7 +31,7 @@ TARGETS := test_blake2s test_curve25519 test_x25519 test_mapresp \
            test_disco_handler test_disco_prober test_retry_after \
            test_backoff test_keys_regen test_skip_value test_jsmn_split \
            test_tai64n test_nacl_box test_tsmp test_tl_date test_stats test_noise_ik \
-           test_http1 test_ctrl_json
+           test_http1 test_ctrl_json test_ts2021
 
 all: $(TARGETS)
 
@@ -146,6 +146,16 @@ NOISE_SRCS := $(TL_SRC)/noise_ik.c $(CRYPTO)/blake2s.c $(CRYPTO)/hkdf_blake2s.c 
 test_noise_ik: test_noise_ik.c $(NOISE_SRCS) $(TL_SRC)/noise_ik.h $(CRYPTO)/secure_zero.h \
                host_include/esp_err.h host_include/esp_log.h
 	$(CC) $(CFLAGS) -I$(TL_SRC) -I$(CRYPTO) -Ihost_include -o $@ test_noise_ik.c $(NOISE_SRCS)
+
+# ts2021 record layer after the Noise handshake (round 1.3.4: D5's
+# EarlyPayload window). Includes ts2021_client.c over a fake esp_tls;
+# host_include/ supplies esp_tls.h, lwip/sockets.h and friends.
+TS2021_DEFS := -DCONFIG_TINYLINK_CONTROL_HOST='"controlplane.test"' \
+               -DCONFIG_TINYLINK_CONTROL_PORT=443 -DCONFIG_TINYLINK_STREAM_IDLE_TIMEOUT_S=120
+test_ts2021: test_ts2021.c $(TL_SRC)/ts2021_client.c $(TL_SRC)/ts2021_client.h \
+             $(TL_SRC)/tls_io.c $(NOISE_SRCS) host_include/esp_tls.h
+	$(CC) $(CFLAGS) $(TS2021_DEFS) -I$(TL_SRC) -I$(TL_INC) -I$(CRYPTO) -Ihost_include -o $@ \
+	    test_ts2021.c $(TL_SRC)/tls_io.c $(NOISE_SRCS)
 
 # WG handshake initiator (step 3a). Pulls in the crypto stack +
 # wg_proto.c + wg_handshake.c. Uses host fallback for time(2) /
@@ -324,7 +334,10 @@ test: test_blake2s.run test_curve25519.run test_x25519.run test_mapresp.run \
       test_retry_after.run test_backoff.run test_keys_regen.run \
       test_skip_value.run test_jsmn_split.run test_tai64n.run \
       test_nacl_box.run test_tsmp.run test_tl_date.run test_stats.run test_noise_ik.run \
-      test_http1.run test_ctrl_json.run
+      test_http1.run test_ctrl_json.run test_ts2021.run
+
+test_ts2021.run: test_ts2021
+	$(RUNNER) ./test_ts2021
 
 test_http1.run: test_http1
 	$(RUNNER) ./test_http1

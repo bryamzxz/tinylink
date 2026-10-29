@@ -243,8 +243,10 @@ esp_err_t h2_session_init(ts2021_conn_t *conn)
         conn->h2 = NULL;
     }
     conn->h2_goaway          = false;
-    conn->h2_rx_len          = 0;
-    conn->h2_rx_off          = 0;
+    /* h2_rx is NOT reset: ts2021_connect's consume_early_payload left
+     * the first HTTP/2 bytes there (round 1.3.4, D5 — they used to sit
+     * in a separate rx_residual buffer), and recv_cb drains them before
+     * it reads another record. */
     conn->h2_may_refill      = false;
 
     nghttp2_session_callbacks *cbs = NULL;
