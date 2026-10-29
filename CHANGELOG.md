@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Optimization round 1.3.3 (in progress, branch `feat/opt-1.3.3`)
+
+- **B22 — a known node registers without Auth.** A restarted tailscaled
+  sends `RegisterRequest` with `Auth` nil (`json:",omitempty"`) and
+  control answers with the node's current state (headscale
+  `handleRegister`: Auth nil + zero Expiry + node not expired → returned
+  unmodified). tinylink sent the auth key on every boot, so every boot
+  ran a full auth-key login server-side — a node-record write and change
+  notification — on the same connection that then pushes endpoints and
+  opens the map stream. That is the prime suspect for the 1.3.2 soak's
+  early stream FIN (3 of 8 boots at 47 / 115 / 244 s, mid keep-alive,
+  only ever on that first connection); a reboot series on 1.3.2 vs 1.3.3
+  tests it. Now NVS `tl_state/reg_keys` (machine_pub ‖ node_pub, written
+  only when the verdict changes) records that control authorized these
+  keys; while it matches, register sends no `Auth` and the auth key is
+  not even read out of NVS. Any refusal of that request — not authorized,
+  `NodeKeyExpired`, an error or malformed answer, a 4xx/5xx other than
+  429/503 — repeats it with the key on the same connection and clears
+  the record; a throttle or a lost answer changes nothing. The long-poll
+  recovery ladder (node expired / deleted / map rejected) still always
+  sends the key. Side effect: revoking the auth key after the first
+  registration (docs/SECURITY-MODEL.md) is now really free. The deployed
+  node has key expiry disabled, which is why a months-old auth key never
+  mattered. Image +720 B; host suite 881 → **899 OK** (CI floor 899):
+  no-Auth body KAT, exact-fit / one-short, and the fallback table.
+
 ### Optimization round B 1.3.2 (2026-10-28, branch `feat/opt-1.3.2`)
 
 Round B of `docs/rounds/2026-10-optimization-list.md` — the code items,

@@ -662,7 +662,8 @@ The original M1-only layout, kept for historical reference:
      handshake. Optionally consumes an EarlyNoise frame containing a
      NodeKeyChallenge and signs it with the NodeKey via NaCl-box.
    - `register_emit()` builds the RegisterRequest JSON (NodeKey,
-     OldNodeKey=zero, Hostinfo, Timestamp, Auth.AuthKey, optional
+     OldNodeKey=zero, Hostinfo, Timestamp, Auth.AuthKey — omitted for
+     an already-authorized node since 1.3.3 —, optional
      NodeKeySignature) and sends it as a single Noise transport record.
      Reads the response, parses JSON, returns based on
      `MachineAuthorized`.

@@ -96,6 +96,47 @@ int main(void)
                                     && out[len0] == 'X');
         e = register_build_body(7, k, "h", "v", "a", out, sizeof(out), &n);
         CHECK("register/capver-digits", e == ESP_OK && strncmp(out, "{\"Version\":7,", 13) == 0);
+
+        /* B22: no auth key → no "Auth" member at all (omitempty), every
+         * other byte as in the typical golden. */
+        char want[2048];
+        const char *auth_at = strstr(k_golden[0], ",\"Auth\":");
+        CHECK("register/golden-has-auth", auth_at != NULL);
+        const size_t head = (size_t)(auth_at - k_golden[0]);
+        memcpy(want, k_golden[0], head);
+        memcpy(want + head, "}", 2);
+        e = register_build_body(148, k, "sensor-cali", "1.3.2-tinylink", NULL,
+                                out, sizeof(out), &n);
+        CHECK("register/no-auth-omits-member", e == ESP_OK && n == strlen(want) &&
+                                               strcmp(out, want) == 0 &&
+                                               strstr(out, "Auth") == NULL);
+        CHECK("register/no-auth-is-object", json_check_object(out, n) == ESP_OK);
+        e = register_build_body(148, k, "sensor-cali", "1.3.2-tinylink", NULL,
+                                out, n + 1, &n);
+        CHECK("register/no-auth-exact-fit", e == ESP_OK && n == strlen(want));
+        e = register_build_body(148, k, "sensor-cali", "1.3.2-tinylink", NULL,
+                                out, strlen(want), &n);
+        CHECK("register/no-auth-one-short", e == ESP_ERR_INVALID_SIZE);
+        /* "" is still a key: the member stays (empty-strings golden). */
+        e = register_build_body(148, k, "", "", "", out, sizeof(out), &n);
+        CHECK("register/empty-auth-keeps-member", e == ESP_OK &&
+                                                  strstr(out, ",\"Auth\":{\"AuthKey\":\"\"}}") != NULL);
+    }
+
+    /* --- B22 fallback: retry with the auth key? ------------------- */
+    {
+        CHECK("retry-auth/ok-never",       !register_retry_with_auth(200, ESP_OK));
+        CHECK("retry-auth/not-authorized",  register_retry_with_auth(200, ESP_ERR_NOT_FINISHED));
+        CHECK("retry-auth/key-expired",     register_retry_with_auth(200, ESP_ERR_INVALID_STATE));
+        CHECK("retry-auth/error-answer",    register_retry_with_auth(200, ESP_FAIL));
+        CHECK("retry-auth/malformed",       register_retry_with_auth(200, ESP_ERR_INVALID_RESPONSE));
+        CHECK("retry-auth/401",             register_retry_with_auth(401, ESP_FAIL));
+        CHECK("retry-auth/404",             register_retry_with_auth(404, ESP_FAIL));
+        CHECK("retry-auth/500",             register_retry_with_auth(500, ESP_FAIL));
+        CHECK("retry-auth/429-throttle",   !register_retry_with_auth(429, ESP_FAIL));
+        CHECK("retry-auth/503-throttle",   !register_retry_with_auth(503, ESP_FAIL));
+        CHECK("retry-auth/no-answer",      !register_retry_with_auth(0, ESP_FAIL));
+        CHECK("retry-auth/busy-buffer",    !register_retry_with_auth(0, ESP_ERR_INVALID_STATE));
     }
 
     /* --- writer -------------------------------------------------- */

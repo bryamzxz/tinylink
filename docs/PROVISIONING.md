@@ -105,6 +105,7 @@ key cannot do (expired user-owned nodes need a valid key,
 - Tailscale auth key change → only relevant if the device needs to
   re-register (e.g. node was force-deleted from the admin panel). The
   on-device NodeKey persists across reboots, so under normal operation
-  no re-registration is needed.
+  no re-registration is needed — since 1.3.3 a reboot registers without
+  the auth key (NVS `tl_state/reg_keys` records the authorized keys).
 - Node identity rotation is not implemented (no remote trigger; see
   `docs/ROADMAP.md` § OTA).

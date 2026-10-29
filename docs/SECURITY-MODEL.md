@@ -72,7 +72,11 @@ The Tailscale auth key is **single-use by convention** — once
 `MachineAuthorized=true` returns, the auth key has done its job and
 should be revoked from the admin panel. Because the device persists its
 NodeKey, future re-registrations would require a new auth key flashed
-into NVS.
+into NVS. Since round 1.3.3 (B22) a reboot of an authorized node sends
+no auth key at all and does not read it out of NVS; it is only sent on
+the first registration and when control refuses the known node (deleted,
+expired, needs approval) — so a revoked or expired key costs nothing
+until then.
 
 ## X25519 — constant-time donna (landed in PR #61)
 

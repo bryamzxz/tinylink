@@ -173,8 +173,11 @@ void tinylink_bootstat_record(void);
  * device. */
 esp_err_t tinylink_tai64n_floor_init(void);
 
-/* Run the ts2021 Noise IK handshake and POST /machine/register. Reads the
- * Tailscale auth key from NVS namespace "tl_creds", key "auth_key".
+/* Run the ts2021 Noise IK handshake and POST /machine/register. A node
+ * control authorized before (NVS "tl_state"/"reg_keys" matches the
+ * device keys) registers without Auth, like a restarted tailscaled;
+ * otherwise, or when control refuses that, it sends the Tailscale auth
+ * key from NVS namespace "tl_creds", key "auth_key" (round 1.3.3, B22).
  * Blocks until either MachineAuthorized=true (returns ESP_OK) or a hard
  * failure (returns an esp_err_t describing the failure). The caller is
  * expected to retry on transient failures; tinylink_register() does not

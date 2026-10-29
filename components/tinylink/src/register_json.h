@@ -44,6 +44,10 @@ static inline void register_keyed_hex(char *out, const char *prefix,
  *    "Followup":"","Expiry":"0001-01-01T00:00:00Z",
  *    "Hostinfo":{"OS":"esp32","Hostname":…,"IPNVersion":…},
  *    "Auth":{"AuthKey":…}}
+ * - auth_key NULL omits "Auth" entirely (round 1.3.3, B22): upstream's
+ *   field is `json:",omitempty"`, and a restarted tailscaled sends no
+ *   Auth for a node control already knows — control then answers with
+ *   the node's current state instead of re-running the auth-key login.
  * - Version is the CapabilityVersion (TINYLINK_CAPVER).
  * - OldNodeKey is all zeros on first registration.
  * - NLKey is required (no `omitempty` upstream); there is no TKA, so an
@@ -84,9 +88,13 @@ static inline esp_err_t register_build_body(unsigned capver,
     json_out_str(&o, hostname);
     json_out_raw(&o, ",\"IPNVersion\":");
     json_out_str(&o, ipn_version);
-    json_out_raw(&o, "},\"Auth\":{\"AuthKey\":");
-    json_out_str(&o, auth_key);
-    json_out_raw(&o, "}}");
+    json_out_raw(&o, "}");
+    if (auth_key != NULL) {
+        json_out_raw(&o, ",\"Auth\":{\"AuthKey\":");
+        json_out_str(&o, auth_key);
+        json_out_raw(&o, "}");
+    }
+    json_out_raw(&o, "}");
     if (!json_out_ok(&o)) return ESP_ERR_INVALID_SIZE;
     *out_len = o.len;
     return ESP_OK;
@@ -123,6 +131,20 @@ static inline esp_err_t register_parse_response(const char *js, size_t len,
     }
     if (key_expired) return ESP_ERR_INVALID_STATE;
     return authorized ? ESP_OK : ESP_ERR_NOT_FINISHED;
+}
+
+/* B22: after a register WITHOUT Auth (a node control authorized before),
+ * whether to repeat it with the auth key on the same connection. Yes when
+ * control answered and did not authorize the node — MachineAuthorized
+ * false (unknown or deleted node: an AuthURL answer), NodeKeyExpired, an
+ * error answer, a malformed one, or a 4xx/5xx refusal (e.g. a machine key
+ * control does not pair with this node key). No for 429 / 503, which are
+ * throttles the caller waits out, and for status 0: the request never got
+ * an answer, so the caller drops the connection and starts over. */
+static inline bool register_retry_with_auth(int http_status, esp_err_t verdict)
+{
+    if (verdict == ESP_OK) return false;
+    return http_status != 0 && http_status != 429 && http_status != 503;
 }
 
 #ifdef __cplusplus

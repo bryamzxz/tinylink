@@ -140,7 +140,7 @@ JSON body, fields used today:
 | `Hostinfo.OS`       | `"esp32"`.                                         |
 | `Hostinfo.Hostname` | from `CONFIG_TINYLINK_DEVICE_HOSTNAME`.            |
 | `Hostinfo.IPNVersion` | `TINYLINK_IPN_VERSION` (currently `"1.0.0-tinylink"`; derived from `TINYLINK_VERSION_{MAJOR,MINOR,PATCH}` in `components/tinylink/include/tinylink.h`). Tailscale parses the `MAJOR.MINOR.PATCH` prefix and labels the node `tsReleaseTrack=stable` when MINOR is even, `unstable` when odd (see `tailscale/version/prop.go::IsUnstableBuild`). |
-| `Auth.AuthKey`      | `tskey-auth-...` from NVS `tl_creds/auth_key`.     |
+| `Auth.AuthKey`      | `tskey-auth-...` from NVS `tl_creds/auth_key`. Since round 1.3.3 (B22) the whole `Auth` member is omitted (upstream `json:",omitempty"`) once control has authorized this machine + node key pair — recorded in NVS `tl_state/reg_keys` — the way a restarted tailscaled re-registers; control answers with the node's current state. Any refusal of that request (not authorized, `NodeKeyExpired`, error answer, 4xx/5xx other than 429/503) repeats it with the key on the same connection. The long-poll recovery ladder (node expired / deleted / map rejected) always sends the key. |
 | `Timestamp`         | RFC3339 from the device clock.                     |
 | `Expiry`            | `"0001-01-01T00:00:00Z"` (no expiry).              |
 | `Ephemeral`         | `false`.                                           |

@@ -42,6 +42,7 @@
 #include "mapreq.h"
 #include "netmap.h"
 #include "register.h"
+#include "register_json.h"   /* register_retry_with_auth */
 #include "stun.h"
 #include "stun_probe.h"
 #include "telemetry.h"
@@ -156,6 +157,8 @@ void tinylink_diag_dump_stacks(void)
     }
 }
 
+static void reg_hint_load(void);
+
 esp_err_t tinylink_init(void)
 {
     /* Task-WDT feed for every blocking TLS poll (see tl_wdt.h). */
@@ -170,6 +173,7 @@ esp_err_t tinylink_init(void)
         ESP_LOGE(TAG, "control_key_get failed: 0x%x", err);
         return err;
     }
+    reg_hint_load();
     s_initialized = true;
     return ESP_OK;
 }
@@ -286,7 +290,61 @@ static esp_err_t read_auth_key(char *out, size_t out_size)
     return err;
 }
 
-esp_err_t tinylink_register(void)
+/* B22 (round 1.3.3): the keys control last authorized — machine_pub ‖
+ * node_pub, so a regenerated key of either kind misses — in the TAI64N
+ * namespace. While they match, a register sends no Auth, the way a
+ * restarted tailscaled re-registers: control answers with the node's
+ * current state instead of re-running the auth-key login (a node-record
+ * write on its side) on every boot, and the auth key is not even read
+ * out of NVS. Written only when the verdict changes. */
+#define REG_NVS_KEY "reg_keys"
+static bool s_reg_known;   /* NVS reg_keys == this device's keys */
+
+static void reg_hint_load(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(TAI64N_NVS_NS, NVS_READONLY, &h) != ESP_OK) return;
+    uint8_t blob[2 * TINYLINK_KEY_LEN];
+    size_t  len = sizeof(blob);
+    s_reg_known = nvs_get_blob(h, REG_NVS_KEY, blob, &len) == ESP_OK &&
+                  len == sizeof(blob) &&
+                  memcmp(blob, s_keys.machine_pub, TINYLINK_KEY_LEN) == 0 &&
+                  memcmp(blob + TINYLINK_KEY_LEN, s_keys.node_pub,
+                         TINYLINK_KEY_LEN) == 0;
+    nvs_close(h);
+}
+
+/* RAM follows the verdict even when NVS fails: worst case the next boot
+ * pays one extra register round trip (or sends Auth it did not need). */
+static void reg_hint_store(bool known)
+{
+    if (s_reg_known == known) return;
+    s_reg_known = known;
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(TAI64N_NVS_NS, NVS_READWRITE, &h);
+    if (err == ESP_OK) {
+        if (known) {
+            uint8_t blob[2 * TINYLINK_KEY_LEN];
+            memcpy(blob, s_keys.machine_pub, TINYLINK_KEY_LEN);
+            memcpy(blob + TINYLINK_KEY_LEN, s_keys.node_pub, TINYLINK_KEY_LEN);
+            err = nvs_set_blob(h, REG_NVS_KEY, blob, sizeof(blob));
+        } else {
+            err = nvs_erase_key(h, REG_NVS_KEY);
+            if (err == ESP_ERR_NVS_NOT_FOUND) err = ESP_OK;
+        }
+        if (err == ESP_OK) err = nvs_commit(h);
+        nvs_close(h);
+    }
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "register hint: nvs %s failed: 0x%x",
+                 known ? "set" : "erase", err);
+    }
+}
+
+/* force_auth: the long-poll recovery ladder (node expired / deleted /
+ * map rejected) — control already refused this node, so go straight to
+ * the auth key, as before B22. */
+static esp_err_t register_node(bool force_auth)
 {
     if (!s_initialized) return ESP_ERR_INVALID_STATE;
 
@@ -294,28 +352,57 @@ esp_err_t tinylink_register(void)
      * doesn't surface a stale value from a previous 429. */
     s_last_register_wait_ms = 0;
 
+    /* Read before connecting when it is going to be sent: a missing key
+     * then fails without a TLS + Noise handshake per retry. */
+    const bool known = s_reg_known && !force_auth;
     char auth_key[128];
-    esp_err_t err = read_auth_key(auth_key, sizeof(auth_key));
-    if (err != ESP_OK) return err;
+    esp_err_t err;
+    if (!known) {
+        err = read_auth_key(auth_key, sizeof(auth_key));
+        if (err != ESP_OK) return err;
+    }
 
     err = ensure_control_conn();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "ts2021_connect failed: 0x%x", err);
-        mbedtls_platform_zeroize(auth_key, sizeof(auth_key));
+        if (!known) mbedtls_platform_zeroize(auth_key, sizeof(auth_key));
         return err;
     }
 
-    err = register_emit(&s_conn, &s_keys, auth_key);
+    int status = 0;
+    if (known) {
+        err = register_emit(&s_conn, &s_keys, NULL, &status);
+        if (register_retry_with_auth(status, err)) {
+            ESP_LOGW(TAG, "register without auth refused (HTTP %d, 0x%x) — "
+                          "retrying with the stored auth key", status, err);
+            reg_hint_store(false);
+            err = read_auth_key(auth_key, sizeof(auth_key));
+            if (err == ESP_OK) {
+                err = register_emit(&s_conn, &s_keys, auth_key, &status);
+                mbedtls_platform_zeroize(auth_key, sizeof(auth_key));
+            }
+        }
+    } else {
+        err = register_emit(&s_conn, &s_keys, auth_key, &status);
+        /* Scrub the auth key in stack memory. mbedtls_platform_zeroize is
+         * a compiler-barrier'd zero (won't be optimized out as a dead
+         * store the way a plain memset on a no-longer-read buffer can). */
+        mbedtls_platform_zeroize(auth_key, sizeof(auth_key));
+    }
 
     /* Snapshot before drop_control_conn — the status + Retry-After live
      * on s_conn; drop_control_conn calls ts2021_close which may zero
      * per-conn state on a future change. */
     s_last_register_wait_ms = control_rate_limit_ms();
 
-    /* Scrub the auth key in stack memory. mbedtls_platform_zeroize is a
-     * compiler-barrier'd zero (won't be optimized out as a dead store the
-     * way a plain memset on a no-longer-read buffer can). */
-    mbedtls_platform_zeroize(auth_key, sizeof(auth_key));
+    /* An authorized node is known from now on; one control answered
+     * without authorizing is not (a throttle or a lost answer says
+     * nothing either way). */
+    if (err == ESP_OK) {
+        reg_hint_store(true);
+    } else if (register_retry_with_auth(status, err)) {
+        reg_hint_store(false);
+    }
 
     /* Keep the conn on success: since M5-2c the nghttp2 session is
      * persistent per ts2021 conn, so the next request (the boot-time
@@ -328,6 +415,11 @@ esp_err_t tinylink_register(void)
      * half-broken channel is never reused. */
     if (err != ESP_OK) drop_control_conn();
     return err;
+}
+
+esp_err_t tinylink_register(void)
+{
+    return register_node(false);
 }
 
 esp_err_t tinylink_dataplane_start(void)
@@ -1513,7 +1605,7 @@ static void long_poll_task(void *arg)
                                   "re-registering with stored authkey",
                              (unsigned)consec_rejected, http_status);
                 }
-                esp_err_t rr = tinylink_register();
+                esp_err_t rr = register_node(true);
                 if (rr == ESP_OK) {
                     ESP_LOGI(TAG, "re-register OK — refreshing endpoints");
                     /* Stream=true is read-only server-side; make sure the

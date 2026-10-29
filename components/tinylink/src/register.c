@@ -27,7 +27,8 @@ _Static_assert(REQUEST_BUF + RESPONSE_BUF <= TL_CTRL_BUF_SZ,
 
 static esp_err_t register_emit_in(ts2021_conn_t *conn,
                                   const tinylink_keys_t *keys,
-                                  const char *auth_key, uint8_t *buf)
+                                  const char *auth_key, uint8_t *buf,
+                                  int *http_status)
 {
     /* Version is the Tailscale CapabilityVersion (TINYLINK_CAPVER,
      * single source of truth). Production clients use
@@ -54,16 +55,20 @@ static esp_err_t register_emit_in(ts2021_conn_t *conn,
                        CONFIG_TINYLINK_CONTROL_HOST,
                        (const uint8_t *)body, body_len,
                        &status, resp, RESPONSE_BUF - 1, &resp_len);
-    /* The request carries the auth key: scrub it the moment it is sent
+    /* The request may carry the auth key: scrub it the moment it is sent
      * (it used to sit in a dead stack frame; the buffer is long-lived). */
     tl_secure_zero(body, body_len);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "h2_post_json failed: 0x%x", err);
         return err;
     }
+    /* Only an answered request reports a status (register_retry_with_auth
+     * reads 0 as "no answer"). */
+    *http_status = status;
     resp[resp_len] = '\0';
-    ESP_LOGI(TAG, "/machine/register status=%d body=%u bytes",
-             status, (unsigned)resp_len);
+    ESP_LOGI(TAG, "/machine/register status=%d body=%u bytes%s",
+             status, (unsigned)resp_len,
+             auth_key != NULL ? "" : " (known node, no auth)");
     if (status != 200) {
         if (status == 429 || status == 503) {
             ESP_LOGW(TAG, "control plane throttled register: HTTP %d "
@@ -127,14 +132,15 @@ static esp_err_t register_emit_in(ts2021_conn_t *conn,
 
 esp_err_t register_emit(ts2021_conn_t *conn,
                         const tinylink_keys_t *keys,
-                        const char *auth_key)
+                        const char *auth_key, int *http_status)
 {
-    if (conn == NULL || keys == NULL || auth_key == NULL) {
+    if (http_status != NULL) *http_status = 0;
+    if (conn == NULL || keys == NULL || http_status == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
     uint8_t *buf = tl_ctrl_buf_claim("register");
     if (buf == NULL) return ESP_ERR_INVALID_STATE;
-    esp_err_t err = register_emit_in(conn, keys, auth_key, buf);
+    esp_err_t err = register_emit_in(conn, keys, auth_key, buf, http_status);
     tl_ctrl_buf_release();
     return err;
 }
