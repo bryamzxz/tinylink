@@ -1627,6 +1627,11 @@ esp_err_t tinylink_wait_dataplane_ms(uint32_t timeout_ms)
     return ESP_OK;
 }
 
+bool tinylink_session_up(void)
+{
+    return wg_netif_is_up();
+}
+
 esp_err_t tinylink_time_start(void)
 {
     esp_err_t err = tl_time_init();
@@ -1640,6 +1645,7 @@ void tinylink_get_stats(tinylink_stats_t *out)
     memset(out, 0, sizeof(*out));
     const int64_t now = esp_timer_get_time();
     out->uptime_s     = (uint32_t)(now / 1000000LL);
+    out->reset_reason = (int)esp_reset_reason();
     out->heap_free    = (uint32_t)esp_get_free_heap_size();
     out->heap_largest = (uint32_t)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT);
     out->ntp_synced   = tl_time_synced();

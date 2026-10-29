@@ -14,9 +14,10 @@ idf_component_register(
         esp_wifi
         esp_event
         esp_pm
+        esp_timer
         tinylink
 )
 
 # -O2 for app_main / app_wifi / app_nvs. Tiny code surface but no reason
-# to leave it at -Og when the rest of tinylink runs -O2 (see above).
+# to leave it at the global -Os when the rest of tinylink runs -O2.
 target_compile_options(${COMPONENT_LIB} PRIVATE -O2)

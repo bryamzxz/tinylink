@@ -32,10 +32,44 @@ islands keep the hot-path gains (lwIP checksum 21 → 9 µs per 1 500 B).
 
 ## Round A — Kconfig / one-liners (biggest win, lowest risk) → 1.3.1
 
+**Status (2026-10-28, branch `feat/opt-1.3.1`): implemented, hardware
+smoke pending.** Image 959 249 → 826 768 B (−132 481 B, −13.8 %),
+static IRAM 78 767 → 73 867 B, static DRAM 108 952 → 108 220 B. Host
+suite 633/0, 0 warnings, partition table byte-identical (app-only
+flash). Deviations from the table below, each verified against IDF
+5.5.6 source:
+- A1 islands as listed (tinylink, main, mbedcrypto + lwIP inet_chksum /
+  pbuf / udp / ip4 + FreeRTOS queue.c via `set_property(SOURCE …
+  TARGET_DIRECTORY)`); -Os also drops FreeRTOS's task-return wrapper —
+  no task returns.
+- A3: Log V2's call chain is ≈ 150–200 B deeper → `tinylink_tlm`
+  4 096 → 4 608 B and the Wi-Fi task +512 B (M16 soak lows: 452 / 584 B
+  free).
+- A7 **dropped**: IDF's hidden `ESP_SLEEP_RTC_BUS_ISO_WORKAROUND` (y on
+  ESP32) already keeps RTC_PERIPH on in every light sleep
+  (`sleep_modes.c:2895`); REFERENCE.md corrected.
+- A8 at **level 6** (2.77 V ±0.05), not 7: lowest level whose band stays
+  above the flash's 2.7 V minimum, 30 mV more nuisance headroom than L7.
+  Reset reason now in the boot log and `/stats` to count BOD resets.
+- A11 as an `esp_timer` in `app_wifi.c` (PS_NONE → MIN_MODEM at WG
+  session up, ≤ 60 s after Wi-Fi start), not a wait in `bringup()` —
+  `app_main` must return to free its 24 KiB stack before the DERP TLS
+  handshake.
+- A12 at **500 000 baud**, not 921 600: with PM_ENABLE the console UART
+  runs from REF_TICK (1 MHz) and 921 600 comes out ≈ 941 k; only
+  settable on the CUSTOM console choice.
+- A13: dynamic log levels off via `LOG_TAG_LEVEL_IMPL_NONE`; nothing
+  calls `esp_log_level_set` except IDF debug drivers.
+- A14 also fixed: CAMELLIA claim (it is gone; only ARIA is linked), RSA
+  "fallback" note, the no-op `MBEDTLS_SSL_MAX_CONTENT_LEN` line, chain
+  now YE1/YE2 → Root YE → X2 → X1, 43 (not 44) CMN roots.
+- New guard: CMake warns when an `sdkconfig` predates 1.3.1 (an
+  existing sdkconfig keeps its old choice selections over the defaults).
+
 | # | item | evidence | gain | risk |
 |---|---|---|---|---|
 | A1 | **-Os global + -O2 islands** (see above); drop the stale "toolchain hangs at -O2" note — all 92 lwIP files build at -O2 | `CONFIG_COMPILER_OPTIMIZATION_DEBUG=y` today | −62 KB flash, −6.6 KB IRAM (measured -Os); islands keep hot paths | M: 155 frames grow / 107 shrink (net +480 B) → soak |
-| A2 | **Cert bundle FULL → common (CMN)**: 44 roots incl. ISRG X1/X2, GTS R1–R4, DigiCert, GlobalSign, Amazon, USERTrust | `x509_crt_bundle.S.obj` 68 988 B | **−51 064 B** measured | L: exotic-CA servers fail closed; closes most of owner item G |
+| A2 | **Cert bundle FULL → common (CMN)**: 43 roots incl. ISRG X1/X2, GTS R1–R4, DigiCert, GlobalSign, Amazon, USERTrust | `x509_crt_bundle.S.obj` 68 988 B | **−51 064 B** measured | L: exotic-CA servers fail closed; closes most of owner item G |
 | A3 | **Log V2** (+ `LOG_COLORS=n`, which alone is −6.6 KB) | measured | −19 368 B flash, +1.9 KB IRAM | L: re-check soak grep patterns |
 | A4 | `ESP_NGHTTP2_INBOUND_BUFFER_LENGTH` 4096 → 512 | `nghttp2_session_recv` frame 4 128 → 544 B | −3.6 KB long-poll stack | L |
 | A5 | **DHCP ARP check really off**: select `CONFIG_LWIP_DHCP_DOES_NOT_CHECK_OFFERED_IP=y` (`sdkconfig.defaults:329` sets a choice member → ignored) | `acd_dhcp_check.c` 2 × 500 ms probes | **−0.5…1.0 s every boot + re-assoc**, −704 B | L |

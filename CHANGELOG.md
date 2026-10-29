@@ -7,6 +7,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Optimization round A 1.3.1 (2026-10-28, branch `feat/opt-1.3.1`)
+
+Round A of `docs/rounds/2026-10-optimization-list.md` — the Kconfig /
+one-liner items, every claim re-checked against the IDF v5.5.6 source,
+then an independent review (its findings are folded in below). Image
+**959 249 → 826 768 B (−132 481 B, −13.8 %)**; static IRAM 78 767 →
+73 867 B; static DRAM 108 952 → 108 220 B. Host suite 633 OK / 0 FAIL,
+0 compiler warnings, partition table byte-identical (app-only flash).
+**Hardware smoke pending.**
+
+- **-Os globally, -O2 where packets flow.** `COMPILER_OPTIMIZATION_SIZE`
+  replaces IDF's -Og; tinylink, main and mbedcrypto stay -O2, and lwIP
+  `inet_chksum.c` / `pbuf.c` / `udp.c` / `ip4.c` plus FreeRTOS
+  `queue.c` become per-source -O2 islands (top-level `CMakeLists.txt`).
+- **Common-CA certificate bundle** (43 roots: ISRG X1/X2, GTS R1–R4,
+  DigiCert, GlobalSign, Amazon, USERTrust…) instead of the full Mozilla
+  list. Live chains re-checked: controlplane leaf → YE1 → Root YE → ISRG
+  X2 (cross-signed by X1), derp* the same via YE2. A self-hosted control
+  server under a root outside that set now fails closed; build with
+  `CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL=y` for it. Closes
+  owner item G.
+- mbedTLS: PEM parsing and the extended / compressed EC key forms off
+  (DER bundle, no client key); **ECP fixed-point tables on** (−0.45…0.6 s
+  per full TLS handshake, +5.6 KB).
+- **Log V2**, no colours, static log levels (`LOG_TAG_LEVEL_IMPL_NONE`).
+  V2's call chain is ≈ 150–200 B deeper, so `tinylink_tlm` 4 096 → 4 608 B
+  and the Wi-Fi driver task +512 B (M16 soak lows: 452 / 584 B free).
+- **DHCP ARP probe really off** — the old `LWIP_DHCP_DOES_ARP_CHECK=n`
+  set a choice member and was ignored; 2 × 500 ms per DHCP bind.
+- `nghttp2_session_recv` inbound buffer 4 096 → 512 B (−3.6 KB of
+  long-poll stack; `recv_cb` serves it from the decrypted record).
+- **No FreeRTOS software timers** (no xTimer anywhere; "Tmr Svc" task
+  gone) and **no run-time stats** (an esp_timer read per context switch).
+- **Brown-out detector level 0 (2.43 V) → 6 (2.77 V ±0.05)**: the lowest
+  level that stays above the flash's 2.7 V minimum across its tolerance.
+  IDF's XMC brown-out reset only covers vendor 0x20; this flash is 0x46.
+- **Console at 500 000 baud** (was 115 200; `idf.py monitor` and
+  `tools/serial_capture.py` follow). 921 600 is unreachable with PM on
+  (REF_TICK 1 MHz → ≈ 941 k).
+- **Wi-Fi awake for the boot exchange**: `WIFI_PS_NONE` until the WG
+  session is up (an `esp_timer` in `app_wifi.c` switches to
+  `MIN_MODEM`, at the latest 60 s after Wi-Fi start) instead of every
+  inbound burst waiting for a DTIM beacon. New `tinylink_session_up()`.
+- **Reset reason** in the boot log (`reset: brown-out, 9`) and in
+  `/stats` (`"reset_reason"`) — the ROM's own line is unreadable at the
+  new console rate.
+- CMake now warns when `sdkconfig` predates 1.3.1: an existing sdkconfig
+  keeps its old choice selections over `sdkconfig.defaults`. **Delete
+  the checkout's `sdkconfig` once** when moving to this release.
+- Not done: errata RTC-126 workaround (A7) — IDF's hidden
+  `ESP_SLEEP_RTC_BUS_ISO_WORKAROUND` already keeps RTC_PERIPH on in
+  light sleep; `docs/esp32/REFERENCE.md` corrected.
+- Comment fixes in `sdkconfig.defaults` (TLS 1.2 only, ECDHE-ECDSA suite,
+  current LE chain, Camellia gone / ARIA still linked, printf float,
+  partition offsets, a no-op `SSL_MAX_CONTENT_LEN` line removed).
+
 ### Upstream sync round 1.3.0 (2026-10-28, branch `feat/upstream-sync-2026-10`)
 
 Inputs: a two-sided upstream audit — tailscale `31d8badb3..f7c1b8e52`

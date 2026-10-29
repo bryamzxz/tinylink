@@ -3,6 +3,8 @@
 
 #include "app_wifi.h"
 
+#include <stdbool.h>
+#include <stdint.h>
 #include <string.h>
 
 #include "freertos/FreeRTOS.h"
@@ -17,6 +19,7 @@
 
 #include "app_nvs.h"
 #include "backoff.h"
+#include "tinylink.h"
 
 static const char *TAG = "app_wifi";
 
@@ -41,6 +44,39 @@ static int s_retry_count;
 #define WIFI_RECONNECT_BASE_MS 500u
 #define WIFI_RECONNECT_CAP_MS  30000u
 static esp_timer_handle_t s_reconnect_timer;
+
+/* Boot power-save switch (round 1.3.1). The station starts with
+ * WIFI_PS_NONE so the boot exchange is not paced by DTIM beacons; this
+ * periodic esp_timer turns modem sleep on once the WG session is up, or
+ * PS_AWAKE_CAP_MS after Wi-Fi start whatever happened (register waiting
+ * for approval, control down) — the modem never stays awake unbounded.
+ * A timer rather than a wait in bringup(): app_main must return to free
+ * its 24 KiB stack before the DERP TLS handshake. */
+#define PS_POLL_MS       500u
+#define PS_AWAKE_CAP_MS  60000u
+static esp_timer_handle_t s_ps_timer;
+static int64_t s_ps_armed_us;
+static bool s_ps_warned;
+
+static void ps_timer_cb(void *arg)
+{
+    (void)arg;
+    const bool up = tinylink_session_up();
+    const int64_t awake_ms = (esp_timer_get_time() - s_ps_armed_us) / 1000;
+    if (!up && awake_ms < (int64_t)PS_AWAKE_CAP_MS) return;
+    esp_err_t ps_err = esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+    if (ps_err != ESP_OK) {
+        /* Retried on the next poll; warn once. */
+        if (!s_ps_warned) {
+            ESP_LOGW(TAG, "esp_wifi_set_ps(MIN_MODEM) failed: 0x%x — retrying", ps_err);
+            s_ps_warned = true;
+        }
+        return;
+    }
+    (void)esp_timer_stop(s_ps_timer);
+    ESP_LOGI(TAG, "modem sleep (MIN_MODEM) on after %u ms awake%s",
+             (unsigned)awake_ms, up ? "" : " — WG session not up yet");
+}
 
 static void reconnect_timer_cb(void *arg)
 {
@@ -109,6 +145,11 @@ esp_err_t app_wifi_start(void)
     ESP_ERROR_CHECK(esp_netif_set_hostname(netif, CONFIG_TINYLINK_DEVICE_HOSTNAME));
 
     wifi_init_config_t init_cfg = WIFI_INIT_CONFIG_DEFAULT();
+    /* +512 B over IDF's 3 072 (round 1.3.1): the driver's own log lines
+     * run through Log V2's deeper esp_log_va → esp_log_format →
+     * esp_log_printf chain (≈ +150–200 B per call vs V1), and the task
+     * bottomed out at 584 B free in the M16 6-h soak under V1. */
+    init_cfg.wifi_task_stack_size += 512;
     ESP_ERROR_CHECK(esp_wifi_init(&init_cfg));
 
     ESP_ERROR_CHECK(esp_event_handler_instance_register(
@@ -162,15 +203,32 @@ esp_err_t app_wifi_start(void)
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg));
     ESP_ERROR_CHECK(esp_wifi_start());
 
-    /* WIFI_PS_MIN_MODEM: wake on every DTIM beacon (does not skip
+    /* Modem awake for the boot exchange (round 1.3.1): under modem
+     * sleep every inbound burst of DHCP, DNS, the two TLS handshakes,
+     * register, netmap and the WG handshake waits for the next DTIM
+     * beacon. ps_timer_cb() switches to WIFI_PS_MIN_MODEM once the WG
+     * session is up (≤ 60 s). While the modem is awake esp_wifi holds
+     * its APB_FREQ_MAX PM lock, so light sleep stays off until then.
+     *
+     * WIFI_PS_MIN_MODEM wakes on every DTIM beacon (does not skip
      * beacons). Together with esp_pm_configure(light_sleep_enable=true)
      * in main.c, this lets the modem sleep between beacons without
      * losing inbound packets. WIFI_PS_MAX_MODEM (DTIM-skipping) is
      * unsafe for tinylink because the sensor must receive WG/DISCO
-     * traffic reliably. */
-    esp_err_t ps_err = esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+     * traffic reliably. If the timer cannot be armed, modem sleep goes
+     * on immediately (the pre-1.3.1 behaviour). */
+    const esp_timer_create_args_t ps_args = {
+        .callback = ps_timer_cb,
+        .name     = "wifi_ps",
+    };
+    s_ps_armed_us = esp_timer_get_time();
+    bool ps_armed = esp_timer_create(&ps_args, &s_ps_timer) == ESP_OK &&
+                    esp_timer_start_periodic(s_ps_timer,
+                                             (uint64_t)PS_POLL_MS * 1000ULL) == ESP_OK;
+    esp_err_t ps_err = esp_wifi_set_ps(ps_armed ? WIFI_PS_NONE : WIFI_PS_MIN_MODEM);
     if (ps_err != ESP_OK) {
-        ESP_LOGW(TAG, "esp_wifi_set_ps(MIN_MODEM) failed: 0x%x", ps_err);
+        ESP_LOGW(TAG, "esp_wifi_set_ps(%s) failed: 0x%x",
+                 ps_armed ? "NONE" : "MIN_MODEM", ps_err);
     }
 
     return ESP_OK;

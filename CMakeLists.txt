@@ -99,6 +99,19 @@ include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 
 project(tinylink)
 
+# An existing sdkconfig always wins over sdkconfig.defaults, so one
+# generated before round 1.3.1 silently keeps the old choice selections
+# (-Og, full cert bundle, Log V1, DHCP ARP probe, brown-out level 0) in
+# a build that reports 1.3.1. Say so; deleting sdkconfig regenerates it.
+if(NOT CONFIG_COMPILER_OPTIMIZATION_SIZE OR NOT CONFIG_LOG_VERSION_2
+   OR NOT CONFIG_LWIP_DHCP_DOES_NOT_CHECK_OFFERED_IP)
+    message(WARNING "sdkconfig does not carry the round-1.3.1 defaults "
+                    "(COMPILER_OPTIMIZATION_SIZE / LOG_VERSION_2 / "
+                    "LWIP_DHCP_DOES_NOT_CHECK_OFFERED_IP). If it predates "
+                    "1.3.1, delete it and rebuild; ignore this for a "
+                    "deliberate debug configuration.")
+endif()
+
 # -O2 for IDF's mbedcrypto library only. This is what mbedtls uses for
 # its symmetric/asymmetric primitives — i.e. the SHA/AES/RSA building
 # blocks behind every TLS handshake on the control plane and DERP
@@ -109,3 +122,24 @@ project(tinylink)
 # validation, not arithmetic, and we want to minimize binary growth
 # on the cold paths.
 target_compile_options(mbedcrypto PRIVATE -O2)
+
+# -O2 islands inside IDF components (round 1.3.1). The global level is
+# -Os (CONFIG_COMPILER_OPTIMIZATION_SIZE); these files sit on every WG
+# packet: lwIP's Internet checksum (21 → 9 µs per 1 500 B at -O2), pbuf
+# alloc/copy, UDP and IPv4 in/out, and the FreeRTOS queue the wg_tx task
+# and the socket layer block on. Source-level COMPILE_OPTIONS land after
+# the component's own flags on the command line, so -O2 wins.
+idf_component_get_property(tl_lwip_lib lwip COMPONENT_LIB)
+idf_component_get_property(tl_lwip_dir lwip COMPONENT_DIR)
+set_property(SOURCE
+        "${tl_lwip_dir}/lwip/src/core/inet_chksum.c"
+        "${tl_lwip_dir}/lwip/src/core/pbuf.c"
+        "${tl_lwip_dir}/lwip/src/core/udp.c"
+        "${tl_lwip_dir}/lwip/src/core/ipv4/ip4.c"
+    TARGET_DIRECTORY ${tl_lwip_lib}
+    APPEND PROPERTY COMPILE_OPTIONS -O2)
+idf_component_get_property(tl_freertos_lib freertos COMPONENT_LIB)
+idf_component_get_property(tl_freertos_dir freertos COMPONENT_DIR)
+set_property(SOURCE "${tl_freertos_dir}/FreeRTOS-Kernel/queue.c"
+    TARGET_DIRECTORY ${tl_freertos_lib}
+    APPEND PROPERTY COMPILE_OPTIONS -O2)

@@ -151,7 +151,7 @@ blocks, the DISCO-pong fast-INIT and the DERP-relayed response path.
 The telemetry task's UDP socket also listens on
 `CONFIG_TINYLINK_STATS_PORT` (27822) and answers any datagram from a
 100.64.0.0/10 source with one JSON line built from
-`tinylink_get_stats()` (uptime, heap, NTP, control/DERP state, public
+`tinylink_get_stats()` (uptime, reset reason, heap, NTP, control/DERP state, public
 endpoint, WG counters: rekeys, cold handshakes, RX-stale events, roams,
 TX drops, relay). `echo | nc -u -w1 <tailnet-ip> 27822`.
 
@@ -666,11 +666,11 @@ or a stack size changes.
 | `tinylink_derp`    | 10 KiB   | IDLE+3  | `tinylink.c::tinylink_derp_supervised_start` | DERP TLS session: relayed DISCO / WG inject, CMM punch |
 | `wg_rx`            | 8 KiB    | IDLE+3  | `wg_netif.c::wg_netif_start`       | UDP recv, demux (WG/DISCO/STUN), handshake, decrypt → lwIP  |
 | `wg_tx`            | 7 KiB    | IDLE+2  | `wg_netif.c::wg_netif_start`       | encrypted-frame queue → `sendto` (direct) or DERP relay     |
-| `tinylink_tlm`     | 4 KiB    | IDLE+2  | `telemetry.c`                      | TMP117 sample → JSON → UDP over the tunnel; 60 s stack diag |
+| `tinylink_tlm`     | 4.5 KiB  | IDLE+2  | `telemetry.c`                      | TMP117 sample → JSON → UDP over the tunnel; 60 s stack diag |
 | `tinylink_stun_re` | 3 KiB    | IDLE+1  | `tinylink.c::tinylink_stun_reprobe_start` | periodic / GOT_IP-triggered STUN re-probe, flags endpoint push |
 | `tiT` (lwIP)       | 4.5 KiB  | 18      | `CONFIG_LWIP_TCPIP_TASK_STACK_SIZE`| TCP/IP thread (raised 3 → 4.5 KiB in #104)                 |
 
-Application task stacks total ≈ 56.5 KiB (the 24 KiB `main` stack is
+Application task stacks total ≈ 57 KiB (the 24 KiB `main` stack is
 returned to the heap when `app_main` returns). The long-poll's 24 KiB is
 the one to watch: its measured lifetime peak is 20 KiB, dominated by
 `ts2021_connect` (9 888 B frame) → `recv_record_plaintext` (4 176 B) →

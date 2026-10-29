@@ -31,11 +31,30 @@ static const char *TAG = "tinylink";
 
 #define WIFI_TIMEOUT_MS 30000
 
+static const char *reset_reason_name(esp_reset_reason_t r)
+{
+    switch (r) {
+    case ESP_RST_POWERON:   return "power-on";
+    case ESP_RST_SW:        return "software";
+    case ESP_RST_PANIC:     return "panic";
+    case ESP_RST_INT_WDT:   return "interrupt WDT";
+    case ESP_RST_TASK_WDT:  return "task WDT";
+    case ESP_RST_WDT:       return "other WDT";
+    case ESP_RST_DEEPSLEEP: return "deep-sleep wake";
+    case ESP_RST_BROWNOUT:  return "brown-out";
+    default:                return "other";
+    }
+}
+
 /* Enable automatic light-sleep entry from FreeRTOS tickless idle. Without
  * this call, esp_pm/pm_impl.c:561+829 short-circuit the tickless idle
  * sleep path (PM_MODE_LIGHT_SLEEP is never selected when
  * s_light_sleep_en is false). Pair with esp_wifi_set_ps(WIFI_PS_MIN_MODEM)
- * in app_wifi_start() so the WiFi modem also sleeps between DTIM beacons. */
+ * (app_wifi.c, once the WG session is up) so the WiFi modem also sleeps
+ * between DTIM beacons. Errata RTC-126 (RTC register reads after a
+ * light-sleep wake with RTC_PERIPH powered down) needs nothing here:
+ * IDF's hidden CONFIG_ESP_SLEEP_RTC_BUS_ISO_WORKAROUND (y on ESP32)
+ * keeps RTC_PERIPH on in every light sleep (sleep_modes.c:2895). */
 static esp_err_t configure_pm(void)
 {
     esp_pm_config_t cfg = {
@@ -48,8 +67,10 @@ static esp_err_t configure_pm(void)
 
 static esp_err_t bringup(void)
 {
-    ESP_LOGI(TAG, "tinylink %s starting on %s",
-             tinylink_version_string(), CONFIG_TINYLINK_DEVICE_HOSTNAME);
+    const esp_reset_reason_t rst = esp_reset_reason();
+    ESP_LOGI(TAG, "tinylink %s starting on %s (reset: %s, %d)",
+             tinylink_version_string(), CONFIG_TINYLINK_DEVICE_HOSTNAME,
+             reset_reason_name(rst), (int)rst);
 
     esp_err_t err = app_nvs_init();
     if (err != ESP_OK) {
@@ -71,10 +92,10 @@ static esp_err_t bringup(void)
     /* Enable light-sleep PM only AFTER WiFi associates. If we enable it
      * before assoc, tickless idle can put the chip to sleep during AUTH
      * /ASSOC where the WiFi PS state machine isn't engaged yet, and the
-     * AP kicks us out after ~6 s of missed beacons. esp_wifi_set_ps()
-     * has been called in app_wifi_start() and takes effect on first
-     * assoc, so by the time wait_connected() returns the modem-sleep
-     * path is fully primed and safe for tickless light sleep to use. */
+     * AP kicks us out after ~6 s of missed beacons. Since round 1.3.1
+     * the modem stays awake (WIFI_PS_NONE, esp_wifi's APB_FREQ_MAX lock
+     * held) until the WG session is up or 60 s have passed (app_wifi.c
+     * power-save timer), so light sleep only engages after that. */
     esp_err_t pm_err = configure_pm();
     if (pm_err != ESP_OK) {
         ESP_LOGW(TAG, "pm configure failed: 0x%x — continuing without light sleep", pm_err);

@@ -70,6 +70,15 @@ idf.py -p /dev/ttyUSB0 flash
 idf.py -p /dev/ttyUSB0 monitor   # Ctrl-] to exit
 ```
 
+The console runs at **500 000 baud** since 1.3.1
+(`CONFIG_ESP_CONSOLE_UART_BAUDRATE`; `idf.py monitor` and
+`tools/serial_capture.py` default to it). Any other terminal must be set
+to 500 000 — at 115 200 only the ROM loader's first lines are readable.
+On this board opening the port resets the chip even with DTR/RTS
+requested low (observed 2026-10-28: Linux raises both on open before
+pyserial can drop them, and the CH340 auto-reset circuit turns that into
+an EN pulse), so a capture starts from a fresh boot.
+
 ## Benchmarking AEAD
 
 The ChaCha20-Poly1305 hot path has an opt-in micro-benchmark that runs

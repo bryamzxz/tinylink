@@ -67,7 +67,7 @@ static int open_dest_socket(const char *host, uint16_t port,
 /* Answer /stats queries while waiting out one telemetry period. Keeps
  * the 5-s cadence (deadline-based), feeds the WDT, ignores non-tailnet
  * sources. The reply is one JSON line built into a BSS buffer (the task
- * stack is 4 KiB). */
+ * stack is 4.5 KiB). */
 static bool is_tailnet_v4(uint32_t be_addr)
 {
     /* 100.64.0.0/10 */
@@ -79,7 +79,7 @@ static int stats_json(char *out, size_t cap, uint32_t telemetry_seq)
     tinylink_stats_t st;
     tinylink_get_stats(&st);
     return snprintf(out, cap,
-        "{\"host\":\"%s\",\"version\":\"%s\",\"uptime_s\":%u,"
+        "{\"host\":\"%s\",\"version\":\"%s\",\"uptime_s\":%u,\"reset_reason\":%d,"
         "\"heap_free\":%u,\"heap_largest\":%u,\"ntp_synced\":%s,"
         "\"control\":{\"open\":%s,\"alive_age_s\":%u,\"reconnects\":%u,\"endpoint_pushes\":%u},"
         "\"derp\":{\"connected\":%s,\"host\":\"%s\"},"
@@ -88,7 +88,8 @@ static int stats_json(char *out, size_t cap, uint32_t telemetry_seq)
         "\"roams\":%u,\"disco_adverts\":%u,\"tx_drops\":%u,\"relayed_stale\":%u,\"relay_errors\":%u,\"last_rx_age_s\":%u},"
         "\"telemetry_seq\":%u}\n",
         CONFIG_TINYLINK_DEVICE_HOSTNAME, tinylink_version_string(),
-        (unsigned)st.uptime_s, (unsigned)st.heap_free, (unsigned)st.heap_largest,
+        (unsigned)st.uptime_s, st.reset_reason,
+        (unsigned)st.heap_free, (unsigned)st.heap_largest,
         st.ntp_synced ? "true" : "false",
         st.control_open ? "true" : "false", (unsigned)st.control_alive_age_s,
         (unsigned)st.control_reconnects, (unsigned)st.endpoint_pushes,
@@ -250,10 +251,13 @@ static void telemetry_task(void *arg)
 
 esp_err_t telemetry_start(void)
 {
-    /* 4 KiB stack matches research §J's `app_task` budget — the TMP117
-     * read + snprintf + sendto path is shallow. */
+    /* 4.5 KiB: research §J's 4 KiB `app_task` budget plus 512 B for Log
+     * V2 (round 1.3.1). The task bottomed out at 452 B free in the M16
+     * 6-h soak (/stats snprintf + sendto + log lines) under Log V1, and
+     * V2's esp_log_va → esp_log_format → esp_log_printf chain costs
+     * ≈ 150–200 B more per call. */
     BaseType_t ok = xTaskCreate(telemetry_task, "tinylink_tlm",
-                                4096, NULL, tskIDLE_PRIORITY + 2, NULL);
+                                4608, NULL, tskIDLE_PRIORITY + 2, NULL);
     if (ok != pdPASS) return ESP_ERR_NO_MEM;
     return ESP_OK;
 }

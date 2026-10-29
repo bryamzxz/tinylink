@@ -12,7 +12,9 @@ import serial
 def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--port", default="/dev/ttyUSB0")
-    p.add_argument("--baud", type=int, default=115200)
+    # Firmware console rate since 1.3.1 (CONFIG_ESP_CONSOLE_UART_BAUDRATE);
+    # pass --baud 115200 for images up to 1.3.0.
+    p.add_argument("--baud", type=int, default=500000)
     p.add_argument("--duration", type=float, default=420.0,
                    help="seconds (default 420 = 7 min)")
     p.add_argument("--out", required=True)

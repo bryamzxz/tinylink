@@ -15,7 +15,7 @@ extern "C" {
 
 #define TINYLINK_VERSION_MAJOR 1
 #define TINYLINK_VERSION_MINOR 3
-#define TINYLINK_VERSION_PATCH 0
+#define TINYLINK_VERSION_PATCH 1
 
 /* String forms derived from the integer components above so a future
  * bump only touches the three #defines. Adjacent-string-literal
@@ -112,6 +112,7 @@ esp_err_t tinylink_time_start(void);
  * task. All counters are since boot. */
 typedef struct {
     uint32_t uptime_s;
+    int      reset_reason;           /* esp_reset_reason_t of this boot */
     uint32_t heap_free;
     uint32_t heap_largest;
     bool     ntp_synced;
@@ -222,6 +223,11 @@ esp_err_t tinylink_long_poll_start(void);
  * Returns ESP_OK if dataplane came up within timeout, ESP_ERR_TIMEOUT
  * otherwise. */
 esp_err_t tinylink_wait_dataplane_ms(uint32_t timeout_ms);
+
+/* True once the WG session has transport keys (a handshake response
+ * was accepted). Non-blocking, callable from any task or an esp_timer
+ * callback; app_wifi.c polls it to end the modem-awake boot window. */
+bool tinylink_session_up(void);
 
 /* M5 step 2a — best-effort DERP smoke test. Opens a TLS connection
  * to CONFIG_TINYLINK_DERP_SMOKE_HOST:443, runs the HTTP Upgrade dance,
