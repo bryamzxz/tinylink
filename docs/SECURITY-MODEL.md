@@ -195,6 +195,42 @@ cheaper than dragging in another dependency.
   (only if the wedge also starves the control stream) or a physical
   power-cycle.
 
+## Control transport and TLS sessions (round 1.3.5)
+
+- **ts2021 over plain HTTP :80, TLS :443 as the fallback**
+  (`ts2021_client.c`, `CONFIG_TINYLINK_CONTROL_PLAIN_HTTP`, default y),
+  as the upstream client does (`control/controlhttp/client.go`). Only
+  when the control key was pinned before the boot (NVS pin or compile-in
+  fallback, `control_key_pinned()`); the TOFU `/key` fetch and the rest
+  of a TOFU boot stay on TLS. Without TLS the server's identity rests on
+  Noise IK alone: msg2's tag is keyed by DH(e, rs) and DH(s, rs), so only
+  the holder of the pinned key's private half can produce it, and the
+  conn is not up before at least one transport record has opened under
+  the keys of that chain — an on-path attacker can refuse, redirect,
+  stall or garble :80 but not complete it. Every such failure (no 101, a
+  redirect, a fake 101, a forged or other-key msg2, an error frame, a
+  3-s connect / answer budget, a trickled header past its deadline)
+  falls back to :443 inside the same connect and, when :443 then works,
+  keeps the rest of the boot on :443 (RAM only); the control key is
+  never re-fetched over either port, so a genuine key rotation fails
+  both, as it failed on :443 before. What :80 gives up is the
+  confidentiality of the HTTP Upgrade request (host, path, the claimed
+  capability version and the base64 Noise msg1 — an ephemeral public key
+  and the machine key sealed under DH(e, rs)) and TLS's cover of record
+  sizes and timing, which Noise does not pad either way. Host tests:
+  `test_ts2021` (`d10_*`).
+- **TLS 1.2 session resumption** for the :443 control conn and DERP
+  (`tls_resume.c`, `CONFIG_MBEDTLS_CLIENT_SSL_SESSION_TICKETS`): one
+  session per server in RAM, never written to flash, dropped after 24 h
+  per master secret (TLS 1.2 resumption reuses it), on a failed connect,
+  or for a different host:port. A resumed handshake skips the chain
+  verify; the session it resumes came from a full handshake verified
+  under `MBEDTLS_SSL_VERIFY_REQUIRED` in the same boot, and a rejected
+  ticket is a full, fully verified handshake. Before the first NTP sync
+  a full handshake tolerates certificate dates (`tl_time.h`); a session
+  from that window can be resumed after the sync, i.e. it lives as long
+  as an open conn would have.
+
 ## Audit + optimization round (2026-09) — memory safety + upstream drift
 
 Fourth audit round; details per item in `CHANGELOG.md`, threat-model

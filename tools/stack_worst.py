@@ -1390,12 +1390,12 @@ def project_config():
           'mapreq_run_stream(.., long_poll_handler)'),
         # tls_io_write_full is an IPA-ICF thunk of tls_io_read_full, so the
         # `rd` site serves both directions; the adapter depends on the task.
-        R('tls_io_read_full', r'\brd\(', ['ts2021_tls_read', 'ts2021_tls_write'],
-          'ts2021_client.c:95/113', tasks=[LP]),
+        R('tls_io_read_full', r'\brd\(', ['ts2021_conn_read', 'ts2021_conn_write'],
+          'ts2021_client.c:176/200 (:80 and :443, round 1.3.5)', tasks=[LP]),
         R('tls_io_read_full', r'\brd\(', ['derp_tls_read_raw', 'derp_tls_write_raw',
                                           'derp_tls_read'],
           'derp_client.c:65/81/369/375/415', tasks=[DERP, RX, TX, TLM]),
-        R('tls_io_read_full', r'\brd\(', ['ts2021_tls_read', 'ts2021_tls_write',
+        R('tls_io_read_full', r'\brd\(', ['ts2021_conn_read', 'ts2021_conn_write',
                                           'derp_tls_read_raw', 'derp_tls_write_raw',
                                           'derp_tls_read', 'key_tls_write'], 'all adapters'),
         R('tls_io_read_full', r's_poll_hook', ['tl_wdt_feed'],

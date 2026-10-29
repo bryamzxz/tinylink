@@ -25,7 +25,7 @@ honest. None of it is official Tailscale documentation — see the published
    HTTP/2 inside Noise (in-tree, 1.3.4)      ← M2
    ────────────────────────────────────────
    /machine/register: HTTP/1.1 inside Noise  ← M1 (current)
-   ts2021: Noise IK + HTTP Upgrade in TLS    ← M1
+   ts2021: Noise IK + HTTP Upgrade, :80      ← M1 (TLS :443 fallback)
    ────────────────────────────────────────
    DISCO: NaCl-box on WG UDP socket          ← M3
    WireGuard data plane (droscy/esp_wireguard)← M2
@@ -53,14 +53,17 @@ honest. None of it is official Tailscale documentation — see the published
 
 ## ts2021 (M1)
 
-The control connection is TLS to `controlplane.tailscale.com`. The HTTP
+The control connection is plain TCP to `controlplane.tailscale.com:80`
+when the control key is pinned, else — and as the fallback on any :80
+failure — TLS to port 443 (round 1.3.5, as upstream `controlhttp`: the
+Noise IK handshake authenticates the server; SECURITY-MODEL.md). The HTTP
 request is `POST /ts2021` with `Upgrade: tailscale-control-protocol`,
 `Connection: upgrade`, and `Content-Length: 0`. The Noise IK initiation
 bytes do **not** travel in the request body — they ride in an
 `X-Tailscale-Handshake: <base64>` header, per
 `tailscale/control/controlhttp/client.go` and
 `controlhttpcommon.HandshakeHeaderName`. The server replies
-`101 Switching Protocols`, after which the same TLS connection carries
+`101 Switching Protocols`, after which the same connection carries
 controlbase frames.
 
 Two distinct frame layouts (see `tailscale/control/controlbase/messages.go`):

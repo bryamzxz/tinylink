@@ -9,6 +9,7 @@ idf_component_register(
         "src/json_helpers.c"
         "src/noise_ik.c"
         "src/tls_io.c"
+        "src/tls_resume.c"
         "src/ts2021_client.c"
         "src/h2_client.c"
         "src/h2_core.c"
@@ -79,8 +80,8 @@ idf_component_register(
 # Everything else is control plane, per-netmap or once-per-minute code
 # at -Os: ts2021_client / noise_ik (record glue; the AEAD itself is in
 # IRAM), h2_client / h2_core / hpack (round 1.3.4, D1: per record and per
-# response header block, not per packet), tls_io, register, control_key,
-# json_helpers,
+# response header block, not per packet), tls_io, tls_resume (once per
+# TLS connect), register, control_key, json_helpers,
 # mapreq (netmap parse, ~4 ms), wg_dataplane (peer selection per
 # netmap), stun / stun_probe, tinylink (bring-up, supervisors, thin
 # DERP dispatch), telemetry (1/min), tl_time, tinylink_bench: the

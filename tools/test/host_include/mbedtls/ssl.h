@@ -10,4 +10,18 @@
 #define MBEDTLS_ERR_SSL_WANT_READ   -0x6900   /* -26880 */
 #define MBEDTLS_ERR_SSL_WANT_WRITE  -0x6880   /* -26752 */
 
+/* The fields of mbedtls_ssl_session that tls_resume.c reads (round 1.3.5),
+ * for the host build of it; MBEDTLS_PRIVATE as mbedtls/private_access.h
+ * defines it for library-external code. */
+#include <stddef.h>
+#ifndef MBEDTLS_PRIVATE
+#define MBEDTLS_PRIVATE(member) member
+#endif
+typedef struct {
+    size_t         id_len;
+    unsigned char  master[48];
+    unsigned char *ticket;
+    size_t         ticket_len;
+} mbedtls_ssl_session;
+
 #endif

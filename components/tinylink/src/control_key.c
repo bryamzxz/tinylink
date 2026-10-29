@@ -292,13 +292,22 @@ static esp_err_t parse_fallback(uint8_t out[CONTROL_KEY_LEN])
  *   3. NVS empty + no fallback → legacy TOFU via GET /key. Logs a
  *      loud WARN so this path is visible in production logs (it
  *      should not happen in production firmware). */
+static bool s_pinned;
+
+bool control_key_pinned(void)
+{
+    return s_pinned;
+}
+
 esp_err_t control_key_get(uint8_t out_pub[CONTROL_KEY_LEN])
 {
     if (out_pub == NULL) return ESP_ERR_INVALID_ARG;
+    s_pinned = false;
 
     esp_err_t err = load_pin(out_pub);
     if (err == ESP_OK) {
         ESP_LOGI(TAG, "using pinned control pub from NVS");
+        s_pinned = true;
         return ESP_OK;
     }
     if (err != ESP_ERR_NVS_NOT_FOUND && err != ESP_ERR_NVS_NOT_INITIALIZED) {
@@ -310,7 +319,9 @@ esp_err_t control_key_get(uint8_t out_pub[CONTROL_KEY_LEN])
     if (err == ESP_OK) {
         ESP_LOGI(TAG, "no NVS pin — installing compile-in fallback (no TOFU)");
         memcpy(out_pub, fallback, CONTROL_KEY_LEN);
-        return persist(out_pub);
+        err = persist(out_pub);
+        s_pinned = (err == ESP_OK);   /* compiled in: as good as a pin */
+        return err;
     }
     if (err != ESP_ERR_NOT_FOUND) {
         /* Malformed Kconfig — surface immediately. */

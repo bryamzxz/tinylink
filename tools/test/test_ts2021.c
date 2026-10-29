@@ -18,7 +18,17 @@
 //  - a fixed-seed fuzz: random record segmentation of
 //    [EarlyPayload] || HTTP/2 bytes, empty records included — the window
 //    followed by ts2021_recv_record must reproduce the HTTP/2 bytes
-//    exactly.
+//    exactly;
+//  - round 1.3.5, D10a: ts2021_connect over plain HTTP :80 (a real
+//    socketpair, the server's bytes scripted from an independent Noise IK
+//    responder) and the :443 fallback: only with a pinned key; a 308, a
+//    fake 101 with garbage, a forged msg2, a msg2 from another key, an
+//    error frame, a refused / silent / closed / trickling :80 all end on
+//    :443 and keep the rest of the boot there, never retried on :80; a
+//    key rotation fails both ports without turning :80 off; an abort is
+//    not a fallback; after Noise IK the socket polls at 30 s; the
+//    early-drop heuristic (a :80 conn that failed within 120 s → the next
+//    dial on :443, once).
 //
 // ts2021_client.c is #included so its static functions are reachable;
 // esp_tls is faked below, records are sealed with a second Noise state
@@ -26,8 +36,17 @@
 
 #include "../../components/tinylink/src/ts2021_client.c"
 
+#include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <sys/socket.h>
+#include <time.h>
+
+#include "blake2s.h"
+#include "chacha20poly1305.h"
+#include "curve25519.h"
+#include "hkdf_blake2s.h"
 
 /* ---- fake esp_tls: the server's byte stream, delivered in chunks ---- */
 
@@ -42,12 +61,19 @@ struct esp_tls {
 
 static struct esp_tls s_tls;
 
+/* :443 connect script: the result and the number of attempts. */
+static int s_tls_rc = -1;
+static int s_tls_connects;
+static char s_tls_url[200];
+
 esp_tls_t *esp_tls_init(void) { return &s_tls; }
 int esp_tls_conn_http_new_sync(const char *url, const esp_tls_cfg_t *cfg,
                                esp_tls_t *tls)
 {
-    (void)url; (void)cfg; (void)tls;
-    return -1;
+    (void)cfg; (void)tls;
+    s_tls_connects++;
+    snprintf(s_tls_url, sizeof(s_tls_url), "%s", url);
+    return s_tls_rc;
 }
 ssize_t esp_tls_conn_read(esp_tls_t *tls, void *data, size_t datalen)
 {
@@ -74,9 +100,58 @@ esp_err_t esp_tls_get_conn_sockfd(esp_tls_t *tls, int *sockfd)
     return ESP_FAIL;
 }
 esp_err_t tl_crt_bundle_attach(void *conf) { (void)conf; return ESP_OK; }
-/* noise_ik_init's ephemeral key (not used: the tests start after the
- * handshake). */
+/* noise_ik_init's ephemeral key: fixed, so the connect tests can
+ * precompute the client's msg1 and answer it. */
 void esp_fill_random(void *buf, size_t len) { memset(buf, 0x5a, len); }
+
+/* Scripted monotonic clock: each read advances it by s_clock_step. */
+static int64_t s_now_us = 1000000;
+static int64_t s_clock_step;
+int64_t esp_timer_get_time(void) { s_now_us += s_clock_step; return s_now_us; }
+
+/* :80 connect script: refuse with s_plain_rc, else a socketpair whose
+ * server end already holds s_plain_reply (then EOF if s_plain_eof). The
+ * timeouts go on the client end as esp-tls's tcp_connect sets them. */
+static esp_err_t s_plain_rc = ESP_OK;
+static int       s_plain_connects;
+static int       s_plain_port;
+static int       s_srv_fd = -1;
+static uint8_t   s_plain_reply[16 * 1024];
+static size_t    s_plain_reply_len;
+static bool      s_plain_eof;
+static bool      s_plain_abort;      /* raise ts2021_abort_reads meanwhile */
+static int       s_plain_timeout_ms;
+
+esp_err_t esp_tls_plain_tcp_connect(const char *host, int hostlen, int port,
+                                    const esp_tls_cfg_t *cfg,
+                                    esp_tls_error_handle_t eh, int *sockfd)
+{
+    s_plain_connects++;
+    s_plain_port = port;
+    if (eh == NULL || sockfd == NULL || (size_t)hostlen != strlen(host) ||
+        strcmp(host, CONFIG_TINYLINK_CONTROL_HOST) != 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (s_plain_abort) ts2021_abort_reads();
+    if (s_plain_rc != ESP_OK) return s_plain_rc;
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) return ESP_FAIL;
+    s_plain_timeout_ms = cfg->timeout_ms;
+    struct timeval tv = { .tv_sec = cfg->timeout_ms / 1000,
+                          .tv_usec = (cfg->timeout_ms % 1000) * 1000 };
+    setsockopt(sv[0], SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(sv[0], SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    if (s_plain_reply_len > 0 &&
+        write(sv[1], s_plain_reply, s_plain_reply_len) != (ssize_t)s_plain_reply_len) {
+        close(sv[0]);
+        close(sv[1]);
+        return ESP_FAIL;
+    }
+    if (s_plain_eof) shutdown(sv[1], SHUT_WR);
+    s_srv_fd = sv[1];
+    *sockfd = sv[0];
+    return ESP_OK;
+}
 
 /* ts2021_connect / ts2021_close call into the HTTP/2 layer; not under
  * test here. */
@@ -485,8 +560,485 @@ static void test_segmentation_fuzz(void)
     check("d5_segmentation_fuzz_2000", bad == 0);
 }
 
+/* ---- D10a: ts2021_connect over :80, the :443 fallback --------------- */
+
+static const uint8_t kMachinePriv[32] = {
+    0x5d, 0x9f, 0x83, 0xf9, 0x23, 0xfa, 0x7c, 0x7f, 0xeb, 0xae, 0x1e, 0x98,
+    0x37, 0x78, 0x69, 0xfb, 0x9f, 0xf9, 0x56, 0xfb, 0x46, 0xd8, 0x4e, 0xc7,
+    0xfc, 0x5c, 0x6a, 0x87, 0x83, 0x3f, 0x09, 0x7f };
+static const uint8_t kControlPriv[32] = {
+    0x58, 0x21, 0x40, 0xa8, 0xee, 0x2b, 0x94, 0x43, 0x29, 0xb5, 0xb9, 0x21,
+    0x43, 0xbd, 0x25, 0x2f, 0x68, 0xf6, 0xef, 0x72, 0xf1, 0x62, 0x22, 0x0d,
+    0x50, 0x11, 0xbf, 0x53, 0xde, 0x75, 0xe3, 0x40 };
+/* An on-path server without the control key: its own static. */
+static const uint8_t kAttackerPriv[32] = {
+    0x60, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b,
+    0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+    0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x5f };
+static const uint8_t kServerEphPriv[32] = {
+    0xf8, 0x39, 0x93, 0x09, 0x47, 0xe4, 0x60, 0xd0, 0xa1, 0xb0, 0x35, 0x5d,
+    0x6d, 0x20, 0x58, 0x29, 0xbd, 0x58, 0x62, 0x31, 0xfe, 0x54, 0x1b, 0x1f,
+    0xcd, 0x08, 0x3a, 0xee, 0x90, 0xbf, 0x2d, 0x4b };
+
+static uint8_t s_machine_pub[32], s_control_pub[32];
+
+/* An independent IK responder (the Noise spec's pattern, as in
+ * test_noise_ik.c): answers msg1 as the holder of `priv` for the static
+ * `pub` the client pinned. With a priv that does not match pub (an
+ * attacker), es / ss differ from the client's — the msg2 it seals cannot
+ * verify. Returns the server's transport keys. */
+typedef struct { uint8_t h[32], ck[32], k[32]; } rsym_t;
+
+static void r_hash(rsym_t *r, const uint8_t *d, size_t n)
+{
+    blake2s_state S;
+    blake2s_init(&S, 32);
+    blake2s_update(&S, r->h, 32);
+    if (n) blake2s_update(&S, d, n);
+    blake2s_final(&S, r->h, 32);
+}
+static void r_key(rsym_t *r, const uint8_t ikm[32])
+{
+    uint8_t ck[32];
+    noise_hkdf2(r->ck, ikm, 32, ck, r->k);
+    memcpy(r->ck, ck, 32);
+}
+static void r_nonce0(uint8_t n[12]) { memset(n, 0, 12); }
+
+static void responder(const uint8_t priv[32], const uint8_t msg1[NOISE_IK_MSG1_LEN],
+                      uint8_t msg2[NOISE_IK_MSG2_LEN],
+                      uint8_t k_c2s[32], uint8_t k_s2c[32])
+{
+    char prologue[40];
+    int plen = snprintf(prologue, sizeof(prologue), "%s%d",
+                        TS2021_PROLOGUE_PREFIX, TS2021_PROTOCOL_VERSION);
+    rsym_t r;
+    blake2s(r.h, 32, TS2021_PROTOCOL_NAME, strlen(TS2021_PROTOCOL_NAME), NULL, 0);
+    memcpy(r.ck, r.h, 32);
+    r_hash(&r, (const uint8_t *)prologue, (size_t)plen);
+    r_hash(&r, s_control_pub, 32);
+    const uint8_t *ie = msg1;
+    r_hash(&r, ie, 32);
+    uint8_t dh[32], nonce[12];
+    curve25519_dh(dh, priv, ie);                        /* es */
+    r_key(&r, dh);
+    r_hash(&r, msg1 + 32, 48);
+    /* The client's static: an honest server opens it; the attacker is
+     * even handed it (it is public), only the DHs with the key fail. */
+    curve25519_dh(dh, priv, s_machine_pub);             /* ss */
+    r_key(&r, dh);
+    r_hash(&r, msg1 + 80, 16);
+    uint8_t re[32];
+    curve25519_derive_pub(re, kServerEphPriv);
+    memcpy(msg2, re, 32);
+    r_hash(&r, re, 32);
+    curve25519_dh(dh, kServerEphPriv, ie);              /* ee */
+    r_key(&r, dh);
+    curve25519_dh(dh, kServerEphPriv, s_machine_pub);   /* se */
+    r_key(&r, dh);
+    r_nonce0(nonce);
+    chacha20poly1305_encrypt(msg2 + 32, NULL, 0, r.h, 32, r.k, nonce);
+    noise_hkdf2(r.ck, NULL, 0, k_c2s, k_s2c);
+}
+
+/* The client's msg1 for this boot's fixed ephemeral: what ts2021_connect
+ * will put in X-Tailscale-Handshake. */
+static void client_msg1(uint8_t msg1[NOISE_IK_MSG1_LEN])
+{
+    static noise_ik_state_t st;
+    char prologue[40];
+    int plen = snprintf(prologue, sizeof(prologue), "%s%d",
+                        TS2021_PROLOGUE_PREFIX, TS2021_PROTOCOL_VERSION);
+    noise_ik_init(&st, kMachinePriv, s_machine_pub, s_control_pub, TS2021_PROTOCOL_NAME,
+                  (const uint8_t *)prologue, (size_t)plen);
+    noise_ik_write_msg1(&st, msg1);
+}
+
+typedef enum {
+    RP_OK,            /* 101, msg2 from the control key, EarlyPayload + H2 */
+    RP_OK_NO_EP,      /* 101, msg2, H2 straight away */
+    RP_REDIRECT,      /* 308 from a reverse proxy */
+    RP_FAKE_101,      /* 101, then a "msg2" of random bytes */
+    RP_FORGED_TAG,    /* 101, the real msg2 with one tag bit flipped */
+    RP_WRONG_KEY,     /* 101, msg2 from a server without the control key */
+    RP_ERROR_FRAME,   /* 101, a controlbase error frame */
+    RP_HUGE_FRAME,    /* 101, a frame header announcing 60 000 B */
+    RP_HALF_101,      /* half a status line, then EOF */
+    RP_SILENT,        /* nothing */
+} reply_t;
+
+static const char k101[] = "HTTP/1.1 101 Switching Protocols\r\n"
+                           "Upgrade: tailscale-control-protocol\r\n"
+                           "Connection: upgrade\r\n\r\n";
+
+static void put(uint8_t *b, size_t *n, const void *d, size_t len)
+{
+    memcpy(b + *n, d, len);
+    *n += len;
+}
+
+/* A sealed transport record from the server, with s_peer's next nonce. */
+static void put_record(uint8_t *b, size_t *n, const void *pt, size_t len)
+{
+    size_t ct = 0;
+    noise_ik_encrypt(&s_peer, b + *n + 3, 4096, (const uint8_t *)pt, len, &ct);
+    b[*n] = TS2021_MSG_RECORD;
+    b[*n + 1] = (uint8_t)(ct >> 8);
+    b[*n + 2] = (uint8_t)ct;
+    *n += 3 + ct;
+}
+
+static size_t build_reply(reply_t kind, uint8_t *b)
+{
+    size_t n = 0;
+    uint8_t msg1[NOISE_IK_MSG1_LEN], msg2[NOISE_IK_MSG2_LEN], kc[32], ks[32];
+    client_msg1(msg1);
+    responder(kind == RP_WRONG_KEY ? kAttackerPriv : kControlPriv, msg1, msg2, kc, ks);
+    memset(&s_peer, 0, sizeof(s_peer));
+    s_peer.transport_ready = true;
+    memcpy(s_peer.k_send, ks, 32);
+    memcpy(s_peer.k_recv, kc, 32);
+    static const uint8_t hdr2[3] = { TS2021_MSG_RESPONSE, 0, NOISE_IK_MSG2_LEN };
+    switch (kind) {
+    case RP_SILENT:
+        return 0;
+    case RP_HALF_101:
+        put(b, &n, "HTTP/1.1 10", 11);
+        return n;
+    case RP_REDIRECT: {
+        static const char r308[] = "HTTP/1.1 308 Permanent Redirect\r\n"
+                                   "Location: https://controlplane.test/ts2021\r\n"
+                                   "Content-Length: 0\r\n\r\n";
+        put(b, &n, r308, sizeof(r308) - 1);
+        return n;
+    }
+    default:
+        break;
+    }
+    put(b, &n, k101, sizeof(k101) - 1);
+    if (kind == RP_ERROR_FRAME) {
+        static const uint8_t ef[] = { TS2021_MSG_ERROR, 0, 4, 'n', 'o', 'p', 'e' };
+        put(b, &n, ef, sizeof(ef));
+        return n;
+    }
+    if (kind == RP_HUGE_FRAME) {
+        static const uint8_t hf[] = { TS2021_MSG_RESPONSE, 0xea, 0x60 };
+        put(b, &n, hf, sizeof(hf));
+        return n;
+    }
+    put(b, &n, hdr2, sizeof(hdr2));
+    if (kind == RP_FAKE_101) {
+        for (int i = 0; i < NOISE_IK_MSG2_LEN; i++) b[n++] = (uint8_t)(i * 37 + 11);
+        return n;
+    }
+    if (kind == RP_FORGED_TAG) msg2[40] ^= 0x01;
+    put(b, &n, msg2, sizeof(msg2));
+    if (kind == RP_OK) {
+        /* tailscale.com's shape: the magic in a record of its own, then
+         * length + JSON, HTTP/2 starting in the same record */
+        static const char json[] = "{\"NodeKeyChallenge\":\"chalpub:00\"}";
+        uint8_t ep[9 + sizeof(json) - 1 + sizeof(kH2)];
+        memcpy(ep, kMagic, 5);
+        ep[5] = 0; ep[6] = 0; ep[7] = 0; ep[8] = (uint8_t)(sizeof(json) - 1);
+        memcpy(ep + 9, json, sizeof(json) - 1);
+        memcpy(ep + 9 + sizeof(json) - 1, kH2, sizeof(kH2));
+        put_record(b, &n, ep, 5);
+        put_record(b, &n, ep + 5, sizeof(ep) - 5);
+        return n;
+    }
+    put_record(b, &n, kH2, sizeof(kH2));
+    return n;
+}
+
+/* Fresh boot state, the :80 server scripted with `p80`, :443 with
+ * `p443` (connect refused when tls_rc != 1). */
+static void boot_reset(void)
+{
+    s_plain_off = false;
+    s_tls_next = false;
+    s_abort_reads = false;
+    s_clock_step = 0;
+}
+
+static void script(int plain_rc, reply_t p80, bool eof80, int tls_rc, reply_t p443)
+{
+    if (s_srv_fd >= 0) { close(s_srv_fd); s_srv_fd = -1; }
+    memset(&s_tls, 0, sizeof(s_tls));
+    s_plain_rc = plain_rc;
+    s_plain_reply_len = build_reply(p80, s_plain_reply);
+    s_plain_eof = eof80;
+    s_plain_abort = false;
+    s_tls_rc = tls_rc;
+    s_tls.rx_len = build_reply(p443, s_tls.rx);
+    s_plain_connects = 0;
+    s_tls_connects = 0;
+    s_plain_port = 0;
+}
+
+static esp_err_t dial(bool pinned)
+{
+    return ts2021_connect(&s_conn, kMachinePriv, s_machine_pub, s_control_pub, pinned);
+}
+
+/* Everything the client sent on the :80 socket. */
+static size_t srv_drain(uint8_t *out, size_t cap)
+{
+    size_t n = 0;
+    int fl = fcntl(s_srv_fd, F_GETFL, 0);
+    fcntl(s_srv_fd, F_SETFL, fl | O_NONBLOCK);
+    for (;;) {
+        ssize_t r = read(s_srv_fd, out + n, cap - n);
+        if (r <= 0) break;
+        n += (size_t)r;
+    }
+    fcntl(s_srv_fd, F_SETFL, fl);
+    return n;
+}
+
+static bool request_ok(const uint8_t *req, size_t n)
+{
+    uint8_t msg1[NOISE_IK_MSG1_LEN];
+    client_msg1(msg1);
+    uint8_t init[TS2021_INIT_HEADER_LEN + NOISE_IK_MSG1_LEN];
+    init[0] = (uint8_t)(TS2021_PROTOCOL_VERSION >> 8);
+    init[1] = (uint8_t)TS2021_PROTOCOL_VERSION;
+    init[2] = TS2021_MSG_INITIATION;
+    init[3] = 0;
+    init[4] = NOISE_IK_MSG1_LEN;
+    memcpy(init + 5, msg1, sizeof(msg1));
+    char b64[((sizeof(init) + 2) / 3) * 4 + 1];
+    b64_encode(init, sizeof(init), b64, sizeof(b64));
+    char want[512];
+    int w = snprintf(want, sizeof(want),
+                     "POST /ts2021 HTTP/1.1\r\nHost: controlplane.test\r\n"
+                     "Upgrade: tailscale-control-protocol\r\nConnection: upgrade\r\n"
+                     "X-Tailscale-Handshake: %s\r\nContent-Length: 0\r\n\r\n", b64);
+    return (size_t)w == n && memcmp(req, want, n) == 0;
+}
+
+static bool window_is_h2(void)
+{
+    return s_conn.h2_rx_len - s_conn.h2_rx_off == sizeof(kH2) &&
+           memcmp(s_conn.h2_rx + s_conn.h2_rx_off, kH2, sizeof(kH2)) == 0;
+}
+
+static void test_plain_ok(void)
+{
+    boot_reset();
+    script(ESP_OK, RP_OK, false, 1, RP_OK);
+    esp_err_t rc = dial(true);
+    check("d10_plain_connects", rc == ESP_OK && s_conn.connected && s_conn.plain &&
+          s_conn.tls == NULL && s_plain_connects == 1 && s_tls_connects == 0 &&
+          s_plain_port == 80 && s_plain_timeout_ms == TS2021_PLAIN_TIMEOUT_MS);
+    check("d10_plain_window_h2_after_ep", window_is_h2());
+    struct timeval tv = { 0 };
+    socklen_t tl = sizeof(tv);
+    getsockopt(s_conn.sock, SOL_SOCKET, SO_RCVTIMEO, &tv, &tl);
+    struct timeval tw = { 0 };
+    socklen_t twl = sizeof(tw);
+    getsockopt(s_conn.sock, SOL_SOCKET, SO_SNDTIMEO, &tw, &twl);
+    check("d10_plain_stream_timeouts_30s",
+          tv.tv_sec == 30 && tw.tv_sec == 30 && s_conn.hs_idle == 0 &&
+          s_conn.hs_deadline_us == 0 && s_conn.up_us != 0);
+    uint8_t req[1024];
+    size_t rn = srv_drain(req, sizeof(req));
+    /* the request, then the HTTP/2 layer's (faked) start sent nothing */
+    check("d10_plain_request_bytes", request_ok(req, rn));
+    /* records flow both ways over the socket */
+    uint8_t ping[9] = { 0, 0, 0, 6, 0, 0, 0, 0, 0 };
+    check("d10_plain_send", ts2021_send(&s_conn, ping, sizeof(ping)) == ESP_OK);
+    uint8_t rec[64];
+    size_t rl = srv_drain(rec, sizeof(rec));
+    size_t pl = 0;
+    uint8_t pt[64];
+    check("d10_plain_record_sealed",
+          rl == 3 + sizeof(ping) + 16 && rec[0] == TS2021_MSG_RECORD &&
+          noise_ik_decrypt(&s_peer, pt, sizeof(pt), rec + 3, rl - 3, &pl) == ESP_OK &&
+          pl == sizeof(ping) && memcmp(pt, ping, pl) == 0);
+    uint8_t in[128];
+    size_t inn = 0;
+    put_record(in, &inn, "pong", 4);
+    s_conn.h2_rx_off = s_conn.h2_rx_len;
+    size_t got = 0;
+    check("d10_plain_recv",
+          write(s_srv_fd, in, inn) == (ssize_t)inn &&
+          ts2021_recv_record(&s_conn, &got) == ESP_OK && got == 4 &&
+          memcmp(s_conn.h2_rx, "pong", 4) == 0);
+    ts2021_close(&s_conn);
+    check("d10_plain_close", !s_conn.plain && s_conn.sock == -1 && !s_conn.connected &&
+          !s_tls_next && !s_plain_off);
+
+    /* no EarlyPayload: the first record is HTTP/2 */
+    boot_reset();
+    script(ESP_OK, RP_OK_NO_EP, false, 1, RP_OK);
+    rc = dial(true);
+    check("d10_plain_no_ep", rc == ESP_OK && s_conn.plain && window_is_h2());
+    ts2021_close(&s_conn);
+}
+
+static void test_not_pinned_tls_only(void)
+{
+    boot_reset();
+    script(ESP_OK, RP_OK, false, 1, RP_OK);
+    esp_err_t rc = dial(false);
+    check("d10_unpinned_never_80",
+          rc == ESP_OK && !s_conn.plain && s_conn.tls == &s_tls &&
+          s_plain_connects == 0 && s_tls_connects == 1 &&
+          strcmp(s_tls_url, "https://controlplane.test:443") == 0);
+    check("d10_unpinned_tls_request", request_ok(s_tls.tx, s_tls.tx_len) && window_is_h2());
+    ts2021_close(&s_conn);
+    check("d10_unpinned_leaves_80_on", !s_plain_off && !s_tls_next);
+}
+
+/* Every way :80 can fail ends on :443 within the same connect, and keeps
+ * the rest of the boot there. */
+static void fallback_case(const char *name, int plain_rc, reply_t p80, bool eof80)
+{
+    char n1[64], n2[64];
+    boot_reset();
+    script(plain_rc, p80, eof80, 1, RP_OK);
+    const int64_t t0 = s_now_us;
+    struct timespec w0, w1;
+    clock_gettime(CLOCK_MONOTONIC, &w0);
+    esp_err_t rc = dial(true);
+    clock_gettime(CLOCK_MONOTONIC, &w1);
+    const long wall_ms = (w1.tv_sec - w0.tv_sec) * 1000 + (w1.tv_nsec - w0.tv_nsec) / 1000000;
+    snprintf(n1, sizeof(n1), "d10_fallback_%s", name);
+    check(n1, rc == ESP_OK && s_conn.connected && !s_conn.plain &&
+          s_conn.tls == &s_tls && s_plain_connects == 1 && s_tls_connects == 1 &&
+          s_plain_off && window_is_h2() &&
+          request_ok(s_tls.tx, s_tls.tx_len) &&
+          wall_ms < 4 * TS2021_PLAIN_TIMEOUT_MS && s_now_us >= t0);
+    ts2021_close(&s_conn);
+    /* the next dial goes straight to :443 */
+    script(ESP_OK, RP_OK, false, 1, RP_OK);
+    rc = dial(true);
+    snprintf(n2, sizeof(n2), "d10_fallback_%s_sticky", name);
+    check(n2, rc == ESP_OK && !s_conn.plain && s_plain_connects == 0 && s_tls_connects == 1);
+    ts2021_close(&s_conn);
+}
+
+static void test_fallbacks(void)
+{
+    fallback_case("refused", ESP_FAIL, RP_SILENT, false);
+    fallback_case("redirect_308", ESP_OK, RP_REDIRECT, false);
+    fallback_case("redirect_308_eof", ESP_OK, RP_REDIRECT, true);
+    fallback_case("fake_101_garbage", ESP_OK, RP_FAKE_101, false);
+    fallback_case("forged_msg2_tag", ESP_OK, RP_FORGED_TAG, false);
+    fallback_case("wrong_key_msg2", ESP_OK, RP_WRONG_KEY, false);
+    fallback_case("error_frame", ESP_OK, RP_ERROR_FRAME, false);
+    fallback_case("huge_frame", ESP_OK, RP_HUGE_FRAME, false);
+    fallback_case("half_101_eof", ESP_OK, RP_HALF_101, true);
+    fallback_case("silent", ESP_OK, RP_SILENT, false);   /* one 3-s poll on target */
+
+    /* A middlebox trickling the 101 (one byte per poll): the deadline
+     * ends it — here a clock that moves 1/4 of the budget per read. */
+    boot_reset();
+    script(ESP_OK, RP_OK, false, 1, RP_OK);
+    s_clock_step = (int64_t)TS2021_PLAIN_TIMEOUT_MS * 1000 / 4;
+    esp_err_t rc = dial(true);
+    s_clock_step = 0;
+    check("d10_fallback_trickle_deadline",
+          rc == ESP_OK && !s_conn.plain && s_plain_connects == 1 && s_tls_connects == 1 &&
+          s_plain_off);
+    ts2021_close(&s_conn);
+}
+
+static void test_both_fail(void)
+{
+    /* :80 broken and :443 down: an outage, not evidence against :80 —
+     * the next dial tries :80 again. */
+    boot_reset();
+    script(ESP_OK, RP_REDIRECT, false, -1, RP_OK);
+    esp_err_t rc = dial(true);
+    check("d10_both_fail", rc != ESP_OK && !s_conn.connected && s_plain_connects == 1 &&
+          s_tls_connects == 1 && !s_plain_off && s_conn.sock == -1 && !s_conn.plain);
+    script(ESP_OK, RP_OK, false, 1, RP_OK);
+    rc = dial(true);
+    check("d10_both_fail_then_80", rc == ESP_OK && s_conn.plain && s_plain_connects == 1 &&
+          s_tls_connects == 0);
+    ts2021_close(&s_conn);
+
+    /* Control key rotated: Noise refuses the pinned key on both ports.
+     * The connect fails (the caller backs off), :80 stays on, nothing
+     * else happens — the pin is never re-fetched from here. */
+    boot_reset();
+    script(ESP_OK, RP_WRONG_KEY, false, 1, RP_WRONG_KEY);
+    rc = dial(true);
+    check("d10_key_rotation_fails_both", rc != ESP_OK && s_plain_connects == 1 &&
+          s_tls_connects == 1 && !s_plain_off && !s_conn.connected);
+    script(ESP_OK, RP_WRONG_KEY, false, 1, RP_WRONG_KEY);
+    rc = dial(true);
+    check("d10_key_rotation_retries_80", rc != ESP_OK && s_plain_connects == 1 &&
+          s_tls_connects == 1 && !s_plain_off);
+
+    /* An abort raised during the :80 attempt is for this dial: no :443. */
+    boot_reset();
+    script(ESP_OK, RP_OK, false, 1, RP_OK);
+    s_plain_abort = true;
+    rc = dial(true);
+    check("d10_abort_no_fallback", rc != ESP_OK && s_plain_connects == 1 &&
+          s_tls_connects == 0 && !s_plain_off);
+    s_abort_reads = false;
+}
+
+/* The early-drop heuristic: a :80 conn that failed at the transport
+ * within TS2021_PLAIN_EARLY_DROP_S of its handshake sends the next dial
+ * to :443, once. */
+static void drop_case(const char *name, int64_t age_s, int how, bool want_tls_next)
+{
+    char n1[64], n2[64];
+    boot_reset();
+    script(ESP_OK, RP_OK, false, 1, RP_OK);
+    esp_err_t rc = dial(true);
+    s_now_us += age_s * 1000000;
+    size_t got = 0;
+    s_conn.h2_rx_off = s_conn.h2_rx_len;
+    if (how == 0) {                       /* server closed the TCP conn */
+        shutdown(s_srv_fd, SHUT_WR);
+        (void)ts2021_recv_record(&s_conn, &got);
+    } else if (how == 1) {                /* tampered record */
+        uint8_t in[128];
+        size_t inn = 0;
+        put_record(in, &inn, "data", 4);
+        in[5] ^= 0x40;
+        if (write(s_srv_fd, in, inn) != (ssize_t)inn) s_fails++;
+        (void)ts2021_recv_record(&s_conn, &got);
+    } else if (how == 2) {                /* deliberate recycle */
+        ts2021_abort_reads();
+        (void)ts2021_recv_record(&s_conn, &got);
+    }                                     /* 3: clean close, no failure */
+    ts2021_close(&s_conn);
+    snprintf(n1, sizeof(n1), "d10_drop_%s", name);
+    check(n1, rc == ESP_OK && s_tls_next == want_tls_next && !s_plain_off);
+    script(ESP_OK, RP_OK, false, 1, RP_OK);
+    rc = dial(true);
+    snprintf(n2, sizeof(n2), "d10_drop_%s_next", name);
+    check(n2, rc == ESP_OK && s_conn.plain == !want_tls_next &&
+          s_plain_connects == (want_tls_next ? 0 : 1) && !s_tls_next && !s_plain_off);
+    ts2021_close(&s_conn);
+    if (want_tls_next) {                  /* only one dial */
+        script(ESP_OK, RP_OK, false, 1, RP_OK);
+        rc = dial(true);
+        snprintf(n2, sizeof(n2), "d10_drop_%s_then_80", name);
+        check(n2, rc == ESP_OK && s_conn.plain && s_plain_connects == 1);
+        ts2021_close(&s_conn);
+    }
+}
+
+static void test_early_drop(void)
+{
+    drop_case("fin_at_30s", 30, 0, true);
+    drop_case("tamper_at_5s", 5, 1, true);
+    drop_case("fin_at_121s", TS2021_PLAIN_EARLY_DROP_S + 1, 0, false);
+    drop_case("abort_at_5s", 5, 2, false);
+    drop_case("clean_at_5s", 5, 3, false);
+}
+
 int main(void)
 {
+    curve25519_derive_pub(s_machine_pub, kMachinePriv);
+    curve25519_derive_pub(s_control_pub, kControlPriv);
     test_no_early_payload();
     test_early_payload_split();
     test_ep_ends_on_record_boundary();
@@ -496,6 +1048,12 @@ int main(void)
     test_d4_recv_in_place();
     test_d4_send();
     test_segmentation_fuzz();
+    test_plain_ok();
+    test_not_pinned_tls_only();
+    test_fallbacks();
+    test_both_fail();
+    test_early_drop();
+    if (s_srv_fd >= 0) close(s_srv_fd);
     if (s_fails == 0) printf("\nALL OK\n");
     return s_fails ? 1 : 0;
 }

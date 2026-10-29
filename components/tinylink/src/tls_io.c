@@ -3,6 +3,9 @@
 
 #include "tls_io.h"
 
+#include <errno.h>
+
+#include "lwip/sockets.h"
 #include "mbedtls/ssl.h"
 
 static tls_io_poll_hook_t s_poll_hook;
@@ -73,4 +76,33 @@ int tls_io_write_full(tls_io_write_fn wr, void *ctx,
         idle = 0;
     }
     return 0;
+}
+
+/* errno after a failed recv() / send(): the socket timeout (and EINTR,
+ * which lwIP never returns) is an idle poll, anything else a hard error. */
+static ssize_t sock_err(ssize_t want)
+{
+    const int e = errno;
+    if (e == EAGAIN || e == EINTR) return want;
+#if EWOULDBLOCK != EAGAIN
+    if (e == EWOULDBLOCK) return want;
+#endif
+    return (e > 0) ? -(ssize_t)e : -1;
+}
+
+ssize_t tls_io_sock_read(int fd, uint8_t *buf, size_t len)
+{
+    const ssize_t r = recv(fd, buf, len, 0);
+    return (r >= 0) ? r : sock_err(MBEDTLS_ERR_SSL_WANT_READ);
+}
+
+ssize_t tls_io_sock_write(int fd, const uint8_t *buf, size_t len)
+{
+#ifdef MSG_NOSIGNAL
+    const int flags = MSG_NOSIGNAL;   /* host: EPIPE, not SIGPIPE */
+#else
+    const int flags = 0;
+#endif
+    const ssize_t w = send(fd, buf, len, flags);
+    return (w >= 0) ? w : sock_err(MBEDTLS_ERR_SSL_WANT_WRITE);
 }

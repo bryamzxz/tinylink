@@ -47,7 +47,7 @@ primitives we did, see [`SECURITY-MODEL.md`](SECURITY-MODEL.md).
 +--------------- components/tinylink/src/ ----------------------+
 |                                                               |
 |  control plane (one Noise+H/2 channel reused for everything): |
-|     ts2021_client.c   Noise IK over TLS Upgrade               |
+|     ts2021_client.c   Noise IK over HTTP Upgrade (:80/:443)   |
 |        │   prologue "Tailscale Control Protocol v148"         |
 |        │   (TINYLINK_CAPVER=148, clears headscale floor 116); |
 |        │   consume_early_payload reads EarlyNoise as a byte   |
@@ -450,7 +450,7 @@ forensic detail.
 ## Control-plane liveness + reconnect ladder (M13, 2026-07)
 
 The long-poll task (`tinylink.c::long_poll_task`) owns the control
-channel end-to-end: `ensure_control_conn` (TLS + Noise IK + h2 session)
+channel end-to-end: `ensure_control_conn` (TCP :80 or TLS :443 + Noise IK + h2 session)
 → `mapreq_run_stream` (blocking read loop) → `drop_control_conn` →
 backoff → repeat. Before M13 the *only* exits from the read loop were
 server-initiated (FIN, RST, GOAWAY, HTTP error) — a **half-open** TCP
@@ -692,7 +692,8 @@ The original M1-only layout, kept for historical reference:
      (was a fixed `v=100` until M14; headscale now gates `/key` on its
      capver floor), parse `{"publicKey":"mkey:<64-hex>"}`, and persist.
 4. `tinylink_register()` runs in a loop until success:
-   - `ts2021_connect()` opens TLS to `controlplane.tailscale.com:443`,
+   - `ts2021_connect()` opens TCP to `controlplane.tailscale.com:80`
+     (pinned key; TLS to :443 otherwise and as the fallback, round 1.3.5),
      sends a `POST /ts2021` HTTP Upgrade request whose body carries Noise
      IK msg1 inside a 4-byte handshake frame, reads the `101 Switching
      Protocols` response and the framed Noise IK msg2, completing the

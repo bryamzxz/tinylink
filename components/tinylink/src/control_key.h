@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <stdbool.h>
 #include <stdint.h>
 
 #include "esp_err.h"
@@ -32,6 +33,14 @@ extern "C" {
  * tinylink_register() after the handshake completes.
  */
 esp_err_t control_key_get(uint8_t out_pub[CONTROL_KEY_LEN]);
+
+/* True when the key control_key_get returned was pinned before this
+ * boot's network activity — path 1 or 2 — and false after a TOFU fetch
+ * (path 3) or before any call. Gates ts2021 over plain HTTP :80 (round
+ * 1.3.5): there the server is authenticated by Noise IK against this key
+ * alone, so a key whose only evidence is this boot's TLS fetch keeps the
+ * whole boot on TLS; the next boot loads it from NVS as a pin. */
+bool control_key_pinned(void);
 
 #ifdef __cplusplus
 }

@@ -77,7 +77,8 @@ static esp_err_t ensure_control_conn(void)
 {
     if (s_conn_open) return ESP_OK;
     esp_err_t err = ts2021_connect(&s_conn, s_keys.machine_priv,
-                                   s_keys.machine_pub, s_control_pub);
+                                   s_keys.machine_pub, s_control_pub,
+                                   control_key_pinned());
     if (err == ESP_OK) {
         s_conn_open = true;
         /* A completed TLS + Noise IK handshake proves the control plane
