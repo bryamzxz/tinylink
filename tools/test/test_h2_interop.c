@@ -235,8 +235,9 @@ static void respond(int32_t sid)
         return;
     }
     case SC_1XX: {
-        nghttp2_nv i[] = { NV(":status", "103"), NV("link", "</style.css>; rel=preload") };
-        nghttp2_submit_headers(S.ng, NGHTTP2_FLAG_NONE, sid, NULL, i, 2, NULL);
+        nghttp2_nv i[] = { NV(":status", "103"), NV("link", "</style.css>; rel=preload"),
+                           NV("retry-after", "9") };
+        nghttp2_submit_headers(S.ng, NGHTTP2_FLAG_NONE, sid, NULL, i, 3, NULL);
         nghttp2_submit_response2(S.ng, sid, base, 3, &dp);
         return;
     }
@@ -884,8 +885,10 @@ static void sc_misc(void)
      * response after a 1xx HCAT_HEADERS — so it reported the 103. */
     check("informational_103", r.err == ESP_OK && r.status == 103 && r.len == S.resp_len);
 #else
-    /* The final status, as HTTP requires (RFC 9110 §15.2). */
-    check("informational_103", r.err == ESP_OK && r.status == 200 && r.len == S.resp_len);
+    /* The final status, as HTTP requires (RFC 9110 §15.2), and none of
+     * the 103's fields: its Retry-After is not the final response's. */
+    check("informational_103", r.err == ESP_OK && r.status == 200 && r.len == S.resp_len &&
+          !s_conn.h2_retry_after_present && s_conn.h2_retry_after_s == 0);
 #endif
     conn_down();
 

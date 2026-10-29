@@ -76,7 +76,13 @@ int h2_io_tx_send(void *io, size_t len)
 
 void h2_io_on_status(void *io, int status)
 {
-    ((ts2021_conn_t *)io)->h2_status = status;
+    ts2021_conn_t *conn = (ts2021_conn_t *)io;
+    /* Every response header block — a 1xx, then the final one — opens
+     * with :status, and a Retry-After belongs to the block it came in:
+     * one on a 103 must not make the final 200 look rate-limited. */
+    conn->h2_status = status;
+    conn->h2_retry_after_s = 0;
+    conn->h2_retry_after_present = false;
 }
 
 void h2_io_on_header(void *io, const hpack_field_t *f)
