@@ -14,6 +14,7 @@
 
 #include "cJSON.h"
 
+#include "ctrl_buf.h"
 #include "json_helpers.h"
 #include "tinylink.h"        /* TINYLINK_CAPVER / TINYLINK_STR */
 
@@ -97,7 +98,7 @@ static esp_err_t http_event_collect(esp_http_client_event_t *evt)
     return ESP_OK;
 }
 
-static esp_err_t fetch_pubkey(uint8_t out[CONTROL_KEY_LEN])
+static esp_err_t fetch_pubkey_in(uint8_t *buf, uint8_t out[CONTROL_KEY_LEN])
 {
     char url[160];
     int n = snprintf(url, sizeof(url), "https://%s:%d%s",
@@ -106,7 +107,7 @@ static esp_err_t fetch_pubkey(uint8_t out[CONTROL_KEY_LEN])
                      KEY_PATH);
     if (n <= 0 || n >= (int)sizeof(url)) return ESP_ERR_INVALID_SIZE;
 
-    char body[BODY_MAX];
+    char *body = (char *)buf;
     body_buf_t bb = { .buf = body, .cap = BODY_MAX, .len = 0 };
 
     esp_http_client_config_t cfg = {
@@ -147,6 +148,17 @@ static esp_err_t fetch_pubkey(uint8_t out[CONTROL_KEY_LEN])
         return ESP_ERR_INVALID_SIZE;
     }
     return hex_decode_32(p, out);
+}
+
+/* The response body lives in the shared control buffer (ctrl_buf.h):
+ * this runs from tinylink_init, before any ts2021 conn. */
+static esp_err_t fetch_pubkey(uint8_t out[CONTROL_KEY_LEN])
+{
+    uint8_t *buf = tl_ctrl_buf_claim("key");
+    if (buf == NULL) return ESP_ERR_INVALID_STATE;
+    esp_err_t err = fetch_pubkey_in(buf, out);
+    tl_ctrl_buf_release();
+    return err;
 }
 
 static esp_err_t persist(const uint8_t pub[CONTROL_KEY_LEN])

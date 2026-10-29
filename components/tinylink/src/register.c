@@ -11,6 +11,8 @@
 
 #include "cJSON.h"
 
+#include "crypto/secure_zero.h"
+#include "ctrl_buf.h"
 #include "h2_client.h"
 #include "json_helpers.h"
 #include "tinylink.h"        /* TINYLINK_CAPVER */
@@ -18,8 +20,13 @@
 
 static const char *TAG = "register";
 
+/* Both live in the shared control buffer (ctrl_buf.h, round 1.3.2): the
+ * request at offset 0, the response right behind it. Same sizes as the
+ * old stack request / static response. */
 #define REQUEST_BUF  2048
 #define RESPONSE_BUF 4096
+_Static_assert(REQUEST_BUF + RESPONSE_BUF <= TL_CTRL_BUF_SZ,
+               "register request + response must fit the control buffer");
 
 static void hex_encode(const uint8_t *in, size_t len, char *out)
 {
@@ -113,30 +120,29 @@ static esp_err_t build_request_body(const tinylink_keys_t *keys,
     return ESP_OK;
 }
 
-esp_err_t register_emit(ts2021_conn_t *conn,
-                        const tinylink_keys_t *keys,
-                        const char *auth_key)
+static esp_err_t register_emit_in(ts2021_conn_t *conn,
+                                  const tinylink_keys_t *keys,
+                                  const char *auth_key, uint8_t *buf)
 {
-    if (conn == NULL || keys == NULL || auth_key == NULL) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    char  body[REQUEST_BUF];
+    char *body     = (char *)buf;
     int   body_len = 0;
     esp_err_t err = build_request_body(keys, auth_key,
-                                       body, sizeof(body), &body_len);
+                                       body, REQUEST_BUF, &body_len);
     if (err != ESP_OK) return err;
 
     /* HTTP/2 POST over the Noise channel. The control plane runs
      * http2.Server.ServeConn after the Upgrade and rejects HTTP/1.1
      * inside Noise with PROTOCOL_ERROR. */
-    static uint8_t resp[RESPONSE_BUF];
-    size_t  resp_len = 0;
-    int     status   = 0;
+    uint8_t *resp     = buf + REQUEST_BUF;
+    size_t   resp_len = 0;
+    int      status   = 0;
     err = h2_post_json(conn, "/machine/register",
                        CONFIG_TINYLINK_CONTROL_HOST,
                        (const uint8_t *)body, (size_t)body_len,
-                       &status, resp, sizeof(resp) - 1, &resp_len);
+                       &status, resp, RESPONSE_BUF - 1, &resp_len);
+    /* The request carries the auth key: scrub it the moment it is sent
+     * (it used to sit in a dead stack frame; the buffer is long-lived). */
+    tl_secure_zero(body, (size_t)body_len);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "h2_post_json failed: 0x%x", err);
         return err;
@@ -164,7 +170,7 @@ esp_err_t register_emit(ts2021_conn_t *conn,
      * costs nothing here. */
     if (conn->h2_resp_overflow) {
         ESP_LOGE(TAG, "register response exceeded %u-byte buffer — refusing to parse",
-                 (unsigned)(sizeof(resp) - 1));
+                 (unsigned)(RESPONSE_BUF - 1));
         return ESP_ERR_INVALID_RESPONSE;
     }
 
@@ -207,4 +213,18 @@ esp_err_t register_emit(ts2021_conn_t *conn,
     }
     ESP_LOGI(TAG, "MachineAuthorized=true — node registered");
     return ESP_OK;
+}
+
+esp_err_t register_emit(ts2021_conn_t *conn,
+                        const tinylink_keys_t *keys,
+                        const char *auth_key)
+{
+    if (conn == NULL || keys == NULL || auth_key == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    uint8_t *buf = tl_ctrl_buf_claim("register");
+    if (buf == NULL) return ESP_ERR_INVALID_STATE;
+    esp_err_t err = register_emit_in(conn, keys, auth_key, buf);
+    tl_ctrl_buf_release();
+    return err;
 }

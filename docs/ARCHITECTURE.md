@@ -167,8 +167,9 @@ BSS): the self `Node`, each `Peers[i]` / `PeersChanged[i]`, each
 element larger than the table is skipped with a log instead of failing
 the map, so there is no document-size ceiling any more (the previous
 2 500-token table failed outright above ≈ 30 peers). The 32 KiB body
-buffer (`RESPONSE_BUF_SZ`) remains: each stream frame is still
-assembled whole before the split runs. Since M16 the parser also
+buffer remains (`TL_CTRL_MAPRESP_CAP`, the MapResponse area of the
+shared control buffer in `ctrl_buf.h` since 1.3.2): each stream frame is
+still assembled whole before the split runs. Since M16 the parser also
 reports `peers_is_delta` and `PeersRemoved` ids, and `tinylink.c` keeps
 a canonical peer table (replace / upsert / delete) that the data plane
 is updated from.

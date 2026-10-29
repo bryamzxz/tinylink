@@ -414,8 +414,12 @@ esp_err_t ts2021_connect(ts2021_conn_t *out,
         return ESP_ERR_INVALID_SIZE;
     }
 
-    char req[1024];
-    int n = snprintf(req, sizeof(req),
+    /* Build the upgrade request in the (still idle) h2_rx ring instead of
+     * a 1 KiB stack buffer: nothing reads the ring before the 101 below,
+     * which overwrites it. −1 KiB on the connect frame (main and
+     * long-poll tasks). */
+    char *req = (char *)out->h2_rx;
+    int n = snprintf(req, sizeof(out->h2_rx),
         "POST /ts2021 HTTP/1.1\r\n"
         "Host: %s\r\n"
         "Upgrade: %s\r\n"
@@ -425,7 +429,7 @@ esp_err_t ts2021_connect(ts2021_conn_t *out,
         "\r\n",
         CONFIG_TINYLINK_CONTROL_HOST, UPGRADE_TOKEN,
         HANDSHAKE_HDR, init_b64);
-    if (n <= 0 || n >= (int)sizeof(req)) {
+    if (n <= 0 || n >= (int)sizeof(out->h2_rx)) {
         ts2021_close(out);
         return ESP_ERR_INVALID_SIZE;
     }
