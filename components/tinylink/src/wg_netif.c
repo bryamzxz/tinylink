@@ -561,14 +561,14 @@ static void send_disco_advert(void)
 }
 
 /* Serialized entry point — see g.hs_lock. Returns true when the response
- * was accepted (session up / rekeyed). The disco advert goes out after
- * hs_lock is released: it only needs g.lock (inside send_plaintext). */
+ * was accepted (session up / rekeyed); the caller then roams if needed
+ * and calls send_disco_advert(), so the advert's destination snapshot is
+ * the endpoint that just authenticated (it only needs g.lock). */
 static bool handle_handshake_response(const uint8_t *buf, size_t len)
 {
     xSemaphoreTake(g.hs_lock, portMAX_DELAY);
     const bool ok = handle_handshake_response_locked(buf, len);
     xSemaphoreGive(g.hs_lock);
-    if (ok) send_disco_advert();
     return ok;
 }
 
@@ -914,8 +914,11 @@ static void rx_task(void *arg)
 
             switch (kind) {
             case WG_DEMUX_HANDSHAKE_RESP:
-                if (handle_handshake_response(buf, (size_t)n) && !from_peer) {
-                    roam_to(&src, "authenticated handshake response");
+                if (handle_handshake_response(buf, (size_t)n)) {
+                    if (!from_peer) {
+                        roam_to(&src, "authenticated handshake response");
+                    }
+                    send_disco_advert();
                 }
                 break;
             case WG_DEMUX_TRANSPORT:
@@ -1411,7 +1414,7 @@ esp_err_t wg_netif_inject_packet(const uint8_t *src_node_pub,
     wg_demux_kind_t kind = wg_demux_classify(buf, len);
     switch (kind) {
     case WG_DEMUX_HANDSHAKE_RESP:
-        (void)handle_handshake_response(buf, len);
+        if (handle_handshake_response(buf, len)) send_disco_advert();
         return ESP_OK;
     case WG_DEMUX_TRANSPORT:
         (void)handle_transport(buf, len);
