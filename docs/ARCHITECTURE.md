@@ -765,8 +765,8 @@ or a stack size changes.
 | `tinylink_derp`    | 8 KiB    | IDLE+3  | `tinylink.c::tinylink_derp_supervised_start` | DERP TLS session from boot (1.3.5: connects alongside the register): relayed DISCO / WG inject, CMM punch |
 | `wg_rx`            | 8 KiB    | IDLE+3  | `wg_netif.c::wg_netif_start`       | UDP recv, demux (WG/DISCO/STUN), handshake, decrypt → lwIP  |
 | `wg_tx`            | 5 KiB    | IDLE+2  | `wg_netif.c::wg_netif_init`        | encrypted-frame queue → `sendto` (direct) or DERP relay     |
-| `tinylink_stun`    | 5 KiB    | IDLE+2  | `tinylink.c::tinylink_stun_probe_start` | boot STUN probe on the WG socket while the register runs (1.3.5); exits after one probe (≤ 3 s + DNS) |
-| `tinylink_tlm`     | 4.5 KiB  | IDLE+2  | `telemetry.c::telemetry_task_start` | TMP117 sample → JSON → UDP over the tunnel; `/stats`; periodic / GOT_IP-triggered STUN re-probe (flags endpoint push); 60 s stack diag + NVS time floor |
+| `tinylink_stun`    | 5 KiB    | IDLE+2  | `tinylink.c::tinylink_stun_probe_start` | boot STUN probe on the WG socket while the register runs (1.3.5), to the home DERP node's STUN at its cached address (no DNS) or `CONFIG_TINYLINK_STUN_HOST`; exits after one probe (≤ 3 s, + DNS without a record) |
+| `tinylink_tlm`     | 4.5 KiB  | IDLE+2  | `telemetry.c::telemetry_task_start` | TMP117 sample → JSON → UDP over the tunnel; `/stats`; periodic / GOT_IP-triggered STUN re-probe (flags endpoint push); 60 s stack diag + NVS time floor + address-cache records (1.3.5, on change only) |
 | `tiT` (lwIP)       | 4.5 KiB  | 18      | `CONFIG_LWIP_TCPIP_TASK_STACK_SIZE`| TCP/IP thread (raised 3 → 4.5 KiB in #104)                 |
 
 Application task stacks total ≈ 36.5 KiB (the 8 KiB `main` stack is

@@ -47,7 +47,8 @@ extern "C" {
  * parse time. n_derp_regions = 0 with have_derp_map set means the map
  * no longer has that region. Max nodes per region observed in prod = 5;
  * the supervisor dials nodes[0], 3 leave room for a node failover.
- * BSS cost: 224 B (was ~6 KiB for 28). */
+ * BSS cost: 236 B (was ~6 KiB for 28; +12 B for IPv4 / STUNPort, round
+ * 1.3.5). */
 #define TL_MAX_DERP_REGIONS     1
 #define TL_MAX_DERP_NODES       3
 
@@ -101,10 +102,19 @@ typedef struct {
     int           derp_region;                     /* 0 = unchanged */
 } tl_peer_patch_t;
 
+/* tailcfg.DERPNode. ipv4 / stun_port (round 1.3.5) let the boot reach the
+ * node without DNS (tl_addr.h): IPv4 "forces an IPv4 address to use,
+ * instead of using DNS" upstream; Tailscale's map sets it on every node.
+ * An absent, "none" or malformed IPv4 is 0.0.0.0 (resolve HostName, as
+ * before). stun_port is the port to send STUN to: STUNPort 0 / absent =
+ * 3478, any other value in 1..65535 as given, and 0 here when STUNPort
+ * disables STUN on the node (-1) or is not a valid port. */
 typedef struct {
     int      region_id;
     char     hostname[TL_DERP_HOSTNAME_LEN];
     uint16_t port;                                 /* 0 → use default 443 */
+    uint16_t stun_port;                            /* 0 = STUN off */
+    uint8_t  ipv4[4];                              /* 0.0.0.0 = none */
 } tl_derp_node_t;
 
 typedef struct {

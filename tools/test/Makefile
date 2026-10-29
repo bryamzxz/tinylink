@@ -31,7 +31,8 @@ TARGETS := test_blake2s test_curve25519 test_x25519 test_mapresp \
            test_disco_handler test_disco_prober test_retry_after \
            test_backoff test_keys_regen test_stun_boot test_skip_value test_jsmn_split \
            test_tai64n test_nacl_box test_tsmp test_tl_date test_stats test_noise_ik \
-           test_http1 test_ctrl_json test_ts2021 test_hpack test_h2_core test_tls_resume
+           test_http1 test_ctrl_json test_ts2021 test_hpack test_h2_core test_tls_resume \
+           test_addr
 
 all: $(TARGETS) $(H2_INTEROP)
 
@@ -71,6 +72,11 @@ test_keys_regen: test_keys_regen.c $(TL_SRC)/keys_regen.h
 # probe task and the waiter. Header-only.
 test_stun_boot: test_stun_boot.c $(TL_SRC)/stun_boot.h
 	$(CC) $(CFLAGS) -I$(TL_SRC) -o $@ test_stun_boot.c
+
+# Last-known server addresses (round 1.3.5): IPv4 literals, the NVS
+# records, write-only-on-change over a fake NVS. Header-only.
+test_addr: test_addr.c $(TL_SRC)/tl_addr.h $(TL_SRC)/netmap.h
+	$(CC) $(CFLAGS) -I$(TL_SRC) -o $@ test_addr.c
 
 # Depth-bounded JSON value skipper (MapResponse stack-overflow guard). Header-only.
 test_skip_value: test_skip_value.c $(TL_SRC)/jsmn_skip.h $(TL_SRC)/jsmn.h
@@ -115,6 +121,7 @@ test_x25519: test_x25519.c $(CRYPTO)/curve25519_fiat32.c $(CRYPTO)/curve25519.c 
 # oracle for chunking / truncation / mutation tests.
 test_mapresp: test_mapresp.c $(TL_SRC)/mapreq.c $(TL_SRC)/mapreq.h $(TL_SRC)/netmap.h \
               $(TL_SRC)/jsmn.h $(TL_SRC)/jsmn_split.h $(TL_SRC)/jsmn_skip.h $(TL_SRC)/ctrl_buf.h \
+              $(TL_SRC)/tl_addr.h \
               ref/mapresp_ref.c ref/mapresp_133.c
 	$(CC) $(CFLAGS) -I$(TL_SRC) -o $@ test_mapresp.c $(TL_SRC)/mapreq.c ref/mapresp_ref.c
 
@@ -159,15 +166,19 @@ test_noise_ik: test_noise_ik.c $(NOISE_SRCS) $(TL_SRC)/noise_ik.h $(CRYPTO)/secu
 # ts2021 record layer after the Noise handshake (round 1.3.4: D5's
 # EarlyPayload window) and the connect over plain :80 with the :443
 # fallback (round 1.3.5, D10a: a real socketpair for :80, the :80
-# budget cut to 200 ms so the silent-server case stays fast). Includes
+# budget cut to 200 ms so the silent-server case stays fast), first at
+# the cached control address, and the one-shot request deadline (cut
+# to 300 ms in 100-ms polls, doubling to 1.2 s; round 1.3.5). Includes
 # ts2021_client.c over a fake esp_tls; host_include/ supplies esp_tls.h,
 # esp_timer.h, lwip/sockets.h and friends.
 TS2021_DEFS := -DCONFIG_TINYLINK_CONTROL_HOST='"controlplane.test"' \
                -DCONFIG_TINYLINK_CONTROL_PORT=443 -DCONFIG_TINYLINK_STREAM_IDLE_TIMEOUT_S=120 \
-               -DCONFIG_TINYLINK_CONTROL_PLAIN_HTTP=1 -DTS2021_PLAIN_TIMEOUT_MS=200
+               -DCONFIG_TINYLINK_CONTROL_PLAIN_HTTP=1 -DTS2021_PLAIN_TIMEOUT_MS=200 \
+               -DTS2021_REQ_TIMEOUT_MS=300 -DTS2021_REQ_POLL_MS=100 \
+               -DTS2021_REQ_TIMEOUT_MAX_MS=1200
 test_ts2021: test_ts2021.c $(TL_SRC)/ts2021_client.c $(TL_SRC)/ts2021_client.h \
-             $(TL_SRC)/tls_io.c $(TL_SRC)/tls_resume.h $(NOISE_SRCS) host_include/esp_tls.h \
-             host_include/esp_timer.h
+             $(TL_SRC)/tls_io.c $(TL_SRC)/tls_resume.h $(TL_SRC)/tl_addr.h $(NOISE_SRCS) \
+             host_include/esp_tls.h host_include/esp_timer.h
 	$(CC) $(CFLAGS) $(TS2021_DEFS) -I$(TL_SRC) -I$(TL_INC) -I$(CRYPTO) -Ihost_include -o $@ \
 	    test_ts2021.c $(TL_SRC)/tls_io.c $(NOISE_SRCS)
 
@@ -414,10 +425,13 @@ test: test_blake2s.run test_curve25519.run test_x25519.run test_mapresp.run \
       test_skip_value.run test_jsmn_split.run test_tai64n.run \
       test_nacl_box.run test_tsmp.run test_tl_date.run test_stats.run test_noise_ik.run \
       test_http1.run test_ctrl_json.run test_ts2021.run test_hpack.run test_h2_core.run \
-      test_tls_resume.run h2_interop.run
+      test_tls_resume.run test_addr.run h2_interop.run
 
 test_tls_resume.run: test_tls_resume
 	$(RUNNER) ./test_tls_resume
+
+test_addr.run: test_addr
+	$(RUNNER) ./test_addr
 
 test_hpack.run: test_hpack
 	$(RUNNER) ./test_hpack

@@ -16,6 +16,7 @@
 #include "mbedtls/ssl.h"
 
 #include "h2_client.h"
+#include "tl_addr.h"
 #include "tls_io.h"
 #include "tls_resume.h"
 #include "crypto/secure_zero.h"
@@ -96,6 +97,63 @@ static const char *TAG = "ts2021";
 static bool s_plain_off;
 static bool s_tls_next;
 
+/* The last good control address (round 1.3.5, tl_addr.h): seeded from
+ * NVS (ts2021_set_addr), replaced by every conn that comes up. A connect
+ * dials it before resolving CONFIG_TINYLINK_CONTROL_HOST — on the
+ * sensor's network a lookup lost an answer in 12 of 30 boots, 1–7 s each
+ * (lwIP resends after 1, 2, 4, 7 s). As upstream controlclient's
+ * dnscache (UseLastGood) does, but first rather than only when DNS
+ * fails: the address is no trust input (see ts2021_connect), so trying
+ * it costs at most one short attempt when stale (TS2021_ADDR_TIMEOUT_MS
+ * to the end of the Noise handshake, on either port). Touched only by
+ * the task in ts2021_connect (main, then the long-poll). s_addr_skip:
+ * the last conn at it failed young (ts2021_close) — the next connect
+ * resolves the name instead, once. */
+static uint8_t s_addr[4];
+static bool    s_addr_skip;
+
+/* How long an address stays first (round 1.3.5): from the NVS seed
+ * (ts2021_set_addr, at boot) or from the by-name conn that reached it —
+ * a conn at the address does not extend it; then the next connect
+ * resolves the name. Upstream's dnscache keeps an answer for its TTL and
+ * falls back to the last good one only when a lookup fails;
+ * controlplane is 8 A records with a 60-s TTL (tls_resume.h), so an
+ * address that left the answer — a frontend being drained — keeps this
+ * client at most this long while it still accepts conns. 10 min covers
+ * the boot and the reconnects right after it, the connects this cache
+ * takes the lookup off; later ones resolve at most once per 10 min. */
+#ifndef TS2021_ADDR_TTL_S
+#define TS2021_ADDR_TTL_S 600
+#endif
+static int64_t s_addr_until_us;
+
+/* That attempt's budget on :443: esp-tls applies timeout_ms to the TCP
+ * connect and to every TLS handshake read; after the TLS handshake the
+ * socket stays at it, and the upgrade, the 101 and Noise msg2 get one
+ * such poll each and one deadline, as on :80 (hs_idle / hs_deadline_us)
+ * — a stale address that still terminates TLS for the name but does not
+ * answer /ts2021 costs this, not the stream's 120 s per read, before the
+ * name. The conn goes to the stream's TLS_TIMEOUT_MS polls after msg2.
+ * The :80 attempt has TS2021_PLAIN_TIMEOUT_MS already. Same 3 s: one
+ * lost SYN at lwIP's 1.5-s RTO. */
+#define TS2021_ADDR_TIMEOUT_MS TS2021_PLAIN_TIMEOUT_MS
+
+/* Which address a by-name conn reached (a test seam: the host tests'
+ * sockets are AF_UNIX). */
+#ifndef TS2021_PEER_V4
+#define TS2021_PEER_V4 tls_io_sock_peer_v4
+#endif
+
+void ts2021_set_addr(const uint8_t ip_v4[4])
+{
+    if (ip_v4 != NULL && tl_ipv4_usable(ip_v4)) {
+        memcpy(s_addr, ip_v4, sizeof(s_addr));
+    } else {
+        memset(s_addr, 0, sizeof(s_addr));
+    }
+    s_addr_until_us = esp_timer_get_time() + (int64_t)TS2021_ADDR_TTL_S * 1000000;
+}
+
 /* TLS session of the last :443 conn, for the next :443 connect (D9). */
 static tls_resume_slot_t s_resume;
 
@@ -137,6 +195,12 @@ void ts2021_abort_reads(void)
     s_abort_reads = true;
 }
 
+/* A one-shot request past its deadline (ts2021_request_deadline). */
+static bool req_overdue(const ts2021_conn_t *c)
+{
+    return c->req_deadline_us != 0 && esp_timer_get_time() > c->req_deadline_us;
+}
+
 /* Transport shims for tls_io_*: esp_tls on :443, the socket on :80
  * (tls_io_sock_*: same return contract). The cast on the TLS write side
  * hides esp_tls_conn_write's `void *` (non-const) second parameter — we
@@ -145,50 +209,87 @@ static ssize_t ts2021_conn_read(void *ctx, uint8_t *buf, size_t len)
 {
     ts2021_conn_t *c = (ts2021_conn_t *)ctx;
     if (s_abort_reads) return TS2021_ERR_READ_ABORTED;
-    if (!c->plain) return esp_tls_conn_read(c->tls, buf, len);
+    if (req_overdue(c)) return TS2021_ERR_REQ_DEADLINE;
     if (c->hs_deadline_us != 0 && esp_timer_get_time() > c->hs_deadline_us) {
         return TS2021_ERR_HS_DEADLINE;
     }
+    if (!c->plain) return esp_tls_conn_read(c->tls, buf, len);
     return tls_io_sock_read(c->sock, buf, len);
 }
 static ssize_t ts2021_conn_write(void *ctx, const uint8_t *buf, size_t len)
 {
     ts2021_conn_t *c = (ts2021_conn_t *)ctx;
+    if (req_overdue(c)) return TS2021_ERR_REQ_DEADLINE;
     return c->plain ? tls_io_sock_write(c->sock, buf, len)
                     : esp_tls_conn_write(c->tls, (void *)buf, len);
 }
 
 /* Consecutive silent socket polls a read / write may sit out: the stream
- * budget, or one poll during the unauthenticated part of a :80 handshake. */
+ * budget, one poll during the unauthenticated part of a :80 handshake
+ * (and of one at the cached address), or a one-shot request's share of
+ * its deadline. */
 static uint32_t idle_budget(const ts2021_conn_t *c)
 {
-    return c->hs_idle != 0 ? c->hs_idle : TS2021_MAX_IDLE_POLLS;
+    return c->hs_idle != 0 ? c->hs_idle : c->req_idle != 0 ? c->req_idle
+                                                            : TS2021_MAX_IDLE_POLLS;
 }
 
 /* The socket timeout behind one such poll. */
 static uint32_t poll_ms(const ts2021_conn_t *c)
 {
-    return c->hs_idle != 0 ? TS2021_PLAIN_TIMEOUT_MS : TLS_TIMEOUT_MS;
+    return c->hs_idle != 0 ? TS2021_PLAIN_TIMEOUT_MS :
+           c->req_idle != 0 ? TS2021_REQ_POLL_MS : TLS_TIMEOUT_MS;
 }
+
+/* A one-shot request ran out of time: one W line per request. */
+static void note_req_expired(ts2021_conn_t *c)
+{
+    if (!c->req_expired) {
+        ESP_LOGW(TAG, "control request: no answer within %u ms — dropping the conn",
+                 (unsigned)c->req_ms);
+    }
+    c->req_expired = true;
+}
+
+/* Which short handshake budget ran out (hs_idle): :80's, or the one at
+ * the cached address on :443. */
+static const char *hs_what(const ts2021_conn_t *c)
+{
+    return c->plain ? ":80 handshake" : "handshake at the cached address";
+}
+
+/* A handshake failing at the cached address is the fallback at work —
+ * the name is tried next — so W there and E by name. Not for Noise IK
+ * refusing msg2: a server without the control key stays an error. */
+#define HS_LOG_FAIL(c, fmt, ...) do {                                    \
+        if ((c)->at_addr && !(c)->connected) ESP_LOGW(TAG, fmt, ##__VA_ARGS__); \
+        else                                 ESP_LOGE(TAG, fmt, ##__VA_ARGS__); \
+    } while (0)
 
 static esp_err_t tls_read_full(ts2021_conn_t *c, uint8_t *buf, size_t need)
 {
     int rc = tls_io_read_full(ts2021_conn_read, c, buf, need, idle_budget(c));
     if (rc != 0) {
         if (rc == TS2021_ERR_READ_ABORTED) {
+            /* The one line a requested recycle logs (round 1.3.5): the
+             * HTTP/2 and map layers above stay below I for it. */
+            c->aborted = true;
             ESP_LOGI(TAG, "control stream read aborted on request (recycle)");
             return ESP_FAIL;
         }
         c->io_failed = true;
-        if (rc == TS2021_ERR_HS_DEADLINE ||
+        if (rc == TS2021_ERR_REQ_DEADLINE ||
+            (rc == TLS_IO_ERR_IDLE_TIMEOUT && c->req_idle != 0)) {
+            note_req_expired(c);
+        } else if (rc == TS2021_ERR_HS_DEADLINE ||
             (rc == TLS_IO_ERR_IDLE_TIMEOUT && c->hs_idle != 0)) {
-            ESP_LOGW(TAG, ":80 handshake: no answer within %d ms",
+            ESP_LOGW(TAG, "%s: no answer within %d ms", hs_what(c),
                      TS2021_PLAIN_TIMEOUT_MS);
         } else if (rc == TLS_IO_ERR_IDLE_TIMEOUT) {
             ESP_LOGW(TAG, "control stream silent past %d s — declaring dead",
                      CONFIG_TINYLINK_STREAM_IDLE_TIMEOUT_S);
         } else {
-            ESP_LOGE(TAG, "tls_read_full failed: %d", rc);
+            HS_LOG_FAIL(c, "tls_read_full failed: %d", rc);
         }
         return ESP_FAIL;
     }
@@ -200,7 +301,12 @@ static esp_err_t tls_write_full(ts2021_conn_t *c, const uint8_t *buf, size_t len
     int rc = tls_io_write_full(ts2021_conn_write, c, buf, len, idle_budget(c));
     if (rc != 0) {
         c->io_failed = true;
-        ESP_LOGE(TAG, "tls_write_full failed: %d", rc);
+        if (rc == TS2021_ERR_REQ_DEADLINE ||
+            (rc == TLS_IO_ERR_IDLE_TIMEOUT && c->req_idle != 0)) {
+            note_req_expired(c);
+        } else {
+            ESP_LOGE(TAG, "tls_write_full failed: %d", rc);
+        }
         return ESP_FAIL;
     }
     return ESP_OK;
@@ -238,19 +344,19 @@ static esp_err_t read_upgrade_response(ts2021_conn_t *c,
              * reader: a server that accepts the connection but never
              * answers the upgrade must not park the caller forever. */
             if (++idle >= idle_budget(c)) {
-                ESP_LOGE(TAG, "no 101 response within %u ms — giving up",
-                         (unsigned)(idle_budget(c) * poll_ms(c)));
+                HS_LOG_FAIL(c, "no 101 response within %u ms — giving up",
+                            (unsigned)(idle_budget(c) * poll_ms(c)));
                 return ESP_FAIL;
             }
             continue;
         }
         idle = 0;
         if (r == TS2021_ERR_HS_DEADLINE) {
-            ESP_LOGW(TAG, ":80 handshake: no 101 within %d ms", TS2021_PLAIN_TIMEOUT_MS);
+            ESP_LOGW(TAG, "%s: no 101 within %d ms", hs_what(c), TS2021_PLAIN_TIMEOUT_MS);
             return ESP_FAIL;
         }
         if (r <= 0) {
-            ESP_LOGE(TAG, "read while waiting for 101: %d", (int)r);
+            HS_LOG_FAIL(c, "read while waiting for 101: %d", (int)r);
             return ESP_FAIL;
         }
         total += (size_t)r;
@@ -263,8 +369,8 @@ static esp_err_t read_upgrade_response(ts2021_conn_t *c,
 
     if (strncmp((const char *)buf, "HTTP/1.1 101 ", 13) != 0 &&
         strncmp((const char *)buf, "HTTP/1.0 101 ", 13) != 0) {
-        ESP_LOGE(TAG, "control plane did not return 101: '%.*s'",
-                 (int)(total > 60 ? 60 : total), (const char *)buf);
+        HS_LOG_FAIL(c, "control plane did not return 101: '%.*s'",
+                    (int)(total > 60 ? 60 : total), (const char *)buf);
         return ESP_FAIL;
     }
     return ESP_OK;
@@ -446,47 +552,88 @@ static esp_err_t consume_early_payload(ts2021_conn_t *c)
     return ESP_OK;
 }
 
-/* Open the :443 transport: TLS, offering the session the previous :443
- * conn left (round 1.3.5, D9; tls_resume.h). */
-static esp_err_t open_tls(ts2021_conn_t *c, tls_resume_result_t *res)
+/* SO_RCVTIMEO / SO_SNDTIMEO: one socket poll of `ms`. */
+static bool set_socket_timeouts(int fd, uint32_t ms)
 {
-    char url[160];
-    snprintf(url, sizeof(url), "https://%s:%d",
-             CONFIG_TINYLINK_CONTROL_HOST, CONFIG_TINYLINK_CONTROL_PORT);
+    struct timeval tv = { .tv_sec = (time_t)(ms / 1000),
+                          .tv_usec = (suseconds_t)((ms % 1000) * 1000) };
+    return fd >= 0 && setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) == 0 &&
+           setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) == 0;
+}
 
+/* Open the :443 transport: TLS, offering the session the previous :443
+ * conn left (round 1.3.5, D9; tls_resume.h) — by name, or at `ip` with
+ * the certificate still checked against the host name: esp-tls hands
+ * cfg.common_name to mbedtls_ssl_set_hostname, the SNI and the name
+ * verification (esp_tls_mbedtls.c set_client_config), and an IP literal
+ * never reaches lwIP's resolver (dns_gethostbyname_addrtype returns it
+ * as is). The session is keyed by the host name either way — the name
+ * the certificate proved; controlplane's ticket keys are per address,
+ * so a conn to the address that issued it resumes more often, and
+ * another address answers with a full, verified handshake. */
+static esp_err_t open_tls(ts2021_conn_t *c, const uint8_t *ip, tls_resume_result_t *res)
+{
     esp_tls_cfg_t tls_cfg = {
         .crt_bundle_attach = tl_crt_bundle_attach,
-        .timeout_ms = TLS_TIMEOUT_MS,
+        .timeout_ms  = ip != NULL ? TS2021_ADDR_TIMEOUT_MS : TLS_TIMEOUT_MS,
+        .common_name = CONFIG_TINYLINK_CONTROL_HOST,
     };
     tls_resume_entry_t *offered = tls_resume_take(&s_resume, CONFIG_TINYLINK_CONTROL_HOST,
                                                   CONFIG_TINYLINK_CONTROL_PORT);
     tls_resume_offer(&tls_cfg, offered);
 
     c->tls = esp_tls_init();
-    const int rc = (c->tls != NULL) ? esp_tls_conn_http_new_sync(url, &tls_cfg, c->tls) : -1;
+    int rc = -1;
+    if (c->tls != NULL && ip != NULL) {
+        char a[TL_IPV4_STRLEN];
+        tl_ipv4_str(ip, a);
+        rc = esp_tls_conn_new_sync(a, (int)strlen(a), CONFIG_TINYLINK_CONTROL_PORT,
+                                   &tls_cfg, c->tls);
+    } else if (c->tls != NULL) {
+        char url[160];
+        snprintf(url, sizeof(url), "https://%s:%d",
+                 CONFIG_TINYLINK_CONTROL_HOST, CONFIG_TINYLINK_CONTROL_PORT);
+        rc = esp_tls_conn_http_new_sync(url, &tls_cfg, c->tls);
+    }
     *res = tls_resume_keep(&s_resume, offered, rc == 1 ? c->tls : NULL,
                            CONFIG_TINYLINK_CONTROL_HOST, CONFIG_TINYLINK_CONTROL_PORT);
     if (rc != 1) {
-        ESP_LOGE(TAG, "TLS connect failed");
+        if (ip != NULL) {
+            ESP_LOGW(TAG, "TLS connect failed");
+        } else {
+            ESP_LOGE(TAG, "TLS connect failed");
+        }
         return ESP_FAIL;
     }
     int fd = -1;
     (void)esp_tls_get_conn_sockfd(c->tls, &fd);
+    if (ip != NULL) {
+        /* The socket stays at TS2021_ADDR_TIMEOUT_MS until msg2
+         * (hs_to_stream); the rest of the handshake shares one deadline. */
+        c->hs_idle = 1;
+        c->hs_deadline_us = esp_timer_get_time() + (int64_t)TS2021_ADDR_TIMEOUT_MS * 1000;
+    }
     set_tcp_nodelay(fd);
     return ESP_OK;
 }
 
-/* Open the :80 transport: a plain TCP socket through esp-tls's resolver
- * and connect-with-timeout (no TLS context is allocated). Until Noise IK
+/* Open the :80 transport: a plain TCP socket through esp-tls's
+ * connect-with-timeout — to `ip`, or to the host name through esp-tls's
+ * resolver — with no TLS context allocated. Until Noise IK
  * authenticates the server, every read and write gets one
  * TS2021_PLAIN_TIMEOUT_MS poll and the whole exchange one deadline. */
-static esp_err_t open_plain(ts2021_conn_t *c)
+static esp_err_t open_plain(ts2021_conn_t *c, const uint8_t *ip)
 {
     esp_tls_cfg_t cfg = { .timeout_ms = TS2021_PLAIN_TIMEOUT_MS };
     esp_tls_last_error_t terr = { 0 };
     int fd = -1;
-    const esp_err_t err = esp_tls_plain_tcp_connect(CONFIG_TINYLINK_CONTROL_HOST,
-                                                    (int)strlen(CONFIG_TINYLINK_CONTROL_HOST),
+    char a[TL_IPV4_STRLEN];
+    const char *host = CONFIG_TINYLINK_CONTROL_HOST;
+    if (ip != NULL) {
+        tl_ipv4_str(ip, a);
+        host = a;
+    }
+    const esp_err_t err = esp_tls_plain_tcp_connect(host, (int)strlen(host),
                                                     TS2021_PLAIN_PORT, &cfg, &terr, &fd);
     if (err != ESP_OK || fd < 0) {
         ESP_LOGW(TAG, ":80 connect failed: 0x%x", err);
@@ -500,17 +647,18 @@ static esp_err_t open_plain(ts2021_conn_t *c)
     return ESP_OK;
 }
 
-/* Noise IK completed on :80, so the peer holds the pinned key's private
- * half: from here the conn is a stream like the TLS one — TLS_TIMEOUT_MS
- * socket polls under the stream idle budget. A socket left at 3-s polls
- * would declare the long-poll dead after 12 s of silence between
- * KeepAlives, so failing to switch fails the attempt. */
-static esp_err_t plain_to_stream(ts2021_conn_t *c)
+/* Noise IK completed under a short budget (on :80, or on :443 at the
+ * cached address), so the peer holds the pinned key's private half:
+ * from here the conn is a stream like any other — TLS_TIMEOUT_MS socket
+ * polls under the stream idle budget. A socket left at 3-s polls would
+ * declare the long-poll dead after 12 s of silence between KeepAlives,
+ * so failing to switch fails the attempt. */
+static esp_err_t hs_to_stream(ts2021_conn_t *c)
 {
-    struct timeval tv = { .tv_sec = TLS_TIMEOUT_MS / 1000, .tv_usec = 0 };
-    if (setsockopt(c->sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) != 0 ||
-        setsockopt(c->sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) != 0) {
-        ESP_LOGE(TAG, ":80 stream timeouts not set");
+    int fd = c->plain ? c->sock : -1;
+    if (!c->plain) (void)esp_tls_get_conn_sockfd(c->tls, &fd);
+    if (!set_socket_timeouts(fd, TLS_TIMEOUT_MS)) {
+        ESP_LOGE(TAG, "stream socket timeouts not set (fd=%d)", fd);
         return ESP_FAIL;
     }
     c->hs_idle = 0;
@@ -647,7 +795,7 @@ static esp_err_t handshake(ts2021_conn_t *out,
     }
     ESP_LOGI(TAG, "ts2021: Noise IK handshake complete");
     out->up_us = esp_timer_get_time();
-    if (out->plain && plain_to_stream(out) != ESP_OK) return ESP_FAIL;
+    if (out->hs_idle != 0 && hs_to_stream(out) != ESP_OK) return ESP_FAIL;
 
     /* Skip optional EarlyPayload, leaving the h2_rx window primed with
      * the first 0..N HTTP/2 plaintext bytes. */
@@ -669,8 +817,9 @@ static esp_err_t handshake(ts2021_conn_t *out,
     return ESP_OK;
 }
 
-/* One attempt on one transport. */
-static esp_err_t connect_on(ts2021_conn_t *out, bool plain,
+/* One attempt on one transport, at `ip` or by name (NULL). On success
+ * peer_v4 is the address the conn reached. */
+static esp_err_t connect_on(ts2021_conn_t *out, bool plain, const uint8_t *ip,
                             const uint8_t machine_priv[NOISE_DHLEN],
                             const uint8_t machine_pub[NOISE_DHLEN],
                             const uint8_t control_pub[NOISE_DHLEN],
@@ -678,10 +827,60 @@ static esp_err_t connect_on(ts2021_conn_t *out, bool plain,
 {
     memset(out, 0, sizeof(*out));
     out->sock = -1;
-    esp_err_t err = plain ? open_plain(out) : open_tls(out, res);
+    out->at_addr = ip != NULL;   /* already for the handshake's log levels */
+    esp_err_t err = plain ? open_plain(out, ip) : open_tls(out, ip, res);
     if (err == ESP_OK) err = handshake(out, machine_priv, machine_pub, control_pub);
-    if (err != ESP_OK) conn_teardown(out);
-    return err;
+    if (err != ESP_OK) {
+        conn_teardown(out);
+        return err;
+    }
+    if (ip != NULL) {
+        memcpy(out->peer_v4, ip, sizeof(out->peer_v4));
+    } else {
+        int fd = out->plain ? out->sock : -1;
+        if (!out->plain) (void)esp_tls_get_conn_sockfd(out->tls, &fd);
+        if (fd < 0 || !TS2021_PEER_V4(fd, out->peer_v4)) {
+            memset(out->peer_v4, 0, sizeof(out->peer_v4));
+        }
+    }
+    return ESP_OK;
+}
+
+/* One transport: the cached address first while *try_addr, then the
+ * name. A failure at the address — refused, its 3-s budget, another
+ * server there now (no 101, a msg2 from another key, a certificate that
+ * is not the control host's) — is retried by name at once, so what
+ * ts2021_connect decides from a transport's failure (the :443 fallback,
+ * and turning :80 off for the boot) always rests on the name's answer,
+ * never on a stale cache. Once the name has been tried, the address
+ * isn't for the rest of the connect: lwIP has the name's answer cached
+ * by then, and a dead address would otherwise cost each transport its
+ * budget. */
+static esp_err_t connect_port(ts2021_conn_t *out, bool plain, bool *try_addr,
+                              bool *at_addr,
+                              const uint8_t machine_priv[NOISE_DHLEN],
+                              const uint8_t machine_pub[NOISE_DHLEN],
+                              const uint8_t control_pub[NOISE_DHLEN],
+                              tls_resume_result_t *res)
+{
+    *at_addr = false;
+    if (*try_addr) {
+        uint8_t ip[4];
+        memcpy(ip, s_addr, sizeof(ip));
+        const esp_err_t err = connect_on(out, plain, ip, machine_priv, machine_pub,
+                                         control_pub, res);
+        if (err == ESP_OK || s_abort_reads) {
+            *at_addr = err == ESP_OK;
+            return err;
+        }
+        *try_addr = false;
+        ESP_LOGW(TAG, "cached control address %u.%u.%u.%u failed on :%d (0x%x) — "
+                      "resolving %s", ip[0], ip[1], ip[2], ip[3],
+                 plain ? TS2021_PLAIN_PORT : CONFIG_TINYLINK_CONTROL_PORT, err,
+                 CONFIG_TINYLINK_CONTROL_HOST);
+    }
+    *try_addr = false;
+    return connect_on(out, plain, NULL, machine_priv, machine_pub, control_pub, res);
 }
 
 /* :80 is tried only with a key pinned before this boot: without TLS the
@@ -695,7 +894,15 @@ static esp_err_t connect_on(ts2021_conn_t *out, bool plain,
  * (control_key.c fetches it once, over TLS, when nothing is pinned). A
  * genuine control-key rotation therefore fails on both ports, as it
  * failed on :443 before: the conn is refused, the caller backs off, the
- * pin stays. */
+ * pin stays.
+ *
+ * The cached address (round 1.3.5, s_addr) changes none of this: it is
+ * only where the SYN goes. On :80 the server still has to complete
+ * Noise IK with the pinned key; on :443 the certificate is still
+ * verified against CONFIG_TINYLINK_CONTROL_HOST. The DNS answer it
+ * stands in for was never authenticated either, so a stale or forged
+ * address can only fail the attempt — which connect_port retries by
+ * name before anything is concluded about :80. */
 esp_err_t ts2021_connect(ts2021_conn_t *out,
                          const uint8_t machine_priv[NOISE_DHLEN],
                          const uint8_t machine_pub[NOISE_DHLEN],
@@ -717,8 +924,12 @@ esp_err_t ts2021_connect(ts2021_conn_t *out,
 
     esp_err_t err = ESP_FAIL;
     bool fallback = !plain;
+    bool try_addr = tl_ipv4_usable(s_addr) && !s_addr_skip && t0 < s_addr_until_us;
+    bool at_addr = false;
+    s_addr_skip = false;
     if (plain) {
-        err = connect_on(out, true, machine_priv, machine_pub, control_pub, &res);
+        err = connect_port(out, true, &try_addr, &at_addr, machine_priv, machine_pub,
+                           control_pub, &res);
         /* An abort raised meanwhile (endpoint push) is for this dial too. */
         if (err != ESP_OK && !s_abort_reads) {
             ESP_LOGW(TAG, ":80 attempt failed (0x%x) — falling back to :%d",
@@ -727,7 +938,8 @@ esp_err_t ts2021_connect(ts2021_conn_t *out,
         }
     }
     if (fallback) {
-        err = connect_on(out, false, machine_priv, machine_pub, control_pub, &res);
+        err = connect_port(out, false, &try_addr, &at_addr, machine_priv, machine_pub,
+                           control_pub, &res);
         if (err == ESP_OK && plain) {
             s_plain_off = true;
             ESP_LOGW(TAG, ":%d answered after :80 failed — :80 off for the rest of this boot",
@@ -735,15 +947,46 @@ esp_err_t ts2021_connect(ts2021_conn_t *out,
         }
     }
     if (err == ESP_OK) {
-        /* One line per connect, for the soak: which port, and on :443
-         * whether the TLS session resumed. */
-        ESP_LOGI(TAG, "ts2021: control conn up on :%d (%s) in %u ms",
+        /* The next connect starts where this one landed; an address the
+         * name gave is good for another TS2021_ADDR_TTL_S. */
+        memcpy(s_addr, out->peer_v4, sizeof(s_addr));
+        if (!at_addr) s_addr_until_us = esp_timer_get_time() + (int64_t)TS2021_ADDR_TTL_S * 1000000;
+        /* One line per connect, for the soak: which port, whether the
+         * cached address answered, and on :443 whether the TLS session
+         * resumed. */
+        char a[TL_IPV4_STRLEN] = "?";
+        if (tl_ipv4_usable(out->peer_v4)) tl_ipv4_str(out->peer_v4, a);
+        ESP_LOGI(TAG, "ts2021: control conn up on :%d (%s) at %s (%s) in %u ms",
                  out->plain ? TS2021_PLAIN_PORT : CONFIG_TINYLINK_CONTROL_PORT,
                  out->plain ? "plain HTTP, Noise IK" :
                  res == TLS_RESUME_RESUMED ? "TLS, session resumed" : "TLS, full handshake",
+                 a, at_addr ? "cached" : "resolved",
                  (unsigned)((esp_timer_get_time() - t0) / 1000));
     }
     return err;
+}
+
+esp_err_t ts2021_request_deadline(ts2021_conn_t *c, uint32_t ms)
+{
+    if (c == NULL || !c->connected) return ESP_ERR_INVALID_STATE;
+    int fd = c->plain ? c->sock : -1;
+    if (!c->plain) (void)esp_tls_get_conn_sockfd(c->tls, &fd);
+    if (!set_socket_timeouts(fd, ms != 0 ? TS2021_REQ_POLL_MS : TLS_TIMEOUT_MS)) {
+        c->io_failed = true;
+        ESP_LOGW(TAG, "control request: socket timeouts not set (fd=%d)", fd);
+        return ESP_FAIL;
+    }
+    if (ms == 0) {
+        c->req_idle = 0;
+        c->req_deadline_us = 0;
+        return ESP_OK;
+    }
+    const uint32_t polls = (ms + TS2021_REQ_POLL_MS - 1) / TS2021_REQ_POLL_MS;
+    c->req_idle = (uint8_t)(polls > 0 && polls < 255 ? polls : 255);
+    c->req_ms = ms;
+    c->req_expired = false;
+    c->req_deadline_us = esp_timer_get_time() + (int64_t)ms * 1000;
+    return ESP_OK;
 }
 
 /* Seal rec[4..4 + len) in place (the tag lands right behind it) and
@@ -821,13 +1064,24 @@ esp_err_t ts2021_recv_record(ts2021_conn_t *c, size_t *len)
 void ts2021_close(ts2021_conn_t *c)
 {
     if (c == NULL) return;
-    if (c->plain && c->connected && c->io_failed) {
-        const int64_t up_s = (esp_timer_get_time() - c->up_us) / 1000000;
-        if (up_s < TS2021_PLAIN_EARLY_DROP_S) {
-            s_tls_next = true;
-            ESP_LOGW(TAG, ":80 conn failed %d s after its handshake — next dial on :%d",
-                     (int)up_s, CONFIG_TINYLINK_CONTROL_PORT);
-        }
+    const int64_t up_s = (esp_timer_get_time() - c->up_us) / 1000000;
+    if (c->plain && c->connected && c->io_failed && up_s < TS2021_PLAIN_EARLY_DROP_S) {
+        s_tls_next = true;
+        ESP_LOGW(TAG, ":80 conn failed %d s after its handshake — next dial on :%d",
+                 (int)up_s, CONFIG_TINYLINK_CONTROL_PORT);
+    }
+    /* A conn at the cached address that failed young — the transport, or
+     * a GOAWAY (a draining server can still take conns) — sends the next
+     * dial to the name, once (round 1.3.5), as upstream re-resolves:
+     * otherwise a server that accepts and then drops would be redialed
+     * forever, since only a failed connect falls back to DNS. A requested
+     * recycle says nothing about the server. */
+    if (c->connected && c->at_addr && !c->aborted && (c->io_failed || c->h2_goaway) &&
+        up_s < TS2021_PLAIN_EARLY_DROP_S) {
+        s_addr_skip = true;
+        ESP_LOGW(TAG, "conn at the cached control address failed %d s after its "
+                      "handshake — next dial resolves %s", (int)up_s,
+                 CONFIG_TINYLINK_CONTROL_HOST);
     }
     conn_teardown(c);
 }

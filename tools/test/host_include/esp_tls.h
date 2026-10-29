@@ -24,6 +24,7 @@ typedef struct esp_tls_client_session {
 typedef struct {
     esp_err_t (*crt_bundle_attach)(void *conf);
     int timeout_ms;
+    const char *common_name;
 #if CONFIG_ESP_TLS_CLIENT_SESSION_TICKETS
     esp_tls_client_session_t *client_session;
 #endif
@@ -39,6 +40,8 @@ typedef esp_tls_last_error_t *esp_tls_error_handle_t;
 esp_tls_t *esp_tls_init(void);
 int esp_tls_conn_http_new_sync(const char *url, const esp_tls_cfg_t *cfg,
                                esp_tls_t *tls);
+int esp_tls_conn_new_sync(const char *hostname, int hostlen, int port,
+                          const esp_tls_cfg_t *cfg, esp_tls_t *tls);
 ssize_t esp_tls_conn_read(esp_tls_t *tls, void *data, size_t datalen);
 ssize_t esp_tls_conn_write(esp_tls_t *tls, const void *data, size_t datalen);
 int esp_tls_conn_destroy(esp_tls_t *tls);

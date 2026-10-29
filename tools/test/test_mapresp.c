@@ -116,6 +116,66 @@ static size_t build_derpmap(char *out, size_t cap, int order)
     return o < cap ? o : 0;
 }
 
+/* Round 1.3.5: a DERP node's IPv4 and STUNPort (tl_addr.h), the fields
+ * the boot uses to reach the home node without DNS. IPv4 is kept only as
+ * a dotted quad Go's netip.ParseAddr would take; anything else — "none"
+ * (tailcfg's "IPv4 disabled"), IPv6, a name, leading zeros — is none, and
+ * the node is dialed by HostName as before. STUNPort: absent / 0 = 3478,
+ * -1 or out of range = no STUN. */
+static int derp_node_case(const char *name, const char *fields,
+                          const uint8_t want_ip[4], unsigned want_stun)
+{
+    char js[512];
+    static tl_netmap_t nm;
+    snprintf(js, sizeof(js),
+             "{\"DERPMap\":{\"Regions\":{\"16\":{\"RegionID\":16,\"Nodes\":["
+             "{\"Name\":\"16b\",\"RegionID\":16,\"HostName\":\"derp16b.example\"%s%s}]}}}}",
+             fields[0] ? "," : "", fields);
+    static const uint8_t zero[4];
+    const uint8_t *w = want_ip ? want_ip : zero;
+    memset(&nm, 0xA5, sizeof(nm));
+    if (mapresp_parse(js, strlen(js), &nm) != ESP_OK || nm.n_derp_regions != 1 ||
+        nm.derp_regions[0].n_nodes != 1 ||
+        memcmp(nm.derp_regions[0].nodes[0].ipv4, w, 4) != 0 ||
+        nm.derp_regions[0].nodes[0].stun_port != want_stun ||
+        strcmp(nm.derp_regions[0].nodes[0].hostname, "derp16b.example") != 0) {
+        const tl_derp_node_t *dn = &nm.derp_regions[0].nodes[0];
+        printf("[derp/node-addr/%s] FAIL ip=%u.%u.%u.%u stun=%u\n", name,
+               dn->ipv4[0], dn->ipv4[1], dn->ipv4[2], dn->ipv4[3], dn->stun_port);
+        return 1;
+    }
+    printf("[derp/node-addr/%s] OK\n", name);
+    return 0;
+}
+
+static int test_derp_node_addr(void)
+{
+    static const uint8_t a[4] = { 203, 0, 113, 7 }, lo[4] = { 0, 0, 0, 0 },
+                         top[4] = { 255, 255, 255, 255 };
+    int f = 0;
+    f |= derp_node_case("ipv4", "\"IPv4\":\"203.0.113.7\",\"IPv6\":\"2001:db8::7\"", a, 3478);
+    f |= derp_node_case("ipv4-after-ipv6", "\"IPv6\":\"2001:db8::7\",\"IPv4\":\"203.0.113.7\"",
+                        a, 3478);
+    f |= derp_node_case("no-ipv4", "\"IPv6\":\"2001:db8::7\"", NULL, 3478);
+    f |= derp_node_case("ipv4-none", "\"IPv4\":\"none\"", NULL, 3478);
+    f |= derp_node_case("ipv4-empty", "\"IPv4\":\"\"", NULL, 3478);
+    f |= derp_node_case("ipv4-is-v6", "\"IPv4\":\"2001:db8::7\"", NULL, 3478);
+    f |= derp_node_case("ipv4-leading-zero", "\"IPv4\":\"203.0.113.07\"", NULL, 3478);
+    f |= derp_node_case("ipv4-octet-256", "\"IPv4\":\"203.0.113.256\"", NULL, 3478);
+    f |= derp_node_case("ipv4-five-fields", "\"IPv4\":\"203.0.113.7.1\"", NULL, 3478);
+    f |= derp_node_case("ipv4-port", "\"IPv4\":\"203.0.113.7:443\"", NULL, 3478);
+    f |= derp_node_case("ipv4-number", "\"IPv4\":3405803783", NULL, 3478);
+    f |= derp_node_case("ipv4-edges-kept", "\"IPv4\":\"255.255.255.255\"", top, 3478);
+    f |= derp_node_case("ipv4-zero-kept", "\"IPv4\":\"0.0.0.0\"", lo, 3478);
+    f |= derp_node_case("stunport-0", "\"IPv4\":\"203.0.113.7\",\"STUNPort\":0", a, 3478);
+    f |= derp_node_case("stunport-3479", "\"IPv4\":\"203.0.113.7\",\"STUNPort\":3479", a, 3479);
+    f |= derp_node_case("stunport-off", "\"IPv4\":\"203.0.113.7\",\"STUNPort\":-1", a, 0);
+    f |= derp_node_case("stunport-65536", "\"STUNPort\":65536", NULL, 0);
+    f |= derp_node_case("stunport-string", "\"STUNPort\":\"3478\"", NULL, 3478);
+    f |= derp_node_case("stunport-float", "\"STUNPort\":3478.5", NULL, 0);
+    return f;
+}
+
 static int test_derpmap_real_shaped(void)
 {
     static char js[24000];
@@ -139,11 +199,15 @@ static int test_derpmap_real_shaped(void)
             continue;
         }
         const tl_derp_region_t *r = &nm.derp_regions[0];
+        static const uint8_t ip0[4] = { 198, 51, 16, 1 }, ip2[4] = { 198, 51, 16, 3 };
         if (nm.n_derp_regions != 1 || r->region_id != 16 ||
             r->n_nodes != TL_MAX_DERP_NODES ||          /* 4 nodes, capped at 3 */
             strcmp(r->nodes[0].hostname, "derp16b.tailscale.com") != 0 ||
             strcmp(r->nodes[2].hostname, "derp16d.tailscale.com") != 0 ||
-            r->nodes[0].region_id != 16 || r->nodes[0].port != 0) {
+            r->nodes[0].region_id != 16 || r->nodes[0].port != 0 ||
+            /* 1.3.5: IPv4 kept, STUNPort absent = 3478 */
+            memcmp(r->nodes[0].ipv4, ip0, 4) != 0 || memcmp(r->nodes[2].ipv4, ip2, 4) != 0 ||
+            r->nodes[0].stun_port != 3478 || r->nodes[2].stun_port != 3478) {
             printf("[%s] FAIL n=%zu id=%d nodes=%zu host=%s\n", names[order],
                    nm.n_derp_regions, r->region_id, r->n_nodes, r->nodes[0].hostname);
             return 1;
@@ -165,7 +229,7 @@ static int test_derpmap_real_shaped(void)
         return 1;
     }
     printf("[derp/selected-by-region-id] OK\n");
-    return 0;
+    return test_derp_node_addr();
 }
 
 int main(void)

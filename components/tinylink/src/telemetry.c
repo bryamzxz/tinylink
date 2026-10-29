@@ -296,6 +296,7 @@ static void telemetry_task(void *arg)
              * task-stack-trim audit item). */
             tinylink_diag_dump_stacks();
             tl_time_poll_persist();
+            tinylink_addr_persist_poll();
             now = esp_timer_get_time();
             next_housekeep = now + TLM_HOUSEKEEP_US;
         }

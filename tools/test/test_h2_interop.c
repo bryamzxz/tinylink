@@ -30,6 +30,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
+#include <sys/time.h>
 
 #include <nghttp2/nghttp2.h>
 
@@ -434,8 +436,39 @@ int esp_tls_conn_http_new_sync(const char *u, const esp_tls_cfg_t *c, esp_tls_t 
     return -1;
 }
 int esp_tls_conn_destroy(esp_tls_t *t) { (void)t; return 0; }
-esp_err_t esp_tls_get_conn_sockfd(esp_tls_t *t, int *fd) { (void)t; *fd = -1; return ESP_FAIL; }
-/* ts2021_connect's :80 path and clock (round 1.3.5) — not dialled here. */
+/* A real (unconnected) socket for the conn's SO_RCVTIMEO (round 1.3.5:
+ * a one-shot request runs on short polls, the stream on 30-s ones); each
+ * read records the poll it ran under. */
+static int s_sock_fd = -1;
+static int s_reads_short, s_reads_stream, s_reads_other;
+/* A server that went silent: every read is a socket timeout. */
+static bool s_silent;
+static int  s_silent_polls;
+static long sock_poll_ms(void)
+{
+    struct timeval tv = { 0 };
+    socklen_t tl = sizeof(tv);
+    if (s_sock_fd < 0 || getsockopt(s_sock_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, &tl) != 0) return -1;
+    return (long)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+}
+esp_err_t esp_tls_get_conn_sockfd(esp_tls_t *t, int *fd)
+{
+    (void)t;
+    if (s_sock_fd < 0) {
+        s_sock_fd = socket(AF_INET, SOCK_STREAM, 0);
+        struct timeval tv = { .tv_sec = 30, .tv_usec = 0 };   /* as esp-tls leaves it */
+        setsockopt(s_sock_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    }
+    *fd = s_sock_fd;
+    return s_sock_fd >= 0 ? ESP_OK : ESP_FAIL;
+}
+/* ts2021_connect's :80 path, its dial by cached address and clock (round
+ * 1.3.5) — not dialled here. */
+int esp_tls_conn_new_sync(const char *h, int hl, int p, const esp_tls_cfg_t *c, esp_tls_t *t)
+{
+    (void)h; (void)hl; (void)p; (void)c; (void)t;
+    return -1;
+}
 esp_err_t esp_tls_plain_tcp_connect(const char *h, int hl, int p, const esp_tls_cfg_t *c,
                                     esp_tls_error_handle_t e, int *fd)
 {
@@ -469,6 +502,14 @@ static void seal_records(const uint8_t *p, size_t n)
 
 ssize_t esp_tls_conn_read(esp_tls_t *t, void *data, size_t len)
 {
+    const long poll = sock_poll_ms();
+    if (poll == TS2021_REQ_POLL_MS) s_reads_short++;
+    else if (poll == 30000) s_reads_stream++;
+    else s_reads_other++;
+    if (s_silent) {
+        s_silent_polls++;
+        return MBEDTLS_ERR_SSL_WANT_READ;     /* SO_RCVTIMEO fired */
+    }
     if (t->s2c_off == t->s2c_len) {
         t->s2c_off = t->s2c_len = 0;
         size_t n = srv_output();
@@ -775,6 +816,56 @@ static void sc_goaway_refuse_and_rst(void)
     conn_down();
 }
 
+#ifndef H2_REF
+/* Round 1.3.5: a one-shot request to a silent server fails after its
+ * deadline's polls; each expiry doubles the next request's deadline up
+ * to TS2021_REQ_TIMEOUT_MAX_MS, and an answered request resets it. */
+static int silent_post(void)
+{
+    srv_new(0);
+    conn_up(true);
+    s_silent = true;
+    s_silent_polls = 0;
+    res_t r = post("/machine/map", kRegBody, sizeof(kRegBody) - 1, 256);
+    s_silent = false;
+    const bool failed = r.err == ESP_FAIL && s_conn.req_expired && s_conn.io_failed &&
+                        s_conn.req_deadline_us == 0 && sock_poll_ms() == 30000;
+    const int polls = s_silent_polls;
+    conn_down();
+    return failed ? polls : -1;
+}
+
+static void sc_deadline_backoff(void)
+{
+    const int base = (TS2021_REQ_TIMEOUT_MS + TS2021_REQ_POLL_MS - 1) / TS2021_REQ_POLL_MS;
+    const int cap = (TS2021_REQ_TIMEOUT_MAX_MS + TS2021_REQ_POLL_MS - 1) / TS2021_REQ_POLL_MS;
+    const int p1 = silent_post(), p2 = silent_post(), p3 = silent_post();
+    int pn = 0;
+    for (int i = 0; i < 4; i++) pn = silent_post();
+    check("deadline_backoff_doubles_to_the_cap",
+          p1 == base && p2 == 2 * base && p3 == 4 * base && pn == cap && cap < 255);
+    /* an answer resets it */
+    srv_new(0);
+    conn_up(true);
+    S.sc = SC_OK;
+    S.resp_len = 2;
+    memcpy(S.resp, "{}", 2);
+    res_t r = post("/machine/map", kRegBody, sizeof(kRegBody) - 1, 256);
+    conn_down();
+    const int after = silent_post();
+    check("deadline_backoff_reset_by_an_answer", r.err == ESP_OK && r.status == 200 &&
+                                                 after == base);
+    /* leave it reset for whatever runs next */
+    srv_new(0);
+    conn_up(true);
+    S.sc = SC_OK;
+    S.resp_len = 2;
+    memcpy(S.resp, "{}", 2);
+    (void)post("/machine/map", kRegBody, sizeof(kRegBody) - 1, 256);
+    conn_down();
+}
+#endif
+
 static void sc_sequence(void)
 {
     /* the boot sequence: register, endpoint push, map stream — one conn */
@@ -783,15 +874,34 @@ static void sc_sequence(void)
     S.sc = SC_OK;
     memcpy(S.resp, kOkBody, sizeof(kOkBody) - 1);
     S.resp_len = sizeof(kOkBody) - 1;
+#ifndef H2_REF
+    s_reads_short = s_reads_stream = s_reads_other = 0;
+#endif
     res_t r1 = post("/machine/register", kRegBody, sizeof(kRegBody) - 1, 4095);
     S.sc = SC_OK;
     S.resp_len = 2;
     memcpy(S.resp, "{}", 2);
     res_t r2 = post("/machine/map", kRegBody, sizeof(kRegBody) - 1, 256);
+#ifndef H2_REF
+    /* round 1.3.5: both one-shot requests read under the request
+     * deadline's short polls, disarmed afterwards; the stream after them
+     * reads under the stream's 30-s polls only */
+    const int oneshot_short = s_reads_short, oneshot_other = s_reads_stream + s_reads_other;
+    const bool disarmed = sock_poll_ms() == 30000 && s_conn.req_idle == 0 &&
+                          s_conn.req_deadline_us == 0 && !s_conn.req_expired;
+    s_reads_short = s_reads_stream = s_reads_other = 0;
+#endif
     S.sc = SC_STREAM;
     fill_mapresponses(2, 9000);
     S.chunk = 5000;
     res_t r3 = stream(kRegBody, sizeof(kRegBody) - 1);
+#ifndef H2_REF
+    check("deadline_oneshot_short_polls_then_disarmed",
+          oneshot_short > 0 && oneshot_other == 0 && disarmed);
+    check("deadline_stream_on_stream_polls",
+          s_reads_stream > 0 && s_reads_short == 0 && s_reads_other == 0 &&
+          s_conn.req_deadline_us == 0);
+#endif
     check("sequence_register_push_stream",
           r1.err == ESP_OK && r1.status == 200 && r2.err == ESP_OK && r2.status == 200 &&
           r2.len == 2 && r3.err == ESP_OK && r3.status == 200 && r3.len == S.resp_len &&
@@ -951,6 +1061,9 @@ int main(void)
     sc_small_server_window();
     sc_large_body();
     sc_misc();
+#ifndef H2_REF
+    sc_deadline_backoff();
+#endif
     if (s_fails == 0) printf("\nALL OK\n");
     return s_fails ? 1 : 0;
 }

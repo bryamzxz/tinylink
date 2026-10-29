@@ -23,6 +23,7 @@
 #define JSMN_STATIC
 #include "jsmn.h"
 #include "jsmn_skip.h"
+#include "tl_addr.h"
 #include "tl_date.h"
 
 #ifdef ESP_PLATFORM
@@ -389,6 +390,7 @@ static esp_err_t parse_one_derp_region(const char *js, const jsmntok_t *toks,
                     tl_derp_node_t *dn = &region->nodes[region->n_nodes];
                     int nfields = toks[nx].size;
                     int nf = nx + 1;
+                    dn->stun_port = TL_STUN_DEFAULT_PORT;   /* STUNPort omitempty */
                     for (int q = 0; q < nfields; q++) {
                         const jsmntok_t *nk = &toks[nf];
                         int nv = nf + 1;
@@ -408,6 +410,19 @@ static esp_err_t parse_one_derp_region(const char *js, const jsmntok_t *toks,
                             if (tok_copy(js, &toks[nv], buf, sizeof(buf)) > 0) {
                                 dn->port = (uint16_t)atoi(buf);
                             }
+                        } else if (tok_eq(js, nk, "IPv4") && tok_is_str(&toks[nv])) {
+                            /* Round 1.3.5 (tl_addr.h): the boot dials it
+                             * and probes its STUN without DNS. */
+                            if (!tl_ipv4_parse(js + toks[nv].start,
+                                               (size_t)(toks[nv].end - toks[nv].start),
+                                               dn->ipv4)) {
+                                memset(dn->ipv4, 0, sizeof(dn->ipv4));
+                            }
+                        } else if (tok_eq(js, nk, "STUNPort") &&
+                                   toks[nv].type == JSMN_PRIMITIVE) {
+                            dn->stun_port = tl_stun_port_parse(
+                                js + toks[nv].start,
+                                (size_t)(toks[nv].end - toks[nv].start));
                         }
                         nf = skip_value(toks, nv);
                     }
@@ -1213,7 +1228,13 @@ static esp_err_t push_endpoints_in(ts2021_conn_t *conn,
                                  (const uint8_t *)body, (size_t)body_len,
                                  &status, resp, 256, &resp_len);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "endpoint push h2_post_json failed: 0x%x", err);
+        /* A recycle or the request deadline is logged once in ts2021
+         * (I / W), the consequence by the caller (round 1.3.5). */
+        if (conn->aborted || conn->req_expired) {
+            ESP_LOGD(TAG, "endpoint push left: %s", conn->aborted ? "recycle" : "deadline");
+        } else {
+            ESP_LOGE(TAG, "endpoint push h2_post_json failed: 0x%x", err);
+        }
         return err;
     }
     ESP_LOGI(TAG, "endpoint push: HTTP %d (resp %u B)",
@@ -1374,7 +1395,14 @@ static esp_err_t run_stream_in(ts2021_conn_t *conn,
                                         (size_t)body_len,
                                         &status, stream_chunk_cb, &s);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "h2_post_json_stream failed: 0x%x", err);
+        /* A requested recycle (endpoint push, IP change) is no error: its
+         * one line is ts2021's "control stream read aborted on request"
+         * (round 1.3.5; it logged two E lines here and in h2 before). */
+        if (conn->aborted) {
+            ESP_LOGD(TAG, "map stream left on request (recycle)");
+        } else {
+            ESP_LOGE(TAG, "h2_post_json_stream failed: 0x%x", err);
+        }
         return err;
     }
     if (status != 200) {

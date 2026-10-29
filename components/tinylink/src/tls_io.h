@@ -9,6 +9,7 @@
 
 #pragma once
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <sys/types.h>   /* ssize_t */
@@ -79,6 +80,11 @@ int tls_io_write_full(tls_io_write_fn wr, void *ctx,
  *         the WANT_* codes and from the TLS_IO_ERR_* / caller codes). */
 ssize_t tls_io_sock_read(int fd, uint8_t *buf, size_t len);
 ssize_t tls_io_sock_write(int fd, const uint8_t *buf, size_t len);
+
+/* The IPv4 address a connected socket's peer has (getpeername; round
+ * 1.3.5: which control address a by-name connect reached). False for
+ * anything but a connected AF_INET socket. */
+bool tls_io_sock_peer_v4(int fd, uint8_t ip_v4[4]);
 
 #ifdef __cplusplus
 }

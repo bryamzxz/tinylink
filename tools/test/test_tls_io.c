@@ -32,6 +32,8 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <string.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <sys/types.h>
@@ -443,6 +445,39 @@ static long ms_since(const struct timespec *t0) {
     return (t1.tv_sec - t0->tv_sec) * 1000 + (t1.tv_nsec - t0->tv_nsec) / 1000000;
 }
 
+/* tls_io_sock_peer_v4 (round 1.3.5): the address a by-name control conn
+ * reached, for the address cache — a real loopback TCP pair; AF_UNIX,
+ * unconnected and closed sockets are not an address. */
+static void test_sock_peer_v4(void) {
+    int ls = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in a;
+    memset(&a, 0, sizeof(a));
+    a.sin_family = AF_INET;
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    socklen_t al = sizeof(a);
+    int c = -1, sv = -1;
+    if (ls >= 0 && bind(ls, (struct sockaddr *)&a, sizeof(a)) == 0 && listen(ls, 1) == 0 &&
+        getsockname(ls, (struct sockaddr *)&a, &al) == 0) {
+        c = socket(AF_INET, SOCK_STREAM, 0);
+        if (c >= 0 && connect(c, (struct sockaddr *)&a, sizeof(a)) == 0) sv = accept(ls, NULL, NULL);
+    }
+    uint8_t ip[4] = { 0 };
+    static const uint8_t lo[4] = { 127, 0, 0, 1 };
+    fails += eq_int("sock_peer_v4/tcp_loopback", sv >= 0 && tls_io_sock_peer_v4(c, ip), 1);
+    fails += eq_bytes("sock_peer_v4/tcp_loopback_addr", ip, lo, 4);
+    int up[2];
+    const bool ux = socketpair(AF_UNIX, SOCK_STREAM, 0, up) == 0;
+    const int u = socket(AF_INET, SOCK_STREAM, 0);
+    fails += eq_int("sock_peer_v4/not_an_address",
+                    ux && !tls_io_sock_peer_v4(up[0], ip) && !tls_io_sock_peer_v4(u, ip) &&
+                    !tls_io_sock_peer_v4(-1, ip), 1);
+    if (ux) { close(up[0]); close(up[1]); }
+    if (u >= 0) close(u);
+    if (sv >= 0) close(sv);
+    if (c >= 0) close(c);
+    if (ls >= 0) close(ls);
+}
+
 static void test_sock_read_write(void) {
     int sv[2];
     fails += eq_int("sock/pair", sock_pair(sv, 50), 0);
@@ -516,6 +551,7 @@ int main(void) {
     test_write_full_null_args();
 
     test_sock_read_write();
+    test_sock_peer_v4();
 
     if (fails) {
         printf("\n[FAIL] %d assertion(s) failed\n", fails);

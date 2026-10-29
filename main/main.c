@@ -108,7 +108,18 @@ static esp_err_t bringup(void)
 
     /* Clock floor + SNTP before the first TLS handshake (tinylink_init
      * may fetch /key over TLS). Certificate dates are enforced once the
-     * first sync lands; until then they are tolerated. See tl_time.h. */
+     * first sync lands; until then they are tolerated. See tl_time.h.
+     *
+     * Not moved later (round 1.3.5): lwIP already sends the first SNTP
+     * query — and its pool.ntp.org lookup — at a random 0–5 s after this
+     * (CONFIG_LWIP_SNTP_STARTUP_DELAY, max 5 000 ms), and with the
+     * address cache (tl_addr.h) a boot with records makes no other DNS
+     * query: DERP, STUN and control go to their last-known addresses. So
+     * there is no burst left for it to join, and nothing on the boot
+     * path waits for it. Starting it after the bringup would only make
+     * the boot's TLS handshakes (DERP, a :443 fallback, the TOFU /key)
+     * run date-unchecked every time instead of whenever the sync is
+     * late. */
     err = tinylink_time_start();
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "time start failed: 0x%x — certificate dates unchecked", err);
