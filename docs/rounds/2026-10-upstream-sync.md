@@ -212,6 +212,27 @@ IDF 5.5.6 itself: +6 088 B flash (lwIP + mbedTLS submodule moves),
 +128 B BSS. Round code: +5 888 B flash, +1 144 B BSS (4 patch slots in
 the static netmap ≈ 850 B, /stats buffer +128 B, self-address cache).
 
+Post-commit: `69caeb5` — the advert was queued before `roam_to` on a
+handshake response from a new source (went to the old endpoint); both
+callers now roam first, then `send_disco_advert()`. Independent review
+agent running on `5de412b..HEAD` (concurrency, stack, merge/expiry
+loops, parser bounds, upstream parity) — results to be folded in here.
+
+### Security fixes found by the optimization audit (pre-existing)
+
+- [x] **S1** `f810686` — replay window updated before the AEAD
+  (`wg_transport.c`): one forged high-counter packet blocked all inbound
+  until rekey (≤110 s), repeatable. Now check → AEAD → update.
+- [x] **S2** `f810686` — forged handshake response mutated
+  `chain_key`/`hash` before the tag check (5-s stall per attempt) and
+  mac1 was never verified. Now local copies + mac1 (keyed with our pub,
+  wireguard-go `cookieGenerator.Init(pk)`/`AddMacs`, `CheckMAC1`) first.
+- [x] Log bugs `002465e`: DERP stats labels shifted; `%zu` under nano.
+- [ ] S3 (crypto hardening, optimization round): donna has ~342k
+  secret-dependent branches per scalarmult; some secret scrubs use
+  plain memset → fiat32-style constant-time field code (also −30 %).
+Host suite now **631 OK / 0 FAIL**, CI floor 631.
+
 ## Optimization track (Goal 2)
 
 Agents running (CPU/crypto/data-plane; memory/footprint/boot/power;
@@ -239,6 +260,44 @@ optimization facts it surfaced:
 - REV_MIN 3.1 vs 3.0 changes nothing in IDF 5.5 beyond the boot check.
 - Global `CONFIG_COMPILER_OPTIMIZATION_DEBUG=y` (-Og); only the tinylink
   component is -O2.
+
+CPU / crypto / data-plane agent: DONE (summary — full list will be in
+`docs/rounds/2026-10-optimization-list.md`). Measured on IDF 5.5.6
+scratch builds, nothing timed on device:
+- P0: global -O2 (`COMPILER_OPTIMIZATION_PERF`: −25.5 KB flash, −3.6 KB
+  IRAM; all lwIP compiles at -O2 — the "-O2 hangs" note is stale; lwIP
+  checksum 21→9 µs/1500 B); DHCP ARP check still ON (`sdkconfig.defaults:329`
+  sets a choice member that is ignored → select
+  `CONFIG_LWIP_DHCP_DOES_NOT_CHECK_OFFERED_IP`, −1.0 s/boot); first WG INIT
+  lost every boot (−2.5…3.5 s: INIT on DERP login/pong/CMM, deadline-
+  based RX timeout); TCP_NODELAY + one TLS record per DERP packet (3
+  records today → +1 RTT per relayed packet), Noise record = 1 TLS
+  record; WIFI_PS_NONE until session up (−0.6…1.5 s); ECP fixed-point
+  optim (+5.6 KB, −0.45…0.6 s/handshake); don't wait SETTINGS ACK (−1 RTT);
+  UART 921600 + no log colors; DISCO pong seal does a full X25519 even
+  with cached K (−20 ms/ping); precompute static-static DH + mac1 key
+  (wg_handshake_init redoes them, −20 ms/INIT); finish crypto-in-IRAM
+  (chacha20_init, zeros[], mbedtls_platform_zeroize in flash); TX queue
+  item 1 556 B copied twice → ring index; wg_lwip_linkoutput 1.5 KB
+  stack frame (static scratch).
+- P1: IRAM for lwIP/FreeRTOS/WiFi RX/WG glue (+43 KB IRAM, 12 KB left);
+  lwIP raw-API WG endpoint (TX copies 6→3, RX 4→1, kills wg_tx task);
+  split g.lock (RX/TX AEAD never run in parallel today); ChaCha20 C
+  rewrite (−18 % instr); Poly1305 pre-shifted r; constant-time fiat32
+  X25519 (−30 %); precompute next INIT off wg_rx; X25519 reuse (DISCO
+  relayed cache, DERP, Noise ss); control plane: plain HTTP :80 for
+  ts2021, DERP before netmap, TLS session tickets, bigger TCP wnd,
+  pipelined push+stream; task priorities/pinning; SO_NO_CHECK.
+- P2/P3: WG AEAD entry w/o memcpy/memset, now_us once per loop, WDT
+  feed 1/s, deadline wakeups, RUN_TIME_STATS off, demux switch on
+  buf[0], word-wise ct_memeq, BLAKE2s/Salsa20 SAR-once, HKDF −17
+  compressions, nacl_box on in-tree Poly1305, unity build, misc control
+  items. Projected WG-up ≈ 5.2 s (3.8 s with :80) vs 14.6–25 s today.
+- Stale sdkconfig.defaults comments: "TLS 1.3" (not compiled in), E8
+  chain (now YE1/YE2 → Root YE → X2 → X1), "ECDHE-RSA" (actually
+  ECDHE-ECDSA-AES128-GCM-SHA256), line 329 no effect.
+- Scratch artifacts: /tmp/tlopt-556/keep/*.map, /tmp/tlopt/cc/,
+  /tmp/tlopt-asym/, /tmp/tlopt-tls-556/.
 
 Ideas captured so far (to merge into the list):
 - `noise_ik.c` still uses mbedTLS `mbedtls_chachapoly_*` → switch to the
