@@ -341,7 +341,31 @@ Stack HWMs (B free), 1.3.1 → 1.3.2: `wg_rx` 2 084 → 2 808,
 `tinylink_tlm` 940–1 084 → 2 836 (now also runs STUN), `tiT` 2 768 →
 3 000, `wg_tx` 5 628 → 4 948, `tinylink_derp` 5 172 → 5 292,
 `tinylink_lp` 16 584 → 17 300, `wifi` 1 008 → 1 016; `tinylink_stun_re`
-and its 3 KiB stack are gone. 6-h soak running.
+and its 3 KiB stack are gone.
+
+**Soak (`c1db6c5`, 265 min, stopped early to flash 1.3.3):** 0 resets /
+panics / WDT / brown-outs, 143 rekeys (two needed a REKEY_TIMEOUT retry —
+a lost INIT or response), 3 128 telemetry packets, 52 STUN re-probes,
+DERP logged in once with 0 errors, heap_free min / last 75 024 / 76 588 B,
+largest block never below 59 392 B. Stack lows (B free): `wg_rx` 2 444
+(the 02:00 event below — a new peer DiscoKey means an uncached DISCO
+X25519 on wg_rx, donna's 2.7-KB frame), `tinylink_tlm` 2 608, `tiT`
+2 776, `wg_tx` 4 788, `tinylink_derp` 5 212, `tinylink_lp` 17 292,
+`esp_timer` 4 564. Events:
+- one server-side TCP FIN on the long-poll at 253 s — the boot connection
+  that carried register + push + netmap, as in 3 of 8 boots of 1.3.0–1.3.2
+  (47 / 115 / 244 s, mid keep-alive, never on a later connection); every
+  boot re-sent the auth key, so B22 (1.3.3) tests that hypothesis;
+- the collector's nightly 02:00 reboot (a 24/7 server on general-purpose
+  hardware at ~2 400 m): DERP `peer-gone`, RX-stale forced rekey at
+  +30.3 s, the peer's new DiscoKey at +44.5 s, endpoint roam + `session
+  rekeyed` + direct path at +50.8 s — **outage 50.8 s, 6.2 s after the
+  peer was back** (`peer_restart.py`, kept per version from now on);
+- at 03:13 a direct-path loss right after a normal rekey (no peer
+  restart): the peer sent call-me-maybe twice, RX-stale at +30 s, re-keyed
+  5 s later — 35 s without inbound. Seen once in the 1.3.1 soak too.
+  Upstream re-validates the path every few seconds and falls back to
+  DERP after ~6.5 s without a pong; candidate for a later round.
 
 ### Optimization round A 1.3.1 (2026-10-28, branch `feat/opt-1.3.1`)
 
