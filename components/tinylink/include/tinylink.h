@@ -315,15 +315,18 @@ esp_err_t tinylink_wg_socket_init(void);
  * WG socket's bound port. */
 esp_err_t tinylink_stun_probe(void);
 
-/* Spawn a low-priority FreeRTOS task that re-runs the STUN probe every
- * CONFIG_TINYLINK_STUN_REPROBE_MS milliseconds, refreshing the cached
- * public AddrPort so subsequent MapRequests advertise the current
- * NAT mapping (which can drift when the NAT rebinds an idle port or
- * the WAN address changes). A failed re-probe leaves the previously
- * cached endpoint untouched — losing the cache only on confirmed
- * change would require explicit "this is invalid" signaling we don't
- * have a way to receive. Best-effort, no return-value contract for
- * the task itself; callers get ESP_OK if the task spawned. */
+/* Re-run the STUN probe every CONFIG_TINYLINK_STUN_REPROBE_MS
+ * milliseconds — and at once when IP_EVENT_STA_GOT_IP reports a new
+ * local address — refreshing the cached public AddrPort so subsequent
+ * MapRequests advertise the current NAT mapping (which can drift when
+ * the NAT rebinds an idle port or the WAN address changes). A changed
+ * endpoint queues a control-plane push. A failed re-probe leaves the
+ * previously cached endpoint untouched — losing the cache only on
+ * confirmed change would require explicit "this is invalid" signaling
+ * we don't have a way to receive. The probes run on the telemetry task
+ * (since 1.3.2; it had its own task before), which this call spawns if
+ * needed in every build. Best-effort; ESP_OK means the re-probe loop
+ * runs or will (a NO_MEM spawn retries every 30 s). */
 esp_err_t tinylink_stun_reprobe_start(void);
 
 /* Endpoint changes found by the STUN re-probe are pushed to the control
@@ -363,7 +366,8 @@ const char *tinylink_version_string(void);
  *
  * Cost: ~1.2 KiB static BSS for the TaskStatus_t snapshot buffer +
  * one ESP_LOGI line per task per call. Called every 60 s from
- * telemetry_task (every 12th tx at the default 5 s telemetry period).
+ * telemetry_task (its own deadline since 1.3.2; every 12th sample
+ * before), with or without CONFIG_TINYLINK_TELEMETRY_ENABLE.
  *
  * Intended audience: this is the data source for the deferred audit
  * items "task stack trim" and (via correlation with the mapresp parse
