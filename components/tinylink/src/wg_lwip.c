@@ -16,6 +16,7 @@
 #include "lwip/def.h"     /* lwip_htonl */
 #include "lwip/ip.h"      /* ip_input */
 #include "lwip/netif.h"
+#include "lwip/netifapi.h"   /* netifapi_netif_set_up / _set_link_up */
 #include "lwip/pbuf.h"
 #include "lwip/tcpip.h"
 
@@ -359,10 +360,19 @@ esp_err_t wg_lwip_attach(uint32_t local_ip_be, uint16_t mtu)
      * has linked it into netif_list. Calling netif_set_up from inside
      * init_fn fires ext_callbacks while the netif is invisible to
      * netif_list iteration — empirically this caused jitter and packet
-     * loss on the raw-IP ingress path. */
+     * loss on the raw-IP ingress path.
+     *
+     * Through netifapi, i.e. under the lwIP core lock (1.3.3): this runs
+     * on the bringup task, and netif_set_up / netif_set_link_up rewrite
+     * the flags, fire the ext callbacks and re-scan routes while tiT
+     * routes Wi-Fi traffic over netif_list — and wg_rx may already be
+     * delivering into this very netif (the INIT went out before attach,
+     * and since C1-S wg_rx runs ip_input itself). lwIP requires the lock
+     * for both calls (LWIP_ASSERT_CORE_LOCKED, off in this build so it
+     * never fired). */
     if (s_lwn != NULL) {
-        netif_set_up(s_lwn);
-        netif_set_link_up(s_lwn);
+        (void)netifapi_netif_set_up(s_lwn);
+        (void)netifapi_netif_set_link_up(s_lwn);
     }
 
     ESP_LOGI(TAG, "WG netif up: ip=%u.%u.%u.%u/32 mtu=%u",
