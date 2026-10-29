@@ -133,7 +133,10 @@ three TLS clients attach the IDF certificate bundle through
 then defers to the bundle's own callback. Result: offline boots and the
 first handshakes of a boot behave as before (no date check); every
 handshake after the first sync validates `notBefore`/`notAfter`. The
-telemetry task persists the synced time hourly.
+telemetry task persists the synced time once it is a day past the
+stored floor (hourly until 1.3.2 — each NVS write may erase a 4 KB
+sector, which stalls both CPUs); the floor only has to stay ≤ real time
+and never decrease, which holds at any write interval.
 
 ## WireGuard roaming and the handshake lock (M16, 2026-09)
 
