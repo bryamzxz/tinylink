@@ -70,7 +70,13 @@ esp_err_t noise_ik_write_msg1(noise_ik_state_t *st,
 esp_err_t noise_ik_read_msg2(noise_ik_state_t *st,
                              const uint8_t in[NOISE_IK_MSG2_LEN]);
 
-/* Transport-mode encrypt/decrypt. Each direction has its own counter. */
+/* Transport-mode encrypt/decrypt. Each direction has its own counter.
+ * Both run on the in-tree ChaCha20-Poly1305 (crypto/chacha20poly1305.c,
+ * IRAM with CONFIG_TINYLINK_CRYPTO_IN_IRAM) with the ts2021 nonce
+ * 0^32 || BE64(n) — see noise_nonce() in noise_ik.c. noise_ik_decrypt
+ * checks the tag in constant time before writing any plaintext: on
+ * ESP_FAIL, out is untouched and n_recv does not advance. out may equal
+ * ciphertext (in place); partial overlap is not supported. */
 esp_err_t noise_ik_encrypt(noise_ik_state_t *st,
                            uint8_t *out, size_t out_max,
                            const uint8_t *plaintext, size_t plaintext_len,

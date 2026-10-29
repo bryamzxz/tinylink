@@ -53,7 +53,7 @@ int hmac_blake2s(uint8_t out[HKDF_BLAKE2S_HASHLEN],
     tl_secure_zero(k, sizeof(k));
     tl_secure_zero(ipad, sizeof(ipad));
     tl_secure_zero(opad, sizeof(opad));
-    memset(inner, 0, sizeof(inner));
+    tl_secure_zero(inner, sizeof(inner));
     return 0;
 }
 

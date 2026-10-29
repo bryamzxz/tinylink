@@ -30,7 +30,7 @@ TARGETS := test_blake2s test_curve25519 test_mapresp \
            test_wg_demux test_disco test_stun test_tls_io test_derp \
            test_disco_handler test_disco_prober test_retry_after \
            test_backoff test_keys_regen test_skip_value test_jsmn_split \
-           test_tai64n test_nacl_box test_tsmp test_tl_date test_stats \
+           test_tai64n test_nacl_box test_tsmp test_tl_date test_stats test_noise_ik \
            test_http1 test_ctrl_json
 
 all: $(TARGETS)
@@ -80,12 +80,14 @@ test_tai64n: test_tai64n.c $(TL_SRC)/wg_proto.c $(TL_SRC)/wg_proto.h
 	$(CC) $(CFLAGS) -I$(TL_SRC) -I$(CRYPTO) -o $@ test_tai64n.c $(TL_SRC)/wg_proto.c \
 	    $(CRYPTO)/blake2s.c $(CRYPTO)/hkdf_blake2s.c
 
-# libsodium reference vectors for the NaCl box (DISCO sealing).
+# libsodium reference vectors for the NaCl box (DISCO sealing). Since
+# 1.3.2 nacl_box.c runs on the in-tree poly1305-donna on target too, so
+# the host build is the firmware's code path (no mbedTLS shim).
 test_nacl_box: test_nacl_box.c $(CRYPTO)/nacl_box.c $(CRYPTO)/salsa20.c $(CRYPTO)/poly1305_donna.c \
-               $(CRYPTO)/curve25519.c $(CRYPTO)/curve25519_donna.c host_mbedtls_shim.c
-	$(CC) $(CFLAGS) -Ihost_include -I$(CRYPTO) -o $@ test_nacl_box.c $(CRYPTO)/nacl_box.c \
+               $(CRYPTO)/curve25519.c $(CRYPTO)/curve25519_donna.c $(CRYPTO)/secure_zero.h
+	$(CC) $(CFLAGS) -I$(CRYPTO) -o $@ test_nacl_box.c $(CRYPTO)/nacl_box.c \
 	    $(CRYPTO)/salsa20.c $(CRYPTO)/poly1305_donna.c $(CRYPTO)/curve25519.c \
-	    $(CRYPTO)/curve25519_donna.c host_mbedtls_shim.c
+	    $(CRYPTO)/curve25519_donna.c
 
 test_blake2s: test_blake2s.c $(CRYPTO)/blake2s.c $(CRYPTO)/blake2s.h
 	$(CC) $(CFLAGS) -I$(CRYPTO) -o $@ test_blake2s.c $(CRYPTO)/blake2s.c
@@ -124,6 +126,16 @@ test_hkdf_noise: test_hkdf_noise.c \
 	$(CC) $(CFLAGS) -I$(CRYPTO) -o $@ test_hkdf_noise.c \
 	    $(CRYPTO)/hkdf_blake2s.c $(CRYPTO)/blake2s.c
 
+# ts2021 Noise IK initiator (noise_ik.c): handshake + transport records
+# against gen_noise_vectors.py (OpenSSL) and an in-file responder.
+# host_include/ supplies esp_err.h / esp_log.h.
+NOISE_SRCS := $(TL_SRC)/noise_ik.c $(CRYPTO)/blake2s.c $(CRYPTO)/hkdf_blake2s.c \
+              $(CRYPTO)/curve25519.c $(CRYPTO)/curve25519_donna.c \
+              $(CRYPTO)/chacha20poly1305.c $(CRYPTO)/chacha20.c $(CRYPTO)/poly1305_donna.c
+test_noise_ik: test_noise_ik.c $(NOISE_SRCS) $(TL_SRC)/noise_ik.h $(CRYPTO)/secure_zero.h \
+               host_include/esp_err.h host_include/esp_log.h
+	$(CC) $(CFLAGS) -I$(TL_SRC) -I$(CRYPTO) -Ihost_include -o $@ test_noise_ik.c $(NOISE_SRCS)
+
 # WG handshake initiator (step 3a). Pulls in the crypto stack +
 # wg_proto.c + wg_handshake.c. Uses host fallback for time(2) /
 # clock_gettime(2) — the ESP_PLATFORM branches in wg_proto.c are
@@ -145,19 +157,16 @@ test_wg_demux: test_wg_demux.c $(TL_SRC)/wg_demux.c $(TL_SRC)/wg_demux.h
 	$(CC) $(CFLAGS) -I$(TL_SRC) -o $@ test_wg_demux.c $(TL_SRC)/wg_demux.c
 
 # DISCO codec (Tailscale magicsock NAT-traversal messages). Pulls in the
-# nacl_box wrapper, which on-target depends on mbedtls poly1305; on host
-# we satisfy that single symbol with host_mbedtls_shim.c using the
-# in-tree poly1305-donna.
+# nacl_box wrapper (XSalsa20 + the in-tree poly1305-donna).
 test_disco: test_disco.c \
             $(TL_SRC)/disco.c $(TL_SRC)/disco.h \
             $(CRYPTO)/nacl_box.c $(CRYPTO)/nacl_box.h \
             $(CRYPTO)/curve25519.c $(CRYPTO)/curve25519_donna.c $(CRYPTO)/salsa20.c \
-            $(CRYPTO)/poly1305_donna.c host_mbedtls_shim.c \
-            host_include/mbedtls/poly1305.h
-	$(CC) $(CFLAGS) -I$(TL_SRC) -I$(CRYPTO) -Ihost_include -o $@ \
+            $(CRYPTO)/poly1305_donna.c
+	$(CC) $(CFLAGS) -I$(TL_SRC) -I$(CRYPTO) -o $@ \
 	    test_disco.c $(TL_SRC)/disco.c \
 	    $(CRYPTO)/nacl_box.c $(CRYPTO)/curve25519.c $(CRYPTO)/curve25519_donna.c $(CRYPTO)/salsa20.c \
-	    $(CRYPTO)/poly1305_donna.c host_mbedtls_shim.c
+	    $(CRYPTO)/poly1305_donna.c
 
 # STUN binding client (RFC 5389) — public-endpoint discovery for
 # magicsock NAT traversal. Pure codec, no I/O, no platform deps.
@@ -181,13 +190,12 @@ test_disco_handler: test_disco_handler.c \
                     $(TL_SRC)/disco.c $(TL_SRC)/disco.h \
                     $(CRYPTO)/nacl_box.c $(CRYPTO)/nacl_box.h \
                     $(CRYPTO)/curve25519.c $(CRYPTO)/curve25519_donna.c $(CRYPTO)/salsa20.c \
-                    $(CRYPTO)/poly1305_donna.c host_mbedtls_shim.c \
-                    host_include/mbedtls/poly1305.h
-	$(CC) $(CFLAGS) -I$(TL_SRC) -I$(CRYPTO) -Ihost_include -o $@ \
+                    $(CRYPTO)/poly1305_donna.c
+	$(CC) $(CFLAGS) -I$(TL_SRC) -I$(CRYPTO) -o $@ \
 	    test_disco_handler.c \
 	    $(TL_SRC)/disco_handler.c $(TL_SRC)/disco.c \
 	    $(CRYPTO)/nacl_box.c $(CRYPTO)/curve25519.c $(CRYPTO)/curve25519_donna.c $(CRYPTO)/salsa20.c \
-	    $(CRYPTO)/poly1305_donna.c host_mbedtls_shim.c
+	    $(CRYPTO)/poly1305_donna.c
 
 # DISCO outbound prober (M3 step 3) — tx-id table that binds inbound
 # Pongs to outbound Pings; defeats the same capture-and-replay attack
@@ -202,20 +210,19 @@ test_disco_prober: test_disco_prober.c \
 
 # DERP wire codec + recv loop — frame header + login handshake +
 # packet relay + ping/pong + control frames + the M5 step 2b dispatch
-# loop. Pulls in nacl_box like test_disco does (same poly1305 host
-# shim) and tls_io for the WANT_READ-tolerant frame reader.
+# loop. Pulls in nacl_box like test_disco does and tls_io for the
+# WANT_READ-tolerant frame reader (host_include/mbedtls/ssl.h shim).
 test_derp: test_derp.c \
            $(TL_SRC)/derp.c $(TL_SRC)/derp.h \
            $(TL_SRC)/tls_io.c $(TL_SRC)/tls_io.h \
            $(CRYPTO)/nacl_box.c $(CRYPTO)/nacl_box.h \
            $(CRYPTO)/curve25519.c $(CRYPTO)/curve25519_donna.c $(CRYPTO)/salsa20.c \
-           $(CRYPTO)/poly1305_donna.c host_mbedtls_shim.c \
-           host_include/mbedtls/poly1305.h \
+           $(CRYPTO)/poly1305_donna.c \
            host_include/mbedtls/ssl.h
 	$(CC) $(CFLAGS) -I$(TL_SRC) -I$(CRYPTO) -Ihost_include -o $@ \
 	    test_derp.c $(TL_SRC)/derp.c $(TL_SRC)/tls_io.c \
 	    $(CRYPTO)/nacl_box.c $(CRYPTO)/curve25519.c $(CRYPTO)/curve25519_donna.c $(CRYPTO)/salsa20.c \
-	    $(CRYPTO)/poly1305_donna.c host_mbedtls_shim.c
+	    $(CRYPTO)/poly1305_donna.c
 
 # HTTP/2 Retry-After header parser (RFC 7231 §7.1.3 delta-seconds).
 # Header-only; the test just compiles the .c against the .h. No platform
@@ -236,7 +243,47 @@ test_wg_transport: test_wg_transport.c \
 	    $(CRYPTO)/chacha20.c $(CRYPTO)/poly1305_donna.c \
 	    $(CRYPTO)/chacha20poly1305.c
 
-.PHONY: all test asan clean $(addsuffix .run,$(TARGETS))
+.PHONY: all test asan clean mbedtls-ref $(addsuffix .run,$(TARGETS))
+
+# ---- Optional: the pre-1.3.2 mbedTLS path as a reference ----------------
+# Not part of `make test` (CI has no ESP-IDF). Needs IDF_PATH (or
+# MBEDTLS_DIR) for the mbedTLS sources IDF ships:
+#   make mbedtls-ref IDF_PATH=/path/to/esp-idf
+#  - test_aead_mbedtls: in-tree ChaCha20-Poly1305 / Poly1305 vs
+#    mbedtls_chachapoly_* / mbedtls_poly1305_mac, fixed-seed fuzz;
+#  - test_noise_ik_mbedtls: test_noise_ik.c linked against noise_ik.c as
+#    of $(NOISE_OLD_REV) (git), i.e. on mbedTLS chachapoly — the same
+#    vectors must pass.
+MBEDTLS_DIR    ?= $(IDF_PATH)/components/mbedtls/mbedtls
+NOISE_OLD_REV  ?= 1477aa3
+MBEDTLS_REF    := test_mbedtls_ref
+MBEDTLS_LIB    := $(MBEDTLS_REF)/libmbedref.a
+MBEDTLS_REF_SRCS := chachapoly.c chacha20.c poly1305.c platform_util.c constant_time.c
+
+$(MBEDTLS_LIB):
+	@test -d "$(MBEDTLS_DIR)/library" || { echo "set IDF_PATH or MBEDTLS_DIR"; exit 2; }
+	mkdir -p $(MBEDTLS_REF)
+	cd $(MBEDTLS_REF) && $(CC) -O2 -w -c -I$(MBEDTLS_DIR)/include -I$(MBEDTLS_DIR)/library \
+	    $(addprefix $(MBEDTLS_DIR)/library/,$(MBEDTLS_REF_SRCS))
+	ar rcs $@ $(addprefix $(MBEDTLS_REF)/,$(MBEDTLS_REF_SRCS:.c=.o))
+
+$(MBEDTLS_REF)/noise_ik_pre132.c:
+	mkdir -p $(MBEDTLS_REF)
+	git -C ../.. show $(NOISE_OLD_REV):components/tinylink/src/noise_ik.c > $@
+
+test_aead_mbedtls: test_aead_mbedtls.c $(MBEDTLS_LIB) \
+                   $(CRYPTO)/chacha20poly1305.c $(CRYPTO)/chacha20.c $(CRYPTO)/poly1305_donna.c
+	$(CC) $(CFLAGS) -I$(CRYPTO) -isystem $(MBEDTLS_DIR)/include -o $@ test_aead_mbedtls.c \
+	    $(CRYPTO)/chacha20poly1305.c $(CRYPTO)/chacha20.c $(CRYPTO)/poly1305_donna.c $(MBEDTLS_LIB)
+
+test_noise_ik_mbedtls: test_noise_ik.c $(MBEDTLS_REF)/noise_ik_pre132.c $(MBEDTLS_LIB) $(NOISE_SRCS)
+	$(CC) $(CFLAGS) -DNOISE_OLD_PATH -I$(TL_SRC) -I$(CRYPTO) -Ihost_include \
+	    -isystem $(MBEDTLS_DIR)/include -o $@ test_noise_ik.c \
+	    $(MBEDTLS_REF)/noise_ik_pre132.c $(filter-out $(TL_SRC)/noise_ik.c,$(NOISE_SRCS)) $(MBEDTLS_LIB)
+
+mbedtls-ref: test_aead_mbedtls test_noise_ik_mbedtls
+	$(RUNNER) ./test_aead_mbedtls
+	$(RUNNER) ./test_noise_ik_mbedtls
 
 # Sanitized run: AddressSanitizer + UndefinedBehaviorSanitizer (incl.
 # alignment checks — the crypto fast paths depend on the
@@ -258,7 +305,7 @@ test: test_blake2s.run test_curve25519.run test_mapresp.run \
       test_derp.run test_disco_handler.run test_disco_prober.run \
       test_retry_after.run test_backoff.run test_keys_regen.run \
       test_skip_value.run test_jsmn_split.run test_tai64n.run \
-      test_nacl_box.run test_tsmp.run test_tl_date.run test_stats.run \
+      test_nacl_box.run test_tsmp.run test_tl_date.run test_stats.run test_noise_ik.run \
       test_http1.run test_ctrl_json.run
 
 test_http1.run: test_http1
@@ -306,6 +353,9 @@ test_tai64n.run: test_tai64n
 test_nacl_box.run: test_nacl_box
 	$(RUNNER) ./test_nacl_box
 
+test_noise_ik.run: test_noise_ik
+	$(RUNNER) ./test_noise_ik
+
 test_poly1305.run: test_poly1305
 	$(RUNNER) ./test_poly1305
 
@@ -346,4 +396,5 @@ test_retry_after.run: test_retry_after
 	$(RUNNER) ./test_retry_after
 
 clean:
-	rm -f $(TARGETS)
+	rm -f $(TARGETS) test_aead_mbedtls test_noise_ik_mbedtls
+	rm -rf $(MBEDTLS_REF)

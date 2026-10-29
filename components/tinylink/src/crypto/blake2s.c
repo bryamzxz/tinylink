@@ -14,6 +14,8 @@
 
 #include <string.h>
 
+#include "secure_zero.h"
+
 static const uint32_t blake2s_iv[8] = {
     0x6A09E667UL, 0xBB67AE85UL, 0x3C6EF372UL, 0xA54FF53AUL,
     0x510E527FUL, 0x9B05688CUL, 0x1F83D9ABUL, 0x5BE0CD19UL,
@@ -199,8 +201,10 @@ int blake2s_final(blake2s_state *S, void *out, size_t outlen)
         store32(buffer + i * 4, S->h[i]);
     }
     memcpy(out, buffer, outlen);
-    /* Best-effort scrub. */
-    memset(S, 0, sizeof(*S));
+    /* Scrub the state (holds the key block for keyed / HMAC use) and the
+     * local digest copy (an HKDF output is key material). */
+    tl_secure_zero(S, sizeof(*S));
+    tl_secure_zero(buffer, sizeof(buffer));
     return 0;
 }
 

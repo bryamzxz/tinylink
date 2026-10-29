@@ -108,8 +108,20 @@ CONFIG_ESP_BROWNOUT_DET_LVL_SEL_6=y
 CONFIG_MBEDTLS_HARDWARE_AES=y
 CONFIG_MBEDTLS_HARDWARE_SHA=y
 CONFIG_MBEDTLS_HARDWARE_MPI=y
-CONFIG_MBEDTLS_CHACHA20_C=y
-CONFIG_MBEDTLS_CHACHAPOLY_C=y
+# No ChaCha20 / Poly1305 in mbedTLS (round 1.3.2). The ts2021 Noise
+# records and the DISCO / DERP NaCl box run on the in-tree IRAM
+# ChaCha20-Poly1305 / Poly1305 the WireGuard data plane uses
+# (components/tinylink/src/crypto/), byte-identical to the mbedTLS path
+# (tools/test: test_noise_ik + `make mbedtls-ref`). Side effect on TLS:
+# mbedTLS lists the ChaCha20 suites FIRST in its ClientHello, and Go's
+# crypto/tls then picks ECDHE-ECDSA-CHACHA20-POLY1305 (client "prefers"
+# ChaCha) — so before 1.3.2 the TLS records were software ChaCha20-
+# Poly1305, not AES-GCM. Without them the offer starts with
+# AES-256-GCM and controlplane + DERP answer ECDHE-ECDSA-AES128-GCM-
+# SHA256 (openssl s_client with both offer orders, 2026-10-28): AES on
+# the HW accelerator + GHASH in software (MBEDTLS_GCM_C stays).
+# CONFIG_MBEDTLS_CHACHA20_C is not set
+# CONFIG_MBEDTLS_CHACHAPOLY_C is not set
 CONFIG_MBEDTLS_HKDF_C=y
 # Heap budget for two simultaneous TLS conns (long-poll + DERP
 # supervisor). Pinning rationale, item-by-item:
@@ -131,8 +143,9 @@ CONFIG_MBEDTLS_HKDF_C=y
 # zero stream ends. IN_CONTENT_LEN stays at 16384 so #14614 does
 # not apply. #15984 was historically a TLS 1.3 panic on connect; it
 # cannot fire here: MBEDTLS_SSL_PROTO_TLS1_3 is not compiled in, every
-# conn negotiates TLS 1.2 (ECDHE-ECDSA-AES128-GCM-SHA256 against the
-# Tailscale fleet, re-checked 2026-10-28).
+# conn negotiates TLS 1.2 (ECDHE-ECDSA-AES128-GCM-SHA256 with X25519
+# against the Tailscale fleet since 1.3.2 — ChaCha20-Poly1305 before,
+# see the CHACHA lines above; re-checked 2026-10-28).
 #
 # Heap effect: at supervisor-connect time (post-bringup, post-WG)
 # largest_block went from 7.4 KiB → 11.8 KiB (+4.4 KiB). Still
@@ -204,9 +217,10 @@ CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_CMN=y
 # CONFIG_MBEDTLS_PK_PARSE_EC_EXTENDED is not set
 # CONFIG_MBEDTLS_PK_PARSE_EC_COMPRESSED is not set
 # Precomputed base-point comb tables in flash for P-256 / P-384:
-# −0.45…0.6 s per full TLS handshake (ECDHE keygen + ECDSA verify do a
-# fixed-point multiplication each; two handshakes per boot plus every
-# reconnect) for +5.6 KB flash (round 1.3.1).
+# −0.45…0.6 s per full TLS handshake (each ECDSA verify does a
+# fixed-point u1·G; the ECDHE itself is X25519, a Montgomery ladder the
+# tables don't apply to; two handshakes per boot plus every reconnect)
+# for +5.6 KB flash (round 1.3.1).
 CONFIG_MBEDTLS_ECP_FIXED_POINT_OPTIM=y
 CONFIG_MBEDTLS_CLIENT_SSL_SESSION_TICKETS=n
 # Tinylink never calls mbedtls_strerror() — error reporting goes through
@@ -241,11 +255,12 @@ CONFIG_MBEDTLS_CLIENT_SSL_SESSION_TICKETS=n
 # different LE chain (E5/E6 are P-256, but the upstream root behind those
 # is still P-384 ISRG X2 today).
 #
-# Curve25519 stays on too — costs ~78 B (ecp_mod_p255) and a few tables,
-# keeps mbedTLS's X25519 KEM path warm for any future TLS 1.3 enablement
-# (currently MBEDTLS_SSL_PROTO_TLS1_3 is off, so this is a hedge). Noise
-# IK + WireGuard use the vendored donna X25519 in crypto/curve25519*.c
-# independently of this Kconfig.
+# Curve25519 stays on too, and it is not a hedge: mbedTLS offers x25519
+# first in supported_groups and both controlplane and DERP pick it, so
+# every TLS 1.2 handshake's ECDHE is mbedTLS X25519 (openssl s_client
+# "Peer Temp Key: X25519", 2026-10-28); without it the ECDHE falls back
+# to P-256. Noise IK + WireGuard use the vendored donna X25519 in
+# crypto/curve25519*.c independently of this Kconfig.
 #
 # Dropped curves (8): SECP192R1, SECP224R1, SECP521R1, the three Koblitz
 # (SECP192K1, SECP224K1, SECP256K1), and the three Brainpool (BP256R1,
@@ -274,11 +289,10 @@ CONFIG_MBEDTLS_CLIENT_SSL_SESSION_TICKETS=n
 #    DTLS deployments that want a lighter alternative to GCM. Modern
 #    Go crypto/tls (controlplane + DERP) advertises ONLY GCM and
 #    ChaCha20-Poly1305 — no CCM in the suite list. Verified empirically
-#    on this branch's parent: the negotiated suite is consistently
-#    ECDHE-ECDSA-AES128-GCM-SHA256 (P-256 leaf keys; this note used to
-#    say ECDHE-RSA). ChaCha20-Poly1305 stays available
-#    via MBEDTLS_CHACHAPOLY_C (separate Kconfig, kept on as a fallback
-#    if the server ever rotates suite preferences).
+#    for an AES-first offer: ECDHE-ECDSA-AES128-GCM-SHA256 (P-256 leaf
+#    keys; this note used to say ECDHE-RSA). Since 1.3.2 that is what
+#    the firmware negotiates — ChaCha20-Poly1305 is no longer compiled
+#    into mbedTLS (see the CHACHA lines at the top of this section).
 #
 # 2. PKCS7_C — Cryptographic Message Syntax (PKCS#7 / RFC 2315) parser.
 #    Used for S/MIME, code-signing envelopes, etc. The IDF bootloader's
@@ -299,10 +313,10 @@ CONFIG_MBEDTLS_CLIENT_SSL_SESSION_TICKETS=n
 #    only the non-AES GCM wrappers. Camellia is gone (esp_config.h
 #    #undefs MBEDTLS_CAMELLIA_C unless CONFIG_MBEDTLS_CAMELLIA_C), but
 #    MBEDTLS_ARIA_C comes from upstream mbedtls_config.h, which IDF does
-#    not override, and cipher_wrap.c still links mbedtls_aria_*
-#    (re-checked 2026-10-28 in the 1.3.0 map). Removing ARIA needs an
-#    MBEDTLS_USER_CONFIG_FILE (docs/rounds/2026-10-optimization-list.md,
-#    round B).
+#    not override, and cipher_wrap.c still linked mbedtls_aria_*
+#    (re-checked 2026-10-28 in the 1.3.0 map). Since round 1.3.2
+#    mbedtls_user_config.h (MBEDTLS_USER_CONFIG_FILE, top-level
+#    CMakeLists.txt) #undefs MBEDTLS_ARIA_C.
 #
 # 4. ECDSA_DETERMINISTIC — RFC 6979 deterministic-nonce ECDSA SIGNING.
 #    Tinylink only VERIFIES ECDSA signatures (the Tailscale cert chain
@@ -313,10 +327,8 @@ CONFIG_MBEDTLS_CLIENT_SSL_SESSION_TICKETS=n
 #    mbedtls_hmac_drbg_*) are pure dead weight here.
 #
 # What stays enabled:
-#   MBEDTLS_GCM_C=y            (AES-GCM, the suite Tailscale uses)
-#   MBEDTLS_CHACHAPOLY_C=y     (ChaCha20-Poly1305 TLS fallback +
-#                               independently used by ts2021/WG via
-#                               the vendored donna implementations)
+#   MBEDTLS_GCM_C=y            (AES-GCM, the suite Tailscale uses;
+#                               the only AEAD suite left since 1.3.2)
 #   MBEDTLS_ECDSA_C=y          (verify-only path)
 #   MBEDTLS_X509_CRT_PARSE_C=y (still load-bearing for cert chain)
 #
@@ -598,7 +610,7 @@ CONFIG_RINGBUF_PLACE_FUNCTIONS_INTO_FLASH=y
 CONFIG_ESP_TLS_USING_MBEDTLS=y
 CONFIG_ESP_TLS_USE_SECURE_ELEMENT=n
 CONFIG_ESP_TLS_INSECURE=n
-CONFIG_MBEDTLS_POLY1305_C=y
+# CONFIG_MBEDTLS_POLY1305_C is not set
 # nghttp2_session_recv() reads into a stack buffer of this size. 512
 # instead of 4096 (round 1.3.1): h2_client.c's recv_cb serves it from
 # the already-decrypted Noise record (conn->h2_rx), and session_recv
