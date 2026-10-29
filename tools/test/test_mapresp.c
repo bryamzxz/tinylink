@@ -465,6 +465,34 @@ int main(void)
         printf("[peers/oversized-element-skipped] OK\n");
     }
 
+    /* A member without its colon (round 1.3.4): jsmn counts it as two
+     * children, so the pair walks went past the tokens jsmn wrote — into
+     * an earlier parse's stale tokens, and with a full table past its end
+     * (1.3.3: ASan global-buffer-overflow in tok_eq, read of s_toks[640]).
+     * Now refused like any unparseable element. */
+    {
+        static char big[8192];
+        size_t o = 0;
+        o += (size_t)snprintf(big + o, sizeof(big) - o, "{\"Peers\":[{\"a\" 1,\"t\":[");
+        for (int i = 0; i < 635; i++) o += (size_t)snprintf(big + o, sizeof(big) - o, "%s\"x\"", i ? "," : "");
+        o += (size_t)snprintf(big + o, sizeof(big) - o, "]},{\"ID\":2}]}");   /* 640 tokens, then a peer */
+        if (mapresp_parse(big, o, &nm) != ESP_OK || nm.n_peers != 1 || nm.peers[0].id != 2) {
+            printf("[peers/missing-colon-at-full-table-refused] FAIL n=%zu\n", nm.n_peers);
+            return 1;
+        }
+        printf("[peers/missing-colon-at-full-table-refused] OK\n");
+        static const char *kNoColon =
+            "{\"Peers\":[{\"ID\" 5,\"HomeDERP\":3},{\"ID\":6}],"
+            "\"PeersChangedPatch\":[{\"NodeID\"02,\"DERPRegion\":1}]}";
+        if (mapresp_parse(kNoColon, strlen(kNoColon), &nm) != ESP_OK || nm.n_peers != 1 ||
+            nm.peers[0].id != 6 || nm.n_patches != 0 || !nm.patches_overflow) {
+            printf("[peers/missing-colon-refused] FAIL n=%zu patches=%zu ovf=%d\n",
+                   nm.n_peers, nm.n_patches, nm.patches_overflow);
+            return 1;
+        }
+        printf("[peers/missing-colon-refused] OK\n");
+    }
+
     printf("ALL OK\n");
     return 0;
 }

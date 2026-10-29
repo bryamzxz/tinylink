@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <stdbool.h>
+
 #include "jsmn.h"
 
 /* Maximum JSON nesting jsmn_skip will recurse through. A real MapResponse
@@ -57,4 +59,46 @@ static int jsmn_skip_d(const jsmntok_t *toks, int i, int depth)
 static inline int jsmn_skip(const jsmntok_t *toks, int i)
 {
     return jsmn_skip_d(toks, i, 0);
+}
+
+/* Can the token tree jsmn_parse just produced (ntok tokens) be walked the
+ * way jsmn_skip and mapreq.c's parsers walk it? (Round 1.3.4, found by
+ * D2's differential fuzz.) They take an object's children as key / value
+ * PAIRS (key = one token, value = a subtree) and never look at the token
+ * count; jsmn in non-strict mode counts a member written without its colon
+ * (`{"NodeID"02,…}`) as TWO children. Such an object sends every walker
+ * past the last token jsmn wrote: into stale tokens of an earlier
+ * sub-parse in the static table, whose sizes lead further, past the end
+ * of the table, and whose start/end offsets reach tok_copy /
+ * parse_keyed_hex / strncmp as `js + start`. This walks the same pairs,
+ * bounded by ntok and by JSMN_SKIP_MAX_DEPTH, and says no where a walker
+ * would leave the table or nest past the cap — on a tree it accepts,
+ * every walk stays below ntok and jsmn_skip is exact. Iterative (a
+ * 260-B stack array instead of up to 65 recursive frames). Valid JSON
+ * nested ≤ 64 deep is always accepted. */
+static inline bool jsmn_tree_ok(const jsmntok_t *toks, int ntok)
+{
+    /* Per open container: values still to visit << 1 | is-object. */
+    int left[JSMN_SKIP_MAX_DEPTH + 1];
+    int d = -1;   /* innermost open container */
+    int i = 0;    /* next token */
+    for (;;) {
+        if (d >= 0) {
+            if (left[d] < 2) {          /* no values left: close it */
+                d--;
+                if (d < 0) return true;
+                continue;
+            }
+            left[d] -= 2;
+            if (left[d] & 1) i++;       /* an object member's key, one token */
+        }
+        if (i >= ntok || d + 1 > JSMN_SKIP_MAX_DEPTH) return false;
+        const jsmntok_t *t = &toks[i++];
+        if (t->type == JSMN_OBJECT || t->type == JSMN_ARRAY) {
+            if (t->size < 0) return false;
+            left[++d] = (t->size << 1) | (t->type == JSMN_OBJECT);
+        } else if (d < 0) {
+            return true;                /* a scalar root */
+        }
+    }
 }

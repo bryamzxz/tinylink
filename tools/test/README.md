@@ -50,7 +50,7 @@ coverage without restating the base flags.
 | `test_tls_io`            | `tls_io.c` WANT_READ retry + idle budget (M13)        | fake reader |
 | `test_retry_after`       | `h2_retry_after.h` 429/503 parsing                    | synthetic |
 | `test_mapresp`           | `mapreq.c::mapresp_parse` (netmap, DERPMap kept by RegionID, patches, Peers vs PeersChanged vs PeersRemoved, oversized element) | real one-peer MapResponse stub + synthetic |
-| `test_skip_value`        | `jsmn_skip.h` depth bound                             | synthetic |
+| `test_skip_value`        | `jsmn_skip.h` depth bound; `jsmn_tree_ok` (1.3.4: a pair walk that stays inside the tokens jsmn wrote) | synthetic + 300 000 random vs a bounds-checked walk |
 | `test_backoff`           | `backoff.h` ladder + jitter                           | synthetic |
 | `test_keys_regen`        | `keys_regen.h` identity regeneration policy           | 8 combinations |
 | `test_jsmn_split`        | `jsmn_split.h` shallow object/array splitter (MapResponse) | synthetic incl. depth bound |

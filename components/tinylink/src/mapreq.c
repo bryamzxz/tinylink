@@ -301,7 +301,10 @@ static esp_err_t parse_one_peer(const char *js, const jsmntok_t *toks,
 static jsmntok_t s_toks[SUB_MAX_TOKENS];
 
 /* Tokenize one extracted value. Returns the jsmn token count (≥ 1) or a
- * negative jsmn error; updates *peak for the soak log. */
+ * negative jsmn error; updates *peak for the soak log. A token tree the
+ * parsers below cannot walk inside the table (jsmn_tree_ok: a member
+ * without its colon) is refused like a jsmn error — round 1.3.4; until
+ * then they walked into stale tokens and past the table. */
 static int sub_parse(const char *js, size_t len, int *peak)
 {
     jsmn_parser p;
@@ -314,6 +317,13 @@ static int sub_parse(const char *js, size_t len, int *peak)
                  SUB_MAX_TOKENS, (unsigned)len);
     }
 #endif
+    if (n >= 1 && !jsmn_tree_ok(s_toks, n)) {
+#ifdef ESP_PLATFORM
+        ESP_LOGW(TAG, "sub-document of %u bytes is not key/value pairs — skipped",
+                 (unsigned)len);
+#endif
+        return JSMN_ERROR_INVAL;
+    }
     return n;
 }
 
