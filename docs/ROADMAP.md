@@ -150,6 +150,41 @@ Effort is rated as *small* (1-3 days), *medium* (1-2 weeks), or
 *large* (≥ 1 month) for one engineer working part-time. Dependencies
 are flagged because some items unblock others.
 
+### War hardening — assume everything fails (deferred, agreed 2026-10-29)
+
+Build tinylink as if it were going to war: every dependency is scarce
+or failing, and the failures are provoked on purpose instead of waited
+for. Prompted by the nightly 02:00 reboot of the collector — a 24/7
+server on general-purpose hardware at ~2 400 m — which on 1.3.2 cost a
+50.8-s outage (6.2 s after the peer was back) and drove `wg_rx` to its
+deepest stack path, one no smoke had exercised. Deferred by the owner:
+worth doing, but not now.
+
+1. **War matrix.** Every external dependency — control plane, DERP,
+   the peer, Wi-Fi, DNS, NTP — and every internal scarcity — heap,
+   flash / NVS wear, power (brown-out), clock, SRAM bit flips (no ECC;
+   the neutron flux at altitude is several times sea level) — with
+   today's behaviour, the evidence (test / log) and the gap.
+2. **Hermetic lab.** The firmware on Espressif's QEMU over its emulated
+   OpenCores Ethernet (`CONFIG_ETH_USE_OPENETH`), joined to a throwaway
+   tailnet on the dev box: headscale built from source (needs Go),
+   embedded DERP, a `tailscaled` peer. Everything killable at will
+   (control plane, DERP, the peer — the 02:00 reboot on demand — the
+   link via QEMU `set_link off`, DNS), clock skew, and scriptable so it
+   can run in CI. Option: a second phase against tailscale.com with a
+   dedicated test node (its own auth key).
+3. **In-firmware fault injection** behind a test-only Kconfig, compiled
+   out of production: drop / corrupt / reorder packets, cut TLS
+   mid-frame, fail `malloc` / `pbuf_alloc`, jump the clock.
+4. **Harden what breaks** — fix, test, commit per failure. Candidate
+   already known: periodic consistency check of the key material in RAM
+   against NVS (a bit flip in the WG private key today kills the tunnel
+   until the next reboot); a faster rekey cadence after a detected peer
+   restart (5 s → 2 s, like B7c), to be measured over several nights
+   with `peer_restart.py`.
+
+Effort: *large*. Depends on: the 1.3.x optimization rounds settling.
+
 ### Streaming JSON parser to eliminate `RESPONSE_BUF_SZ`
 
 **What**: Replace the current `jsmn`-based parser in `mapreq.c` (which
