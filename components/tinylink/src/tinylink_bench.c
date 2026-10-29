@@ -213,12 +213,15 @@ esp_err_t tinylink_bench_aead(void)
  * first: on the device it is the only oracle for the Xtensa asm in the
  * field multiplication (mull / muluh / src with SAR = 28), which the host
  * KATs never compile. Then the time per scalarmult, and a timing probe:
- * CCOUNT cycles for a spread of scalars and points, the minimum of 3 runs
- * each (filters interrupts; the code runs from flash, so the first call
- * also pays the cache fill). The field code has no secret-dependent
- * branch or address (round 1.3.3 notes); what this measures is the rest
- * — the multiplier's latency is not documented as constant (REFERENCE.md,
- * "Multiplier timing is unspecified"). Expect a spread of a few cycles. */
+ * CCOUNT cycles for eight scalar/point pairs, 3 runs each. The field code
+ * has no secret-dependent branch or address (round 1.3.3 notes); what
+ * this probes is the rest — the multiplier's latency is not documented
+ * as constant (REFERENCE.md, "Multiplier timing is unspecified"). The
+ * runs are not interrupt-free (the 100 Hz FreeRTOS tick lands once or
+ * twice per scalarmult, Wi-Fi may), so the spread across inputs (of the
+ * per-input minimum) is reported next to the jitter of one input against
+ * itself; an operand-dependent multiplier would show as a spread well
+ * above that jitter. Run the same build twice to see the noise floor. */
 esp_err_t tinylink_bench_x25519(void)
 {
     static const char *TAG_X = "bench-x25519";
@@ -249,26 +252,29 @@ esp_err_t tinylink_bench_x25519(void)
 
     /* Inputs: zero / all-ones / alternating scalars (clamped inside),
      * the base point, the RFC point, an all-ones (non-canonical) u. */
-    uint32_t cmin = UINT32_MAX, cmax = 0;
+    uint32_t cmin = UINT32_MAX, cmax = 0, jitter = 0;
     for (int v = 0; v < 8; ++v) {
         for (int i = 0; i < 32; ++i) {
             sk[i] = v == 0 ? 0x00 : v == 1 ? 0xff : v == 2 ? 0x55 : (uint8_t)(k[i] * (v + 1) + i);
             pt[i] = v == 3 ? (i == 0 ? 9 : 0) : v == 4 ? 0xff : (uint8_t)(u[i] ^ (uint8_t)(v * 37));
         }
         pt[31] &= v == 4 ? 0xff : 0x7f;
-        uint32_t best = UINT32_MAX;
+        uint32_t best = UINT32_MAX, worst = 0;
         for (int r = 0; r < 3; ++r) {
             const uint32_t c0 = esp_cpu_get_cycle_count();
             (void)curve25519_scalarmult(q, sk, pt);
             const uint32_t c = esp_cpu_get_cycle_count() - c0;
             if (c < best) best = c;
+            if (c > worst) worst = c;
         }
         if (best < cmin) cmin = best;
         if (best > cmax) cmax = best;
-        ESP_LOGI(TAG_X, "input %d: %u cycles", v, (unsigned)best);
+        if (worst - best > jitter) jitter = worst - best;
+        ESP_LOGI(TAG_X, "input %d: %u..%u cycles", v, (unsigned)best, (unsigned)worst);
     }
-    ESP_LOGI(TAG_X, "timing probe: min %u max %u spread %u cycles over 8 inputs",
-             (unsigned)cmin, (unsigned)cmax, (unsigned)(cmax - cmin));
+    ESP_LOGI(TAG_X, "timing probe: per-input minimum %u..%u, spread %u cycles over 8 inputs; "
+             "same-input jitter up to %u cycles",
+             (unsigned)cmin, (unsigned)cmax, (unsigned)(cmax - cmin), (unsigned)jitter);
     return ESP_OK;
 }
 
