@@ -72,11 +72,12 @@ typedef struct {
  *
  * server_v4 (round 1.3.5, tl_addr.h): the node's IPv4 from the DERP map
  * (NULL or 0.0.0.0 = none). When given it is dialed first, with a 3-s
- * budget, and the certificate is still verified against server_host
- * (the SNI and mbedtls' hostname check are server_host's); if that
- * fails for any reason, server_host is resolved and dialed in the same
- * call, as without an address. The TLS session is resumed by
- * server_host:port either way.
+ * budget per step through the login, and the certificate is still
+ * verified against server_host (the SNI and mbedtls' hostname check are
+ * server_host's); if the TLS connect or the login fails there for any
+ * reason, server_host is resolved and dialed in the same call, as
+ * without an address. The TLS session is resumed by server_host:port
+ * either way.
  *
  * Identity is the device's NodePrivate/NodePublic (the same WireGuard
  * key the control plane already knows about). Memory budget for the

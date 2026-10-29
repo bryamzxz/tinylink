@@ -33,11 +33,12 @@ static tls_resume_slot_t s_resume;
 #define DERP_TLS_TIMEOUT_MS 30000
 
 /* A dial by the DERP map's address (round 1.3.5, tl_addr.h): esp-tls
- * applies timeout_ms to the TCP connect and to every handshake read, so
- * the attempt gets 3 s per step — one lost SYN at lwIP's 1.5-s RTO, as
- * ts2021's :80 budget — and a stale address costs at most that before
- * the name is resolved. Once up, the socket goes to the stream's
- * DERP_TLS_TIMEOUT_MS polls. */
+ * applies timeout_ms to the TCP connect and to every handshake read, and
+ * the socket stays at it through the login, one poll per read, so the
+ * attempt gets 3 s per step — one lost SYN at lwIP's 1.5-s RTO, as
+ * ts2021's :80 budget — and a stale address costs at most that per step
+ * before the name is resolved. Once logged in, the socket goes to the
+ * stream's DERP_TLS_TIMEOUT_MS polls. */
 #define DERP_ADDR_TIMEOUT_MS 3000
 
 /* Liveness budget, same shape as ts2021_client.c: consecutive silent
@@ -78,10 +79,11 @@ static ssize_t derp_tls_read(void *ctx, uint8_t *buf, size_t len) {
     return esp_tls_conn_read(c->tls, buf, len);
 }
 
-static esp_err_t tls_read_full(esp_tls_t *tls, uint8_t *buf, size_t need)
+/* The login's reads and writes: `idle` silent socket polls each at most
+ * (1 at the DERP map's address, DERP_MAX_IDLE_POLLS by name). */
+static esp_err_t tls_read_full(esp_tls_t *tls, uint8_t *buf, size_t need, uint32_t idle)
 {
-    int rc = tls_io_read_full(derp_tls_read_raw, tls, buf, need,
-                              DERP_MAX_IDLE_POLLS);
+    int rc = tls_io_read_full(derp_tls_read_raw, tls, buf, need, idle);
     if (rc != 0) {
         if (rc == TLS_IO_ERR_IDLE_TIMEOUT) {
             ESP_LOGW(TAG, "DERP stream silent past %d s — declaring dead",
@@ -94,10 +96,10 @@ static esp_err_t tls_read_full(esp_tls_t *tls, uint8_t *buf, size_t need)
     return ESP_OK;
 }
 
-static esp_err_t tls_write_full(esp_tls_t *tls, const uint8_t *buf, size_t len)
+static esp_err_t tls_write_full(esp_tls_t *tls, const uint8_t *buf, size_t len,
+                                uint32_t idle)
 {
-    int rc = tls_io_write_full(derp_tls_write_raw, tls, buf, len,
-                               DERP_MAX_IDLE_POLLS);
+    int rc = tls_io_write_full(derp_tls_write_raw, tls, buf, len, idle);
     if (rc != 0) {
         ESP_LOGE(TAG, "tls_write_full failed: %d", rc);
         return ESP_FAIL;
@@ -121,7 +123,7 @@ static void set_tcp_nodelay(esp_tls_t *tls)
 }
 
 /* SO_RCVTIMEO / SO_SNDTIMEO back to the stream's 30-s polls after a
- * connect made with DERP_ADDR_TIMEOUT_MS: left at 3 s, the idle budget
+ * login made with DERP_ADDR_TIMEOUT_MS: left at 3 s, the idle budget
  * (DERP_MAX_IDLE_POLLS polls) would declare the stream dead after 12 s
  * between server keepalives. */
 static bool set_stream_timeouts(esp_tls_t *tls)
@@ -162,10 +164,6 @@ static bool open_tls(derp_client_t *out, const char *host, uint16_t port,
         char a[TL_IPV4_STRLEN];
         tl_ipv4_str(ip, a);
         rc = esp_tls_conn_new_sync(a, (int)strlen(a), port, &cfg, out->tls);
-        if (rc == 1 && !set_stream_timeouts(out->tls)) {
-            ESP_LOGW(TAG, "stream socket timeouts not set");
-            rc = -1;
-        }
     } else {
         char url[160];
         snprintf(url, sizeof(url), "https://%s:%u", host, (unsigned)port);
@@ -180,7 +178,7 @@ static bool open_tls(derp_client_t *out, const char *host, uint16_t port,
  * read_upgrade_response — DERP servers return a real 101 (no fast-
  * start path on this code path), so we wait for full headers. */
 static esp_err_t read_upgrade_response(esp_tls_t *tls,
-                                       uint8_t *buf, size_t buf_size)
+                                       uint8_t *buf, size_t buf_size, uint32_t max_idle)
 {
     size_t   total = 0;
     uint32_t idle  = 0;
@@ -190,9 +188,9 @@ static esp_err_t read_upgrade_response(esp_tls_t *tls,
             r == MBEDTLS_ERR_SSL_WANT_WRITE) {
             /* Bounded like the frame reader — a server that accepts
              * TLS but never answers the upgrade must not hang us. */
-            if (++idle >= DERP_MAX_IDLE_POLLS) {
-                ESP_LOGE(TAG, "no 101 response within %d s — giving up",
-                         CONFIG_TINYLINK_STREAM_IDLE_TIMEOUT_S);
+            if (++idle >= max_idle) {
+                ESP_LOGE(TAG, "no 101 response within %u polls — giving up",
+                         (unsigned)max_idle);
                 return ESP_FAIL;
             }
             continue;
@@ -225,10 +223,10 @@ static esp_err_t read_upgrade_response(esp_tls_t *tls,
 static esp_err_t read_one_frame(esp_tls_t *tls,
                                 derp_frame_type_t *type,
                                 uint8_t *payload, size_t pcap,
-                                size_t *plen_out)
+                                size_t *plen_out, uint32_t idle)
 {
     uint8_t hdr[DERP_FRAME_HDR_LEN];
-    if (tls_read_full(tls, hdr, sizeof(hdr)) != ESP_OK) return ESP_FAIL;
+    if (tls_read_full(tls, hdr, sizeof(hdr), idle) != ESP_OK) return ESP_FAIL;
 
     uint32_t plen;
     if (derp_read_frame_header(hdr, sizeof(hdr), type, &plen) != 0) {
@@ -240,9 +238,131 @@ static esp_err_t read_one_frame(esp_tls_t *tls,
         return ESP_ERR_INVALID_SIZE;
     }
     if (plen > 0) {
-        if (tls_read_full(tls, payload, plen) != ESP_OK) return ESP_FAIL;
+        if (tls_read_full(tls, payload, plen, idle) != ESP_OK) return ESP_FAIL;
     }
     *plen_out = plen;
+    return ESP_OK;
+}
+
+/* The DERP login on an open TLS conn: HTTP upgrade, ServerKey,
+ * ClientInfo, ServerInfo. On failure the caller closes `out`. */
+static esp_err_t login(derp_client_t *out, const char *server_host, uint32_t idle,
+                       const uint8_t client_priv[DERP_KEY_LEN],
+                       const uint8_t client_pub[DERP_KEY_LEN])
+{
+    /* Build and send: GET /derp HTTP/1.1 + Upgrade: DERP. The Host
+     * header MUST match the SNI / cert host we just dialed. */
+    char req[256];
+    int n = snprintf(req, sizeof(req),
+        "GET /derp HTTP/1.1\r\n"
+        "Host: %s\r\n"
+        "Upgrade: DERP\r\n"
+        "Connection: Upgrade\r\n"
+        "User-Agent: tinylink/0.1\r\n"
+        "\r\n",
+        server_host);
+    if (n <= 0 || n >= (int)sizeof(req)) return ESP_ERR_INVALID_SIZE;
+    if (tls_write_full(out->tls, (const uint8_t *)req, (size_t)n, idle) != ESP_OK) {
+        return ESP_FAIL;
+    }
+
+    /* Read the 101 response. */
+    uint8_t up_resp[DERP_LOGIN_BUF_LEN];
+    if (read_upgrade_response(out->tls, up_resp, sizeof(up_resp), idle) != ESP_OK) {
+        return ESP_FAIL;
+    }
+    ESP_LOGI(TAG, "got HTTP 101, entering DERP frame mode");
+
+    /* Frame 1: server → client FrameServerKey. */
+    derp_frame_type_t ftype;
+    uint8_t  payload[DERP_LOGIN_BUF_LEN];
+    size_t   plen = 0;
+    if (read_one_frame(out->tls, &ftype, payload, sizeof(payload), &plen, idle) != ESP_OK) {
+        return ESP_FAIL;
+    }
+    if (ftype != DERP_FRAME_SERVER_KEY) {
+        ESP_LOGE(TAG, "expected ServerKey, got 0x%02x", (unsigned)ftype);
+        return ESP_FAIL;
+    }
+    if (derp_parse_server_key(payload, plen, out->server_pub) != 0) {
+        ESP_LOGE(TAG, "ServerKey parse failed (plen=%u)", (unsigned)plen);
+        return ESP_FAIL;
+    }
+
+    /* Frame 2: client → server FrameClientInfo. */
+    uint8_t nonce[DERP_NONCE_LEN];
+    esp_fill_random(nonce, sizeof(nonce));
+
+    /* Header(5) + payload(32+24+16+32) = 5 + 104 = 109 B. */
+    uint8_t ci_buf[5 + 32 + 24 + 16 + 64];
+    size_t ci_payload_len = derp_build_client_info(
+        ci_buf + DERP_FRAME_HDR_LEN, sizeof(ci_buf) - DERP_FRAME_HDR_LEN,
+        client_pub, client_priv, out->server_pub, nonce);
+    if (ci_payload_len == 0) {
+        ESP_LOGE(TAG, "client_info build failed");
+        return ESP_FAIL;
+    }
+    derp_write_frame_header(ci_buf, DERP_FRAME_CLIENT_INFO,
+                            (uint32_t)ci_payload_len);
+    if (tls_write_full(out->tls, ci_buf,
+                       DERP_FRAME_HDR_LEN + ci_payload_len, idle) != ESP_OK) {
+        return ESP_FAIL;
+    }
+
+    /* Frame 3: server → client FrameServerInfo. */
+    if (read_one_frame(out->tls, &ftype, payload, sizeof(payload), &plen, idle) != ESP_OK) {
+        return ESP_FAIL;
+    }
+    if (ftype != DERP_FRAME_SERVER_INFO) {
+        ESP_LOGE(TAG, "expected ServerInfo, got 0x%02x", (unsigned)ftype);
+        return ESP_FAIL;
+    }
+    if (derp_parse_server_info(payload, plen, client_priv, out->server_pub,
+                               &out->server_version) != 0) {
+        ESP_LOGE(TAG, "ServerInfo decrypt/parse failed");
+        return ESP_FAIL;
+    }
+    return ESP_OK;
+}
+
+/* One attempt, at `ip` or by name (NULL): TLS, then the login. On
+ * failure `out` is closed. */
+static esp_err_t connect_on(derp_client_t *out, const char *server_host, uint16_t port,
+                            const uint8_t *ip, int64_t t0,
+                            const uint8_t client_priv[DERP_KEY_LEN],
+                            const uint8_t client_pub[DERP_KEY_LEN])
+{
+    tls_resume_result_t res = TLS_RESUME_NONE;
+    char via[TL_IPV4_STRLEN + 3] = "by name";
+    if (ip != NULL) {
+        char a[TL_IPV4_STRLEN];
+        tl_ipv4_str(ip, a);
+        snprintf(via, sizeof(via), "at %s", a);
+    }
+    if (!open_tls(out, server_host, port, ip, &res)) {
+        if (ip == NULL) {
+            ESP_LOGE(TAG, "TLS connect to %s:%u failed", server_host, (unsigned)port);
+        }
+        derp_client_close(out);
+        return ESP_FAIL;
+    }
+    set_tcp_nodelay(out->tls);
+    ESP_LOGI(TAG, "TLS up to %s:%u %s (%s handshake, %u ms), sending HTTP upgrade",
+             server_host, (unsigned)port, via,
+             res == TLS_RESUME_RESUMED ? "resumed" : "full",
+             (unsigned)((esp_timer_get_time() - t0) / 1000));
+    esp_err_t err = login(out, server_host, ip != NULL ? 1 : DERP_MAX_IDLE_POLLS,
+                          client_priv, client_pub);
+    if (err == ESP_OK && ip != NULL && !set_stream_timeouts(out->tls)) {
+        ESP_LOGW(TAG, "stream socket timeouts not set");
+        err = ESP_FAIL;
+    }
+    if (err != ESP_OK) {
+        derp_client_close(out);
+        return err;
+    }
+    out->connected = true;
+    ESP_LOGI(TAG, "DERP login OK: server version=%d", out->server_version);
     return ESP_OK;
 }
 
@@ -282,125 +402,24 @@ esp_err_t derp_client_connect_login(derp_client_t *out,
     /* The DERP map's address first (round 1.3.5): no DNS on the boot
      * path, where 1.3.5's lookups lost answers and the connect took
      * 1.79–6.36 s. Any failure there — refused, the 3-s budget, a
-     * certificate that is not server_host's — falls back to the name in
-     * this same call, so a stale address costs one short attempt. */
+     * certificate that is not server_host's, a server there that does
+     * not complete the DERP login — falls back to the name in this same
+     * call, so a stale address costs one short attempt. */
     const int64_t t0 = esp_timer_get_time();
-    tls_resume_result_t res = TLS_RESUME_NONE;
-    char via[TL_IPV4_STRLEN + 3] = "by name";
-    bool up = false;
+    esp_err_t err = ESP_FAIL;
     if (server_v4 != NULL && tl_ipv4_usable(server_v4)) {
-        char a[TL_IPV4_STRLEN];
-        tl_ipv4_str(server_v4, a);
-        up = open_tls(out, server_host, port, server_v4, &res);
-        if (up) {
-            snprintf(via, sizeof(via), "at %s", a);
-        } else {
-            ESP_LOGW(TAG, "TLS to %s at %s:%u failed — resolving the name",
-                     server_host, a, (unsigned)port);
-            derp_client_close(out);
+        err = connect_on(out, server_host, port, server_v4, t0, client_priv, client_pub);
+        if (err != ESP_OK) {
+            char a[TL_IPV4_STRLEN];
+            tl_ipv4_str(server_v4, a);
+            ESP_LOGW(TAG, "DERP to %s at %s:%u failed (0x%x) — resolving the name",
+                     server_host, a, (unsigned)port, err);
         }
     }
-    if (!up) up = open_tls(out, server_host, port, NULL, &res);
-    if (!up) {
-        ESP_LOGE(TAG, "TLS connect to %s:%u failed", server_host, (unsigned)port);
-        derp_client_close(out);
-        return ESP_FAIL;
+    if (err != ESP_OK) {
+        err = connect_on(out, server_host, port, NULL, t0, client_priv, client_pub);
     }
-    set_tcp_nodelay(out->tls);
-    ESP_LOGI(TAG, "TLS up to %s:%u %s (%s handshake, %u ms), sending HTTP upgrade",
-             server_host, (unsigned)port, via,
-             res == TLS_RESUME_RESUMED ? "resumed" : "full",
-             (unsigned)((esp_timer_get_time() - t0) / 1000));
-
-    /* Build and send: GET /derp HTTP/1.1 + Upgrade: DERP. The Host
-     * header MUST match the SNI / cert host we just dialed. */
-    char req[256];
-    int n = snprintf(req, sizeof(req),
-        "GET /derp HTTP/1.1\r\n"
-        "Host: %s\r\n"
-        "Upgrade: DERP\r\n"
-        "Connection: Upgrade\r\n"
-        "User-Agent: tinylink/0.1\r\n"
-        "\r\n",
-        server_host);
-    if (n <= 0 || n >= (int)sizeof(req)) {
-        derp_client_close(out);
-        return ESP_ERR_INVALID_SIZE;
-    }
-    if (tls_write_full(out->tls, (const uint8_t *)req, (size_t)n) != ESP_OK) {
-        derp_client_close(out);
-        return ESP_FAIL;
-    }
-
-    /* Read the 101 response. */
-    uint8_t up_resp[DERP_LOGIN_BUF_LEN];
-    if (read_upgrade_response(out->tls, up_resp, sizeof(up_resp)) != ESP_OK) {
-        derp_client_close(out);
-        return ESP_FAIL;
-    }
-    ESP_LOGI(TAG, "got HTTP 101, entering DERP frame mode");
-
-    /* Frame 1: server → client FrameServerKey. */
-    derp_frame_type_t ftype;
-    uint8_t  payload[DERP_LOGIN_BUF_LEN];
-    size_t   plen = 0;
-    if (read_one_frame(out->tls, &ftype, payload, sizeof(payload), &plen) != ESP_OK) {
-        derp_client_close(out);
-        return ESP_FAIL;
-    }
-    if (ftype != DERP_FRAME_SERVER_KEY) {
-        ESP_LOGE(TAG, "expected ServerKey, got 0x%02x", (unsigned)ftype);
-        derp_client_close(out);
-        return ESP_FAIL;
-    }
-    if (derp_parse_server_key(payload, plen, out->server_pub) != 0) {
-        ESP_LOGE(TAG, "ServerKey parse failed (plen=%u)", (unsigned)plen);
-        derp_client_close(out);
-        return ESP_FAIL;
-    }
-
-    /* Frame 2: client → server FrameClientInfo. */
-    uint8_t nonce[DERP_NONCE_LEN];
-    esp_fill_random(nonce, sizeof(nonce));
-
-    /* Header(5) + payload(32+24+16+32) = 5 + 104 = 109 B. */
-    uint8_t ci_buf[5 + 32 + 24 + 16 + 64];
-    size_t ci_payload_len = derp_build_client_info(
-        ci_buf + DERP_FRAME_HDR_LEN, sizeof(ci_buf) - DERP_FRAME_HDR_LEN,
-        client_pub, client_priv, out->server_pub, nonce);
-    if (ci_payload_len == 0) {
-        ESP_LOGE(TAG, "client_info build failed");
-        derp_client_close(out);
-        return ESP_FAIL;
-    }
-    derp_write_frame_header(ci_buf, DERP_FRAME_CLIENT_INFO,
-                            (uint32_t)ci_payload_len);
-    if (tls_write_full(out->tls, ci_buf,
-                       DERP_FRAME_HDR_LEN + ci_payload_len) != ESP_OK) {
-        derp_client_close(out);
-        return ESP_FAIL;
-    }
-
-    /* Frame 3: server → client FrameServerInfo. */
-    if (read_one_frame(out->tls, &ftype, payload, sizeof(payload), &plen) != ESP_OK) {
-        derp_client_close(out);
-        return ESP_FAIL;
-    }
-    if (ftype != DERP_FRAME_SERVER_INFO) {
-        ESP_LOGE(TAG, "expected ServerInfo, got 0x%02x", (unsigned)ftype);
-        derp_client_close(out);
-        return ESP_FAIL;
-    }
-    if (derp_parse_server_info(payload, plen, client_priv, out->server_pub,
-                               &out->server_version) != 0) {
-        ESP_LOGE(TAG, "ServerInfo decrypt/parse failed");
-        derp_client_close(out);
-        return ESP_FAIL;
-    }
-
-    out->connected = true;
-    ESP_LOGI(TAG, "DERP login OK: server version=%d", out->server_version);
-    return ESP_OK;
+    return err;
 }
 
 void derp_client_close(derp_client_t *c)
