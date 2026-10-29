@@ -136,6 +136,46 @@ int main(void) {
                        WG_DEMUX_DISCARD);
     }
 
+    /* First-byte switch (round 1.3.2, B21): the STUN magic only counts
+     * behind a STUN first byte (0x00 / 0x01). A WG datagram whose index
+     * field at offset 4 happens to read 21 12 a4 42 keeps its WG kind —
+     * until 1.3.1 it was routed to the STUN handler (for transport: our
+     * own random receiver index, the whole session). */
+    {
+        const uint8_t magic[4] = {0x21, 0x12, 0xa4, 0x42};
+        uint8_t buf[148] = {0};
+        memcpy(buf + 4, magic, 4);
+        buf[0] = 0x04;
+        fails += check("switch/transport-index-looks-stun",
+                       wg_demux_classify(buf, 64), WG_DEMUX_TRANSPORT);
+        buf[0] = 0x02;
+        fails += check("switch/response-index-looks-stun",
+                       wg_demux_classify(buf, 92), WG_DEMUX_HANDSHAKE_RESP);
+        buf[0] = 0x03;
+        fails += check("switch/cookie-index-looks-stun",
+                       wg_demux_classify(buf, 64), WG_DEMUX_HANDSHAKE_COOKIE);
+        buf[0] = 0x02;
+        fails += check("switch/stun-magic-wrong-first-byte",
+                       wg_demux_classify(buf, 20), WG_DEMUX_DISCARD);
+        /* Still STUN: error response (0x0111) and indication (0x0011). */
+        buf[0] = 0x01; buf[1] = 0x11;
+        fails += check("switch/stun-error-resp",
+                       wg_demux_classify(buf, 20), WG_DEMUX_STUN);
+        buf[0] = 0x00; buf[1] = 0x11;
+        fails += check("switch/stun-indication",
+                       wg_demux_classify(buf, 20), WG_DEMUX_STUN);
+        /* 0x01 + magic beats the INIT size (as before): STUN. */
+        buf[0] = 0x01; buf[1] = 0x01;
+        fails += check("switch/stun-before-init",
+                       wg_demux_classify(buf, 148), WG_DEMUX_STUN);
+        /* DISCO magic owns 0x54 outright, STUN-looking offset 4 or not. */
+        const uint8_t dmagic[6] = {0x54,0x53,0xf0,0x9f,0x92,0xac};
+        uint8_t d[80] = {0};
+        memcpy(d, dmagic, 6);
+        fails += check("switch/disco-unaffected", wg_demux_classify(d, 80),
+                       WG_DEMUX_DISCO);
+    }
+
     if (fails == 0) printf("\nALL OK\n");
     return fails ? 1 : 0;
 }

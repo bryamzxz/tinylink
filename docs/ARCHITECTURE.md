@@ -163,7 +163,11 @@ as a TAI64N replay — so new INITs stay one per `REKEY_TIMEOUT`
 (wireguard-go / kernel rule; magicsock queues the INIT on DERP and sends
 to both paths while `bestAddr` is untrusted). A session that came up on
 a DERP-relayed response sends every frame on both paths until something
-authenticates on the UDP socket ("direct path confirmed").
+authenticates on the UDP socket ("direct path confirmed"). Wake cadence
+(B21): `wg_rx` sleeps until its next timer deadline, at most
+`REKEY_TIMEOUT` (5 s) when idle; `wg_tx` blocks until a frame arrives
+(10-s idle wait, woken by a sentinel on stop); both feed the task WDT at
+most once per second — 3 → ~0.3 light-sleep exits/s for an idle tunnel.
 
 ## `/stats` (M16, 2026-09)
 

@@ -281,10 +281,49 @@ static void test_negative_paths(void) {
     }
 }
 
+/* Wire layout against the AEAD called directly with the whitepaper's
+ * nonce (§5.4.6: 4 zero bytes || LE64 counter), for counters on both
+ * sides of 2^32 — pins the word-built nonce of round 1.3.2 (B21), which
+ * a self-roundtrip could not tell from a wrong but symmetric one. */
+static void test_nonce_layout(void) {
+    static const uint64_t counters[] = { 0, 1, 0xFFFFFFFFull, 0x123456789ull,
+                                         0xFFFFFFFFFFFFFFFEull };
+    uint8_t key[32];
+    for (int i = 0; i < 32; i++) key[i] = (uint8_t)(0xA0 + i);
+    uint8_t pt[64];
+    for (int i = 0; i < 64; i++) pt[i] = (uint8_t)(i * 7);
+    for (unsigned c = 0; c < sizeof(counters) / sizeof(counters[0]); c++) {
+        struct wg_transport_session s;
+        wg_transport_session_init(&s, 0x11111111u, 0x22222222u, key, key);
+        s.send_counter = counters[c];
+        uint8_t wire[16 + 64 + 16];
+        int n = wg_transport_encrypt(&s, wire, sizeof(wire), pt, sizeof(pt));
+        uint8_t nonce[CHACHA20POLY1305_NONCE_LEN] = {0};
+        for (int b = 0; b < 8; b++) nonce[4 + b] = (uint8_t)(counters[c] >> (8 * b));
+        uint8_t want[64 + 16];
+        chacha20poly1305_encrypt(want, pt, sizeof(pt), NULL, 0, key, nonce);
+        char name[64];
+        snprintf(name, sizeof(name), "nonce/layout-%u", c);
+        const int same = n == (int)sizeof(wire) &&
+                         memcmp(wire + 16, want, sizeof(want)) == 0;
+        fails += check_eq_int(name, same, 1);
+        /* And the receive side takes it back. */
+        uint8_t out[64];
+        size_t olen = 0;
+        struct wg_transport_session r;
+        wg_transport_session_init(&r, 0x22222222u, 0x11111111u, key, key);
+        snprintf(name, sizeof(name), "nonce/decrypt-%u", c);
+        fails += check_eq_int(name, wg_transport_decrypt(&r, wire, sizeof(wire),
+                                                         out, sizeof(out), &olen) == 0 &&
+                                    olen == sizeof(pt) && memcmp(out, pt, olen) == 0, 1);
+    }
+}
+
 int main(void) {
     test_replay_window();
     test_roundtrip();
     test_negative_paths();
+    test_nonce_layout();
     if (fails == 0) printf("\nALL OK\n");
     return fails ? 1 : 0;
 }

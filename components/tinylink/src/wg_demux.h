@@ -14,7 +14,8 @@
 //   first byte 0x02 → MessageResponse         ( 92 B exactly)
 //   first byte 0x03 → MessageCookieReply      ( 64 B exactly)
 //   first byte 0x04 → MessageTransport        (≥ 32 B; 16 hdr + 16 tag)
-//   first byte 0x00 0x01 → STUN binding request (RFC 5389 first 2 bytes)
+//   first byte 0x00 / 0x01 + magic cookie 21 12 a4 42 at offset 4 → STUN
+//                    (request / response; checked before the WG 0x01 arm)
 //   6-byte prefix "TS💬" (\x54\x53\xf0\x9f\x92\xac) → DISCO v1 (step 7)
 //   anything else → discard
 

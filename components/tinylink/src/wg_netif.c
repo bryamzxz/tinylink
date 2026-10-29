@@ -110,8 +110,25 @@ static const char *TAG = "wg_netif";
 
 /* Upper bound on one RX wait. The RX task sleeps until its next timer
  * deadline (wg_timers.h) but no longer than this, so a deadline another
- * task moves earlier is honoured at most this late. */
-#define WG_RX_MAX_WAIT_MS 1000
+ * task moves earlier is honoured at most this late. Equal to
+ * REKEY_TIMEOUT (B21): the only deadline another task creates that must
+ * not slip — the retry of a cold INIT kicked by wg_netif_update_peer_keys
+ * — lies a full REKEY_TIMEOUT ahead, so a wait that started before the
+ * kick ends before that retry is due and re-plans; the others (errno
+ * path probe, stop: close() wakes recvfrom) tolerate it. Idle wakes drop
+ * from 1/s to 0.2/s; the 60-s task WDT is fed on every wake. */
+#define WG_RX_MAX_WAIT_MS WG_REKEY_TIMEOUT_MS
+
+/* Idle wait of the TX worker (B21): it wakes for every frame anyway and
+ * wg_netif_stop wakes it with a sentinel, so this only paces the WDT
+ * feed (60-s budget). Was a 500-ms poll: two light-sleep exits per
+ * second for nothing. */
+#define WG_TX_IDLE_WAIT_MS 10000
+
+/* Feed the task WDT at most once per second (B21) instead of on every
+ * packet: esp_task_wdt_reset takes a spinlock and walks the subscriber
+ * list, and the budget is 60 s. */
+#define WG_WDT_FEED_EVERY_US 1000000LL
 
 /* WG persistent keepalive cadence (host-order ms). When the device has
  * been UP and silent on the outbound transport for this long, we send
@@ -403,6 +420,14 @@ static struct {
 /* --- Helpers --------------------------------------------------------- */
 
 static int64_t now_us(void) { return esp_timer_get_time(); }
+
+static void wdt_feed_throttled(int64_t now, int64_t *last_feed_us)
+{
+    if (now - *last_feed_us >= WG_WDT_FEED_EVERY_US) {
+        tl_wdt_feed();
+        *last_feed_us = now;
+    }
+}
 
 /* The peer's static key under g.lock: wg_netif_update_peer_keys (long-poll
  * task) rewrites it on a peer re-login; wg_tx (DERP relay destination) and
@@ -1100,16 +1125,21 @@ static void rx_task(void *arg)
     setsockopt(g.sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
     tl_wdt_subscribe();
+    /* Off the stack: rx_task's frame is the base of every wg_rx chain
+     * (the tightest stack); there is one RX task. */
+    static int64_t last_feed_us;
+    last_feed_us = 0;
     while (!g.stop_requested) {
-        tl_wdt_feed();
         struct sockaddr_in src;
         socklen_t srclen = sizeof(src);
         ssize_t n = recvfrom(g.sock, buf, sizeof(buf), 0,
                              (struct sockaddr *)&src, &srclen);
-        /* One clock read per iteration for the stamps and timers below
-         * (packet handling may run ~40 ms of handshake crypto first; a
-         * stale `now` only makes a timer fire that much later). */
+        /* One clock read per iteration for the WDT, the stamps and the
+         * timers below (B21; was ~12 esp_timer reads). Packet handling
+         * may run ~40 ms of handshake crypto first; a stale `now` only
+         * makes a timer fire that much later. */
         const int64_t now = now_us();
+        wdt_feed_throttled(now, &last_feed_us);
         if (n < 0) {
             /* EAGAIN/EWOULDBLOCK on timeout — fall through to retry
              * timer below. Other errors get logged but don't kill the
@@ -1397,7 +1427,7 @@ retry_timer:;
 /* Send one filled TX slot: DERP relay when the direct path is stale,
  * direct sendto otherwise (relay again on a sendto error); both while a
  * DERP-completed session has no confirmed direct path (B7). */
-static void tx_send_item(const wg_tx_item_t *it)
+static void tx_send_item(const wg_tx_item_t *it, int64_t now)
 {
     uint8_t dst_pub[WG_KEY_LEN];   /* filled only when relaying */
     if (it->relay_only) {
@@ -1424,8 +1454,8 @@ static void tx_send_item(const wg_tx_item_t *it)
         g.relay_cb != NULL &&
         g.state == WG_NETIF_UP &&
         g.last_transport_recv_us > 0 &&
-        (now_us() - g.last_transport_recv_us) >
-            (int64_t)WG_RX_STALE_THRESHOLD_MS * 1000LL;
+        wg_timer_due(now, g.last_transport_recv_us,
+                     (int64_t)WG_RX_STALE_THRESHOLD_MS * 1000LL);
     /* The session came up on a DERP-relayed response and nothing has
      * authenticated on the UDP socket since: the direct path is
      * unproven (at boot the peer may not have punched its side yet), so
@@ -1489,18 +1519,21 @@ static void tx_task_fn(void *arg)
 {
     (void)arg;
     tl_wdt_subscribe();
+    int64_t last_feed_us = 0;
     while (!g.stop_requested) {
-        tl_wdt_feed();
-        /* 500 ms wakeup so stop_requested is observed even when no
-         * outbound traffic is flowing. Only the slot index is copied;
-         * the frame stays in its heap slot, off this stack (sendto
-         * recurses into the WiFi TX callback chain). */
+        /* Blocks until a frame (or wg_netif_stop's sentinel) arrives;
+         * the timeout only paces the WDT feed. Only the slot index is
+         * copied; the frame stays in its heap slot, off this stack
+         * (sendto recurses into the WiFi TX callback chain). */
         uint8_t slot;
-        if (xQueueReceive(g.tx_ready_q, &slot, pdMS_TO_TICKS(500)) != pdTRUE) {
-            continue;
+        const BaseType_t got = xQueueReceive(g.tx_ready_q, &slot,
+                                             pdMS_TO_TICKS(WG_TX_IDLE_WAIT_MS));
+        const int64_t now = now_us();
+        wdt_feed_throttled(now, &last_feed_us);
+        if (got != pdTRUE || slot >= WG_TX_SLOTS) {
+            continue;   /* idle, or the stop sentinel (loop re-checks) */
         }
-        if (slot >= WG_TX_SLOTS) continue;   /* stop sentinel */
-        tx_send_item(&g.tx_slots[slot]);
+        tx_send_item(&g.tx_slots[slot], now);
         (void)xQueueSend(g.tx_free_q, &slot, 0);   /* never full */
     }
     if (g.tx_done_sem != NULL) {
@@ -1865,12 +1898,17 @@ void wg_netif_stop(void)
     if (!g.initialized) return;
     g.stop_requested = true;
     /* Wait for the TX worker to observe stop_requested and exit before
-     * we tear down its queue; otherwise vQueueDelete can race against
-     * an in-flight xQueueReceive. The worker wakes at most every 500
-     * ms; 2 s is comfortable margin even under priority pressure. The
-     * RX task observes stop_requested via its 1-s recvfrom timeout
-     * and self-deletes; we don't gate on it here because nothing it
-     * touches gets freed below. */
+     * we tear down its queues; otherwise vQueueDelete can race against
+     * an in-flight xQueueReceive. The sentinel wakes it at once (its idle
+     * wait is WG_TX_IDLE_WAIT_MS); tx_ready_q has a spare entry for it.
+     * 2 s is comfortable margin even under priority pressure. The RX
+     * task observes stop_requested when close() below ends its recvfrom
+     * (or at its next deadline wake) and self-deletes; we don't gate on
+     * it here because nothing it touches gets freed below. */
+    if (g.tx_ready_q != NULL) {
+        const uint8_t stop = WG_TX_SLOT_STOP;
+        (void)xQueueSend(g.tx_ready_q, &stop, 0);
+    }
     if (g.tx_done_sem != NULL) {
         if (xSemaphoreTake(g.tx_done_sem, pdMS_TO_TICKS(2000)) != pdTRUE) {
             ESP_LOGW(TAG, "tx task did not exit within 2s — forcing teardown");
