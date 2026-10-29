@@ -48,6 +48,33 @@ python serial_capture.py --port /dev/ttyUSB0 --duration 150 --out /tmp/boot.log
 
 Needs `pyserial` (ships with the ESP-IDF python environment).
 
+## `stack_worst.py`
+
+Static worst-case stack depth per long-lived task (`tinylink_lp`, `derp`,
+`wg_rx`, `wg_tx`, `tlm`, `tiT`, `esp_timer`) — the evidence for stack
+trims, to be compared with the 60-s `stack diag` HWM dumps. It needs a
+scratch build with stack-usage and call-graph output (the flags do not
+change code generation, but keep the dir apart from `build/`):
+
+```bash
+W=work/artifacts/stack
+EXTRA_CFLAGS="-fstack-usage -fcallgraph-info=su,da" \
+EXTRA_CXXFLAGS="-fstack-usage -fcallgraph-info=su,da" \
+    idf.py -B $W/build -DSDKCONFIG=$W/sdkconfig reconfigure build
+python tools/stack_worst.py --build $W/build --cache-dir $W \
+    --toolchain "$IDF_TOOLS_PATH"/tools/xtensa-esp-elf/<ver>/xtensa-esp-elf/bin \
+    --rom-elf "$IDF_TOOLS_PATH"/tools/esp-rom-elfs/<ver>/esp32_rev0_rom.elf \
+    --summary                      # or --task wg_rx --frames 12 --indirect
+```
+
+Each result is the deepest call chain plus 368 B of per-task overhead
+(CPSA, one interrupt frame, alignment, canary). Indirect calls are
+resolved by the project rules at the end of the script; edges that are
+infeasible at run time (TLS renegotiation, TCP on the UDP-only tasks, …)
+are cut with a stated reason — `--no-cut` shows the bound without them.
+`--why <fn>` explains how a function is reached, `--residual zero` drops
+the conservative bound for unresolved Wi-Fi blob callbacks.
+
 ## `credentials.csv.example`
 
 Template consumed by `nvs_provision.py`. **Never** commit a populated copy
