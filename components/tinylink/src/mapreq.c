@@ -41,12 +41,13 @@ static const char *TAG = "mapreq";
  * is not tokenized as a whole: it is cut into its top-level values (since
  * 1.3.4 on the stream, below) and this table only ever holds the self
  * Node object, one peer object, one DERP region object or one patch
- * entry at a time. The
- * largest of those in the wild is a peer with a full Hostinfo (a few
- * hundred tokens); 640 leaves ~2× headroom, and an oversized element is
+ * entry at a time. The largest of those the sensor logs has 179 tokens
+ * (`mapresp peak`); 640 leaves 3.5× headroom and matches the 8 KiB
+ * element buffer at ~12.5 B per token, and an oversized element is
  * skipped with a log instead of failing the whole map. Was 2 500 tokens
  * (40 KiB BSS) for the whole document — which also capped the tailnet
- * size the parser could handle at all. 640 × 16 = 10 KiB BSS. */
+ * size the parser could handle at all. 640 × 16 = 10 KiB, in IRAM since
+ * 1.3.4 (s_toks below). */
 #define SUB_MAX_TOKENS   640
 
 /* ------------------------------ helpers ----------------------------------- */
@@ -299,8 +300,31 @@ static esp_err_t parse_one_peer(const char *js, const jsmntok_t *toks,
     return ESP_OK;
 }
 
-/* One jsmn token table for every sub-parse (BSS, see SUB_MAX_TOKENS). */
-static jsmntok_t s_toks[SUB_MAX_TOKENS];
+/* One jsmn token table for every sub-parse (see SUB_MAX_TOKENS).
+ *
+ * In IRAM on the target (round 1.3.4, D6): 10 KiB out of DRAM — the
+ * byte-addressable memory every heap user competes for — into the IRAM
+ * behind the code (56 KB of it unused before; it only competes with
+ * future IRAM code, round C3). IRAM takes 32-bit loads and stores only;
+ * a byte or half-word access is a LoadStoreError. jsmntok_t is four
+ * ints and every use compiles to l32i / s32i: jsmn_parse (inlined into
+ * sub_parse), jsmn_tree_ok, jsmn_skip_d, tok_eq / tok_copy (start /
+ * end) and the parse_* walkers; no token pointer reaches memcpy /
+ * memset / a string function — only `js + tok->start`, which is the
+ * element buffer. That is proved on the object code after every build
+ * (tools/iram_access_check.py, run from
+ * components/tinylink/CMakeLists.txt), because an innocent edit — e.g.
+ * `(tok->type & 0xff)`, which GCC compiles to an l8ui — would trap.
+ * .iram.bss is IDF's NOLOAD IRAM section (IRAM_BSS_ATTR is only defined
+ * with the 8-bit IRAM option, which also zeroes it at boot; nothing
+ * here needs that: jsmn writes every token before it is read, and
+ * jsmn_tree_ok keeps every walk below the tokens jsmn wrote). */
+#ifdef ESP_PLATFORM
+#define TL_TOKS_ATTR __attribute__((section(".iram.bss"), aligned(4)))
+#else
+#define TL_TOKS_ATTR
+#endif
+static jsmntok_t s_toks[SUB_MAX_TOKENS] TL_TOKS_ATTR;
 
 /* Tokenize one extracted value. Returns the jsmn token count (≥ 1) or a
  * negative jsmn error; updates *peak for the soak log. A token tree the

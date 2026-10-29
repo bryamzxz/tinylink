@@ -126,3 +126,17 @@ target_link_libraries(${COMPONENT_LIB} INTERFACE "-u _printf_float" "-u _scanf_f
 # the firmware will meet before its first NTP sync.
 string(TIMESTAMP TL_BUILD_EPOCH "%s" UTC)
 target_compile_definitions(${COMPONENT_LIB} PRIVATE TL_BUILD_EPOCH=${TL_BUILD_EPOCH}ULL)
+
+# The jsmn token table of mapreq.c is in IRAM (round 1.3.4, D6), where a
+# byte or half-word access is a LoadStoreError. Re-prove after every build
+# of this component that every access the compiled mapreq.c makes through
+# a pointer into it is 32-bit (tools/iram_access_check.py, a data-flow
+# check of the object code): an innocent-looking source change such as
+# `(tok->type & 0xff) == JSMN_STRING` compiles to an l8ui, and fails the
+# build here instead of crashing the device.
+idf_build_get_property(tl_python PYTHON)
+add_custom_command(TARGET ${COMPONENT_LIB} POST_BUILD
+    COMMAND ${tl_python} ${CMAKE_CURRENT_LIST_DIR}/../../tools/iram_access_check.py
+            --objdump ${CMAKE_OBJDUMP} --section .iram.bss
+            ${CMAKE_CURRENT_BINARY_DIR}/CMakeFiles/${COMPONENT_LIB}.dir/src/mapreq.c.obj
+    VERBATIM)
