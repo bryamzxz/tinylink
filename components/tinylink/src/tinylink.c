@@ -779,6 +779,9 @@ static void handle_disco_relayed(const derp_event_t *e,
         st->disco_cmms_seen++;
         ESP_LOGI(TAG, "disco call-me-maybe — punching endpoints");
         send_disco_pings_to_cmm_endpoints(e);
+        /* The peer is punching towards us: if our handshake is still
+         * pending, its INIT can get through now (B7). */
+        wg_netif_handshake_kick(WG_NETIF_KICK_CALL_ME_MAYBE);
         break;
     default: {
         /* Not a DISCO frame for us — could be a relayed WireGuard
@@ -938,6 +941,10 @@ static void derp_supervised_task(void *arg)
                               "(after %u attempts)",
                          s_derp_sup.server_version, attempt);
                 attempt = 0;
+                /* A handshake still pending (the boot INIT goes out at
+                 * netmap time, ~2 s before this login) gets its INIT
+                 * relayed now instead of after REKEY_TIMEOUT (B7). */
+                wg_netif_handshake_kick(WG_NETIF_KICK_RELAY_UP);
                 break;
             }
             const uint32_t delay_ms = tl_backoff_ms(fail, base_ms, cap_ms,

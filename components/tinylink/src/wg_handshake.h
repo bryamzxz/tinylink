@@ -14,8 +14,10 @@
 //                                                          [step 3b]
 //
 // All intermediate Noise state lives in `struct wg_handshake_state`.
-// The struct holds private keys and the chaining key, so callers MUST
-// scrub it (memset 0) once transport keys have been derived.
+// The struct holds private keys and the chaining key: once transport
+// keys have been derived, wipe the live Noise material with
+// wg_handshake_scrub_live() (keeps the per-peer cache for the next
+// attempt) and everything with wg_handshake_scrub() on teardown.
 
 #pragma once
 
@@ -28,15 +30,19 @@ extern "C" {
 #endif
 
 struct wg_handshake_state {
-    /* --- Long-term identity (caller-provided, not owned) ----------- */
+    /* --- Long-term identity (copied in by wg_handshake_init) -------- */
     uint8_t  local_static_priv[WG_KEY_LEN];
     uint8_t  local_static_pub[WG_KEY_LEN];
     uint8_t  peer_static_pub[WG_KEY_LEN];
     uint8_t  preshared_key[WG_KEY_LEN];   /* zero if no PSK */
 
-    /* --- Per-peer cached derivations -------------------------------- */
-    uint8_t  mac1_key[WG_HASH_LEN];        /* BLAKE2s(LABEL_MAC1 || peer_pub) */
+    /* --- Per-peer cached derivations (valid while identity_valid) --- */
+    uint8_t  mac1_key[WG_HASH_LEN];        /* BLAKE2s(LABEL_MAC1 || peer_pub):
+                                            * mac1 of our INIT */
+    uint8_t  mac1_key_self[WG_HASH_LEN];   /* BLAKE2s(LABEL_MAC1 || local_pub):
+                                            * mac1 check of the response */
     uint8_t  static_static_dh[WG_KEY_LEN]; /* X25519(local_priv, peer_pub) */
+    uint8_t  identity_valid;               /* identity + caches above are set */
 
     /* --- Live handshake state --------------------------------------- */
     uint8_t  chain_key[WG_HASH_LEN];
@@ -44,12 +50,22 @@ struct wg_handshake_state {
     uint8_t  ephemeral_priv[WG_KEY_LEN];
     uint8_t  ephemeral_pub[WG_KEY_LEN];
     uint32_t local_index;                  /* sender_index we picked */
+    uint8_t  armed;                        /* an INIT was built and no response
+                                            * accepted since: process_response
+                                            * refuses an unarmed state */
 };
 
-/* One-time setup. Caches mac1_key and static_static_dh (the long-lived
- * X25519 of our private with the peer's public) so subsequent handshake
- * attempts don't re-do the work. Returns 0 on success or -1 if the
- * static DH lands on a low-order point (impossible with valid keys). */
+/* Arm the state for a new handshake attempt. The per-peer derivations
+ * (both mac1 keys and the static-static X25519) are computed only when
+ * the identity differs from the one cached in *st — a new peer static
+ * key, a regenerated local key or a new PSK — or the state was scrubbed;
+ * otherwise only the live Noise material is reset, so a rekey or retry
+ * costs no static DH (round 1.3.2, B11; wireguard-go likewise keeps
+ * precomputedStaticStatic and the cookie generator's mac1 key per peer
+ * and recomputes them on SetPrivateKey / a peer key change). The output
+ * of wg_handshake_create_initiation is byte-identical either way.
+ * Returns 0 on success or -1 if the static DH lands on a low-order point
+ * (impossible with valid keys); *st is then wiped. */
 int wg_handshake_init(struct wg_handshake_state *st,
                       const uint8_t local_static_priv[WG_KEY_LEN],
                       const uint8_t local_static_pub[WG_KEY_LEN],
@@ -91,8 +107,14 @@ int wg_handshake_process_response(struct wg_handshake_state *st,
                                   uint8_t recv_key[WG_KEY_LEN],
                                   uint32_t *out_remote_index);
 
-/* Wipe sensitive material in the state. Call after transport keys have
- * been split, or on abort. */
+/* Wipe the live Noise material (chaining key, hash, ephemeral pair,
+ * local index, armed) and keep the identity + per-peer cache for the
+ * next attempt. Call once transport keys have been split. A scrubbed
+ * state accepts no response until the next
+ * wg_handshake_create_initiation. */
+void wg_handshake_scrub_live(struct wg_handshake_state *st);
+
+/* Wipe everything, cache included. Call on teardown or abort. */
 void wg_handshake_scrub(struct wg_handshake_state *st);
 
 #ifdef __cplusplus

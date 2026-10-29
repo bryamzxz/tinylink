@@ -71,16 +71,23 @@ void wg_transport_session_init(struct wg_transport_session *s,
     memset(&s->replay, 0, sizeof(s->replay));
 }
 
-/* Build the 12-byte AEAD nonce from a 64-bit counter: 4 zero bytes
- * followed by the 8-byte LE counter (per WG whitepaper §5.4.6).
- * Xtensa LX6 + every supported host build is little-endian, so the
- * __builtin_memcpy of `counter` is byte-identical to a manual LE
- * pack — same correctness rationale as chacha20.c. */
-static void counter_to_nonce(uint64_t counter,
-                             uint8_t nonce[CHACHA20POLY1305_NONCE_LEN])
+/* The 12-byte AEAD nonce: 4 zero bytes followed by the 8-byte LE
+ * counter (per WG whitepaper §5.4.6). Word-typed, so building it is
+ * three aligned word stores; Xtensa LX6 + every supported host build is
+ * little-endian, so w[1]/w[2] are the LE counter bytes — same
+ * correctness rationale as chacha20.c. It IS the counter in the packet
+ * header, i.e. public: since round 1.3.2 (B21) it is no longer memset
+ * after use like the key material. */
+typedef union {
+    uint8_t  b[CHACHA20POLY1305_NONCE_LEN];
+    uint32_t w[CHACHA20POLY1305_NONCE_LEN / 4];
+} wg_nonce_t;
+
+static void counter_to_nonce(uint64_t counter, wg_nonce_t *n)
 {
-    memset(nonce, 0, 4);
-    __builtin_memcpy(nonce + 4, &counter, sizeof(counter));
+    n->w[0] = 0;
+    n->w[1] = (uint32_t)counter;
+    n->w[2] = (uint32_t)(counter >> 32);
 }
 
 /* Wire-format header layout:
@@ -138,14 +145,12 @@ int wg_transport_encrypt(struct wg_transport_session *s,
     store_u32_le(out + HDR_RX_IDX_OFF,  s->remote_index);
     store_u64_le(out + HDR_COUNTER_OFF, counter);
 
-    uint8_t nonce[CHACHA20POLY1305_NONCE_LEN];
-    counter_to_nonce(counter, nonce);
+    wg_nonce_t nonce;
+    counter_to_nonce(counter, &nonce);
     chacha20poly1305_encrypt(out + HDR_PAYLOAD_OFF,
                              plaintext, plen,
                              NULL, 0,
-                             s->send_key, nonce);
-
-    memset(nonce, 0, sizeof(nonce));
+                             s->send_key, nonce.b);
     return (int)wire_len;
 }
 
@@ -177,13 +182,12 @@ int wg_transport_decrypt(struct wg_transport_session *s,
     const size_t plen       = cipher_len - WG_TAG_LEN;
     if (out_size < plen) return -1;
 
-    uint8_t nonce[CHACHA20POLY1305_NONCE_LEN];
-    counter_to_nonce(counter, nonce);
+    wg_nonce_t nonce;
+    counter_to_nonce(counter, &nonce);
     int rc = chacha20poly1305_decrypt(out,
                                       wire + HDR_PAYLOAD_OFF, cipher_len,
                                       NULL, 0,
-                                      s->recv_key, nonce);
-    memset(nonce, 0, sizeof(nonce));
+                                      s->recv_key, nonce.b);
     if (rc != 0) return -1;
 
     wg_replay_update(&s->replay, counter);

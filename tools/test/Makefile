@@ -27,7 +27,7 @@ TL_INC  := ../../components/tinylink/include
 TARGETS := test_blake2s test_curve25519 test_mapresp \
            test_chacha20 test_poly1305 test_chacha20poly1305 \
            test_hkdf_noise test_wg_handshake test_wg_transport \
-           test_wg_demux test_disco test_stun test_tls_io test_derp \
+           test_wg_demux test_wg_timers test_disco test_stun test_tls_io test_derp \
            test_disco_handler test_disco_prober test_retry_after \
            test_backoff test_keys_regen test_skip_value test_jsmn_split \
            test_tai64n test_nacl_box test_tsmp test_tl_date test_stats test_noise_ik \
@@ -155,6 +155,10 @@ test_wg_handshake: test_wg_handshake.c \
 # WG datagram classifier (UDP demuxer dispatch logic).
 test_wg_demux: test_wg_demux.c $(TL_SRC)/wg_demux.c $(TL_SRC)/wg_demux.h
 	$(CC) $(CFLAGS) -I$(TL_SRC) -o $@ test_wg_demux.c $(TL_SRC)/wg_demux.c
+
+# wg_netif RX-task deadline helpers (B7/B21). Header-only.
+test_wg_timers: test_wg_timers.c $(TL_SRC)/wg_timers.h
+	$(CC) $(CFLAGS) -I$(TL_SRC) -o $@ test_wg_timers.c
 
 # DISCO codec (Tailscale magicsock NAT-traversal messages). Pulls in the
 # nacl_box wrapper (XSalsa20 + the in-tree poly1305-donna).
@@ -301,7 +305,7 @@ asan:
 test: test_blake2s.run test_curve25519.run test_mapresp.run \
       test_chacha20.run test_poly1305.run test_chacha20poly1305.run \
       test_hkdf_noise.run test_wg_handshake.run test_wg_transport.run \
-      test_wg_demux.run test_disco.run test_stun.run test_tls_io.run \
+      test_wg_demux.run test_wg_timers.run test_disco.run test_stun.run test_tls_io.run \
       test_derp.run test_disco_handler.run test_disco_prober.run \
       test_retry_after.run test_backoff.run test_keys_regen.run \
       test_skip_value.run test_jsmn_split.run test_tai64n.run \
@@ -373,6 +377,9 @@ test_wg_transport.run: test_wg_transport
 
 test_wg_demux.run: test_wg_demux
 	$(RUNNER) ./test_wg_demux
+
+test_wg_timers.run: test_wg_timers
+	$(RUNNER) ./test_wg_timers
 
 test_disco.run: test_disco
 	$(RUNNER) ./test_disco

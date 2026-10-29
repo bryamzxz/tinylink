@@ -6,6 +6,7 @@
 #include "wg_netif.h"
 
 #include <errno.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "freertos/FreeRTOS.h"
@@ -13,7 +14,9 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 
+#include "esp_event.h"
 #include "esp_log.h"
+#include "esp_netif_types.h"
 #include "esp_random.h"
 #include "esp_timer.h"
 
@@ -28,6 +31,7 @@
 #include "tsmp.h"
 #include "wg_demux.h"
 #include "wg_handshake.h"
+#include "wg_timers.h"
 #include "wg_transport.h"
 
 static const char *TAG = "wg_netif";
@@ -85,16 +89,48 @@ static const char *TAG = "wg_netif";
  * of total outage produces ~60 probes, not 3000. */
 #define WG_PATH_PROBE_COOLDOWN_MS 10000
 
-/* Anti-burst throttle for the "fast-INIT-on-pong-driven-roam" fast path.
- * When handle_disco_direct's PONG branch swaps g.peer.peer_endpoint to a
- * new working AddrPort, we want to kick INIT/rekey immediately instead
- * of waiting for the next rx_task tick. But the tick may already have
- * fired an INIT 100 ms before the pong arrived; a second INIT in the
- * same window is wasteful. This min-interval gates the fast path
- * against the existing g.last_handshake_us timestamp. 500 ms is short
- * enough that recovery still feels instant (~1 RTT to the new
- * endpoint), long enough to coalesce close-following pong events. */
-#define WG_DISCO_FAST_INIT_MIN_MS 500
+/* INIT re-send on path events (round 1.3.2, B7). The first INIT of every
+ * boot used to be lost: it goes out direct at netmap time, before the
+ * peer has punched its side and before the DERP relay is up, and the
+ * retry waited REKEY_TIMEOUT + the old 1-s RX tick (WG-up − netmap =
+ * 5.2–6.2 s on the sensor). Now, while a handshake is pending, the INIT
+ * of the attempt in flight is re-sent when a path becomes usable — DERP
+ * login (wg_netif_handshake_kick), a CallMeMaybe from the peer, a
+ * solicited DISCO pong — and every INIT also goes via DERP while no
+ * direct path is confirmed (magicsock sends to UDP and DERP while
+ * bestAddr is untrusted, and queues DERP writes until the relay is up).
+ * It is the SAME message, not a new attempt: the responder consumes the
+ * first copy that arrives and drops the rest as a TAI64N replay, so the
+ * whitepaper's one-new-INIT-per-REKEY_TIMEOUT rule holds (wireguard-go
+ * and the kernel rate-limit new INITs unconditionally; the old fast
+ * INIT on a pong roam built a new one 500 ms apart). A response from
+ * any path matches the one attempt. Per path, a re-send needs
+ * WG_INIT_RESEND_MIN_MS since that path last carried this INIT, unless
+ * the direct destination changed or the relay just came up — this
+ * coalesces pong bursts (one per probed endpoint). */
+#define WG_INIT_RESEND_MIN_MS 500
+
+/* Upper bound on one RX wait. The RX task sleeps until its next timer
+ * deadline (wg_timers.h) but no longer than this, so a deadline another
+ * task moves earlier is honoured at most this late. Equal to
+ * REKEY_TIMEOUT (B21): the only deadline another task creates that must
+ * not slip — the retry of a cold INIT kicked by wg_netif_update_peer_keys
+ * — lies a full REKEY_TIMEOUT ahead, so a wait that started before the
+ * kick ends before that retry is due and re-plans; the others (errno
+ * path probe, stop: close() wakes recvfrom) tolerate it. Idle wakes drop
+ * from 1/s to 0.2/s; the 60-s task WDT is fed on every wake. */
+#define WG_RX_MAX_WAIT_MS WG_REKEY_TIMEOUT_MS
+
+/* Idle wait of the TX worker (B21): it wakes for every frame anyway and
+ * wg_netif_stop wakes it with a sentinel, so this only paces the WDT
+ * feed (60-s budget). Was a 500-ms poll: two light-sleep exits per
+ * second for nothing. */
+#define WG_TX_IDLE_WAIT_MS 10000
+
+/* Feed the task WDT at most once per second (B21) instead of on every
+ * packet: esp_task_wdt_reset takes a spinlock and walks the subscriber
+ * list, and the budget is 60 s. */
+#define WG_WDT_FEED_EVERY_US 1000000LL
 
 /* WG persistent keepalive cadence (host-order ms). When the device has
  * been UP and silent on the outbound transport for this long, we send
@@ -133,7 +169,10 @@ static const char *TAG = "wg_netif";
  * overflow in task wg_rx" reset on every inbound CMM-punched ping).
  * 8 KiB has comfortable headroom for the deepest path (handle_disco_direct
  * → disco_handle_recv → disco_open → NaCl box_open with curve25519/salsa20
- * crypto on the stack → disco_seal → sendto into WiFi TX). */
+ * crypto on the stack → disco_seal → sendto into WiFi TX). Since round
+ * 1.3.2 (B10) the cached-K branch seals with K and never reaches
+ * curve25519_donna (2.7 KiB frame); the uncached fallback, the INIT
+ * build and the path-stale prepunch still do. */
 #define WG_RX_TASK_STACK_BYTES 8192
 #define WG_RX_TASK_PRIO        (tskIDLE_PRIORITY + 3)
 
@@ -179,18 +218,32 @@ static const char *TAG = "wg_netif";
  * during the recovery window.
  *
  * The queue length (WG_TX_QUEUE_LEN=3) makes a real flood
- * impossible — drops happen at xQueueSend(..., 0) when full. The
- * 1.5 KiB queue item still stays OFF this stack (in
- * g.tx_worker_scratch). */
+ * impossible — a frame is dropped when no TX slot is free. The
+ * 1.5 KiB slots live on the heap (g.tx_slots), never on this stack. */
 #define WG_TX_TASK_STACK_BYTES 7168
 #define WG_TX_TASK_PRIO        (tskIDLE_PRIORITY + 2)
 
-/* Outbound TX queue depth. At 1.5 KiB per item, 3 items = 4.7 KiB
- * heap. Telemetry ticks every 5 s and ICMP responses are sporadic;
- * realistic burst depth is 1–2. Three gives margin without waste.
- * If this ever fills under steady-state operation it shows up in
- * wg_netif_get_tx_drops + the throttled drop log below. */
+/* Outbound TX queue depth: frames that may wait while the worker is
+ * busy with one more. Telemetry ticks every 5 s and ICMP responses are
+ * sporadic; realistic burst depth is 1–2. Three gives margin without
+ * waste. If this ever fills under steady-state operation it shows up
+ * in wg_netif_get_tx_drops + the throttled drop log below. */
 #define WG_TX_QUEUE_LEN        3
+
+/* TX ring (round 1.3.2, B14). Until 1.3.1 a 1 556-B item was encrypted
+ * into a BSS scratch, copied into a FreeRTOS queue of whole items and
+ * copied out again into the worker's BSS scratch (two memcpy of ~1.5 KB
+ * per packet, 4.7 KiB of queue storage + 3.1 KiB of scratch). Now the
+ * frame is encrypted straight into a slot and only its one-byte index
+ * travels: tx_free_q holds the free slot indices, tx_ready_q the filled
+ * ones in wire order. WG_TX_QUEUE_LEN + 1 slots keep the old capacity
+ * exactly — three waiting plus the one the worker is sending (it used to
+ * sit in the worker scratch) — and a frame is dropped exactly when the
+ * old queue was full. tx_ready_q has one spare entry for the stop
+ * sentinel. A slot is owned by whoever dequeued its index; the queues
+ * are the only shared state, so the worker needs no g.lock. */
+#define WG_TX_SLOTS            (WG_TX_QUEUE_LEN + 1)
+#define WG_TX_SLOT_STOP        0xFFu   /* tx_ready_q sentinel: worker exits */
 
 /* Drop-on-full log throttle. Print one warning per N drops so the
  * UART doesn't spam if the worker is stuck for an extended window. */
@@ -201,16 +254,20 @@ static const char *TAG = "wg_netif";
  * headroom for IPv4 over WG. */
 #define WG_RX_BUF_LEN 1536
 
-/* Item shipped from wg_netif_send_plaintext (lwIP TCPIP context) to
- * the TX worker task. Carries the already-encrypted wire bytes plus a
- * snapshot of the destination sockaddr — snapshotting avoids racing
- * wg_netif_update_peer_endpoint between encrypt and send (the WG spec
- * tolerates a short trailing window of packets to the old endpoint
- * during roaming, so the old snapshot landing is fine). */
+/* TX slot filled by wg_netif_send_plaintext (lwIP TCPIP context, or
+ * wg_rx for keepalives/adverts) for the TX worker task. Carries the
+ * already-encrypted wire bytes plus a snapshot of the destination
+ * sockaddr — snapshotting avoids racing wg_netif_update_peer_endpoint
+ * between encrypt and send (the WG spec tolerates a short trailing
+ * window of packets to the old endpoint during roaming, so the old
+ * snapshot landing is fine). buf is word-aligned (offset 20 in a
+ * heap block) so the AEAD writes the ciphertext at buf+16 on its
+ * l32i/s32i fast path. */
 typedef struct {
     size_t              len;
     struct sockaddr_in  dst;
     uint8_t             buf[WG_RX_BUF_LEN];
+    bool                relay_only;   /* B7 INIT copy: DERP relay, no sendto */
 } wg_tx_item_t;
 
 typedef enum {
@@ -283,10 +340,13 @@ static struct {
     TaskHandle_t            rx_task;
     SemaphoreHandle_t       lock;
     /* Serializes the handshake state machine (g.handshake, state,
-     * rekey flags, attempt counters): rx_task's timer blocks, the DISCO
-     * pong fast-INIT and the DERP-relayed response path
-     * (wg_netif_inject_packet, another task) all mutate it. Never held
-     * while g.lock is taken, and never across rx_cb. (M16, 2026-09) */
+     * rekey flags, attempt counters, the pending INIT): rx_task's timer
+     * blocks, the DISCO-pong INIT re-send, the DERP task's
+     * wg_netif_handshake_kick and DERP-relayed response path
+     * (wg_netif_inject_packet), and wg_netif_update_peer_keys (long-poll
+     * task) all mutate it. Never taken while g.lock is held (order
+     * hs_lock → g.lock), never held across rx_cb or a DERP/TLS call.
+     * (M16, 2026-09; 1.3.2) */
     SemaphoreHandle_t       hs_lock;
     /* /stats counters (since boot). */
     uint32_t                stat_rekeys;
@@ -295,24 +355,17 @@ static struct {
     uint32_t                stat_roams;
     uint32_t                stat_disco_adverts;   /* TSMP adverts queued */
 
-    /* Outbound TX queue + worker. The worker drains in non-TCPIP
-     * context so sendto can re-enter lwIP safely. tx_done_sem is
-     * given by the worker as the last thing it does before
+    /* Outbound TX ring + worker (see WG_TX_SLOTS). The worker drains in
+     * non-TCPIP context so sendto can re-enter lwIP safely. tx_done_sem
+     * is given by the worker as the last thing it does before
      * vTaskDelete(NULL); wg_netif_stop takes it (with timeout) so
      * vQueueDelete cannot race against an in-flight xQueueReceive. */
-    QueueHandle_t           tx_queue;
+    wg_tx_item_t           *tx_slots;      /* WG_TX_SLOTS, heap, never on a stack */
+    QueueHandle_t           tx_free_q;     /* uint8_t slot indices, free */
+    QueueHandle_t           tx_ready_q;    /* uint8_t slot indices, to send */
     TaskHandle_t            tx_task;
     SemaphoreHandle_t       tx_done_sem;
     uint64_t                tx_drops;
-
-    /* Scratch slots that keep the 1.5 KiB tx items OFF the stacks of
-     * the producer (lwIP TCPIP, 3 KiB) and the worker (4 KiB but
-     * sendto's WiFi tx chain eats most of it). Each is single-owner:
-     * only the TCPIP task ever writes to tx_scratch (input to
-     * xQueueSend), only the wg_tx worker ever writes to
-     * tx_worker_scratch (output of xQueueReceive). */
-    wg_tx_item_t            tx_scratch;
-    wg_tx_item_t            tx_worker_scratch;
 
     wg_netif_rx_cb_t        rx_cb;
     void                   *rx_cb_user;
@@ -344,12 +397,30 @@ static struct {
     uint64_t                 relayed_errno;
     uint64_t                 relay_errors;
 
-    /* Anti-burst gate for the fast-INIT-on-pong-driven-roam fast path.
-     * Tracks only fast-INITs (not all INITs) so that an rx_task tick
-     * INIT to a stale endpoint immediately followed by a pong from a
-     * working endpoint still gets the fast-INIT — only suppresses
-     * back-to-back fast-INITs from multiple endpoints roaming in burst. */
-    int64_t                 last_fast_init_us;
+    /* The INIT of the attempt in flight (B7, see WG_INIT_RESEND_MIN_MS):
+     * public wire bytes, re-sent verbatim on path events. Valid from a
+     * successful build until its response is accepted or the next INIT
+     * replaces it. All five fields under hs_lock. */
+    struct wg_msg_initiation init_msg;
+    bool                     init_valid;
+    int64_t                  init_direct_us;   /* last direct send of init_msg */
+    struct sockaddr_in       init_direct_dst;  /* ...and where it went */
+    int64_t                  init_relay_us;    /* last DERP copy queued, 0 = none */
+
+    /* Direct-path confirmation (B7): last authenticated datagram that
+     * came in on the UDP socket — transport, handshake response, or a
+     * prober-matched pong from the peer. Older than the RX-stale window =
+     * no confirmed direct path: INITs then also go via DERP. Written by
+     * wg_rx; read unlocked elsewhere (a torn read misroutes one copy). */
+    int64_t                  last_direct_rx_us;
+    /* The session in g.transport came up on a DERP-relayed response.
+     * Until a direct datagram authenticates after that, the TX worker
+     * sends every frame on both paths (magicsock: UDP + DERP while
+     * bestAddr is untrusted). Under hs_lock, read unlocked by wg_tx. */
+    bool                     session_via_relay;
+    /* Wi-Fi came back (IP_EVENT_STA_GOT_IP): rx_task re-sends a pending
+     * INIT at its next wake. Set by the event task. */
+    volatile bool            link_up_pending;
 
     bool                    stop_requested;
 } g;
@@ -357,6 +428,14 @@ static struct {
 /* --- Helpers --------------------------------------------------------- */
 
 static int64_t now_us(void) { return esp_timer_get_time(); }
+
+static void wdt_feed_throttled(int64_t now, int64_t *last_feed_us)
+{
+    if (now - *last_feed_us >= WG_WDT_FEED_EVERY_US) {
+        tl_wdt_feed();
+        *last_feed_us = now;
+    }
+}
 
 /* The peer's static key under g.lock: wg_netif_update_peer_keys (long-poll
  * task) rewrites it on a peer re-login; wg_tx (DERP relay destination) and
@@ -386,10 +465,21 @@ static void rebuild_peer_sockaddr(void)
     g.peer_addr.sin_addr.s_addr = g.peer.peer_endpoint_v4_be;
 }
 
-static int send_to_peer(const uint8_t *buf, size_t len)
+/* g.peer_addr under g.lock — roam_to / update_peer_endpoint rewrite it
+ * from other tasks. Callers may hold hs_lock (order hs_lock → g.lock). */
+static struct sockaddr_in peer_addr_snapshot(void)
+{
+    xSemaphoreTake(g.lock, portMAX_DELAY);
+    const struct sockaddr_in a = g.peer_addr;
+    xSemaphoreGive(g.lock);
+    return a;
+}
+
+static int send_to_peer(const uint8_t *buf, size_t len,
+                        const struct sockaddr_in *dst)
 {
     ssize_t n = sendto(g.sock, buf, len, 0,
-                       (struct sockaddr *)&g.peer_addr, sizeof(g.peer_addr));
+                       (const struct sockaddr *)dst, sizeof(*dst));
     if (n < 0) {
         ESP_LOGW(TAG, "sendto: errno=%d", errno);
         /* Kernel-level negative signal: ENETUNREACH means there is no
@@ -399,8 +489,10 @@ static int send_to_peer(const uint8_t *buf, size_t len)
          * g.peer.peer_endpoint is dead; the existing 30 s
          * WG_RX_STALE_THRESHOLD_MS wait is wasted. Backdate
          * last_transport_recv_us and zero the path-probe cooldown so
-         * rx_task fires path_stale_cb on its next iteration (≤1 s),
-         * triggering DISCO probes of the peer's alternate endpoints.
+         * rx_task fires path_stale_cb on its next wake (at once when
+         * this send ran on wg_rx, within WG_RX_MAX_WAIT_MS from another
+         * task), triggering DISCO probes of the peer's alternate
+         * endpoints.
          * Models upstream tailscale magicsock noteBadEndpoint
          * (endpoint.go:1634-1641). */
         if (errno == ENETUNREACH || errno == EHOSTUNREACH) {
@@ -413,13 +505,80 @@ static int send_to_peer(const uint8_t *buf, size_t len)
     return (int)n;
 }
 
-/* Build a fresh INIT and send it. Mutates g.handshake (overwrites the
- * Noise material with new ephemerals + chain key) and assigns a fresh
- * sender_index into g.local_index. Does NOT mutate g.state or the
- * existing g.transport session — callers decide what those mean for
- * the path they're on (cold start vs. proactive rekey). */
+/* A direct path is confirmed while something authenticated arrived on
+ * the UDP socket within the RX-stale window (B7). */
+static bool direct_path_confirmed(int64_t now)
+{
+    return g.last_direct_rx_us > 0 &&
+           !wg_timer_due(now, g.last_direct_rx_us,
+                         (int64_t)WG_RX_STALE_THRESHOLD_MS * 1000LL);
+}
+
+/* An authenticated datagram arrived on the UDP socket (wg_rx only). */
+static void note_direct_rx(int64_t now, const char *what)
+{
+    if (g.session_via_relay && g.state == WG_NETIF_UP &&
+        g.last_direct_rx_us < g.last_handshake_completed_us) {
+        ESP_LOGI(TAG, "direct path confirmed (%s) — DERP copies stop", what);
+    }
+    g.last_direct_rx_us = now;
+}
+
+/* A handshake attempt is in flight: cold (PENDING) or make-before-break
+ * rekey. */
+static bool handshake_pending(void)
+{
+    return g.state == WG_NETIF_HANDSHAKE_PENDING ||
+           (g.state == WG_NETIF_UP && g.rekey_in_flight);
+}
+
+/* Direct copy of g.init_msg to the live endpoint. Caller holds hs_lock. */
+static void init_send_direct(int64_t now)
+{
+    const struct sockaddr_in dst = peer_addr_snapshot();
+    (void)send_to_peer((const uint8_t *)&g.init_msg, sizeof(g.init_msg), &dst);
+    g.init_direct_us  = now;
+    g.init_direct_dst = dst;
+}
+
+/* DERP copy of g.init_msg: queued on the TX ring for the worker, which
+ * owns every call into the relay — no wg lock is ever held across the
+ * TLS write. Best effort, like magicsock's DERP write channel: no relay
+ * registered or no free slot = no copy (the direct copy and the
+ * REKEY_TIMEOUT retry stand). Caller holds hs_lock. */
+static bool init_queue_relay(int64_t now)
+{
+    if (g.relay_cb == NULL || g.tx_slots == NULL) return false;
+    uint8_t slot;
+    if (xQueueReceive(g.tx_free_q, &slot, 0) != pdTRUE) return false;
+    wg_tx_item_t *it = &g.tx_slots[slot];
+    memcpy(it->buf, &g.init_msg, sizeof(g.init_msg));
+    it->len        = sizeof(g.init_msg);
+    it->relay_only = true;
+    (void)xQueueSend(g.tx_ready_q, &slot, 0);   /* never full */
+    g.init_relay_us = now;
+    return true;
+}
+
+/* Build a fresh INIT for a NEW attempt, keep it in g.init_msg and send
+ * it: direct, plus a DERP copy while no direct path is confirmed.
+ * Mutates g.handshake (new ephemeral + chain key) and g.local_index;
+ * does NOT touch g.state or g.transport — callers decide what the
+ * attempt means (cold start vs. proactive rekey).
+ *
+ * g.last_handshake_us is stamped first, so the attempt counts even if
+ * the build or the send fails and the next try is one REKEY_TIMEOUT
+ * away (wireguard-go stamps lastSentHandshake before
+ * CreateMessageInitiation too). Until 1.3.1 a failed sendto returned
+ * before the stamp and the retry fired on the next 1-s tick; with the
+ * deadline-based RX wait that would spin. A failed direct send is not a
+ * failed attempt: the DERP copy may still deliver it. Returns -1 only if
+ * the INIT could not be built. Caller holds hs_lock. */
 static int build_and_send_init(void)
 {
+    const int64_t now = now_us();
+    g.last_handshake_us = now;
+    g.init_valid = false;
     if (wg_handshake_init(&g.handshake,
                           g.local.static_priv,
                           g.local.static_pub,
@@ -431,29 +590,72 @@ static int build_and_send_init(void)
 
     g.local_index = fresh_local_index();
 
-    struct wg_msg_initiation msg;
-    if (wg_handshake_create_initiation(&g.handshake, g.local_index, &msg) != 0) {
+    if (wg_handshake_create_initiation(&g.handshake, g.local_index,
+                                       &g.init_msg) != 0) {
         ESP_LOGE(TAG, "create_initiation failed");
         return -1;
     }
-    if (send_to_peer((const uint8_t *)&msg, sizeof(msg)) < 0) {
-        return -1;
+    g.init_valid    = true;
+    g.init_relay_us = 0;
+    init_send_direct(now);
+    if (!direct_path_confirmed(now)) {
+        (void)init_queue_relay(now);
     }
-    g.last_handshake_us = now_us();
     return 0;
+}
+
+/* Re-send the INIT of the attempt in flight (B7) — the same bytes, see
+ * WG_INIT_RESEND_MIN_MS. `force_relay`: the relay just came up, so an
+ * earlier copy queued while it was down was dropped. Caller holds
+ * hs_lock. */
+static void init_resend(bool direct, bool relay, bool force_relay,
+                        const char *why)
+{
+    if (!g.init_valid || !handshake_pending()) return;
+    const int64_t now = now_us();
+    const int64_t min_us = (int64_t)WG_INIT_RESEND_MIN_MS * 1000LL;
+    bool sent_direct = false, sent_relay = false;
+    if (direct) {
+        const struct sockaddr_in dst = peer_addr_snapshot();
+        const bool moved =
+            dst.sin_addr.s_addr != g.init_direct_dst.sin_addr.s_addr ||
+            dst.sin_port        != g.init_direct_dst.sin_port;
+        if (moved || wg_timer_due(now, g.init_direct_us, min_us)) {
+            (void)send_to_peer((const uint8_t *)&g.init_msg,
+                               sizeof(g.init_msg), &dst);
+            g.init_direct_us  = now;
+            g.init_direct_dst = dst;
+            sent_direct = true;
+        }
+    }
+    if (relay && (force_relay || g.init_relay_us == 0 ||
+                  wg_timer_due(now, g.init_relay_us, min_us))) {
+        sent_relay = init_queue_relay(now);
+    }
+    if (sent_direct || sent_relay) {
+        ESP_LOGI(TAG, "handshake init re-sent via %s%s%s (%s, idx=0x%08x)",
+                 sent_direct ? "direct" : "",
+                 sent_direct && sent_relay ? " + " : "",
+                 sent_relay ? "DERP" : "", why, (unsigned)g.local_index);
+    }
 }
 
 /* Cold start: send INIT and transition to HANDSHAKE_PENDING. App
  * traffic is paused until the response lands. Used at boot and as the
- * fallback path when proactive rekey exhausts its budget. */
+ * fallback path when proactive rekey exhausts its budget. The attempt
+ * counts even if the INIT could not be built (see build_and_send_init),
+ * so a persistent failure walks the retry budget and backoff instead of
+ * looping. */
 static int kick_off_handshake(void)
 {
-    if (build_and_send_init() != 0) return -1;
+    const int rc = build_and_send_init();
     g.handshake_attempt++;
     g.state = WG_NETIF_HANDSHAKE_PENDING;
-    ESP_LOGI(TAG, "handshake init sent (attempt %d, idx=0x%08x)",
-             g.handshake_attempt, (unsigned)g.local_index);
-    return 0;
+    if (rc == 0) {
+        ESP_LOGI(TAG, "handshake init sent (attempt %d, idx=0x%08x)",
+                 g.handshake_attempt, (unsigned)g.local_index);
+    }
+    return rc;
 }
 
 /* Proactive rekey: send a fresh INIT while keeping g.state == UP and
@@ -461,15 +663,19 @@ static int kick_off_handshake(void)
  * handle_handshake_response sees the matching reply and calls
  * wg_transport_session_init to swap them in atomically. Until then,
  * outbound app traffic continues to encrypt with the OLD keys (which
- * the responder still accepts up to its REJECT_AFTER_TIME = 180 s). */
-static int start_rekey(void)
+ * the responder still accepts up to its REJECT_AFTER_TIME = 180 s).
+ * Sets rekey_in_flight whatever the outcome, so the rekey-retry timer
+ * (REKEY_TIMEOUT) owns the next try. */
+static void start_rekey(void)
 {
-    if (build_and_send_init() != 0) return -1;
+    const int rc = build_and_send_init();
     g.rekey_attempt++;
-    ESP_LOGI(TAG, "rekey init sent (attempt %d, idx=0x%08x, age=%lds)",
-             g.rekey_attempt, (unsigned)g.local_index,
-             (long)((now_us() - g.last_handshake_completed_us) / 1000000LL));
-    return 0;
+    g.rekey_in_flight = true;
+    if (rc == 0) {
+        ESP_LOGI(TAG, "rekey init sent (attempt %d, idx=0x%08x, age=%lds)",
+                 g.rekey_attempt, (unsigned)g.local_index,
+                 (long)((now_us() - g.last_handshake_completed_us) / 1000000LL));
+    }
 }
 
 /* Process a MessageResponse arriving on the socket. Two valid paths:
@@ -489,8 +695,12 @@ static int start_rekey(void)
  * encrypt could latch the OLD high counter, then read the NEWLY installed
  * send_key, emitting (new_key, old_counter) — a counter the fresh session
  * re-uses as it climbs from 0, i.e. catastrophic ChaCha20-Poly1305 nonce
- * reuse. So we take the SAME g.lock send_plaintext uses around the swap. */
-static bool handle_handshake_response_locked(const uint8_t *buf, size_t len)
+ * reuse. So we take the SAME g.lock send_plaintext uses around the swap.
+ *
+ * `via_relay`: the response came through DERP (wg_netif_inject_packet),
+ * which proves nothing about the direct path — see session_via_relay. */
+static bool handle_handshake_response_locked(const uint8_t *buf, size_t len,
+                                             bool via_relay)
 {
     if (len != sizeof(struct wg_msg_response)) return false;
     const bool cold_path  = (g.state == WG_NETIF_HANDSHAKE_PENDING);
@@ -517,12 +727,23 @@ static bool handle_handshake_response_locked(const uint8_t *buf, size_t len)
     wg_transport_session_init(&g.transport, g.local_index, remote_index,
                               send_key, recv_key);
     xSemaphoreGive(g.lock);
-    /* Scrub once the keys are copied into the session. */
+    /* Scrub once the keys are copied into the session. The live Noise
+     * material goes; the per-peer cache (static-static DH, mac1 keys)
+     * stays for the next rekey (B11) — wg_handshake_init recomputes it
+     * when the peer static key changes (wg_netif_update_peer_keys), and
+     * wg_netif_stop wipes all of it. */
     tl_secure_zero(send_key, sizeof(send_key));
     tl_secure_zero(recv_key, sizeof(recv_key));
-    wg_handshake_scrub(&g.handshake);
+    wg_handshake_scrub_live(&g.handshake);
 
-    g.last_handshake_completed_us = now_us();
+    const int64_t now = now_us();
+    g.last_handshake_completed_us = now;
+    /* The attempt is answered: no more re-sends of its INIT (B7). A
+     * direct response confirms the direct path at the same instant the
+     * session starts, so the TX worker's dual send stays off. */
+    g.init_valid = false;
+    g.session_via_relay = via_relay;
+    if (!via_relay) g.last_direct_rx_us = now;
     /* Reset RX-stale watchdog clock on handshake (cold or rekey).
      * A fresh session starts with no transport packets seen yet —
      * setting last_transport_recv_us to now gives the watchdog a
@@ -530,17 +751,20 @@ static bool handle_handshake_response_locked(const uint8_t *buf, size_t len)
      * a peer-initiated rekey would immediately satisfy the stale
      * predicate (last_transport_recv_us would be 0 or stale from
      * the prior session). */
-    g.last_transport_recv_us = now_us();
+    g.last_transport_recv_us = now;
+    const char *path = via_relay ? " (via DERP)" : "";
     if (cold_path) {
         g.state = WG_NETIF_UP;
         g.handshake_attempt = 0;
         g.stat_cold_handshakes++;
-        ESP_LOGI(TAG, "session up: remote_idx=0x%08x", (unsigned)remote_index);
+        ESP_LOGI(TAG, "session up: remote_idx=0x%08x%s",
+                 (unsigned)remote_index, path);
     } else {
         g.rekey_in_flight = false;
         g.rekey_attempt = 0;
         g.stat_rekeys++;
-        ESP_LOGI(TAG, "session rekeyed: remote_idx=0x%08x", (unsigned)remote_index);
+        ESP_LOGI(TAG, "session rekeyed: remote_idx=0x%08x%s",
+                 (unsigned)remote_index, path);
     }
     return true;
 }
@@ -574,10 +798,11 @@ static void send_disco_advert(void)
  * was accepted (session up / rekeyed); the caller then roams if needed
  * and calls send_disco_advert(), so the advert's destination snapshot is
  * the endpoint that just authenticated (it only needs g.lock). */
-static bool handle_handshake_response(const uint8_t *buf, size_t len)
+static bool handle_handshake_response(const uint8_t *buf, size_t len,
+                                      bool via_relay)
 {
     xSemaphoreTake(g.hs_lock, portMAX_DELAY);
-    const bool ok = handle_handshake_response_locked(buf, len);
+    const bool ok = handle_handshake_response_locked(buf, len, via_relay);
     xSemaphoreGive(g.hs_lock);
     return ok;
 }
@@ -704,15 +929,19 @@ static void handle_disco_direct_snap(const uint8_t *buf, size_t len,
         }
     }
 
-    /* Hot path: use the cached shared K if available (skips X25519 +
-     * HSalsa20 per frame). Falls back to the per-frame compute path
-     * for the (rare) bringup where peer_disco_pub wasn't supplied. */
+    /* Hot path: use the cached shared K if available — both the open
+     * and the Pong seal skip X25519 + HSalsa20 (B10: ~20 ms → ~50 µs per
+     * direct ping, and no donna frame on this stack). The snapshot holds
+     * K and the DiscoKey it was derived from together (both swapped under
+     * g.lock by wg_netif_update_peer_keys), and the pre-AEAD gate above
+     * already dropped any other sender. Falls back to the per-frame
+     * compute path for the (rare) bringup where peer_disco_pub wasn't
+     * supplied. */
     size_t reply_len;
     if (peer->k_valid) {
         reply_len = disco_handle_recv_with_shared(
             reply, sizeof(reply), buf, len,
-            peer->k,
-            g.local.disco_priv, g.local.disco_pub,
+            peer->k, g.local.disco_pub,
             &type, peer_disco_pub, txid);
     } else {
         reply_len = disco_handle_recv(
@@ -797,6 +1026,10 @@ static void handle_disco_direct_snap(const uint8_t *buf, size_t len,
         if (roam_allowed) {
             uint32_t src_v4_be = (uint32_t)src->sin_addr.s_addr;
             uint16_t src_port  = ntohs(src->sin_port);
+            /* A pong we solicited, from the peer, at the address we
+             * probed: the direct path works both ways right now
+             * (magicsock trusts bestAddr on exactly this). */
+            note_direct_rx(now_us(), "pong");
             if (src_v4_be != g.peer.peer_endpoint_v4_be ||
                 src_port  != g.peer.peer_endpoint_port) {
                 ESP_LOGI(TAG, "WG endpoint roam (via pong) → %s:%u",
@@ -807,39 +1040,20 @@ static void handle_disco_direct_snap(const uint8_t *buf, size_t len,
                 rebuild_peer_sockaddr();
                 g.stat_roams++;
                 xSemaphoreGive(g.lock);
-
-                /* Fast-INIT fast path. We just learned a working
-                 * AddrPort via the pong; if a handshake/rekey was
-                 * already pending against the stale endpoint, don't
-                 * wait for the 5 s rx_task retry tick — fire INIT
-                 * immediately at the new address. State machine guard
-                 * ensures we only fire when an INIT is genuinely
-                 * wanted. The anti-burst gate uses a separate
-                 * timestamp (g.last_fast_init_us) so that a regular
-                 * tick-driven INIT to a stale endpoint at T=0 does NOT
-                 * suppress a productive fast-INIT triggered by a pong
-                 * from a different endpoint at T+50 ms — only
-                 * back-to-back FAST INITs from multiple-endpoint roam
-                 * bursts get coalesced. */
-                const int64_t now = now_us();
-                xSemaphoreTake(g.hs_lock, portMAX_DELAY);
-                if ((now - g.last_fast_init_us) >
-                        WG_DISCO_FAST_INIT_MIN_MS * 1000LL) {
-                    if (g.state == WG_NETIF_HANDSHAKE_PENDING) {
-                        ESP_LOGI(TAG,
-                            "fast INIT on pong-driven endpoint roam");
-                        g.last_fast_init_us = now;
-                        kick_off_handshake();
-                    } else if (g.state == WG_NETIF_UP &&
-                               g.rekey_in_flight) {
-                        ESP_LOGI(TAG,
-                            "fast rekey INIT on pong-driven endpoint roam");
-                        g.last_fast_init_us = now;
-                        start_rekey();
-                    }
-                }
-                xSemaphoreGive(g.hs_lock);
             }
+
+            /* Handshake pending (cold or rekey): re-send its INIT down
+             * the path that just answered instead of waiting out
+             * REKEY_TIMEOUT against a stale or not-yet-punched endpoint
+             * (B7). Same message, so this is not a new attempt; the
+             * per-path gate coalesces a burst of pongs, a roam to a new
+             * address always goes. Replaces the 1.3.1 "fast INIT",
+             * which built a NEW INIT 500 ms apart and only on a roam —
+             * the boot case (peer endpoint right, just not punched yet)
+             * never roams. */
+            xSemaphoreTake(g.hs_lock, portMAX_DELAY);
+            init_resend(true, false, false, "pong");
+            xSemaphoreGive(g.hs_lock);
         }
         return;
     }
@@ -866,6 +1080,81 @@ static void roam_to(const struct sockaddr_in *src, const char *why)
              (unsigned)ntohs(src->sin_port));
 }
 
+/* Earliest instant one of rx_task's timer blocks can fire, from the same
+ * (timestamp, period) pairs and the same state conditions — keep the two
+ * in sync (a deadline here that no block acts on would make the RX wait
+ * spin at one tick; a block missing here would fire up to
+ * WG_RX_MAX_WAIT_MS late). Caller holds hs_lock, like the blocks. */
+static int64_t rx_next_deadline_us(void)
+{
+    int64_t d = INT64_MAX;
+#define RX_DEADLINE(t, ms) do {                                            \
+        const int64_t at_ = wg_timer_at((t), (int64_t)(ms) * 1000LL);      \
+        if (at_ < d) d = at_;                                              \
+    } while (0)
+    if (g.state == WG_NETIF_HANDSHAKE_PENDING || g.rekey_in_flight) {
+        RX_DEADLINE(g.last_handshake_us, WG_REKEY_TIMEOUT_MS);
+    }
+    if (g.state == WG_NETIF_UP && !g.rekey_in_flight) {
+        if (g.last_handshake_completed_us > 0) {
+            RX_DEADLINE(g.last_handshake_completed_us, WG_REKEY_AFTER_MS);
+        }
+        if (g.last_transport_recv_us > 0) {
+            RX_DEADLINE(g.last_transport_recv_us, WG_RX_STALE_THRESHOLD_MS);
+        }
+    }
+    if ((g.state == WG_NETIF_UP || g.state == WG_NETIF_HANDSHAKE_PENDING) &&
+        g.path_stale_cb != NULL && g.last_transport_recv_us > 0) {
+        /* Both conditions of the probe block: the later instant. */
+        const int64_t stale = wg_timer_at(g.last_transport_recv_us,
+                                          WG_RX_STALE_THRESHOLD_MS * 1000LL);
+        const int64_t cool  = wg_timer_at(g.last_path_probe_us,
+                                          WG_PATH_PROBE_COOLDOWN_MS * 1000LL);
+        const int64_t at = stale > cool ? stale : cool;
+        if (at < d) d = at;
+    }
+    if (g.state == WG_NETIF_UP && g.last_tx_us > 0) {
+        RX_DEADLINE(g.last_tx_us, WG_PERSISTENT_KEEPALIVE_MS);
+    }
+#undef RX_DEADLINE
+    return d;
+}
+
+/* Wi-Fi is back. While it was down every INIT copy failed in sendto
+ * and still counted as an attempt (build_and_send_init), so a long
+ * outage ends in the 30-s budget backoff; without this the tunnel would
+ * wait for the next burst. Re-send the pending INIT — it never left the
+ * device, so this is still not a new attempt — direct and via DERP.
+ * 1.3.1 rebuilt an INIT on every 1-s tick while sends failed (~60 ms of
+ * X25519 a second) and so recovered within a tick; this recovers within
+ * one RX wait (≤ WG_RX_MAX_WAIT_MS) without the rebuilds. */
+static __attribute__((noinline)) void rx_link_up_resend(void)
+{
+    xSemaphoreTake(g.hs_lock, portMAX_DELAY);
+    init_resend(true, true, true, "link up");
+    xSemaphoreGive(g.hs_lock);
+}
+
+static void on_sta_got_ip(void *arg, esp_event_base_t base, int32_t id,
+                          void *data)
+{
+    (void)arg; (void)base; (void)id; (void)data;
+    g.link_up_pending = true;
+}
+
+/* The next RX wait in ms. Planned from a fresh clock read, not the
+ * iteration's `now`: the iteration may have spent ~0.3 s in a path-stale
+ * prepunch (one X25519 per ping) since. noinline keeps its locals off
+ * rx_task's frame, the base of every wg_rx call chain. */
+static __attribute__((noinline)) uint32_t rx_plan_wait_ms(void)
+{
+    xSemaphoreTake(g.hs_lock, portMAX_DELAY);
+    const int64_t deadline = rx_next_deadline_us();
+    xSemaphoreGive(g.hs_lock);
+    return wg_recv_timeout_ms(now_us(), deadline, WG_RX_MAX_WAIT_MS,
+                              portTICK_PERIOD_MS);
+}
+
 /* RX task: blocks on recvfrom, classifies, dispatches. */
 static void rx_task(void *arg)
 {
@@ -874,18 +1163,32 @@ static void rx_task(void *arg)
      * an aligned packet buffer means an aligned AEAD input (fast path in
      * chacha20.c / poly1305_donna_32.h). */
     uint8_t __attribute__((aligned(4))) buf[WG_RX_BUF_LEN];
-    /* Short receive timeout so we can periodically check
-     * stop_requested and the handshake retry timer. */
-    struct timeval tv = {.tv_sec = 1, .tv_usec = 0};
+    /* The receive timeout is the time to the next timer deadline (B7,
+     * computed at the end of every iteration); it starts at the cap. */
+    uint32_t rcv_ms = WG_RX_MAX_WAIT_MS;
+    struct timeval tv = {.tv_sec = rcv_ms / 1000, .tv_usec = (rcv_ms % 1000) * 1000};
     setsockopt(g.sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
     tl_wdt_subscribe();
+    /* Off the stack: rx_task's frame is the base of every wg_rx chain
+     * (the tightest stack); there is one RX task. */
+    static int64_t last_feed_us;
+    last_feed_us = 0;
     while (!g.stop_requested) {
-        tl_wdt_feed();
         struct sockaddr_in src;
         socklen_t srclen = sizeof(src);
         ssize_t n = recvfrom(g.sock, buf, sizeof(buf), 0,
                              (struct sockaddr *)&src, &srclen);
+        /* One clock read for the WDT, the stamps and the timers below
+         * (B21; was ~12 esp_timer reads, now this + the wait plan).
+         * Packet handling may run ~40 ms of handshake crypto first; a
+         * stale `now` only makes a timer fire that much later. */
+        const int64_t now = now_us();
+        wdt_feed_throttled(now, &last_feed_us);
+        if (g.link_up_pending) {
+            g.link_up_pending = false;
+            rx_link_up_resend();
+        }
         if (n < 0) {
             /* EAGAIN/EWOULDBLOCK on timeout — fall through to retry
              * timer below. Other errors get logged but don't kill the
@@ -924,7 +1227,9 @@ static void rx_task(void *arg)
 
             switch (kind) {
             case WG_DEMUX_HANDSHAKE_RESP:
-                if (handle_handshake_response(buf, (size_t)n)) {
+                /* Accepted here = authenticated on the direct path; the
+                 * handler stamps last_direct_rx_us itself. */
+                if (handle_handshake_response(buf, (size_t)n, false)) {
                     if (!from_peer) {
                         roam_to(&src, "authenticated handshake response");
                     }
@@ -932,8 +1237,11 @@ static void rx_task(void *arg)
                 }
                 break;
             case WG_DEMUX_TRANSPORT:
-                if (handle_transport(buf, (size_t)n) && !from_peer) {
-                    roam_to(&src, "authenticated transport");
+                if (handle_transport(buf, (size_t)n)) {
+                    note_direct_rx(now, "transport");
+                    if (!from_peer) {
+                        roam_to(&src, "authenticated transport");
+                    }
                 }
                 break;
             case WG_DEMUX_DISCO:
@@ -979,7 +1287,7 @@ retry_timer:;
          * from now (rather than the 5 s that the unmodified
          * `now - last > REKEY_TIMEOUT` predicate would yield). */
         if (g.state == WG_NETIF_HANDSHAKE_PENDING &&
-            (now_us() - g.last_handshake_us) > WG_REKEY_TIMEOUT_MS * 1000LL) {
+            wg_timer_due(now, g.last_handshake_us, WG_REKEY_TIMEOUT_MS * 1000LL)) {
             if (g.handshake_attempt >= WG_HANDSHAKE_MAX_RETRIES) {
                 ESP_LOGW(TAG, "handshake budget exhausted (%d × %ds = %ds) — "
                               "backing off %ds before next burst (peer may be "
@@ -994,7 +1302,7 @@ retry_timer:;
                  * `now - last > WG_REKEY_TIMEOUT_MS` predicate above evaluates
                  * false until enough wall-clock time has elapsed. The +1 us
                  * avoids the corner where the math evaluates exactly equal. */
-                g.last_handshake_us = now_us() +
+                g.last_handshake_us = now +
                     (WG_HANDSHAKE_BACKOFF_MS - WG_REKEY_TIMEOUT_MS) * 1000LL + 1;
             } else {
                 ESP_LOGW(TAG, "handshake retry %d", g.handshake_attempt + 1);
@@ -1010,14 +1318,12 @@ retry_timer:;
          * gives up. */
         if (g.state == WG_NETIF_UP && !g.rekey_in_flight &&
             g.last_handshake_completed_us > 0 &&
-            (now_us() - g.last_handshake_completed_us) >
-                WG_REKEY_AFTER_MS * 1000LL) {
+            wg_timer_due(now, g.last_handshake_completed_us,
+                         WG_REKEY_AFTER_MS * 1000LL)) {
             ESP_LOGI(TAG, "session age >%ds — triggering proactive rekey",
                      WG_REKEY_AFTER_MS / 1000);
             g.rekey_attempt = 0;
-            if (start_rekey() == 0) {
-                g.rekey_in_flight = true;
-            }
+            start_rekey();
         }
 
         /* Active DISCO probe of alternate peer endpoints. Fires when
@@ -1047,11 +1353,11 @@ retry_timer:;
         if ((g.state == WG_NETIF_UP || g.state == WG_NETIF_HANDSHAKE_PENDING) &&
             g.path_stale_cb != NULL &&
             g.last_transport_recv_us > 0 &&
-            (now_us() - g.last_transport_recv_us) >
-                WG_RX_STALE_THRESHOLD_MS * 1000LL &&
-            (now_us() - g.last_path_probe_us) >
-                WG_PATH_PROBE_COOLDOWN_MS * 1000LL) {
-            g.last_path_probe_us = now_us();
+            wg_timer_due(now, g.last_transport_recv_us,
+                         WG_RX_STALE_THRESHOLD_MS * 1000LL) &&
+            wg_timer_due(now, g.last_path_probe_us,
+                         WG_PATH_PROBE_COOLDOWN_MS * 1000LL)) {
+            g.last_path_probe_us = now;
             ESP_LOGI(TAG, "path stale (>%ds no transport decrypt) — "
                           "probing alternate peer endpoints via DISCO",
                      WG_RX_STALE_THRESHOLD_MS / 1000);
@@ -1075,22 +1381,22 @@ retry_timer:;
          * peer is actually fine and just briefly silent. */
         if (g.state == WG_NETIF_UP && !g.rekey_in_flight &&
             g.last_transport_recv_us > 0 &&
-            (now_us() - g.last_transport_recv_us) >
-                WG_RX_STALE_THRESHOLD_MS * 1000LL) {
+            wg_timer_due(now, g.last_transport_recv_us,
+                         WG_RX_STALE_THRESHOLD_MS * 1000LL)) {
             ESP_LOGW(TAG, "RX stale >%ds (no transport decrypt since) — "
                           "forcing rekey (suspected peer restart)",
                      WG_RX_STALE_THRESHOLD_MS / 1000);
             g.stat_rx_stale++;
             g.rekey_attempt = 0;
-            if (start_rekey() == 0) {
-                g.rekey_in_flight = true;
-                /* Reset the watchdog clock so the rekey-in-flight has
-                 * its own grace window (the rekey-retry block below
-                 * handles rekey-itself-failed). Without this, if rekey
-                 * INIT also doesn't get a response, we'd keep tripping
-                 * this branch on every rx_task tick. */
-                g.last_transport_recv_us = now_us();
-            }
+            /* Reset the watchdog clock so the rekey-in-flight has its
+             * own grace window (the rekey-retry block below handles
+             * rekey-itself-failed). Without this, if rekey INIT also
+             * doesn't get a response, we'd keep tripping this branch on
+             * every rx_task wake. Reset BEFORE the send: an ENETUNREACH
+             * from it backdates the clock again (send_to_peer) so the
+             * path probe still fires at the next wake. */
+            g.last_transport_recv_us = now;
+            start_rekey();
         }
 
         /* Rekey retry timer. Mirrors the cold-path retry but does NOT
@@ -1101,7 +1407,7 @@ retry_timer:;
          * ~170 s and the responder is about to invalidate our keys
          * anyway; better a brief outage now than a silent black hole. */
         if (g.rekey_in_flight &&
-            (now_us() - g.last_handshake_us) > WG_REKEY_TIMEOUT_MS * 1000LL) {
+            wg_timer_due(now, g.last_handshake_us, WG_REKEY_TIMEOUT_MS * 1000LL)) {
             if (g.rekey_attempt >= WG_HANDSHAKE_MAX_RETRIES) {
                 ESP_LOGW(TAG, "proactive rekey exhausted after %d attempts — "
                               "falling back to cold handshake",
@@ -1131,15 +1437,31 @@ retry_timer:;
          * protected so this rx_task path does not race with TCPIP-side
          * encrypts on g.transport.send_counter. */
         if (g.state == WG_NETIF_UP && g.last_tx_us > 0 &&
-            (now_us() - g.last_tx_us) >
-                WG_PERSISTENT_KEEPALIVE_MS * 1000LL) {
+            wg_timer_due(now, g.last_tx_us,
+                         WG_PERSISTENT_KEEPALIVE_MS * 1000LL)) {
             esp_err_t err = wg_netif_send_plaintext(NULL, 0);
             if (err == ESP_OK) {
                 ESP_LOGD(TAG, "persistent keepalive sent (0 B)");
             } else {
                 ESP_LOGW(TAG,
                     "persistent keepalive failed: 0x%x", err);
+                /* Try again in ~1 s (the old tick), not on every wake:
+                 * the deadline-based wait would otherwise spin on a
+                 * full TX ring. */
+                g.last_tx_us = now -
+                    (WG_PERSISTENT_KEEPALIVE_MS - 1000) * 1000LL;
             }
+        }
+
+        /* Sleep until the next timer deadline (B7). Until 1.3.1 the
+         * wait was a fixed 1-s tick, so a REKEY_TIMEOUT retry fired 5–6 s
+         * after its INIT. setsockopt only when the value changes. */
+        const uint32_t want_ms = rx_plan_wait_ms();
+        if (want_ms != rcv_ms) {
+            rcv_ms = want_ms;
+            tv.tv_sec  = rcv_ms / 1000;
+            tv.tv_usec = (rcv_ms % 1000) * 1000;
+            setsockopt(g.sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
         }
     }
 
@@ -1148,87 +1470,150 @@ retry_timer:;
     vTaskDelete(NULL);
 }
 
-/* TX worker: drains tx_queue + sendto outside the lwIP TCPIP task.
+/* Send one filled TX slot: DERP relay when the direct path is stale,
+ * direct sendto otherwise (relay again on a sendto error); both while a
+ * DERP-completed session has no confirmed direct path (B7). */
+static void tx_send_item(const wg_tx_item_t *it, int64_t now)
+{
+    uint8_t dst_pub[WG_KEY_LEN];   /* filled only when relaying */
+    if (it->relay_only) {
+        /* DERP copy of a handshake INIT (B7). The direct copy already
+         * went out from the task that built or re-sent it. A relay that
+         * is not up yet (boot: INIT at netmap time, DERP login ~2 s
+         * later) declines — dropped silently, the login kick re-sends. */
+        if (g.relay_cb != NULL) {
+            peer_static_snapshot(dst_pub);
+            (void)g.relay_cb(dst_pub, it->buf, it->len, g.relay_cb_user);
+        }
+        return;
+    }
+
+    /* Preemptive DERP relay when the path-stale watchdog has fired
+     * (RX has been silent past WG_RX_STALE_THRESHOLD_MS). Direct
+     * UDP is almost certainly going to a black hole at this point
+     * (peer NAT mapping aged out, peer changed WAN endpoint, etc.).
+     * Skipping the direct sendto when the relay accepts the bytes
+     * is the lossless-during-recovery property — without it, those
+     * 30 s of telemetry packets between path-goes-stale and
+     * peer-roam-handshake-completes are dropped silently. */
+    bool path_stale =
+        g.relay_cb != NULL &&
+        g.state == WG_NETIF_UP &&
+        g.last_transport_recv_us > 0 &&
+        wg_timer_due(now, g.last_transport_recv_us,
+                     (int64_t)WG_RX_STALE_THRESHOLD_MS * 1000LL);
+    /* The session came up on a DERP-relayed response and nothing has
+     * authenticated on the UDP socket since: the direct path is
+     * unproven (at boot the peer may not have punched its side yet), so
+     * send on both — magicsock's untrusted-bestAddr behaviour. The peer's
+     * replay window drops whichever copy lands second. Ends at the
+     * first direct transport / response / pong ("direct path
+     * confirmed" log); a dead direct path falls to path_stale above. */
+    const bool dual =
+        !path_stale && g.relay_cb != NULL &&
+        g.state == WG_NETIF_UP && g.session_via_relay &&
+        g.last_direct_rx_us < g.last_handshake_completed_us;
+    if (path_stale) {
+        peer_static_snapshot(dst_pub);
+        esp_err_t rerr = g.relay_cb(dst_pub, it->buf, it->len,
+                                    g.relay_cb_user);
+        if (rerr == ESP_OK) {
+            g.relayed_stale++;
+            return;  /* skip direct sendto: already shipped via relay */
+        }
+        /* relay declined (e.g. supervisor not connected) — fall
+         * through to direct sendto. Errors logged once per worker
+         * iteration cap below to avoid UART spam during sustained
+         * relay-unavailable windows. */
+        g.relay_errors++;
+    }
+
+    ssize_t n = sendto(g.sock, it->buf, it->len, 0,
+                       (const struct sockaddr *)&it->dst, sizeof(it->dst));
+    if (dual) {
+        if (n < 0) ESP_LOGW(TAG, "tx sendto: errno=%d", errno);
+        peer_static_snapshot(dst_pub);
+        if (g.relay_cb(dst_pub, it->buf, it->len, g.relay_cb_user) != ESP_OK) {
+            g.relay_errors++;
+        }
+        return;
+    }
+    if (n < 0) {
+        ESP_LOGW(TAG, "tx sendto: errno=%d", errno);
+        /* Direct UDP outright failed (ENETUNREACH, EHOSTUNREACH,
+         * EAGAIN under load). Try the relay as a last resort. The
+         * path_stale branch above already attempted it if relevant,
+         * so we only re-try here when path wasn't yet marked stale
+         * (i.e. errno arrived before the watchdog tripped). */
+        if (!path_stale && g.relay_cb != NULL) {
+            peer_static_snapshot(dst_pub);
+            esp_err_t rerr = g.relay_cb(dst_pub, it->buf, it->len,
+                                        g.relay_cb_user);
+            if (rerr == ESP_OK) {
+                g.relayed_errno++;
+            } else {
+                g.relay_errors++;
+            }
+        }
+    }
+}
+
+/* TX worker: drains tx_ready_q + sendto outside the lwIP TCPIP task.
  * Gives tx_done_sem as the last thing before vTaskDelete(NULL) so
- * wg_netif_stop can wait for clean exit before destroying the queue. */
+ * wg_netif_stop can wait for clean exit before destroying the queues. */
 static void tx_task_fn(void *arg)
 {
     (void)arg;
     tl_wdt_subscribe();
+    int64_t last_feed_us = 0;
     while (!g.stop_requested) {
-        tl_wdt_feed();
-        /* 500 ms wakeup so stop_requested is observed even when no
-         * outbound traffic is flowing. xQueueReceive memcpys the
-         * dequeued item directly into our BSS scratch — keeping it
-         * off-stack matters here because sendto recurses into the
-         * WiFi TX callback chain and chews into our budget. */
-        if (xQueueReceive(g.tx_queue, &g.tx_worker_scratch,
-                          pdMS_TO_TICKS(500)) != pdTRUE) {
-            continue;
+        /* Blocks until a frame (or wg_netif_stop's sentinel) arrives;
+         * the timeout only paces the WDT feed. Only the slot index is
+         * copied; the frame stays in its heap slot, off this stack
+         * (sendto recurses into the WiFi TX callback chain). */
+        uint8_t slot;
+        const BaseType_t got = xQueueReceive(g.tx_ready_q, &slot,
+                                             pdMS_TO_TICKS(WG_TX_IDLE_WAIT_MS));
+        const int64_t now = now_us();
+        wdt_feed_throttled(now, &last_feed_us);
+        if (got != pdTRUE || slot >= WG_TX_SLOTS) {
+            continue;   /* idle, or the stop sentinel (loop re-checks) */
         }
-
-        /* Preemptive DERP relay when the path-stale watchdog has fired
-         * (RX has been silent past WG_RX_STALE_THRESHOLD_MS). Direct
-         * UDP is almost certainly going to a black hole at this point
-         * (peer NAT mapping aged out, peer changed WAN endpoint, etc.).
-         * Skipping the direct sendto when the relay accepts the bytes
-         * is the lossless-during-recovery property — without it, those
-         * 30 s of telemetry packets between path-goes-stale and
-         * peer-roam-handshake-completes are dropped silently. */
-        bool path_stale =
-            g.relay_cb != NULL &&
-            g.state == WG_NETIF_UP &&
-            g.last_transport_recv_us > 0 &&
-            (now_us() - g.last_transport_recv_us) >
-                (int64_t)WG_RX_STALE_THRESHOLD_MS * 1000LL;
-        uint8_t dst_pub[WG_KEY_LEN];   /* filled only when relaying */
-        if (path_stale) {
-            peer_static_snapshot(dst_pub);
-            esp_err_t rerr = g.relay_cb(dst_pub,
-                                        g.tx_worker_scratch.buf,
-                                        g.tx_worker_scratch.len,
-                                        g.relay_cb_user);
-            if (rerr == ESP_OK) {
-                g.relayed_stale++;
-                continue;  /* skip direct sendto: already shipped via relay */
-            }
-            /* relay declined (e.g. supervisor not connected) — fall
-             * through to direct sendto. Errors logged once per worker
-             * iteration cap below to avoid UART spam during sustained
-             * relay-unavailable windows. */
-            g.relay_errors++;
-        }
-
-        ssize_t n = sendto(g.sock,
-                           g.tx_worker_scratch.buf, g.tx_worker_scratch.len, 0,
-                           (struct sockaddr *)&g.tx_worker_scratch.dst,
-                           sizeof(g.tx_worker_scratch.dst));
-        if (n < 0) {
-            ESP_LOGW(TAG, "tx sendto: errno=%d", errno);
-            /* Direct UDP outright failed (ENETUNREACH, EHOSTUNREACH,
-             * EAGAIN under load). Try the relay as a last resort. The
-             * path_stale branch above already attempted it if relevant,
-             * so we only re-try here when path wasn't yet marked stale
-             * (i.e. errno arrived before the watchdog tripped). */
-            if (!path_stale && g.relay_cb != NULL) {
-                peer_static_snapshot(dst_pub);
-                esp_err_t rerr = g.relay_cb(dst_pub,
-                                            g.tx_worker_scratch.buf,
-                                            g.tx_worker_scratch.len,
-                                            g.relay_cb_user);
-                if (rerr == ESP_OK) {
-                    g.relayed_errno++;
-                } else {
-                    g.relay_errors++;
-                }
-            }
-        }
+        tx_send_item(&g.tx_slots[slot], now);
+        (void)xQueueSend(g.tx_free_q, &slot, 0);   /* never full */
     }
     if (g.tx_done_sem != NULL) {
         xSemaphoreGive(g.tx_done_sem);
     }
     tl_wdt_unsubscribe();
     vTaskDelete(NULL);
+}
+
+/* Allocate the TX slots (one heap block, like the old queue storage)
+ * and the two index queues; every slot starts free. Boot-time only. */
+static esp_err_t tx_ring_create(void)
+{
+    g.tx_slots   = calloc(WG_TX_SLOTS, sizeof(wg_tx_item_t));
+    g.tx_free_q  = xQueueCreate(WG_TX_SLOTS, sizeof(uint8_t));
+    g.tx_ready_q = xQueueCreate(WG_TX_SLOTS + 1, sizeof(uint8_t));
+    if (g.tx_slots == NULL || g.tx_free_q == NULL || g.tx_ready_q == NULL) {
+        return ESP_ERR_NO_MEM;   /* caller runs tx_ring_destroy() */
+    }
+    for (uint8_t i = 0; i < WG_TX_SLOTS; i++) {
+        (void)xQueueSend(g.tx_free_q, &i, 0);
+    }
+    return ESP_OK;
+}
+
+static void tx_ring_destroy(void)
+{
+    if (g.tx_free_q != NULL)  { vQueueDelete(g.tx_free_q);  g.tx_free_q  = NULL; }
+    if (g.tx_ready_q != NULL) { vQueueDelete(g.tx_ready_q); g.tx_ready_q = NULL; }
+    if (g.tx_slots != NULL) {
+        tl_secure_zero(g.tx_slots, WG_TX_SLOTS * sizeof(wg_tx_item_t));
+        free(g.tx_slots);
+        g.tx_slots = NULL;
+    }
 }
 
 /* --- Public API ----------------------------------------------------- */
@@ -1273,17 +1658,15 @@ esp_err_t wg_netif_init(const struct wg_netif_local_config *local)
     }
     ESP_LOGI(TAG, "udp bound on port %u", (unsigned)g.bind_port_actual);
 
-    g.tx_queue = xQueueCreate(WG_TX_QUEUE_LEN, sizeof(wg_tx_item_t));
-    if (g.tx_queue == NULL) {
-        ESP_LOGE(TAG, "tx_queue create failed");
+    if (tx_ring_create() != ESP_OK) {
+        ESP_LOGE(TAG, "tx ring alloc failed");
         close(g.sock);
         return ESP_ERR_NO_MEM;
     }
     g.tx_done_sem = xSemaphoreCreateBinary();
     if (g.tx_done_sem == NULL) {
         ESP_LOGE(TAG, "tx_done_sem create failed");
-        vQueueDelete(g.tx_queue);
-        g.tx_queue = NULL;
+        tx_ring_destroy();
         close(g.sock);
         return ESP_ERR_NO_MEM;
     }
@@ -1294,10 +1677,16 @@ esp_err_t wg_netif_init(const struct wg_netif_local_config *local)
         ESP_LOGE(TAG, "tx task spawn failed");
         vSemaphoreDelete(g.tx_done_sem);
         g.tx_done_sem = NULL;
-        vQueueDelete(g.tx_queue);
-        g.tx_queue = NULL;
+        tx_ring_destroy();
         close(g.sock);
         return ESP_ERR_NO_MEM;
+    }
+
+    /* Best effort: without it a long Wi-Fi outage recovers at the next
+     * handshake burst instead of at the next RX wake. */
+    if (esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
+                                   on_sta_got_ip, NULL) != ESP_OK) {
+        ESP_LOGW(TAG, "GOT_IP handler not registered");
     }
 
     g.state       = WG_NETIF_IDLE;
@@ -1429,7 +1818,7 @@ esp_err_t wg_netif_inject_packet(const uint8_t *src_node_pub,
     wg_demux_kind_t kind = wg_demux_classify(buf, len);
     switch (kind) {
     case WG_DEMUX_HANDSHAKE_RESP:
-        if (handle_handshake_response(buf, len)) send_disco_advert();
+        if (handle_handshake_response(buf, len, true)) send_disco_advert();
         return ESP_OK;
     case WG_DEMUX_TRANSPORT:
         (void)handle_transport(buf, len);
@@ -1447,6 +1836,29 @@ esp_err_t wg_netif_inject_packet(const uint8_t *src_node_pub,
     }
 }
 
+void wg_netif_handshake_kick(wg_netif_kick_t why)
+{
+    if (!g.initialized || g.hs_lock == NULL) return;
+    /* Lock order hs_lock → g.lock (peer_addr snapshot); the DERP copy is
+     * queued for wg_tx, never written to TLS under a wg lock — callers
+     * run in the DERP task. */
+    xSemaphoreTake(g.hs_lock, portMAX_DELAY);
+    switch (why) {
+    case WG_NETIF_KICK_RELAY_UP:
+        /* The INIT's own DERP copy (if any) was declined while the relay
+         * was down: re-queue it now, past the per-path gate. */
+        init_resend(false, true, true, "DERP relay up");
+        break;
+    case WG_NETIF_KICK_CALL_ME_MAYBE:
+        /* The peer is punching towards our endpoints right now: its NAT
+         * has a mapping for us, so the direct copy can get through. */
+        init_resend(true, !direct_path_confirmed(now_us()), false,
+                    "call-me-maybe");
+        break;
+    }
+    xSemaphoreGive(g.hs_lock);
+}
+
 esp_err_t wg_netif_send_plaintext(const uint8_t *pkt, size_t len)
 {
     if (!g.initialized || g.state != WG_NETIF_UP) {
@@ -1458,42 +1870,17 @@ esp_err_t wg_netif_send_plaintext(const uint8_t *pkt, size_t len)
     /* Encrypt inline. ChaCha20-Poly1305 is pure CPU + memory and is
      * safe to run on the lwIP TCPIP task. The actual sendto is what
      * re-enters lwIP — that's why the wire bytes are handed off to the
-     * tx worker via tx_queue instead of called here directly.
+     * tx worker via the TX ring instead of called here directly.
      *
-     * Use g.tx_scratch (BSS) instead of a stack-local item so the
-     * TCPIP task's small stack doesn't have to absorb the 1.5 KiB
-     * wire buffer alongside its own frames. xQueueSend memcpys the
-     * full sizeof(wg_tx_item_t) into the queue's internal storage,
-     * so it's safe to reuse the scratch on the next call.
-     *
-     * Wrap the encrypt+enqueue critical section under g.lock so a
-     * concurrent caller (lwIP TCPIP for app traffic vs rx_task for the
-     * persistent-keepalive path) cannot race on g.transport.send_counter
-     * — `wg_transport_encrypt` reads-modifies-writes the 64-bit
-     * counter, which is NOT atomic on ESP32-LX6. Same lock also
-     * protects g.tx_scratch since both callers reuse it. */
-    xSemaphoreTake(g.lock, portMAX_DELAY);
-    int wlen = wg_transport_encrypt(&g.transport,
-                                    g.tx_scratch.buf, sizeof(g.tx_scratch.buf),
-                                    pkt, len);
-    if (wlen < 0) {
-        xSemaphoreGive(g.lock);
-        return ESP_FAIL;
-    }
-    g.tx_scratch.len = (size_t)wlen;
-    /* Snapshot the dest sockaddr at enqueue time so a concurrent
-     * wg_netif_update_peer_endpoint after we release can't redirect a
-     * frame whose counter is already committed. */
-    g.tx_scratch.dst = g.peer_addr;
-
-    BaseType_t qrc = xQueueSend(g.tx_queue, &g.tx_scratch, 0);
-    xSemaphoreGive(g.lock);
-
-    if (qrc != pdTRUE) {
-        /* Queue full. Drop this frame; lwIP treats any non-OK return
-         * as a TX failure and discards its pbuf. The worker is either
-         * starving (priority) or stuck in sendto — log throttled so
-         * UART doesn't spam if backlog runs hot for a sustained burst. */
+     * Claim a free slot first (B14): the frame is encrypted straight
+     * into it (heap, off the TCPIP task's small stack) and only its
+     * index is queued. No free slot = the old "queue full": drop this
+     * frame; lwIP treats any non-OK return as a TX failure and discards
+     * its pbuf. The worker is either starving (priority) or stuck in
+     * sendto — log throttled so UART doesn't spam if backlog runs hot
+     * for a sustained burst. */
+    uint8_t slot;
+    if (xQueueReceive(g.tx_free_q, &slot, 0) != pdTRUE) {
         uint64_t prev = g.tx_drops++;
         if ((prev % WG_TX_DROP_LOG_EVERY) == 0) {
             ESP_LOGW(TAG, "tx queue full — dropped frame (total=%lu)",
@@ -1501,6 +1888,31 @@ esp_err_t wg_netif_send_plaintext(const uint8_t *pkt, size_t len)
         }
         return ESP_FAIL;
     }
+    wg_tx_item_t *it = &g.tx_slots[slot];
+
+    /* Encrypt + enqueue under g.lock so a concurrent caller (lwIP
+     * TCPIP for app traffic vs rx_task for the persistent-keepalive
+     * path) cannot race on g.transport.send_counter —
+     * `wg_transport_encrypt` reads-modifies-writes the 64-bit counter,
+     * which is NOT atomic on ESP32-LX6 — and frames reach tx_ready_q in
+     * counter order. */
+    xSemaphoreTake(g.lock, portMAX_DELAY);
+    int wlen = wg_transport_encrypt(&g.transport,
+                                    it->buf, sizeof(it->buf), pkt, len);
+    if (wlen < 0) {
+        xSemaphoreGive(g.lock);
+        (void)xQueueSend(g.tx_free_q, &slot, 0);
+        return ESP_FAIL;
+    }
+    it->len = (size_t)wlen;
+    it->relay_only = false;
+    /* Snapshot the dest sockaddr at enqueue time so a concurrent
+     * wg_netif_update_peer_endpoint after we release can't redirect a
+     * frame whose counter is already committed. */
+    it->dst = g.peer_addr;
+    (void)xQueueSend(g.tx_ready_q, &slot, 0);   /* WG_TX_SLOTS + 1 deep: never full */
+    xSemaphoreGive(g.lock);
+
     g.last_tx_us = now_us();
     return ESP_OK;
 }
@@ -1539,21 +1951,33 @@ void wg_netif_stop(void)
     if (!g.initialized) return;
     g.stop_requested = true;
     /* Wait for the TX worker to observe stop_requested and exit before
-     * we tear down its queue; otherwise vQueueDelete can race against
-     * an in-flight xQueueReceive. The worker wakes at most every 500
-     * ms; 2 s is comfortable margin even under priority pressure. The
-     * RX task observes stop_requested via its 1-s recvfrom timeout
-     * and self-deletes; we don't gate on it here because nothing it
-     * touches gets freed below. */
+     * we tear down its queues; otherwise vQueueDelete can race against
+     * an in-flight xQueueReceive. The sentinel wakes it at once (its idle
+     * wait is WG_TX_IDLE_WAIT_MS); tx_ready_q has a spare entry for it.
+     * 2 s is comfortable margin even under priority pressure. The RX
+     * task observes stop_requested when close() below ends its recvfrom
+     * (or at its next deadline wake) and self-deletes; we don't gate on
+     * it here because nothing it touches gets freed below. */
+    if (g.tx_ready_q != NULL) {
+        const uint8_t stop = WG_TX_SLOT_STOP;
+        (void)xQueueSend(g.tx_ready_q, &stop, 0);
+    }
+    (void)esp_event_handler_unregister(IP_EVENT, IP_EVENT_STA_GOT_IP,
+                                       on_sta_got_ip);
+    bool tx_exited = true;
     if (g.tx_done_sem != NULL) {
         if (xSemaphoreTake(g.tx_done_sem, pdMS_TO_TICKS(2000)) != pdTRUE) {
             ESP_LOGW(TAG, "tx task did not exit within 2s — forcing teardown");
+            tx_exited = false;
         }
     }
-    if (g.tx_queue != NULL) {
-        vQueueDelete(g.tx_queue);
-        g.tx_queue = NULL;
+    /* A worker still inside tx_send_item (e.g. a blocked DERP TLS write)
+     * would touch a freed slot and deleted queues: leak the ring (~6 KB,
+     * start-failure path only) rather than risk a use-after-free. */
+    if (tx_exited) {
+        tx_ring_destroy();
     }
+    g.init_valid = false;
     if (g.tx_done_sem != NULL) {
         vSemaphoreDelete(g.tx_done_sem);
         g.tx_done_sem = NULL;

@@ -77,10 +77,25 @@ int nacl_box(uint8_t *c,
              const uint8_t peer_pub[NACL_BOX_KEY_LEN],
              const uint8_t my_priv[NACL_BOX_KEY_LEN])
 {
-    if (mlen > NACL_BOX_MAX_INNER) return -1;
-
     uint8_t k[NACL_BOX_KEY_LEN];
     if (box_beforenm(k, peer_pub, my_priv) != 0) return -1;
+    const int rc = nacl_box_after_shared(c, m, mlen, nonce, k);
+    memset(k, 0, sizeof(k));
+    return rc;
+}
+
+/* crypto_box_afternm. Seals with a K from nacl_box_compute_shared. */
+int nacl_box_after_shared(uint8_t *c,
+                          const uint8_t *m, size_t mlen,
+                          const uint8_t nonce[NACL_BOX_NONCE_LEN],
+                          const uint8_t shared_k[NACL_BOX_KEY_LEN])
+{
+    if (mlen > NACL_BOX_MAX_INNER) return -1;
+
+    /* Local copy: the scrub at the end wipes only memory this function
+     * owns; the caller's (cached) K is left alone. */
+    uint8_t k[NACL_BOX_KEY_LEN];
+    memcpy(k, shared_k, NACL_BOX_KEY_LEN);
 
     /* Generate keystream of length mlen + 32 (first 32 bytes are the
      * Poly1305 one-time key). Stack-resident, sized for the worst case
