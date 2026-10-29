@@ -12,10 +12,10 @@ dependencies:
   idf:
     source:
       type: idf
-    version: 5.5.4
+    version: 5.5.6
 direct_dependencies:
 - espressif/nghttp
 - idf
-manifest_hash: b67347429aac5da5ab85319880a350a09599e952245bd35c884eb9bf0ae30d53
+manifest_hash: 6422e82b51b65144eb39836a4a7f7b06c94b5d9b359d7f77a20524e2cc25215d
 target: esp32
 version: 2.0.0

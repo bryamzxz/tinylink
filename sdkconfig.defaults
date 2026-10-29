@@ -103,7 +103,7 @@ CONFIG_MBEDTLS_HKDF_C=y
 # zero stream ends. IN_CONTENT_LEN stays at 16384 so #14614 does
 # not apply. #15984 was historically a TLS 1.3 panic on connect;
 # our tinylink-→Tailscale TLS path negotiates 1.3 and connects
-# cleanly here, so either the IDF fix landed in v5.5.4 or our
+# cleanly here, so either the IDF fix landed by v5.5.4 or our
 # ciphersuite/extension set sidesteps the trigger.
 #
 # Heap effect: at supervisor-connect time (post-bringup, post-WG)

@@ -2,8 +2,10 @@
 
 ## Prerequisites
 
-- ESP-IDF **v5.5.4** installed (the project is frozen on this exact
-  release — see "CI" below). `$IDF_PATH` below is its checkout.
+- ESP-IDF **v5.5.6** installed (the project is pinned to this exact
+  release — see "CI" below; moved from v5.5.4 in round 1.3.0, 2026-10:
+  same toolchain `esp-14.2.0_20260121`, Wi-Fi supplicant security fixes,
+  both `idf-patches/` still needed). `$IDF_PATH` below is its checkout.
 - A Python virtualenv with the project tooling installed (the helper scripts
   in `tools/` use `pyserial` and the IDF Python deps).
 - A Freenove ESP32-WROOM-32E DevKit on `/dev/ttyUSB0` (CH340).
@@ -53,7 +55,7 @@ To revert (e.g. to test against stock IDF — expect the panic):
 
 ```bash
 cd "$IDF_PATH"
-git reset --hard v5.5.4
+git reset --hard v5.5.6
 ```
 
 See [`idf-patches/README.md`](../idf-patches/README.md) for the full
@@ -97,7 +99,7 @@ is not set`); the bench code drops out of the binary entirely.
 ## Size budget snapshot
 
 Reference `idf.py size` numbers for the ESP32-WROOM-32E (no PSRAM)
-target on ESP-IDF v5.5.4:
+target (M16 and earlier on ESP-IDF v5.5.4, 1.3.0 on v5.5.6):
 
 | Region        | Post-η baseline (`4bd5b0f`) | M13 (`c383e49`)     | M14 (`8f353c5`)       | M15 (`8a18425`)       | **M16**                       |
 |---------------|----------------------------:|--------------------:|----------------------:|----------------------:|------------------------------:|
@@ -189,7 +191,7 @@ GitHub Actions (`.github/workflows/build.yml`) runs, on every push and PR:
    number of `OK` cases) and the same suite under ASan + UBSan;
 2. a dry-run of the two `idf-patches/` against the pinned ESP-IDF, so a
    patch that stops applying is caught before a device panics;
-3. `idf.py build` for `esp32` against the pinned ESP-IDF **v5.5.4**, plus
+3. `idf.py build` for `esp32` against the pinned ESP-IDF **v5.5.6**, plus
    `idf.py size` / `size-components` (posted to the run summary) and a
    check that `dependencies.lock` was not rewritten.
 

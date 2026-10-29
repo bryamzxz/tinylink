@@ -25,7 +25,7 @@ concurrency:
 env:
   # Strict per-case count of `[name] OK` lines the suite must reach.
   # Bump when tests are added (see CHANGELOG for the running number).
-  HOST_TESTS_MIN_OK: 570
+  HOST_TESTS_MIN_OK: 623
 
 jobs:
   host-tests:
@@ -76,7 +76,7 @@ jobs:
       # applying against a point release, so check it explicitly.
       - name: Fetch pinned ESP-IDF and dry-run the patches
         run: |
-          git clone --depth 1 --branch v5.5.4 https://github.com/espressif/esp-idf.git /tmp/esp-idf
+          git clone --depth 1 --branch v5.5.6 https://github.com/espressif/esp-idf.git /tmp/esp-idf
           cd /tmp/esp-idf
           for p in "$GITHUB_WORKSPACE"/idf-patches/*.patch; do
             echo "== $p"
@@ -91,9 +91,9 @@ jobs:
       matrix:
         target: [esp32]
         # Pinned to the exact release the project freezes on (see the
-        # "no IDF upgrade until v5.5 EOL" policy) so CI can't silently
+        # "stay on the v5.5 line" policy) so CI can't silently
         # drift ahead of the local toolchain via the floating v5.5 tag.
-        idf_version: ["v5.5.4"]
+        idf_version: ["v5.5.6"]
 
     steps:
       - name: Checkout

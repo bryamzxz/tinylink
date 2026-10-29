@@ -1,6 +1,6 @@
 # IDF patches required for `feat/wg-netif-without-is-ppp`
 
-These two patches must be applied to ESP-IDF v5.5.4 (and current master at time of writing) for the firmware on this branch to boot without panicking.
+These two patches must be applied to ESP-IDF v5.5.6 (also verified on v5.5.4; 0001 applies to v5.5.6 with a 21-line offset; neither is upstreamed as of 2026-10-28) for the firmware to boot without panicking.
 
 | Patch | Target file | Why |
 |---|---|---|
@@ -10,7 +10,7 @@ These two patches must be applied to ESP-IDF v5.5.4 (and current master at time 
 ## Applying
 
 ```sh
-cd "$IDF_PATH"            # your ESP-IDF v5.5.4 checkout
+cd "$IDF_PATH"            # your ESP-IDF v5.5.6 checkout
 git apply --check /path/to/tinylink/idf-patches/0001-*.patch /path/to/tinylink/idf-patches/0002-*.patch
 git am /path/to/tinylink/idf-patches/0001-*.patch /path/to/tinylink/idf-patches/0002-*.patch
 ```
@@ -21,7 +21,7 @@ If `git am` complains about whitespace, `git apply` followed by a manual commit 
 
 ```sh
 cd "$IDF_PATH"
-git reset --hard v5.5.4
+git reset --hard v5.5.6
 ```
 
 The firmware on this branch will **panic at boot** with stock IDF — the symptom is `LoadProhibited` at `dhcp_state.c:52` from the lwIP-task, fired by the `netif_add()` → `netif_set_addr()` → ext-callback path during WG netif bring-up. That is not a regression in the firmware; it is the IDF bug these patches fix.

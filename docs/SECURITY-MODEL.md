@@ -98,7 +98,7 @@ The same argument applies even more strongly to mbedTLS's curve25519
 path: it has not historically been written with the same constant-time
 discipline as donna, and on ESP32 the HW assistance is weaker than the
 generic "mbedTLS uses HW MPI" narrative suggests. IDF source review
-(v5.5.4):
+(v5.5.4, re-checked unchanged in v5.5.6):
 
 - `port/mbedtls/esp_config.h` defines `MBEDTLS_MPI_MUL_MPI_ALT` only —
   there are **no** `_MXZ_ALT` hooks for the Montgomery-curve operations
