@@ -219,6 +219,17 @@ cheaper than dragging in another dependency.
   and the machine key sealed under DH(e, rs)) and TLS's cover of record
   sizes and timing, which Noise does not pad either way. Host tests:
   `test_ts2021` (`d10_*`).
+- **TLS 1.2 session resumption** for the :443 control conn and DERP
+  (`tls_resume.c`, `CONFIG_MBEDTLS_CLIENT_SSL_SESSION_TICKETS`): one
+  session per server in RAM, never written to flash, dropped after 24 h
+  per master secret (TLS 1.2 resumption reuses it), on a failed connect,
+  or for a different host:port. A resumed handshake skips the chain
+  verify; the session it resumes came from a full handshake verified
+  under `MBEDTLS_SSL_VERIFY_REQUIRED` in the same boot, and a rejected
+  ticket is a full, fully verified handshake. Before the first NTP sync
+  a full handshake tolerates certificate dates (`tl_time.h`); a session
+  from that window can be resumed after the sync, i.e. it lives as long
+  as an open conn would have.
 
 ## Audit + optimization round (2026-09) — memory safety + upstream drift
 

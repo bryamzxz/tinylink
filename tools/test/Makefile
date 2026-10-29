@@ -31,7 +31,7 @@ TARGETS := test_blake2s test_curve25519 test_x25519 test_mapresp \
            test_disco_handler test_disco_prober test_retry_after \
            test_backoff test_keys_regen test_skip_value test_jsmn_split \
            test_tai64n test_nacl_box test_tsmp test_tl_date test_stats test_noise_ik \
-           test_http1 test_ctrl_json test_ts2021 test_hpack test_h2_core
+           test_http1 test_ctrl_json test_ts2021 test_hpack test_h2_core test_tls_resume
 
 all: $(TARGETS) $(H2_INTEROP)
 
@@ -161,10 +161,17 @@ TS2021_DEFS := -DCONFIG_TINYLINK_CONTROL_HOST='"controlplane.test"' \
                -DCONFIG_TINYLINK_CONTROL_PORT=443 -DCONFIG_TINYLINK_STREAM_IDLE_TIMEOUT_S=120 \
                -DCONFIG_TINYLINK_CONTROL_PLAIN_HTTP=1 -DTS2021_PLAIN_TIMEOUT_MS=200
 test_ts2021: test_ts2021.c $(TL_SRC)/ts2021_client.c $(TL_SRC)/ts2021_client.h \
-             $(TL_SRC)/tls_io.c $(NOISE_SRCS) host_include/esp_tls.h \
+             $(TL_SRC)/tls_io.c $(TL_SRC)/tls_resume.h $(NOISE_SRCS) host_include/esp_tls.h \
              host_include/esp_timer.h
 	$(CC) $(CFLAGS) $(TS2021_DEFS) -I$(TL_SRC) -I$(TL_INC) -I$(CRYPTO) -Ihost_include -o $@ \
 	    test_ts2021.c $(TL_SRC)/tls_io.c $(NOISE_SRCS)
+
+# TLS 1.2 session resumption slot (round 1.3.5, D9) over a scripted
+# esp_tls: tickets on, host shims for the session fields it reads.
+test_tls_resume: test_tls_resume.c $(TL_SRC)/tls_resume.c $(TL_SRC)/tls_resume.h \
+                 host_include/esp_tls.h host_include/mbedtls/ssl.h host_include/esp_timer.h
+	$(CC) $(CFLAGS) -DCONFIG_ESP_TLS_CLIENT_SESSION_TICKETS=1 -I$(TL_SRC) -Ihost_include \
+	    -o $@ test_tls_resume.c
 
 # In-tree HTTP/2 client (round 1.3.4, D1): HPACK (RFC 7541 Appendix C,
 # Huffman, fuzz) and the frame / connection engine against a scripted
@@ -402,7 +409,10 @@ test: test_blake2s.run test_curve25519.run test_x25519.run test_mapresp.run \
       test_skip_value.run test_jsmn_split.run test_tai64n.run \
       test_nacl_box.run test_tsmp.run test_tl_date.run test_stats.run test_noise_ik.run \
       test_http1.run test_ctrl_json.run test_ts2021.run test_hpack.run test_h2_core.run \
-      h2_interop.run
+      test_tls_resume.run h2_interop.run
+
+test_tls_resume.run: test_tls_resume
+	$(RUNNER) ./test_tls_resume
 
 test_hpack.run: test_hpack
 	$(RUNNER) ./test_hpack

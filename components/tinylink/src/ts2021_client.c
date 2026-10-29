@@ -17,6 +17,7 @@
 
 #include "h2_client.h"
 #include "tls_io.h"
+#include "tls_resume.h"
 #include "crypto/secure_zero.h"
 
 static const char *TAG = "ts2021";
@@ -94,6 +95,9 @@ static const char *TAG = "ts2021";
  * firewall, a proxy, a redirect); one-dial :443 after an early drop. */
 static bool s_plain_off;
 static bool s_tls_next;
+
+/* TLS session of the last :443 conn, for the next :443 connect (D9). */
+static tls_resume_slot_t s_resume;
 
 /* base64 encoder used for the X-Tailscale-Handshake header. */
 static int b64_encode(const uint8_t *in, size_t in_len,
@@ -442,8 +446,9 @@ static esp_err_t consume_early_payload(ts2021_conn_t *c)
     return ESP_OK;
 }
 
-/* Open the :443 transport: TLS. */
-static esp_err_t open_tls(ts2021_conn_t *c)
+/* Open the :443 transport: TLS, offering the session the previous :443
+ * conn left (round 1.3.5, D9; tls_resume.h). */
+static esp_err_t open_tls(ts2021_conn_t *c, tls_resume_result_t *res)
 {
     char url[160];
     snprintf(url, sizeof(url), "https://%s:%d",
@@ -453,9 +458,14 @@ static esp_err_t open_tls(ts2021_conn_t *c)
         .crt_bundle_attach = tl_crt_bundle_attach,
         .timeout_ms = TLS_TIMEOUT_MS,
     };
+    tls_resume_entry_t *offered = tls_resume_take(&s_resume, CONFIG_TINYLINK_CONTROL_HOST,
+                                                  CONFIG_TINYLINK_CONTROL_PORT);
+    tls_resume_offer(&tls_cfg, offered);
 
     c->tls = esp_tls_init();
     const int rc = (c->tls != NULL) ? esp_tls_conn_http_new_sync(url, &tls_cfg, c->tls) : -1;
+    *res = tls_resume_keep(&s_resume, offered, rc == 1 ? c->tls : NULL,
+                           CONFIG_TINYLINK_CONTROL_HOST, CONFIG_TINYLINK_CONTROL_PORT);
     if (rc != 1) {
         ESP_LOGE(TAG, "TLS connect failed");
         return ESP_FAIL;
@@ -663,11 +673,12 @@ static esp_err_t handshake(ts2021_conn_t *out,
 static esp_err_t connect_on(ts2021_conn_t *out, bool plain,
                             const uint8_t machine_priv[NOISE_DHLEN],
                             const uint8_t machine_pub[NOISE_DHLEN],
-                            const uint8_t control_pub[NOISE_DHLEN])
+                            const uint8_t control_pub[NOISE_DHLEN],
+                            tls_resume_result_t *res)
 {
     memset(out, 0, sizeof(*out));
     out->sock = -1;
-    esp_err_t err = plain ? open_plain(out) : open_tls(out);
+    esp_err_t err = plain ? open_plain(out) : open_tls(out, res);
     if (err == ESP_OK) err = handshake(out, machine_priv, machine_pub, control_pub);
     if (err != ESP_OK) conn_teardown(out);
     return err;
@@ -695,6 +706,7 @@ esp_err_t ts2021_connect(ts2021_conn_t *out,
     s_abort_reads = false;   /* a pending abort targets the OLD conn only */
 
     const int64_t t0 = esp_timer_get_time();
+    tls_resume_result_t res = TLS_RESUME_NONE;
     bool plain = TS2021_PLAIN && key_pinned && !s_plain_off;
     if (plain && s_tls_next) {
         ESP_LOGW(TAG, "last :80 conn dropped early — this dial on :%d",
@@ -706,7 +718,7 @@ esp_err_t ts2021_connect(ts2021_conn_t *out,
     esp_err_t err = ESP_FAIL;
     bool fallback = !plain;
     if (plain) {
-        err = connect_on(out, true, machine_priv, machine_pub, control_pub);
+        err = connect_on(out, true, machine_priv, machine_pub, control_pub, &res);
         /* An abort raised meanwhile (endpoint push) is for this dial too. */
         if (err != ESP_OK && !s_abort_reads) {
             ESP_LOGW(TAG, ":80 attempt failed (0x%x) — falling back to :%d",
@@ -715,7 +727,7 @@ esp_err_t ts2021_connect(ts2021_conn_t *out,
         }
     }
     if (fallback) {
-        err = connect_on(out, false, machine_priv, machine_pub, control_pub);
+        err = connect_on(out, false, machine_priv, machine_pub, control_pub, &res);
         if (err == ESP_OK && plain) {
             s_plain_off = true;
             ESP_LOGW(TAG, ":%d answered after :80 failed — :80 off for the rest of this boot",
@@ -723,10 +735,12 @@ esp_err_t ts2021_connect(ts2021_conn_t *out,
         }
     }
     if (err == ESP_OK) {
-        /* One line per connect, for the soak: which port. */
+        /* One line per connect, for the soak: which port, and on :443
+         * whether the TLS session resumed. */
         ESP_LOGI(TAG, "ts2021: control conn up on :%d (%s) in %u ms",
                  out->plain ? TS2021_PLAIN_PORT : CONFIG_TINYLINK_CONTROL_PORT,
-                 out->plain ? "plain HTTP, Noise IK" : "TLS",
+                 out->plain ? "plain HTTP, Noise IK" :
+                 res == TLS_RESUME_RESUMED ? "TLS, session resumed" : "TLS, full handshake",
                  (unsigned)((esp_timer_get_time() - t0) / 1000));
     }
     return err;

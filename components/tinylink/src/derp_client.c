@@ -15,9 +15,18 @@
 #include "lwip/sockets.h"
 #include "mbedtls/ssl.h"
 
+#include "esp_timer.h"
 #include "tls_io.h"
+#include "tls_resume.h"
 
 static const char *TAG = "derp_client";
+
+/* TLS session of the last DERP connect (round 1.3.5, D9; tls_resume.h),
+ * for a reconnect to the same relay: one per firmware — the supervisor
+ * (or, with SUPERVISED=n, the boot smoke) is the only DERP client. A
+ * different host (home region change) is a full handshake. derp16b
+ * resumed 5/5 from the host (one address, TTL 600 s). */
+static tls_resume_slot_t s_resume;
 
 /* Same budget as ts2021 — covers cert chain verify + ECDSA. */
 #define DERP_TLS_TIMEOUT_MS 30000
@@ -204,30 +213,40 @@ esp_err_t derp_client_connect_login(derp_client_t *out,
         .crt_bundle_attach = tl_crt_bundle_attach,
         .timeout_ms        = DERP_TLS_TIMEOUT_MS,
     };
+    tls_resume_entry_t *offered = tls_resume_take(&s_resume, server_host, port);
+    tls_resume_offer(&cfg, offered);
 
     if (out->write_lock == NULL) {
         out->write_lock = xSemaphoreCreateMutex();
     }
     if (out->write_lock == NULL) {
         ESP_LOGE(TAG, "write_lock create failed");
+        tls_resume_keep(&s_resume, offered, NULL, server_host, port);
         return ESP_ERR_NO_MEM;
     }
 
     out->tls = esp_tls_init();
     if (out->tls == NULL) {
         ESP_LOGE(TAG, "esp_tls_init failed");
+        tls_resume_keep(&s_resume, offered, NULL, server_host, port);
         derp_client_close(out);
         return ESP_FAIL;
     }
 
+    const int64_t t0 = esp_timer_get_time();
     int rc = esp_tls_conn_http_new_sync(url, &cfg, out->tls);
+    const tls_resume_result_t res =
+        tls_resume_keep(&s_resume, offered, rc == 1 ? out->tls : NULL, server_host, port);
     if (rc != 1) {
         ESP_LOGE(TAG, "TLS connect to %s:%u failed", server_host, (unsigned)port);
         derp_client_close(out);
         return ESP_FAIL;
     }
     set_tcp_nodelay(out->tls);
-    ESP_LOGI(TAG, "TLS up to %s:%u, sending HTTP upgrade", server_host, (unsigned)port);
+    ESP_LOGI(TAG, "TLS up to %s:%u (%s handshake, %u ms), sending HTTP upgrade",
+             server_host, (unsigned)port,
+             res == TLS_RESUME_RESUMED ? "resumed" : "full",
+             (unsigned)((esp_timer_get_time() - t0) / 1000));
 
     /* Build and send: GET /derp HTTP/1.1 + Upgrade: DERP. The Host
      * header MUST match the SNI / cert host we just dialed. */
