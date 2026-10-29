@@ -71,6 +71,7 @@ static esp_err_t bringup(void)
     ESP_LOGI(TAG, "tinylink %s starting on %s (reset: %s, %d)",
              tinylink_version_string(), CONFIG_TINYLINK_DEVICE_HOSTNAME,
              reset_reason_name(rst), (int)rst);
+    tinylink_bootstat_record();   /* RTC boot counters for /stats */
 
     esp_err_t err = app_nvs_init();
     if (err != ESP_OK) {

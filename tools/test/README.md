@@ -46,12 +46,13 @@ coverage without restating the base flags.
 | `test_derp`              | `derp.c` frame codec, ServerInfo/ClientInfo           | upstream `derp_test.go` |
 | `test_tls_io`            | `tls_io.c` WANT_READ retry + idle budget (M13)        | fake reader |
 | `test_retry_after`       | `h2_retry_after.h` 429/503 parsing                    | synthetic |
-| `test_mapresp`           | `mapreq.c::mapresp_parse` (netmap, DERPMap, patches, Peers vs PeersChanged vs PeersRemoved, oversized element) | real one-peer MapResponse stub + synthetic |
+| `test_mapresp`           | `mapreq.c::mapresp_parse` (netmap, DERPMap kept by RegionID, patches, Peers vs PeersChanged vs PeersRemoved, oversized element) | real one-peer MapResponse stub + synthetic |
 | `test_skip_value`        | `jsmn_skip.h` depth bound                             | synthetic |
 | `test_backoff`           | `backoff.h` ladder + jitter                           | synthetic |
 | `test_keys_regen`        | `keys_regen.h` identity regeneration policy           | 8 combinations |
 | `test_jsmn_split`        | `jsmn_split.h` shallow object/array splitter (MapResponse) | synthetic incl. depth bound |
 | `test_tai64n`            | `wg_proto.c` TAI64N floor / reservation / persist     | synthetic |
+| `test_stats`             | `tl_bootstat.h` RTC boot counters, `stats_json.h` /stats worst case vs buffer | synthetic + jsmn validity |
 | `test_nacl_box`          | `nacl_box.c` seal/open/precomputed-shared/tamper      | **libsodium** vectors (PyNaCl, `gen_nacl_vectors.py`) |
 
 ## Not covered on the host (needs a seam or a fixture)
@@ -60,5 +61,5 @@ coverage without restating the base flags.
   chachapoly shim over `chacha20poly1305.c`; `host_mbedtls_shim.c` shows
   the pattern).
 - `register.c` RegisterResponse parsing (cJSON-based), `control_key.c`
-  `/key` parsing, `stun_probe.c`, `telemetry.c` JSON formatting — all
-  platform-bound today.
+  `/key` parsing, `stun_probe.c` — all platform-bound today
+  (`telemetry.c`'s /stats line moved to `stats_json.h`, covered).

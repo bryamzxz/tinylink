@@ -23,6 +23,7 @@
 #include "lwip/sockets.h"
 #include "lwip/netdb.h"
 
+#include "stats_json.h"
 #include "tmp117.h"
 #include "tl_wdt.h"
 #include "tl_time.h"
@@ -84,10 +85,12 @@ static int open_dest_socket(const char *host, uint16_t port,
     return s;
 }
 
-/* Answer /stats queries while waiting out one telemetry period. Keeps
- * the 5-s cadence (deadline-based), feeds the WDT, ignores non-tailnet
- * sources. The reply is one JSON line built into a BSS buffer (the task
- * stack is 4.5 KiB). */
+static uint32_t s_stats_seq;
+
+#if CONFIG_TINYLINK_STATS_PORT > 0
+/* Answer /stats queries while waiting out one telemetry period (tlm_wait):
+ * deadline-based, feeds the WDT, ignores non-tailnet sources. The reply
+ * is one JSON line built into a BSS buffer (the task stack is 4.5 KiB). */
 static bool is_tailnet_v4(uint32_t be_addr)
 {
     /* 100.64.0.0/10 */
@@ -98,36 +101,14 @@ static int stats_json(char *out, size_t cap, uint32_t telemetry_seq)
 {
     tinylink_stats_t st;
     tinylink_get_stats(&st);
-    return snprintf(out, cap,
-        "{\"host\":\"%s\",\"version\":\"%s\",\"uptime_s\":%u,\"reset_reason\":%d,"
-        "\"heap_free\":%u,\"heap_largest\":%u,\"ntp_synced\":%s,"
-        "\"control\":{\"open\":%s,\"alive_age_s\":%u,\"reconnects\":%u,\"endpoint_pushes\":%u},"
-        "\"derp\":{\"connected\":%s,\"host\":\"%s\"},"
-        "\"endpoint\":\"%u.%u.%u.%u:%u\","
-        "\"wg\":{\"state\":%d,\"rekeys\":%u,\"cold_handshakes\":%u,\"rx_stale\":%u,"
-        "\"roams\":%u,\"disco_adverts\":%u,\"tx_drops\":%u,\"relayed_stale\":%u,\"relay_errors\":%u,\"last_rx_age_s\":%u},"
-        "\"telemetry_seq\":%u}\n",
-        CONFIG_TINYLINK_DEVICE_HOSTNAME, tinylink_version_string(),
-        (unsigned)st.uptime_s, st.reset_reason,
-        (unsigned)st.heap_free, (unsigned)st.heap_largest,
-        st.ntp_synced ? "true" : "false",
-        st.control_open ? "true" : "false", (unsigned)st.control_alive_age_s,
-        (unsigned)st.control_reconnects, (unsigned)st.endpoint_pushes,
-        st.derp_connected ? "true" : "false", st.derp_host,
-        st.public_v4[0], st.public_v4[1], st.public_v4[2], st.public_v4[3],
-        (unsigned)st.public_port,
-        st.wg_state, (unsigned)st.wg_rekeys, (unsigned)st.wg_cold_handshakes,
-        (unsigned)st.wg_rx_stale_events, (unsigned)st.wg_roams,
-        (unsigned)st.wg_disco_adverts,
-        (unsigned)st.wg_tx_drops, (unsigned)st.wg_relayed_stale,
-        (unsigned)st.wg_relay_errors, (unsigned)st.wg_last_rx_age_s,
-        (unsigned)telemetry_seq);
+    return tl_stats_json(out, cap, &st, CONFIG_TINYLINK_DEVICE_HOSTNAME,
+                         tinylink_version_string(), telemetry_seq);
 }
 
-static uint32_t s_stats_seq;
-/* ~560 B with the default hostname; a truncated reply is not sent, so
- * size for a 63-char hostname + DERP host with headroom. */
-static char     s_stats_buf[768];
+/* A truncated reply is not sent, so this is sized for the worst case
+ * (stats_json.h; tools/test/test_stats.c checks it). */
+static char     s_stats_buf[TL_STATS_JSON_CAP];
+#endif
 
 /* TMP117, destination socket, /stats bind. Returns the socket (-1: no
  * telemetry and no /stats); *sensor_ok says whether samples can be
@@ -335,9 +316,10 @@ static bool tlm_try_spawn(void)
      * V2's esp_log_va → esp_log_format → esp_log_printf chain costs
      * ≈ 150–200 B more per call; 1 084 B free on hardware at 1.3.1.
      * The STUN re-probe folded in at 1.3.2 is not the deepest path: it
-     * peaked at ~1.8 KB on its own task, ≈ 2.5 KB here on top of this
-     * task's own frames, against ≈ 3.5 KB for the sample / /stats path
-     * (frame sums in docs/ARCHITECTURE.md "FreeRTOS task layout"). */
+     * peaked at ~1.8 KB on its own task, ≈ 1.9 KB here, against
+     * ≈ 3.3 KB for the /stats and sample paths, each ≥ 176 B shallower
+     * than at 1.3.1 (frame sums in docs/ARCHITECTURE.md "FreeRTOS task
+     * layout"). */
     TaskHandle_t h = NULL;
     if (xTaskCreate(telemetry_task, "tinylink_tlm",
                     4608, NULL, tskIDLE_PRIORITY + 2, &h) != pdPASS) {

@@ -154,9 +154,31 @@ blocks, the DISCO-pong fast-INIT and the DERP-relayed response path.
 The telemetry task's UDP socket also listens on
 `CONFIG_TINYLINK_STATS_PORT` (27822) and answers any datagram from a
 100.64.0.0/10 source with one JSON line built from
-`tinylink_get_stats()` (uptime, reset reason, heap, NTP, control/DERP state, public
-endpoint, WG counters: rekeys, cold handshakes, RX-stale events, roams,
-TX drops, relay). `echo | nc -u -w1 <tailnet-ip> 27822`.
+`tinylink_get_stats()` (`stats_json.h`): uptime, reset reason, boot
+counters, heap (`heap_free`, `heap_min` = lowest free heap since boot
+from `esp_get_minimum_free_heap_size()`, `heap_largest` = largest free
+block), NTP, control/DERP state, public endpoint, WG counters (rekeys,
+cold handshakes, RX-stale events, roams, TX drops, relay).
+`echo | nc -u -w1 <tailnet-ip> 27822`.
+
+`boots` (1.3.2) = `{total, brownout, panic, task_wdt, int_wdt}`: a
+28-byte record in RTC no-init memory (`RTC_NOINIT_ATTR`,
+`tl_bootstat.h`), counted once per boot from `esp_reset_reason()` by
+`tinylink_bootstat_record()` (first thing in `bringup()`). RTC slow
+memory survives every reset except a power loss, so the counters span
+boots since the last power-on; a magic + FNV-1a checksum restarts the
+record from zero when it holds power-on garbage, a torn write or another
+layout (the boot log then says "RTC record restarted"). `total` counts
+every boot, this one included; the other four count the boots that
+followed that kind of reset (software restarts, RTC WDT and other
+reasons only add to `total`).
+
+The reply is formatted into a static `TL_STATS_JSON_CAP` (896 B) buffer
+and is not sent at all if it would be truncated. Worst case 862 B —
+every counter at its type's widest value, a 63-char hostname and a
+63-char DERP host — checked by `tools/test/test_stats.c`; 1.3.1's line
+peaked at 721 B in 768 B, which the new fields (+135 B) no longer fit.
+About 600 B on the sensor.
 
 ## MapResponse parsing (M15, 2026-09)
 
@@ -680,10 +702,10 @@ exists in every build — with `CONFIG_TINYLINK_TELEMETRY_ENABLE=n` it
 only re-probes and does the 60-s housekeeping. `tinylink_tlm` is spawned
 by `tinylink_stun_reprobe_start` at the end of bringup (retried every
 30 s on NO_MEM) and starts sampling on the first netmap. Its stack,
-from the `entry` frames: `telemetry_task` 80 B, then `tlm_wait` 448 B
+from the `entry` frames: `telemetry_task` 80 B, then `tlm_wait` 464 B
 (`/stats` reply), `tlm_sample` 224 B (telemetry datagram) or
 `tinylink_stun_reprobe_poll` 32 B + `tinylink_stun_probe` 176 B; every
-path stands ≥ 192 B shallower than in 1.3.1 (one 688-B frame then), and
+path stands ≥ 176 B shallower than in 1.3.1 (one 688-B frame then), and
 the STUN path (~1.8 KB on its own task) ≈ 1.9 KB here, well under the
 `/stats`/sample paths (≈ 3.3 KB, ≤ 1.3.1's measured 3.5 KB peak). A
 GOT_IP wakes the loop at once, except while `select()` serves `/stats`:

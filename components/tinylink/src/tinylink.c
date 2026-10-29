@@ -12,6 +12,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 
+#include "esp_attr.h"
 #include "esp_event.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
@@ -44,6 +45,7 @@
 #include "stun.h"
 #include "stun_probe.h"
 #include "telemetry.h"
+#include "tl_bootstat.h"
 #include "ts2021_client.h"
 #include "wg_dataplane.h"
 #include "wg_netif.h"
@@ -1639,14 +1641,44 @@ esp_err_t tinylink_time_start(void)
     return (err != ESP_OK) ? err : serr;
 }
 
+/* Boot counters (/stats, 1.3.2). RTC slow memory survives every reset
+ * but a power loss and is never cleared by the startup code; the record
+ * validates itself (tl_bootstat.h). Light sleep keeps RTC slow memory
+ * powered because it is in use (.rtc.force_slow already was). */
+static RTC_NOINIT_ATTR tl_bootstat_t s_bootstat;
+static bool                          s_bootstat_done;
+
+_Static_assert(TL_RST_PANIC == ESP_RST_PANIC && TL_RST_INT_WDT == ESP_RST_INT_WDT &&
+               TL_RST_TASK_WDT == ESP_RST_TASK_WDT && TL_RST_BROWNOUT == ESP_RST_BROWNOUT,
+               "tl_bootstat.h reset-reason values drifted from esp_reset_reason_t");
+
+void tinylink_bootstat_record(void)
+{
+    if (s_bootstat_done) return;
+    s_bootstat_done = true;
+    const bool kept = tl_bootstat_count(&s_bootstat, (int)esp_reset_reason());
+    ESP_LOGI(TAG, "boots=%u (brown-out %u, panic %u, task WDT %u, int WDT %u)%s",
+             (unsigned)s_bootstat.boots, (unsigned)s_bootstat.brownout,
+             (unsigned)s_bootstat.panic, (unsigned)s_bootstat.task_wdt,
+             (unsigned)s_bootstat.int_wdt,
+             kept ? "" : " — RTC record restarted");
+}
+
 void tinylink_get_stats(tinylink_stats_t *out)
 {
     if (out == NULL) return;
+    tinylink_bootstat_record();
     memset(out, 0, sizeof(*out));
     const int64_t now = esp_timer_get_time();
     out->uptime_s     = (uint32_t)(now / 1000000LL);
     out->reset_reason = (int)esp_reset_reason();
+    out->boots          = s_bootstat.boots;
+    out->boots_brownout = s_bootstat.brownout;
+    out->boots_panic    = s_bootstat.panic;
+    out->boots_task_wdt = s_bootstat.task_wdt;
+    out->boots_int_wdt  = s_bootstat.int_wdt;
     out->heap_free    = (uint32_t)esp_get_free_heap_size();
+    out->heap_min     = (uint32_t)esp_get_minimum_free_heap_size();
     out->heap_largest = (uint32_t)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT);
     out->ntp_synced   = tl_time_synced();
     out->control_open = s_conn_open;

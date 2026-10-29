@@ -109,11 +109,20 @@ esp_err_t tinylink_time_start(void);
 
 /* Read-only runtime snapshot, served as JSON by the telemetry task's
  * /stats responder (CONFIG_TINYLINK_STATS_PORT) and usable from any
- * task. All counters are since boot. */
+ * task. All counters are since boot, except boots*. */
 typedef struct {
     uint32_t uptime_s;
     int      reset_reason;           /* esp_reset_reason_t of this boot */
+    /* Boot counters (RTC no-init memory, tl_bootstat.h): boots since the
+     * record last restarted — normally the last power-on — this one
+     * included, and how many followed each kind of reset. */
+    uint32_t boots;
+    uint32_t boots_brownout;
+    uint32_t boots_panic;
+    uint32_t boots_task_wdt;
+    uint32_t boots_int_wdt;
     uint32_t heap_free;
+    uint32_t heap_min;               /* lowest heap_free since boot */
     uint32_t heap_largest;
     bool     ntp_synced;
     /* control plane */
@@ -142,6 +151,12 @@ typedef struct {
 } tinylink_stats_t;
 
 void tinylink_get_stats(tinylink_stats_t *out);
+
+/* Count this boot in the RTC boot counters (by esp_reset_reason()) and
+ * log them. Call first thing in app_main, before anything that can
+ * reset again, so a boot that dies early still records why the previous
+ * one ended. Idempotent; tinylink_get_stats calls it too. */
+void tinylink_bootstat_record(void);
 
 /* Load the persisted TAI64N floor from NVS namespace "tl_state" key
  * "tai_floor" (default 0 on first ever boot), pre-reserve a 1-day
