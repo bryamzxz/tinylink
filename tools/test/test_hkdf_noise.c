@@ -139,6 +139,36 @@ int main(void) {
     uint8_t one[1] = {0x42};
     fails += run_case("varied-ck/1byte-in", ck3, one, 1);
 
+    /* Independent vectors (Python hmac + hashlib.blake2s, the Noise §4.3
+     * definition) for case 3 and for an empty input: all three outputs,
+     * so noise_hkdf3's third slot is pinned too (round 1.3.3, C9, made it
+     * reuse the extract instead of recomputing it). */
+    {
+        static const char *want3[2][3] = {
+            { "340c4fa9a336071b0dcaf792946cf8c3fcb1cea3bce93ad404d19516a3ab313f",
+              "6769c3ac81c9036758c3ab1c6da5cdccf43196cd99e4e2480fb7d12ba6306b00",
+              "32762d5ea6adf65b065ff208781220814af8728e6c478fe491e4129f41eb86e0" },
+            { "c4031a65073884c1ee3094ef57720a4ad05bbdfd4f51ef0a150db10145608960",
+              "07a103b7b2ff9421d6219650b89381f476bceff8be0dc357a93502a2264da166",
+              "cb264ae611d7765b3c57eac3e38666eb34fe9faafdcc5fcfd5df66cac5c46bf9" },
+        };
+        for (int v = 0; v < 2; v++) {
+            uint8_t o[3][32], w[32];
+            int bad = noise_hkdf3(ck3, in3, v == 0 ? sizeof(in3) : 0, o[0], o[1], o[2]) != 0;
+            for (int j = 0; j < 3; j++) {
+                for (int i = 0; i < 32; i++) {
+                    unsigned b;
+                    sscanf(want3[v][j] + 2 * i, "%2x", &b);
+                    w[i] = (uint8_t)b;
+                }
+                bad |= memcmp(o[j], w, 32) != 0;
+            }
+            printf("[%s/hkdf3 vs python hmac-blake2s] %s\n",
+                   v == 0 ? "varied-ck/varied-in" : "varied-ck/empty-in", bad ? "FAIL" : "OK");
+            fails += bad;
+        }
+    }
+
     if (fails == 0) printf("\nALL OK\n");
     return fails ? 1 : 0;
 }
