@@ -3,11 +3,12 @@
 //
 // Placement attribute for the per-packet crypto hot path. With
 // CONFIG_TINYLINK_CRYPTO_IN_IRAM the ChaCha20 / Poly1305 / AEAD glue live
-// in IRAM (≈3.7 KiB of the ~56 KiB unused), so a packet that arrives after
-// TLS / WiFi code evicted them from the 32 KiB flash cache does not pay
-// ~225 CPU cycles per 32-byte line to refill. On by default since the
-// cold numbers of CONFIG_TINYLINK_BENCH_AEAD (Kconfig help); the Noise
-// (ts2021) records share the same AEAD since 1.3.2. Host builds: no-op.
+// in IRAM (≈4.3 KiB of the ~56 KiB unused; 1.3.3's ChaCha20 is 0.8 KiB
+// larger), so a packet that arrives after TLS / WiFi code evicted them
+// from the 32 KiB flash cache does not pay ~225 CPU cycles per 32-byte
+// line to refill. On by default since the cold numbers of
+// CONFIG_TINYLINK_BENCH_AEAD (Kconfig help); the Noise (ts2021) records
+// share the same AEAD since 1.3.2. Host builds: no-op.
 
 #pragma once
 

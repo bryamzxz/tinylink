@@ -21,7 +21,7 @@ menu "tinylink core"
         default y
         help
             Marks chacha20(), poly1305 blocks/update/finish and the AEAD
-            glue IRAM_ATTR (3.6 KiB of the ~56 KiB free IRAM). Removes the
+            glue IRAM_ATTR (4.3 KiB of the ~56 KiB free IRAM). Removes the
             flash-cache refill cost (~225 CPU cycles per 32-byte line)
             when TLS/WiFi code has evicted the crypto between packets.
             Measured 2026-09-04 with TINYLINK_BENCH_AEAD's cold variant
@@ -30,13 +30,17 @@ menu "tinylink core"
             move (385 us / 31.6 us). Off only if IRAM runs short.
 
     config TINYLINK_BENCH_AEAD
-        bool "Run ChaCha20-Poly1305 AEAD micro-benchmark on boot"
+        bool "Run ChaCha20-Poly1305 AEAD and X25519 micro-benchmarks on boot"
         default n
         help
-            When y, bringup() calls tinylink_bench_aead() once after
-            tinylink_init() and before register, printing µs/call,
-            MB/s and ns/byte for 64B and 1500B payloads. Used as the
-            baseline against which crypto micro-optimizations are
-            measured. Off by default; opt-in for perf work.
+            When y, bringup() calls tinylink_bench_aead() and
+            tinylink_bench_x25519() once after tinylink_init() and
+            before register. AEAD: RFC 8439 KAT (aligned and unaligned
+            buffers), µs/call, MB/s and ns/byte for 64B and 1500B
+            payloads, hot and cold cache, raw ChaCha20 per MTU. X25519:
+            RFC 7748 KAT, µs per scalarmult, CCOUNT spread over eight
+            scalar/point pairs. Used as the baseline against which crypto
+            micro-optimizations are measured. Off by default; opt-in for
+            perf work.
 
 endmenu

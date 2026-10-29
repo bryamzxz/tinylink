@@ -24,7 +24,7 @@ CRYPTO  := ../../components/tinylink/src/crypto
 TL_SRC  := ../../components/tinylink/src
 TL_INC  := ../../components/tinylink/include
 
-TARGETS := test_blake2s test_curve25519 test_mapresp \
+TARGETS := test_blake2s test_curve25519 test_x25519 test_mapresp \
            test_chacha20 test_poly1305 test_chacha20poly1305 \
            test_hkdf_noise test_wg_handshake test_wg_transport \
            test_wg_demux test_wg_timers test_disco test_stun test_tls_io test_derp \
@@ -84,16 +84,24 @@ test_tai64n: test_tai64n.c $(TL_SRC)/wg_proto.c $(TL_SRC)/wg_proto.h
 # 1.3.2 nacl_box.c runs on the in-tree poly1305-donna on target too, so
 # the host build is the firmware's code path (no mbedTLS shim).
 test_nacl_box: test_nacl_box.c $(CRYPTO)/nacl_box.c $(CRYPTO)/salsa20.c $(CRYPTO)/poly1305_donna.c \
-               $(CRYPTO)/curve25519.c $(CRYPTO)/curve25519_donna.c $(CRYPTO)/secure_zero.h
+               $(CRYPTO)/curve25519.c $(CRYPTO)/curve25519_fiat32.c $(CRYPTO)/secure_zero.h
 	$(CC) $(CFLAGS) -I$(CRYPTO) -o $@ test_nacl_box.c $(CRYPTO)/nacl_box.c \
 	    $(CRYPTO)/salsa20.c $(CRYPTO)/poly1305_donna.c $(CRYPTO)/curve25519.c \
-	    $(CRYPTO)/curve25519_donna.c
+	    $(CRYPTO)/curve25519_fiat32.c
 
 test_blake2s: test_blake2s.c $(CRYPTO)/blake2s.c $(CRYPTO)/blake2s.h
 	$(CC) $(CFLAGS) -I$(CRYPTO) -o $@ test_blake2s.c $(CRYPTO)/blake2s.c
 
-test_curve25519: test_curve25519.c $(CRYPTO)/curve25519.c $(CRYPTO)/curve25519_donna.c $(CRYPTO)/curve25519.h
-	$(CC) $(CFLAGS) -I$(CRYPTO) -o $@ test_curve25519.c $(CRYPTO)/curve25519.c $(CRYPTO)/curve25519_donna.c
+test_curve25519: test_curve25519.c $(CRYPTO)/curve25519.c $(CRYPTO)/curve25519_fiat32.c $(CRYPTO)/curve25519.h
+	$(CC) $(CFLAGS) -I$(CRYPTO) -o $@ test_curve25519.c $(CRYPTO)/curve25519.c $(CRYPTO)/curve25519_fiat32.c
+
+# X25519 on the round-1.3.3 field (C6): RFC 7748 iterated vector, 4 000
+# cross-checks against curve25519-donna (ref/, the pre-1.3.3 X25519),
+# the carry-free field ops against a mod-p reference. Includes
+# curve25519_fiat32.c itself to reach the static field functions.
+test_x25519: test_x25519.c $(CRYPTO)/curve25519_fiat32.c $(CRYPTO)/curve25519.c \
+             $(CRYPTO)/curve25519.h ref/curve25519_donna.c
+	$(CC) $(CFLAGS) -I$(CRYPTO) -o $@ test_x25519.c $(CRYPTO)/curve25519.c ref/curve25519_donna.c
 
 # mapreq.c builds on host because its ESP-IDF-specific code is guarded
 # by #ifdef ESP_PLATFORM; the mapresp_parse() entry point we test here
@@ -101,9 +109,12 @@ test_curve25519: test_curve25519.c $(CRYPTO)/curve25519.c $(CRYPTO)/curve25519_d
 test_mapresp: test_mapresp.c $(TL_SRC)/mapreq.c $(TL_SRC)/netmap.h $(TL_SRC)/jsmn.h $(TL_SRC)/jsmn_split.h
 	$(CC) $(CFLAGS) -I$(TL_SRC) -o $@ test_mapresp.c $(TL_SRC)/mapreq.c
 
-# RFC 8439 §2.4.2 — ChaCha20 keystream KAT.
-test_chacha20: test_chacha20.c $(CRYPTO)/chacha20.c $(CRYPTO)/chacha20.h
-	$(CC) $(CFLAGS) -I$(CRYPTO) -o $@ test_chacha20.c $(CRYPTO)/chacha20.c
+# RFC 8439 §2.3.2 / §2.4.2 / A.1 / A.2 + HChaCha20 KATs, and a
+# differential test against the 1.3.2 ChaCha20 (ref/chacha20_132.c,
+# linked as ref_* through ref/chacha20_ref.c) — round 1.3.3, C4.
+test_chacha20: test_chacha20.c $(CRYPTO)/chacha20.c $(CRYPTO)/chacha20.h \
+               ref/chacha20_ref.c ref/chacha20_132.c
+	$(CC) $(CFLAGS) -I$(CRYPTO) -o $@ test_chacha20.c $(CRYPTO)/chacha20.c ref/chacha20_ref.c
 
 # RFC 8439 §2.5.2 — poly1305-donna one-time-MAC KAT.
 test_poly1305: test_poly1305.c $(CRYPTO)/poly1305_donna.c $(CRYPTO)/poly1305_donna.h $(CRYPTO)/poly1305_donna_32.h
@@ -130,7 +141,7 @@ test_hkdf_noise: test_hkdf_noise.c \
 # against gen_noise_vectors.py (OpenSSL) and an in-file responder.
 # host_include/ supplies esp_err.h / esp_log.h.
 NOISE_SRCS := $(TL_SRC)/noise_ik.c $(CRYPTO)/blake2s.c $(CRYPTO)/hkdf_blake2s.c \
-              $(CRYPTO)/curve25519.c $(CRYPTO)/curve25519_donna.c \
+              $(CRYPTO)/curve25519.c $(CRYPTO)/curve25519_fiat32.c \
               $(CRYPTO)/chacha20poly1305.c $(CRYPTO)/chacha20.c $(CRYPTO)/poly1305_donna.c
 test_noise_ik: test_noise_ik.c $(NOISE_SRCS) $(TL_SRC)/noise_ik.h $(CRYPTO)/secure_zero.h \
                host_include/esp_err.h host_include/esp_log.h
@@ -143,12 +154,12 @@ test_noise_ik: test_noise_ik.c $(NOISE_SRCS) $(TL_SRC)/noise_ik.h $(CRYPTO)/secu
 test_wg_handshake: test_wg_handshake.c \
                   $(TL_SRC)/wg_handshake.c $(TL_SRC)/wg_handshake.h \
                   $(TL_SRC)/wg_proto.c $(TL_SRC)/wg_proto.h \
-                  $(CRYPTO)/blake2s.c $(CRYPTO)/curve25519.c $(CRYPTO)/curve25519_donna.c \
+                  $(CRYPTO)/blake2s.c $(CRYPTO)/curve25519.c $(CRYPTO)/curve25519_fiat32.c \
                   $(CRYPTO)/hkdf_blake2s.c $(CRYPTO)/chacha20.c \
                   $(CRYPTO)/poly1305_donna.c $(CRYPTO)/chacha20poly1305.c
 	$(CC) $(CFLAGS) -I$(TL_SRC) -I$(CRYPTO) -o $@ test_wg_handshake.c \
 	    $(TL_SRC)/wg_handshake.c $(TL_SRC)/wg_proto.c \
-	    $(CRYPTO)/blake2s.c $(CRYPTO)/curve25519.c $(CRYPTO)/curve25519_donna.c \
+	    $(CRYPTO)/blake2s.c $(CRYPTO)/curve25519.c $(CRYPTO)/curve25519_fiat32.c \
 	    $(CRYPTO)/hkdf_blake2s.c $(CRYPTO)/chacha20.c \
 	    $(CRYPTO)/poly1305_donna.c $(CRYPTO)/chacha20poly1305.c
 
@@ -165,11 +176,11 @@ test_wg_timers: test_wg_timers.c $(TL_SRC)/wg_timers.h
 test_disco: test_disco.c \
             $(TL_SRC)/disco.c $(TL_SRC)/disco.h \
             $(CRYPTO)/nacl_box.c $(CRYPTO)/nacl_box.h \
-            $(CRYPTO)/curve25519.c $(CRYPTO)/curve25519_donna.c $(CRYPTO)/salsa20.c \
+            $(CRYPTO)/curve25519.c $(CRYPTO)/curve25519_fiat32.c $(CRYPTO)/salsa20.c \
             $(CRYPTO)/poly1305_donna.c
 	$(CC) $(CFLAGS) -I$(TL_SRC) -I$(CRYPTO) -o $@ \
 	    test_disco.c $(TL_SRC)/disco.c \
-	    $(CRYPTO)/nacl_box.c $(CRYPTO)/curve25519.c $(CRYPTO)/curve25519_donna.c $(CRYPTO)/salsa20.c \
+	    $(CRYPTO)/nacl_box.c $(CRYPTO)/curve25519.c $(CRYPTO)/curve25519_fiat32.c $(CRYPTO)/salsa20.c \
 	    $(CRYPTO)/poly1305_donna.c
 
 # STUN binding client (RFC 5389) — public-endpoint discovery for
@@ -193,12 +204,12 @@ test_disco_handler: test_disco_handler.c \
                     $(TL_SRC)/disco_handler.c $(TL_SRC)/disco_handler.h \
                     $(TL_SRC)/disco.c $(TL_SRC)/disco.h \
                     $(CRYPTO)/nacl_box.c $(CRYPTO)/nacl_box.h \
-                    $(CRYPTO)/curve25519.c $(CRYPTO)/curve25519_donna.c $(CRYPTO)/salsa20.c \
+                    $(CRYPTO)/curve25519.c $(CRYPTO)/curve25519_fiat32.c $(CRYPTO)/salsa20.c \
                     $(CRYPTO)/poly1305_donna.c
 	$(CC) $(CFLAGS) -I$(TL_SRC) -I$(CRYPTO) -o $@ \
 	    test_disco_handler.c \
 	    $(TL_SRC)/disco_handler.c $(TL_SRC)/disco.c \
-	    $(CRYPTO)/nacl_box.c $(CRYPTO)/curve25519.c $(CRYPTO)/curve25519_donna.c $(CRYPTO)/salsa20.c \
+	    $(CRYPTO)/nacl_box.c $(CRYPTO)/curve25519.c $(CRYPTO)/curve25519_fiat32.c $(CRYPTO)/salsa20.c \
 	    $(CRYPTO)/poly1305_donna.c
 
 # DISCO outbound prober (M3 step 3) — tx-id table that binds inbound
@@ -220,12 +231,12 @@ test_derp: test_derp.c \
            $(TL_SRC)/derp.c $(TL_SRC)/derp.h \
            $(TL_SRC)/tls_io.c $(TL_SRC)/tls_io.h \
            $(CRYPTO)/nacl_box.c $(CRYPTO)/nacl_box.h \
-           $(CRYPTO)/curve25519.c $(CRYPTO)/curve25519_donna.c $(CRYPTO)/salsa20.c \
+           $(CRYPTO)/curve25519.c $(CRYPTO)/curve25519_fiat32.c $(CRYPTO)/salsa20.c \
            $(CRYPTO)/poly1305_donna.c \
            host_include/mbedtls/ssl.h
 	$(CC) $(CFLAGS) -I$(TL_SRC) -I$(CRYPTO) -Ihost_include -o $@ \
 	    test_derp.c $(TL_SRC)/derp.c $(TL_SRC)/tls_io.c \
-	    $(CRYPTO)/nacl_box.c $(CRYPTO)/curve25519.c $(CRYPTO)/curve25519_donna.c $(CRYPTO)/salsa20.c \
+	    $(CRYPTO)/nacl_box.c $(CRYPTO)/curve25519.c $(CRYPTO)/curve25519_fiat32.c $(CRYPTO)/salsa20.c \
 	    $(CRYPTO)/poly1305_donna.c
 
 # HTTP/2 Retry-After header parser (RFC 7231 §7.1.3 delta-seconds).
@@ -296,14 +307,16 @@ mbedtls-ref: test_aead_mbedtls test_noise_ik_mbedtls
 # purpose: the vendored curve25519-donna does `limb << n` on negative
 # 64-bit limbs (curve25519_donna.c:226 and friends), which C11 calls
 # undefined but GCC documents as two's-complement (and every KAT
-# confirms); flagging it would only hide real findings. Always rebuilds
+# confirms); flagging it would only hide real findings. Donna is only
+# the X25519 test oracle since round 1.3.3 (ref/curve25519_donna.c).
+# Always rebuilds
 # from clean so stale unsanitized binaries can't slip through.
 asan:
 	$(MAKE) clean
 	$(MAKE) EXTRA_CFLAGS='-g -O1 -fno-omit-frame-pointer -fsanitize=address,undefined -fno-sanitize=shift-base -fno-sanitize-recover=all' test
 	$(MAKE) clean
 
-test: test_blake2s.run test_curve25519.run test_mapresp.run \
+test: test_blake2s.run test_curve25519.run test_x25519.run test_mapresp.run \
       test_chacha20.run test_poly1305.run test_chacha20poly1305.run \
       test_hkdf_noise.run test_wg_handshake.run test_wg_transport.run \
       test_wg_demux.run test_wg_timers.run test_disco.run test_stun.run test_tls_io.run \
@@ -324,6 +337,9 @@ test_blake2s.run: test_blake2s
 
 test_curve25519.run: test_curve25519
 	$(RUNNER) ./test_curve25519
+
+test_x25519.run: test_x25519
+	$(RUNNER) ./test_x25519
 
 test_mapresp.run: test_mapresp
 	$(RUNNER) ./test_mapresp

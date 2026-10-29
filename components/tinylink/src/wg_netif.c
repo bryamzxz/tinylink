@@ -197,9 +197,10 @@ static const char *TAG = "wg_netif";
  * 8 KiB has comfortable headroom for the deepest path (handle_disco_direct
  * → disco_handle_recv → disco_open → NaCl box_open with curve25519/salsa20
  * crypto on the stack → disco_seal → sendto into WiFi TX). Since round
- * 1.3.2 (B10) the cached-K branch seals with K and never reaches
- * curve25519_donna (2.7 KiB frame); the uncached fallback, the INIT
- * build and the path-stale prepunch still do. */
+ * 1.3.2 (B10) the cached-K branch seals with K and never reaches X25519;
+ * the uncached fallback, the INIT build and the path-stale prepunch
+ * still do (since 1.3.3 curve25519_fiat32: 848 B frame + 160 B for the
+ * field multiply under it; donna's frame was 2.7 KiB). */
 #define WG_RX_TASK_STACK_BYTES 8192
 #define WG_RX_TASK_PRIO        (tskIDLE_PRIORITY + 3)
 
@@ -1095,7 +1096,7 @@ static void handle_disco_direct_snap(const uint8_t *buf, size_t len,
 
     /* Hot path: use the cached shared K if available — both the open
      * and the Pong seal skip X25519 + HSalsa20 (B10: ~20 ms → ~50 µs per
-     * direct ping, and no donna frame on this stack). The snapshot holds
+     * direct ping, and no X25519 frame on this stack). The snapshot holds
      * K and the DiscoKey it was derived from together (both swapped under
      * g.lock by wg_netif_update_peer_keys), and the pre-AEAD gate above
      * already dropped any other sender. Falls back to the per-frame
@@ -1944,7 +1945,7 @@ esp_err_t wg_netif_update_peer_keys(const uint8_t static_pub[WG_KEY_LEN],
     /* X25519 + HSalsa20 for the new DISCO shared key runs here, in the
      * caller's task (the long-poll task, 24 KiB stack) and outside both
      * locks, so neither the swap nor wg_rx waits ~20 ms on it
-     * (curve25519_donna is also a 2.7 KiB frame). */
+     * (X25519 also needs ~1 KiB of stack; 2.7 KiB before 1.3.3). */
     uint8_t k[WG_KEY_LEN];
     bool    k_ok = false;
     if (disco_pub != NULL) {

@@ -31,7 +31,7 @@ idf_component_register(
         "src/telemetry.c"
         "src/crypto/blake2s.c"
         "src/crypto/curve25519.c"
-        "src/crypto/curve25519_donna.c"
+        "src/crypto/curve25519_fiat32.c"
         "src/crypto/hkdf_blake2s.c"
         "src/crypto/salsa20.c"
         "src/crypto/nacl_box.c"
@@ -64,8 +64,9 @@ idf_component_register(
 # (CONFIG_COMPILER_OPTIMIZATION_SIZE); a source-level COMPILE_OPTIONS
 # lands after the target's flags, so -O2 wins for these files only:
 #  - crypto/*: the IRAM AEAD (every WG packet and Noise record), X25519
-#    (WG / DISCO / Noise handshakes, 20 ms each), BLAKE2s + HKDF, XSalsa20
-#    + NaCl box (DISCO, DERP login);
+#    (WG / DISCO / Noise handshakes, 2.4 M instructions each since 1.3.3,
+#    20 ms under donna), BLAKE2s + HKDF, XSalsa20 + NaCl box (DISCO, DERP
+#    login);
 #  - the WireGuard data plane and handshake: wg_netif, wg_lwip,
 #    wg_transport, wg_demux (per packet), wg_handshake, wg_proto;
 #  - DISCO (disco, disco_handler, disco_prober — on wg_rx) and the DERP
@@ -88,7 +89,7 @@ idf_component_register(
 set_property(SOURCE
         "src/crypto/blake2s.c"
         "src/crypto/curve25519.c"
-        "src/crypto/curve25519_donna.c"
+        "src/crypto/curve25519_fiat32.c"
         "src/crypto/hkdf_blake2s.c"
         "src/crypto/salsa20.c"
         "src/crypto/nacl_box.c"

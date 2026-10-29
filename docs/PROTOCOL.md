@@ -38,17 +38,17 @@ honest. None of it is official Tailscale documentation — see the published
 | Primitive           | Used by             | Source              | Why                                |
 |---------------------|---------------------|---------------------|------------------------------------|
 | ChaCha20-Poly1305   | Noise IK, WG, DERP  | mbedTLS (HW-accel)  | ESP32 has accelerator; same impl   |
-| Curve25519 (X25519) | Noise IK, WG        | vendored placeholder | constant-time required (see below) |
+| Curve25519 (X25519) | Noise IK, WG        | vendored fiat-crypto | constant-time required (see below) |
 | BLAKE2s             | Noise IK            | vendored RFC 7693   | small, simple, no IDF builtin      |
 | HMAC-BLAKE2s + HKDF | Noise IK            | vendored            | Noise §4.3 KDF                     |
 | TLS 1.2/1.3         | ts2021, DERP        | mbedTLS             | already linked                     |
 | Salsa20 / XSalsa20  | NaCl-box (DISCO)    | vendored            | tiny dep                           |
 | Poly1305            | NaCl-box auth tag   | mbedTLS             | already linked                     |
 
-> The `curve25519.c` shipped today is **TweetNaCl-derived, not constant-time
-> donna**. It is *designed* to be constant-time but is not as carefully
-> audited as the canonical donna implementation. For production use, swap
-> with `trombik/esp_wireguard`'s `src/crypto/x25519.c`. See
+> X25519 is fiat-crypto's formally verified 32-bit Curve25519
+> (`crypto/curve25519_fiat32.c`, round 1.3.3) with a carry-free field
+> multiplication, so the Xtensa build has no secret-dependent branch;
+> the TweetNaCl-derived and then donna versions came before it. See
 > [`SECURITY-MODEL.md`](SECURITY-MODEL.md).
 
 ## ts2021 (M1)

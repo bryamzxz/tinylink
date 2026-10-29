@@ -79,23 +79,29 @@ requested low (observed 2026-10-28: Linux raises both on open before
 pyserial can drop them, and the CH340 auto-reset circuit turns that into
 an EN pulse), so a capture starts from a fresh boot.
 
-## Benchmarking AEAD
+## Benchmarking AEAD and X25519
 
-The ChaCha20-Poly1305 hot path has an opt-in micro-benchmark that runs
-once on boot, prints µs/call + ns/B + MB/s for 64 B and 1500 B payloads
-(encrypt and decrypt), and verifies a round-trip before reporting any
-numbers.
+The ChaCha20-Poly1305 hot path and X25519 have an opt-in micro-benchmark
+that runs once on boot. AEAD (`bench-aead`): the RFC 8439 §2.8.2 KAT on
+word-aligned and unaligned buffers, a 1500 B round trip, then µs/call +
+ns/B + MB/s for 64 B and 1500 B payloads (encrypt and decrypt, hot and
+cold cache) and raw ChaCha20 per MTU. X25519 (`bench-x25519`, round
+1.3.3): the RFC 7748 §5.2 KAT — the only on-device check of the field
+multiplication's Xtensa asm — µs per scalarmult, and the CCOUNT cycle
+spread over eight scalar/point pairs (a timing probe: the code has no
+secret-dependent branch, the multiplier's latency is undocumented). No
+number is reported if a KAT fails.
 
 Enable, build, flash, capture:
 
 ```bash
 idf.py menuconfig             # tinylink core → Run ChaCha20-Poly1305 AEAD
-                              # micro-benchmark on boot → y
+                              # and X25519 micro-benchmarks on boot → y
 idf.py build
 idf.py -p /dev/ttyUSB0 flash
-python tools/serial_capture.py --port /dev/ttyUSB0 --duration 30 \
+python tools/serial_capture.py --port /dev/ttyUSB0 --duration 40 \
     --out /tmp/bench.log
-grep "bench-aead" /tmp/bench.log
+grep -E "bench-(aead|x25519)" /tmp/bench.log
 ```
 
 The bench fires after `tinylink_init()` returns and before
