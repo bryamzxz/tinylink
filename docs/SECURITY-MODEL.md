@@ -318,13 +318,14 @@ threat-model record; the commit-level detail lives in `CHANGELOG.md`.
 
 Done (host KATs in `tools/test`, run in CI plain and under ASan/UBSan):
 RFC 7693 BLAKE2s, RFC 7748 X25519, RFC 8439 ChaCha20 / Poly1305 /
-AEAD, the WireGuard handshake transcript, DISCO / STUN / DERP codecs.
+AEAD (incl. Appendix A.3 / A.5), the WireGuard handshake transcript,
+the ts2021 Noise IK transcript (`test_noise_ik`: handshake + transport
+records against an OpenSSL-based generator and an in-file responder;
+`make mbedtls-ref` re-runs it on the pre-1.3.2 mbedTLS-chachapoly
+`noise_ik.c`), DISCO / STUN / DERP codecs.
 
 Still open:
 
-- The ts2021 Noise IK transcript (`noise_ik.c`) end-to-end on the host —
-  today it is validated only by the live control plane accepting the
-  handshake.
 - Cross-check `TS2021_VERIFY` markers in
   `components/tinylink/src/ts2021_client.c` against the live Tailscale
   control plane source (see `PROTOCOL.md` for the exact files).
@@ -336,17 +337,22 @@ Distilled from the protocol research artifact §L.
 - **Validate peer public keys.** RFC 7748 §5 lists low-order points that,
   if accepted, leak your private key. The `curve25519_scalarmult` call
   rejects all-zero outputs in constant time; do not bypass that check.
-- **Nonce uniqueness across two AEAD contexts.** ts2021 (LE64 counter)
+- **Nonce uniqueness across two AEAD contexts.** ts2021 (4 zero bytes
+  || BE64 counter — Tailscale controlbase, not the Noise spec's LE64)
   and DISCO (24-byte random) have different nonce schemes. Force a
   rekey on every boot by zeroing all transport keys at startup; never
   reuse a counter across reboots.
 - **Secret-key scrubbing — sweep COMPLETE.** Every site that holds
-  secret key material now zeroes it with `tl_secure_zero` (a
-  `volatile`-pointer scrub the optimizer cannot elide), not plain
-  `memset`. This covers the WG session keys (`wg_netif.c`), the WG
-  handshake DH / chaining / tau / derived keys and `wg_handshake_scrub`
-  (`wg_handshake.c`), and the AEAD/KDF scratch in `salsa20.c`,
-  `hkdf_blake2s.c`, and `chacha20poly1305.c`. Public, non-secret values
+  secret key material now zeroes it with `tl_secure_zero` (memset plus
+  an empty asm that takes the buffer as input and clobbers memory — the
+  optimizer cannot elide it; inlined, so it runs from IRAM in the AEAD),
+  not plain `memset`. This covers the WG session keys and the decrypted
+  RX plaintext (`wg_netif.c`), the WG handshake DH / chaining / tau /
+  derived keys and `wg_handshake_scrub` (`wg_handshake.c`,
+  `wg_proto.c`), the Noise IK chaining key / k / DH outputs
+  (`noise_ik.c`), the NaCl-box shared key / keystream / Poly1305 state
+  (`nacl_box.c`), and the AEAD/KDF scratch in `salsa20.c`,
+  `hkdf_blake2s.c`, `blake2s.c` and `chacha20poly1305.c`. Public, non-secret values
   (nonces, timestamps, on-wire message buffers) deliberately keep plain
   `memset` — scrubbing them buys nothing. The earlier state where WG
   session/handshake keys were torn down with a dead-code-eliminable

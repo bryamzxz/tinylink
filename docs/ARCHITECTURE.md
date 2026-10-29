@@ -574,15 +574,16 @@ The original M1-only layout, kept for historical reference:
 |     salsa20.c        — Salsa20 / HSalsa20 / XSalsa20           |
 |     nacl_box.c       — crypto_box / crypto_box_open            |
 |     secure_zero.h    — tl_secure_zero scrubs ALL secret key    |
-|                        material (39 sites: wg session/handshake|
-|                        keys, salsa20, hkdf, chachapoly); public|
+|                        material (63 sites: wg session/handshake|
+|                        keys, noise, nacl box, salsa20, hkdf,   |
+|                        blake2s, chachapoly); public            |
 |                        nonces/timestamps keep plain memset     |
 +----------------------------------------------------------------+
         │
         ▼
 +------------- ESP-IDF v5.5 ------------------------------------+
 |  wifi / lwIP                                                  |
-|  esp_tls + mbedtls (ChaCha20-Poly1305, Poly1305, X.509 bundle)|
+|  esp_tls + mbedtls (AES-GCM TLS, X.509 bundle; no ChaCha/Poly)|
 |  cJSON                                                        |
 |  nvs_flash                                                    |
 +---------------------------------------------------------------+
@@ -629,7 +630,7 @@ sizes once M1–M5 are all landed.
 
 | Component                                                    | Flash KB |
 |--------------------------------------------------------------|----------|
-| mbedTLS minimal preset + chachapoly + curve25519 + bundle    | 250      |
+| mbedTLS minimal preset + curve25519 + bundle (no chachapoly) | 250      |
 | nghttp2 (espressif/nghttp managed component)                 | 60       |
 | lwIP + WiFi + FreeRTOS                                       | 180      |
 | In-tree WireGuard data plane (wg_netif + wg_lwip + wg_*.c)   | 40       |
