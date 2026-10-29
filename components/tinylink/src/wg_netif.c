@@ -1110,6 +1110,19 @@ static int64_t rx_next_deadline_us(void)
     return d;
 }
 
+/* The next RX wait in ms. Planned from a fresh clock read, not the
+ * iteration's `now`: the iteration may have spent ~0.3 s in a path-stale
+ * prepunch (one X25519 per ping) since. noinline keeps its locals off
+ * rx_task's frame, the base of every wg_rx call chain. */
+static __attribute__((noinline)) uint32_t rx_plan_wait_ms(void)
+{
+    xSemaphoreTake(g.hs_lock, portMAX_DELAY);
+    const int64_t deadline = rx_next_deadline_us();
+    xSemaphoreGive(g.hs_lock);
+    return wg_recv_timeout_ms(now_us(), deadline, WG_RX_MAX_WAIT_MS,
+                              portTICK_PERIOD_MS);
+}
+
 /* RX task: blocks on recvfrom, classifies, dispatches. */
 static void rx_task(void *arg)
 {
@@ -1134,10 +1147,10 @@ static void rx_task(void *arg)
         socklen_t srclen = sizeof(src);
         ssize_t n = recvfrom(g.sock, buf, sizeof(buf), 0,
                              (struct sockaddr *)&src, &srclen);
-        /* One clock read per iteration for the WDT, the stamps and the
-         * timers below (B21; was ~12 esp_timer reads). Packet handling
-         * may run ~40 ms of handshake crypto first; a stale `now` only
-         * makes a timer fire that much later. */
+        /* One clock read for the WDT, the stamps and the timers below
+         * (B21; was ~12 esp_timer reads, now this + the wait plan).
+         * Packet handling may run ~40 ms of handshake crypto first; a
+         * stale `now` only makes a timer fire that much later. */
         const int64_t now = now_us();
         wdt_feed_throttled(now, &last_feed_us);
         if (n < 0) {
@@ -1405,12 +1418,7 @@ retry_timer:;
         /* Sleep until the next timer deadline (B7). Until 1.3.1 the
          * wait was a fixed 1-s tick, so a REKEY_TIMEOUT retry fired 5–6 s
          * after its INIT. setsockopt only when the value changes. */
-        xSemaphoreTake(g.hs_lock, portMAX_DELAY);
-        const int64_t deadline = rx_next_deadline_us();
-        xSemaphoreGive(g.hs_lock);
-        const uint32_t want_ms = wg_recv_timeout_ms(now, deadline,
-                                                    WG_RX_MAX_WAIT_MS,
-                                                    portTICK_PERIOD_MS);
+        const uint32_t want_ms = rx_plan_wait_ms();
         if (want_ms != rcv_ms) {
             rcv_ms = want_ms;
             tv.tv_sec  = rcv_ms / 1000;
