@@ -404,7 +404,7 @@ static esp_err_t register_node(bool force_auth)
         reg_hint_store(false);
     }
 
-    /* Keep the conn on success: since M5-2c the nghttp2 session is
+    /* Keep the conn on success: since M5-2c the HTTP/2 session is
      * persistent per ts2021 conn, so the next request (the boot-time
      * endpoint push, then the map stream — or, on the in-place
      * re-register path, the push the long-poll runs right after) rides

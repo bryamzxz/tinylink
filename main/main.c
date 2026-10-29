@@ -226,10 +226,10 @@ static esp_err_t bringup(void)
     }
 #endif
 
-    /* Long-poll FIRST so its TLS conn + nghttp2 session land on a
-     * fresh heap. The long-poll task runs at priority IDLE+4 (higher
-     * than this bringup task) so it preempts here and starts its
-     * handshake immediately. */
+    /* Long-poll FIRST so its TLS conn lands on a fresh heap (the
+     * HTTP/2 session needs none since 1.3.4). The long-poll task runs
+     * at priority IDLE+4 (higher than this bringup task) so it preempts
+     * here and starts its handshake immediately. */
     err = tinylink_long_poll_start();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "long-poll start failed: 0x%x", err);

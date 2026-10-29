@@ -4,7 +4,7 @@
 // Control-plane rate limiting (capver 147, tailscale 29cfb0b4c):
 // Retry-After parsing and the "how long to wait" decision for
 // /machine/register and /machine/map. Header-only so the host test
-// target can exercise it without nghttp2 / esp-tls.
+// target can exercise it without esp-tls.
 
 #pragma once
 

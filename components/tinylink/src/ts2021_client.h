@@ -21,8 +21,7 @@
 #include "esp_err.h"
 #include "esp_tls.h"
 
-#include "nghttp2/nghttp2.h"
-
+#include "h2_core.h"
 #include "noise_ik.h"
 #include "tinylink.h"  /* TINYLINK_CAPVER — single source of truth */
 
@@ -79,52 +78,42 @@ typedef struct {
     /* (Round 1.3.4, D5: the 4 077-B `rx_residual` copy is gone. The
      * HTTP/2 bytes that follow the Noise handshake — after the optional
      * EarlyPayload — stay in h2_rx below as the window
-     * [h2_rx_off, h2_rx_len), which recv_cb drains before it reads the
-     * next record.) */
+     * [h2_rx_off, h2_rx_len), parsed before the first request.) */
 
     /* ---- Persistent HTTP/2 session state (M5 step 2c) ----
      *
-     * The session is created once by h2_session_init() at the end of
-     * ts2021_connect (when only the long-poll TLS conn is alive and
-     * ~24 KiB of contiguous heap is still available) and torn down by
-     * h2_session_destroy() at the start of ts2021_close. This avoids
-     * the per-request session_client_new/del cycle that returned
-     * NGHTTP2_ERR_NOMEM (-901) once a second TLS conn (the DERP
-     * supervisor) had fragmented the heap.
-     *
-     * All h2_* fields below live in this struct so the nghttp2
-     * callbacks (which receive `ts2021_conn_t *` as user_data) can
-     * persist state across requests without heap allocs. */
-    nghttp2_session *h2;
+     * One session per ts2021 conn, started by h2_session_init() at the
+     * end of ts2021_connect and dropped by h2_session_destroy() in
+     * ts2021_close; requests run on it one after the other (register,
+     * endpoint push, then the map stream). Since round 1.3.4 (D1) it is
+     * the in-tree engine (h2_core.h), embedded here — no heap: the
+     * nghttp2 session (10–14 KiB, plus a 16 KiB send chunk) had to be
+     * allocated while the heap was still unfragmented, which is why it
+     * was created at connect time. */
+    h2_core_t        h2;
     bool             h2_goaway;          /* server sent GOAWAY → reconnect */
 
-    /* Decrypted-Noise plaintext ring fed into nghttp2's recv_cb. Lives
-     * in BSS via the file-scope ts2021_conn_t in tinylink.c — one Noise
-     * record plus the up-to-4 EarlyPayload magic bytes that
-     * consume_early_payload may have to put back in front of a record
-     * (round 1.3.4, D5): TS2021_MAX_MESSAGE ≥ 4 077 + 4. */
+    /* The record ring: each Noise record is decrypted into it and the
+     * engine parses it where it lies; a request is built in it between
+     * records (h2_io_tx_buf). Lives in BSS via the file-scope
+     * ts2021_conn_t in tinylink.c — one Noise record plus the up-to-4
+     * EarlyPayload magic bytes that consume_early_payload may have to
+     * put back in front of a record (round 1.3.4, D5):
+     * TS2021_MAX_MESSAGE ≥ 4 080 + 4. */
     uint8_t  h2_rx[TS2021_MAX_MESSAGE];
     size_t   h2_rx_len;
     size_t   h2_rx_off;
 
-    /* One-shot permission token for h2_recv_cb. Set by h2_drive_request
-     * before each session_recv; recv_cb consumes it on the first refill
-     * and returns NGHTTP2_ERR_WOULDBLOCK on subsequent ones so
-     * session_recv unwinds and queued outbound frames (notably
-     * SETTINGS_ACK) flush. Without this the server's idle timeout
-     * (~31 s) closes us before we send ACK. */
-    bool     h2_may_refill;
-
-    /* Body cursor for the in-flight POST. Cleared after each request. */
+    /* Body of the in-flight POST (borrowed). Cleared after each request. */
     const uint8_t *h2_req_body;
     size_t         h2_req_body_len;
-    size_t         h2_req_body_off;
 
-    /* Response status + per-stream tracking, written by the nghttp2
-     * callbacks. Cleared at the start of each h2_drive_request. */
+    /* Response status + stream outcome, written by the engine hooks
+     * (h2_client.c). Cleared at the start of each request.
+     * h2_stream_error is the HTTP/2 code the stream closed with (0 = a
+     * normal end). */
     int      h2_status;
     int32_t  h2_stream_id;
-    bool     h2_stream_closed;
     int      h2_stream_error;
 
     /* Retry-After of the current response (capver 147): `present` =

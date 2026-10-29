@@ -246,7 +246,7 @@ static esp_err_t recv_record_plaintext(ts2021_conn_t *c,
  * Records are read into the conn's h2_rx ring and consumed byte-wise.
  * Whatever is left once the header (and any JSON) is dealt with stays
  * there as the window [h2_rx_off, h2_rx_len) — the first HTTP/2 bytes,
- * which recv_cb hands to nghttp2 before it reads another record. Until
+ * which the HTTP/2 layer parses before it reads another record. Until
  * round 1.3.4 (D5) that tail was copied into a second 4 077-B buffer,
  * `rx_residual`. */
 
@@ -491,13 +491,9 @@ esp_err_t ts2021_connect(ts2021_conn_t *out,
      * flush can ride ts2021_send (which guards on c->connected). */
     out->connected = true;
 
-    /* Allocate the persistent nghttp2 session NOW, while only this
-     * (long-poll) TLS conn is alive and the heap still has a single
-     * contiguous ~24 KiB block. nghttp2_session_client_new2 wants
-     * ~10–14 KiB in one malloc; if we deferred this until first
-     * request, a second TLS conn (DERP supervisor) could already
-     * have fragmented the heap and the call would return -901
-     * NGHTTP2_ERR_NOMEM. */
+    /* Start the HTTP/2 session: client preface + SETTINGS (no heap since
+     * round 1.3.4, D1 — the nghttp2 session it replaced needed a
+     * 10–14 KiB block, which is why this runs at connect time). */
     if (h2_session_init(out) != ESP_OK) {
         ESP_LOGE(TAG, "h2_session_init failed");
         ts2021_close(out);
@@ -544,9 +540,9 @@ esp_err_t ts2021_recv(ts2021_conn_t *c,
 void ts2021_close(ts2021_conn_t *c)
 {
     if (c == NULL) return;
-    /* Free the persistent H2 session BEFORE the TLS context: nghttp2
-     * may call into our send_cb during shutdown (RST_STREAM/GOAWAY
-     * frames it had queued), and that path dereferences c->tls. */
+    /* Drop the H2 session before the TLS context (it sends nothing on
+     * the way out; the order is kept so it never could touch a destroyed
+     * TLS context). */
     h2_session_destroy(c);
     if (c->tls != NULL) {
         esp_tls_conn_destroy(c->tls);

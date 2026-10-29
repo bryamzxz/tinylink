@@ -1,35 +1,38 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Bryam (bryamzxz)
 //
-// Persistent HTTP/2 client over a ts2021 Noise channel. The session is
-// owned by ts2021_conn_t and lives across multiple requests so the
-// ~10-14 KiB nghttp2 session alloc happens exactly once when the
-// long-poll TLS conn is fresh and the heap is unfragmented.
+// Persistent HTTP/2 client over a ts2021 Noise channel. Since round
+// 1.3.4 (D1) it runs on the in-tree engine (h2_core.c + hpack.c) instead
+// of nghttp2: no heap at all (nghttp2 took a 10–14 KiB session plus a
+// 16 KiB send chunk per connect), 0 B of Huffman tables to speak of
+// (nghttp2: 16 KB), and every received record is parsed where it lies in
+// conn->h2_rx. The engine state lives in ts2021_conn_t (BSS). This file
+// binds the engine's hooks to the conn, and keeps the request loop and
+// the error mapping callers rely on (see h2_drive_request).
 
 #include "h2_client.h"
 
+#include <stdio.h>
 #include <string.h>
 #include <time.h>
 
 #include "esp_log.h"
-#include "nghttp2/nghttp2.h"
 
+#include "h2_core.h"
 #include "h2_retry_after.h"
 #include "tl_time.h"
 #include "ts2021_client.h"
 
 static const char *TAG = "h2";
 
-/* Reset per-request fields on conn before a new submit_request. Keeps
- * session-wide state (h2, h2_goaway) intact. */
+/* Reset per-request fields on conn before a new request. Keeps
+ * session-wide state (the engine, h2_goaway) intact. */
 static void h2_request_reset(ts2021_conn_t *conn)
 {
     conn->h2_req_body      = NULL;
     conn->h2_req_body_len  = 0;
-    conn->h2_req_body_off  = 0;
     conn->h2_status        = 0;
     conn->h2_stream_id     = -1;
-    conn->h2_stream_closed = false;
     conn->h2_stream_error  = 0;
     conn->h2_retry_after_s = 0;
     conn->h2_retry_after_present = false;
@@ -40,140 +43,76 @@ static void h2_request_reset(ts2021_conn_t *conn)
     conn->h2_cb            = NULL;
     conn->h2_cb_ctx        = NULL;
     conn->h2_cb_stop       = false;
-    /* h2_rx and h2_may_refill carry over: the recv ring may legitimately
-     * hold bytes from the previous request's tail that belong to a new
-     * SETTINGS update or PING from the server. */
+    /* h2_rx carries over: it may hold the start of the server's stream
+     * (ts2021_connect) — parsed before the next request goes out. */
 }
 
-/* nghttp2 -> network. nghttp2 hands us framed HTTP/2 bytes; we wrap them
- * in a Noise transport record and send through ts2021. */
-static ssize_t send_cb(nghttp2_session *session, const uint8_t *data,
-                       size_t length, int flags, void *user_data)
-{
-    (void)session; (void)flags;
-    ts2021_conn_t *conn = (ts2021_conn_t *)user_data;
+/* ---- h2_core hooks ---------------------------------------------------- */
 
-    /* ts2021_send caps at TS2021_RECORD_PLAINTEXT_MAX per record. Chunk. */
-    size_t off = 0;
-    while (off < length) {
-        size_t take = length - off;
-        if (take > TS2021_RECORD_PLAINTEXT_MAX) {
-            take = TS2021_RECORD_PLAINTEXT_MAX;
-        }
-        if (ts2021_send(conn, data + off, take) != ESP_OK) {
-            return NGHTTP2_ERR_CALLBACK_FAILURE;
-        }
-        off += take;
-    }
-    return (ssize_t)length;
+/* Control frames (preface, SETTINGS / ACK, PING ACK, WINDOW_UPDATE,
+ * RST_STREAM, GOAWAY): one Noise record. */
+int h2_io_send(void *io, const uint8_t *buf, size_t len)
+{
+    return ts2021_send((ts2021_conn_t *)io, buf, len) == ESP_OK ? 0 : -1;
 }
 
-/* Network -> nghttp2. Cooperative non-blocking: refilling from the
- * network is gated on conn->h2_may_refill so session_recv unwinds when
- * we've already pulled one record this iteration, letting queued
- * outbound (e.g. SETTINGS_ACK) flush via session_send. */
-static ssize_t recv_cb(nghttp2_session *session, uint8_t *buf,
-                       size_t length, int flags, void *user_data)
+/* A request (pending control frames, HEADERS, DATA) is built in the
+ * record ring: the engine only asks between records, when every byte in
+ * it has been parsed, and it is one record long. */
+uint8_t *h2_io_tx_buf(void *io, size_t *cap)
 {
-    (void)session; (void)flags;
-    ts2021_conn_t *conn = (ts2021_conn_t *)user_data;
-
-    /* Drain any plaintext already buffered from a prior refill. */
-    if (conn->h2_rx_off < conn->h2_rx_len) {
-        size_t avail = conn->h2_rx_len - conn->h2_rx_off;
-        size_t take = (length < avail) ? length : avail;
-        memcpy(buf, conn->h2_rx + conn->h2_rx_off, take);
-        conn->h2_rx_off += take;
-        return (ssize_t)take;
-    }
-
-    if (!conn->h2_may_refill) {
-        return NGHTTP2_ERR_WOULDBLOCK;
-    }
-    conn->h2_may_refill = false;
-
-    size_t got = 0;
-    if (ts2021_recv(conn, conn->h2_rx, sizeof(conn->h2_rx), &got) != ESP_OK) {
-        return NGHTTP2_ERR_CALLBACK_FAILURE;
-    }
-    conn->h2_rx_len = got;
-    conn->h2_rx_off = 0;
-    if (got == 0) {
-        return NGHTTP2_ERR_WOULDBLOCK;
-    }
-    size_t take = (length < got) ? length : got;
-    memcpy(buf, conn->h2_rx, take);
-    conn->h2_rx_off = take;
-    return (ssize_t)take;
+    ts2021_conn_t *c = (ts2021_conn_t *)io;
+    c->h2_rx_off = 0;
+    c->h2_rx_len = 0;
+    *cap = TS2021_RECORD_PLAINTEXT_MAX;
+    return c->h2_rx;
 }
 
-/* Body provider for the outgoing POST. */
-static ssize_t data_provider_read(nghttp2_session *session, int32_t stream_id,
-                                  uint8_t *buf, size_t length,
-                                  uint32_t *data_flags,
-                                  nghttp2_data_source *source, void *user_data)
+int h2_io_tx_send(void *io, size_t len)
 {
-    (void)session; (void)stream_id; (void)source;
-    ts2021_conn_t *conn = (ts2021_conn_t *)user_data;
-
-    size_t remaining = conn->h2_req_body_len - conn->h2_req_body_off;
-    size_t take = (length < remaining) ? length : remaining;
-    if (take > 0) {
-        memcpy(buf, conn->h2_req_body + conn->h2_req_body_off, take);
-        conn->h2_req_body_off += take;
-    }
-    if (conn->h2_req_body_off >= conn->h2_req_body_len) {
-        *data_flags |= NGHTTP2_DATA_FLAG_EOF;
-    }
-    return (ssize_t)take;
+    ts2021_conn_t *c = (ts2021_conn_t *)io;
+    return ts2021_send(c, c->h2_rx, len) == ESP_OK ? 0 : -1;
 }
 
-static int header_cb(nghttp2_session *session, const nghttp2_frame *frame,
-                     const uint8_t *name, size_t namelen,
-                     const uint8_t *value, size_t valuelen,
-                     uint8_t flags, void *user_data)
+void h2_io_on_status(void *io, int status)
 {
-    (void)session; (void)flags;
-    ts2021_conn_t *conn = (ts2021_conn_t *)user_data;
-
-    if (frame->hd.type != NGHTTP2_HEADERS ||
-        frame->headers.cat != NGHTTP2_HCAT_RESPONSE) {
-        return 0;
-    }
-    if (namelen == 7 && memcmp(name, ":status", 7) == 0) {
-        char status_str[8] = {0};
-        size_t copy = (valuelen < sizeof(status_str) - 1)
-                       ? valuelen : sizeof(status_str) - 1;
-        memcpy(status_str, value, copy);
-        conn->h2_status = atoi(status_str);
-    } else if (namelen == 11 && memcmp(name, "retry-after", 11) == 0) {
-        /* HTTP/2 normalizes header names to lowercase (RFC 7540 §8.1.2),
-         * so an exact match is sufficient. Captured unconditionally;
-         * h2_rate_limit_wait_ms decides whether the status makes it a
-         * rate limit. An HTTP-date needs a real clock, so `now` is only
-         * passed once SNTP has synced. */
-        conn->h2_retry_after_present = valuelen > 0;
-        conn->h2_retry_after_s = h2_parse_retry_after_seconds(
-            value, valuelen, tl_time_synced() ? (int64_t)time(NULL) : 0);
-    }
-    return 0;
+    ((ts2021_conn_t *)io)->h2_status = status;
 }
 
-static int data_chunk_cb(nghttp2_session *session, uint8_t flags,
-                         int32_t stream_id, const uint8_t *data,
-                         size_t len, void *user_data)
+void h2_io_on_header(void *io, const hpack_field_t *f)
 {
-    (void)session; (void)flags; (void)stream_id;
-    ts2021_conn_t *conn = (ts2021_conn_t *)user_data;
+    ts2021_conn_t *conn = (ts2021_conn_t *)io;
+    /* HTTP/2 field names are lowercase (RFC 9113 §8.2.1; the engine
+     * resets the stream on an uppercase one), so an exact match is
+     * enough. Captured unconditionally; h2_rate_limit_wait_ms decides
+     * whether the status makes it a rate limit. An HTTP-date needs a
+     * real clock, so `now` is only passed once SNTP has synced. A value
+     * longer than the decoder's capture (64 B, more than any valid
+     * Retry-After) counts as present but invalid. */
+    if (f->name_total == 11 && memcmp(f->name, "retry-after", 11) == 0) {
+        conn->h2_retry_after_present = f->value_total > 0;
+        conn->h2_retry_after_s = (f->flags & HPACK_F_VALUE_CUT) ? 0
+            : h2_parse_retry_after_seconds(f->value, f->value_len,
+                                           tl_time_synced() ? (int64_t)time(NULL) : 0);
+    }
+}
+
+int h2_io_on_data(void *io, const uint8_t *data, size_t len)
+{
+    ts2021_conn_t *conn = (ts2021_conn_t *)io;
 
     if (conn->h2_cb != NULL) {
-        int rc = conn->h2_cb(data, len, conn->h2_cb_ctx);
-        if (rc < 0) {
+        /* A negative return stops the stream: the engine delivers no
+         * more DATA and h2_drive_request returns. */
+        if (conn->h2_cb(data, len, conn->h2_cb_ctx) < 0) {
             conn->h2_cb_stop = true;
+            return -1;
         }
         return 0;
     }
 
+    /* One-shot: collect up to the cap, latch the overflow and keep
+     * consuming (register.c refuses to parse a truncated body). */
     if (conn->h2_resp_len + len > conn->h2_resp_cap) {
         size_t take = conn->h2_resp_cap - conn->h2_resp_len;
         if (take > 0) {
@@ -188,140 +127,50 @@ static int data_chunk_cb(nghttp2_session *session, uint8_t flags,
     return 0;
 }
 
-static int stream_close_cb(nghttp2_session *session, int32_t stream_id,
-                           uint32_t error_code, void *user_data)
+/* GOAWAY: the server is done with the conn; we must reconnect after the
+ * current stream finishes. */
+void h2_io_on_goaway(void *io, uint32_t last_stream_id, uint32_t error_code)
 {
-    (void)session;
-    ts2021_conn_t *conn = (ts2021_conn_t *)user_data;
-    if (stream_id == conn->h2_stream_id) {
-        conn->h2_stream_closed = true;
-        conn->h2_stream_error = (int)error_code;
-    }
-    return 0;
+    ts2021_conn_t *conn = (ts2021_conn_t *)io;
+    conn->h2_goaway = true;
+    ESP_LOGW(TAG, "received GOAWAY (last_stream=%d, error=0x%x)",
+             (int)last_stream_id, (unsigned)error_code);
 }
 
-/* Frame-level recv hook: catches GOAWAY (server is done with the conn,
- * we must reconnect after the current stream finishes). */
-static int frame_recv_cb(nghttp2_session *session,
-                         const nghttp2_frame *frame, void *user_data)
-{
-    (void)session;
-    ts2021_conn_t *conn = (ts2021_conn_t *)user_data;
-
-    switch (frame->hd.type) {
-        case NGHTTP2_GOAWAY:
-            conn->h2_goaway = true;
-            ESP_LOGW(TAG, "received GOAWAY (last_stream=%d, error=0x%x)",
-                     frame->goaway.last_stream_id,
-                     (unsigned)frame->goaway.error_code);
-            break;
-        default:
-            break;
-    }
-    return 0;
-}
-
-static nghttp2_nv mknv(const char *name, const char *value)
-{
-    nghttp2_nv nv = {
-        .name      = (uint8_t *)name,
-        .value     = (uint8_t *)value,
-        .namelen   = strlen(name),
-        .valuelen  = strlen(value),
-        .flags     = NGHTTP2_NV_FLAG_NO_INDEX,
-    };
-    return nv;
-}
+/* ---- session ----------------------------------------------------------- */
 
 esp_err_t h2_session_init(ts2021_conn_t *conn)
 {
     if (conn == NULL) return ESP_ERR_INVALID_ARG;
 
-    /* Idempotent: if a prior session is still around, free it first. */
-    if (conn->h2 != NULL) {
-        nghttp2_session_del(conn->h2);
-        conn->h2 = NULL;
-    }
-    conn->h2_goaway          = false;
+    /* Idempotent: a second call starts a fresh session on the conn. */
+    conn->h2_goaway = false;
     /* h2_rx is NOT reset: ts2021_connect's consume_early_payload left
-     * the first HTTP/2 bytes there (round 1.3.4, D5 — they used to sit
-     * in a separate rx_residual buffer), and recv_cb drains them before
-     * it reads another record. */
-    conn->h2_may_refill      = false;
+     * the first HTTP/2 bytes there (round 1.3.4, D5); the first request
+     * parses them before it goes out. */
+    h2c_init(&conn->h2, conn);
 
-    nghttp2_session_callbacks *cbs = NULL;
-    if (nghttp2_session_callbacks_new(&cbs) != 0) return ESP_ERR_NO_MEM;
-    nghttp2_session_callbacks_set_send_callback(cbs, send_cb);
-    nghttp2_session_callbacks_set_recv_callback(cbs, recv_cb);
-    nghttp2_session_callbacks_set_on_header_callback(cbs, header_cb);
-    nghttp2_session_callbacks_set_on_data_chunk_recv_callback(cbs, data_chunk_cb);
-    nghttp2_session_callbacks_set_on_stream_close_callback(cbs, stream_close_cb);
-    nghttp2_session_callbacks_set_on_frame_recv_callback(cbs, frame_recv_cb);
-
-    /* Drop the HPACK encoder's dynamic table to zero: nghttp2 default
-     * is 4 KiB per side. We're a small client; header indexing buys
-     * nothing and saves ~4 KiB heap permanently. The peer is hinted via
-     * SETTINGS_HEADER_TABLE_SIZE=0 below. */
-    nghttp2_option *opt = NULL;
-    if (nghttp2_option_new(&opt) != 0) {
-        nghttp2_session_callbacks_del(cbs);
-        return ESP_ERR_NO_MEM;
-    }
-    nghttp2_option_set_max_deflate_dynamic_table_size(opt, 0);
-
-    int rc = nghttp2_session_client_new2(&conn->h2, cbs, conn, opt);
-    nghttp2_option_del(opt);
-    nghttp2_session_callbacks_del(cbs);
-    if (rc != 0) {
-        ESP_LOGE(TAG, "session_client_new: %d", rc);
-        conn->h2 = NULL;
-        return ESP_FAIL;
-    }
-
-    /* Tell the peer we won't index headers either: it can stop holding
-     * its 4 KiB encoder dynamic table. ENABLE_PUSH=0 disables server
-     * push (we never PUSH_PROMISE-handle). */
-    const nghttp2_settings_entry settings[] = {
-        { NGHTTP2_SETTINGS_HEADER_TABLE_SIZE, 0 },
-        { NGHTTP2_SETTINGS_ENABLE_PUSH, 0 },
-    };
-    rc = nghttp2_submit_settings(conn->h2, NGHTTP2_FLAG_NONE, settings,
-                                 sizeof(settings) / sizeof(settings[0]));
-    if (rc != 0) {
-        ESP_LOGE(TAG, "submit_settings: %d", rc);
-        nghttp2_session_del(conn->h2);
-        conn->h2 = NULL;
-        return ESP_FAIL;
-    }
-
-    /* Flush the client preface + our SETTINGS now, and return WITHOUT
-     * waiting for the server's SETTINGS or its ACK of ours (round 1.3.2,
-     * B9 — the old pump spent one full RTT here on every control
-     * connect). RFC 9113 §3.4 lets a client send requests right after
-     * its preface, and the upstream client does exactly that (x/net
-     * http2.Transport writes preface, SETTINGS, WINDOW_UPDATE and then
-     * the first request; it only waits for the server's SETTINGS for
-     * extended CONNECT). Nothing tinylink sends depends on the server's
-     * values: our bodies (< 2 KiB) fit the default 64 KiB windows and
-     * 16 KiB frames, and nghttp2 applies whatever the server announces
-     * as soon as h2_drive_request's first session_recv reads it (and
-     * ACKs it from the same loop). The old worry — "the server might
-     * HPACK-index our response headers before seeing HEADER_TABLE_SIZE
-     * 0" — does not hold: the server reads our SETTINGS before our
-     * HEADERS on the same byte stream, and nghttp2's inflater keeps the
-     * default 4 KiB table until the server's ACK arrives (in order,
-     * before the response HEADERS: Go's write scheduler sends control
-     * frames first), after which the server's encoder must open its next
-     * header block with the size update — exactly as with the pump.
-     * Holds for both control planes: tailscale.com (x/net
-     * http2.Server.ServeConn) and headscale's net/http h2c front end
-     * (62714564), which waits for the client preface, then processes
-     * frames in order. */
-    int prc = nghttp2_session_send(conn->h2);
-    if (prc != 0) {
-        ESP_LOGE(TAG, "session_send during init: %d", prc);
-        nghttp2_session_del(conn->h2);
-        conn->h2 = NULL;
+    /* Send the client preface + our SETTINGS now (one record), and
+     * return WITHOUT waiting for the server's SETTINGS or its ACK of
+     * ours (round 1.3.2, B9 — the old pump spent one full RTT here on
+     * every control connect). RFC 9113 §3.4 lets a client send requests
+     * right after its preface, and the upstream client does exactly that
+     * (x/net http2.Transport writes preface, SETTINGS, WINDOW_UPDATE and
+     * then the first request; it only waits for the server's SETTINGS
+     * for extended CONNECT). Nothing tinylink sends depends on the
+     * server's values: our bodies (< 2 KiB) fit the default 64 KiB
+     * windows and 16 KiB frames, and the engine applies whatever the
+     * server announces as soon as the first request's loop reads it (and
+     * ACKs it from the same loop). HEADER_TABLE_SIZE 0 holds for every
+     * response: the server reads our SETTINGS before our HEADERS on the
+     * same byte stream, so each of its response header blocks is encoded
+     * for a 0-byte table (opening with the size update to 0); the decoder
+     * enforces 0 from the start (h2_core.c). Holds for both control
+     * planes: tailscale.com (x/net http2.Server.ServeConn) and headscale's
+     * net/http h2c front end (62714564), which waits for the client
+     * preface, then processes frames in order. */
+    if (h2c_start(&conn->h2) != H2C_OK) {
+        ESP_LOGE(TAG, "preface + SETTINGS send failed");
         return ESP_FAIL;
     }
     return ESP_OK;
@@ -330,22 +179,45 @@ esp_err_t h2_session_init(ts2021_conn_t *conn)
 void h2_session_destroy(ts2021_conn_t *conn)
 {
     if (conn == NULL) return;
-    if (conn->h2 != NULL) {
-        nghttp2_session_del(conn->h2);
-        conn->h2 = NULL;
-    }
-    conn->h2_goaway          = false;
-    conn->h2_rx_len          = 0;
-    conn->h2_rx_off          = 0;
+    /* Nothing to free and nothing sent: the conn is closed under it. */
+    conn->h2.started   = false;
+    conn->h2_goaway    = false;
+    conn->h2_rx_len    = 0;
+    conn->h2_rx_off    = 0;
 }
 
-/* Submit + drive one HTTP/2 request on the persistent session bound to
- * `conn`. Caller pre-fills h2_req_body / h2_resp_buf / h2_cb on conn. */
+/* Parse what h2_rx still holds (the connect's leftover HTTP/2 bytes).
+ * Its SETTINGS ACK rides in the request's record. */
+static int feed_pending(ts2021_conn_t *conn)
+{
+    if (conn->h2_rx_off >= conn->h2_rx_len) return H2C_OK;
+    const int rc = h2c_feed_staged(&conn->h2, conn->h2_rx + conn->h2_rx_off,
+                                   conn->h2_rx_len - conn->h2_rx_off);
+    conn->h2_rx_off = conn->h2_rx_len;
+    return rc;
+}
+
+/* One HTTP/2 request on the persistent session bound to `conn`. Caller
+ * pre-fills h2_req_body / h2_resp_buf / h2_cb on conn.
+ *
+ * Return mapping (the callers' contract, kept from the nghttp2 client):
+ *  - ESP_OK: the stream closed — normally, or reset by the server or by
+ *    us for a malformed response (h2_stream_error = the HTTP/2 code; no
+ *    final response means h2_status 0), or refused by a GOAWAY below its
+ *    ID (REFUSED_STREAM) — or the stream callback asked to stop;
+ *  - ESP_ERR_INVALID_STATE: no session, a GOAWAY arrived earlier, or one
+ *    arrived while the stream was still open (the caller reconnects);
+ *  - ESP_FAIL: the record layer failed (TLS error, EOF, the 120-s idle
+ *    budget, ts2021_abort_reads), or a connection-level protocol error
+ *    (GOAWAY sent). nghttp2 returned ESP_OK with whatever status it had
+ *    for the latter; every caller treats both as a failed exchange and
+ *    drops the conn. */
 static esp_err_t h2_drive_request(ts2021_conn_t *conn,
                                   const char *path, const char *authority,
                                   size_t body_len)
 {
-    if (conn->h2 == NULL) {
+    h2_core_t *h = &conn->h2;
+    if (!h->started || h->dead) {
         ESP_LOGE(TAG, "drive_request without active session");
         return ESP_ERR_INVALID_STATE;
     }
@@ -354,63 +226,62 @@ static esp_err_t h2_drive_request(ts2021_conn_t *conn,
          * this session. Caller (long-poll/register) will close + reopen. */
         return ESP_ERR_INVALID_STATE;
     }
+    /* The server's first bytes (SETTINGS, maybe a GOAWAY) may already be
+     * here: apply them before the request goes out. */
+    if (feed_pending(conn) != H2C_OK) {
+        ESP_LOGE(TAG, "connection error in the server preface");
+        return ESP_FAIL;
+    }
+    if (conn->h2_goaway) return ESP_ERR_INVALID_STATE;
 
     char content_length[16];
     snprintf(content_length, sizeof(content_length), "%u", (unsigned)body_len);
-
-    nghttp2_nv hdrs[] = {
-        mknv(":method",      "POST"),
-        mknv(":scheme",      "https"),
-        mknv(":path",        path),
-        mknv(":authority",   authority),
-        mknv("content-type", "application/json"),
-        mknv("content-length", content_length),
+    /* Same fields, same order as the nghttp2 client sent. */
+    const h2_field_t hdrs[] = {
+        { ":method",        "POST" },
+        { ":scheme",        "https" },
+        { ":path",          path },
+        { ":authority",     authority },
+        { "content-type",   "application/json" },
+        { "content-length", content_length },
     };
-    nghttp2_data_provider dp = {
-        .source.ptr   = NULL,
-        .read_callback = data_provider_read,
-    };
-    int32_t stream_id = nghttp2_submit_request(conn->h2, NULL,
-                                               hdrs,
-                                               sizeof(hdrs) / sizeof(hdrs[0]),
-                                               &dp, conn);
-    if (stream_id < 0) {
-        ESP_LOGE(TAG, "submit_request: %d", stream_id);
+    int rc = h2c_request(h, hdrs, sizeof(hdrs) / sizeof(hdrs[0]),
+                         conn->h2_req_body, body_len);
+    if (rc != H2C_OK) {
+        ESP_LOGE(TAG, "request send failed: %d", rc);
         return ESP_FAIL;
     }
-    conn->h2_stream_id = stream_id;
+    conn->h2_stream_id = (int32_t)h->s.id;
 
-    while (!conn->h2_stream_closed && !conn->h2_cb_stop) {
-        if (nghttp2_session_want_write(conn->h2)) {
-            int rc = nghttp2_session_send(conn->h2);
-            if (rc != 0) {
-                ESP_LOGE(TAG, "session_send: %d", rc);
-                return ESP_FAIL;
-            }
+    /* One Noise record per iteration: parse it, flush what it asked for
+     * (ACKs, WINDOW_UPDATEs — h2c_feed sends them before returning), then
+     * push more of the request body if the server opened its window. */
+    while (!h->s.closed && !h->s.stop) {
+        size_t got = 0;
+        if (ts2021_recv(conn, conn->h2_rx, sizeof(conn->h2_rx), &got) != ESP_OK) {
+            ESP_LOGE(TAG, "stream read failed (stream %d)", (int)conn->h2_stream_id);
+            return ESP_FAIL;
         }
-        if (!conn->h2_stream_closed && nghttp2_session_want_read(conn->h2)) {
-            conn->h2_may_refill = true;
-            int rc = nghttp2_session_recv(conn->h2);
-            if (rc != 0) {
-                ESP_LOGE(TAG, "session_recv: %d", rc);
-                return ESP_FAIL;
-            }
+        conn->h2_rx_len = got;
+        conn->h2_rx_off = 0;
+        rc = h2c_feed(h, conn->h2_rx, got);
+        conn->h2_rx_off = got;
+        if (rc == H2C_OK) rc = h2c_pump(h);
+        if (rc != H2C_OK) {
+            ESP_LOGE(TAG, "%s (stream %d)", rc == H2C_ERR_PROTO
+                         ? "protocol error from the server — GOAWAY sent"
+                         : "send failed", (int)conn->h2_stream_id);
+            return ESP_FAIL;
         }
-        if (conn->h2_goaway) {
-            /* GOAWAY detected mid-stream. Let the current stream finish
-             * if it's already closing, otherwise bail to caller for
-             * reconnection. */
-            if (!conn->h2_stream_closed) {
-                ESP_LOGW(TAG, "GOAWAY during in-flight stream %d",
-                         (int)conn->h2_stream_id);
-                return ESP_ERR_INVALID_STATE;
-            }
-        }
-        if (!nghttp2_session_want_read(conn->h2) &&
-            !nghttp2_session_want_write(conn->h2)) {
-            break;
+        if (conn->h2_goaway && !h->s.closed) {
+            /* GOAWAY with the stream still open: bail to the caller for
+             * reconnection (as with nghttp2). */
+            ESP_LOGW(TAG, "GOAWAY during in-flight stream %d",
+                     (int)conn->h2_stream_id);
+            return ESP_ERR_INVALID_STATE;
         }
     }
+    conn->h2_stream_error = (int)h->s.close_err;
 
     if (conn->h2_resp_overflow) {
         ESP_LOGW(TAG, "response truncated (status=%d)", conn->h2_status);
@@ -450,6 +321,7 @@ esp_err_t h2_post_json(ts2021_conn_t *conn,
      * caller's buffer. The session itself stays. */
     conn->h2_req_body = NULL;
     conn->h2_resp_buf = NULL;
+    conn->h2.s.body   = NULL;
     return err;
 }
 
@@ -478,5 +350,6 @@ esp_err_t h2_post_json_stream(ts2021_conn_t *conn,
     conn->h2_req_body = NULL;
     conn->h2_cb       = NULL;
     conn->h2_cb_ctx   = NULL;
+    conn->h2.s.body   = NULL;
     return err;
 }

@@ -1,21 +1,10 @@
 dependencies:
-  espressif/nghttp:
-    component_hash: e16db3335787c9104404d517236f2c98182038dd03227cacb78f614b5e7ba273
-    dependencies:
-    - name: idf
-      require: private
-      version: '>=5.0'
-    source:
-      registry_url: https://components.espressif.com/
-      type: service
-    version: 1.68.1
   idf:
     source:
       type: idf
     version: 5.5.6
 direct_dependencies:
-- espressif/nghttp
 - idf
-manifest_hash: 6422e82b51b65144eb39836a4a7f7b06c94b5d9b359d7f77a20524e2cc25215d
+manifest_hash: 8718c694afbbdf314c112b0ea9e4d2d45b4430e25cde4d09aff2875d899804a0
 target: esp32
 version: 2.0.0

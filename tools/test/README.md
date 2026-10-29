@@ -26,6 +26,13 @@ Every case prints `[name] OK`; every binary ends with `ALL OK` or
 `CFLAGS` carries `-Werror`; `EXTRA_CFLAGS` is appended for sanitizers or
 coverage without restating the base flags.
 
+The HTTP/2 interop pair (`test_h2_interop`, `test_h2_ref`) needs nghttp2
+on the host: the `espressif__nghttp` component the firmware used until
+1.3.4 (`make test NGHTTP2_COMPONENT=/path/to/espressif__nghttp`, compiled
+here, with the sanitizers under `make asan`), or the system library
+(`libnghttp2-dev` / `pkg-config libnghttp2`). Without either, `make
+test` prints a skip notice and runs everything else (53 fewer OK lines).
+
 ## Coverage
 
 | Binary                   | Exercises                                             | Vectors / oracle |
@@ -38,6 +45,9 @@ coverage without restating the base flags.
 | `test_chacha20poly1305`  | AEAD glue (`chacha20poly1305.c`)                      | RFC 8439 §2.8.2 (114 B: exercises the tail path) + A.5 |
 | `test_noise_ik`          | `noise_ik.c` ts2021 Noise IK handshake + transport records (BE64 nonce, tamper / replay / in-place) | OpenSSL-based `gen_noise_vectors.py` + in-file responder |
 | `test_ts2021`            | `ts2021_client.c` record layer after the handshake, over a fake esp_tls: the EarlyPayload skip and the HTTP/2 start kept in the record ring by offset (D5), magic bytes put back across records, rejects | synthetic + 2 000-case record-segmentation fuzz |
+| `test_hpack`             | `hpack.c` (D1): streaming decoder, canonical Huffman, dynamic table bounded by the advertised size, literal encoder | RFC 7541 C.1–C.6 (block / byte-by-byte / random splits, table sizes), every symbol vs an independent Appendix B table, §5.2 padding / EOS, malformed blocks, device table 0, round-trip fuzz vs an in-test encoder + table model, 200 000-block garbage fuzz |
+| `test_h2_core`           | `h2_core.c` (D1) against a scripted peer: exact preface / SETTINGS / request bytes, padding, CONTINUATION + its limit, WINDOW_UPDATE at half the window, window violations, request bodies held by small / negative server windows, PING / GOAWAY / RST_STREAM, nghttp2's response checks, every connection-error code | synthetic, every stream fed whole / byte by byte / at random splits; structured + garbage frame fuzz |
+| `test_h2_interop` / `test_h2_ref` | the firmware HTTP/2 stack (h2_client → h2_core → ts2021 records over Noise) / the 1.3.4 nghttp2 client (`ref/h2_134/`), same scenarios | **nghttp2's server** in memory: POST JSON, 429 / 503 + Retry-After, overflow latch, 100 KB stream through WINDOW_UPDATEs, server PING, GOAWAY mid-stream / refusing, RST, register → push → stream, tiny server window, padding, CONTINUATION, trailers, 1xx, EOF, callback stop. Needs nghttp2 (`NGHTTP2_COMPONENT=<espressif__nghttp dir>` or `pkg-config libnghttp2`), else skipped |
 | `test_hkdf_noise`        | `crypto/hkdf_blake2s.c` (HKDF, Noise §4.3 KDFs)       | cross-consistency |
 | `test_wg_handshake`      | `wg_proto.c`, `wg_handshake.c` (Noise IKpsk2 initiator) | upstream-derived transcript |
 | `test_wg_transport`      | `wg_transport.c` (RFC 6479 replay window, AEAD framing; 1.3.3 reserve / begin / open / commit split, every rekey / duplicate interleaving, pthread race test with the races forced) | synthetic + fuzz vs the old bit-wise window |

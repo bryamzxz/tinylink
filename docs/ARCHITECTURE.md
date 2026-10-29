@@ -703,7 +703,7 @@ sizes once M1–M5 are all landed.
 | Component                                                    | Flash KB |
 |--------------------------------------------------------------|----------|
 | mbedTLS minimal preset + curve25519 + bundle (no chachapoly) | 250      |
-| nghttp2 (espressif/nghttp managed component)                 | 60       |
+| HTTP/2 client, in-tree since 1.3.4 (was nghttp2, 60)         | 10       |
 | lwIP + WiFi + FreeRTOS                                       | 180      |
 | In-tree WireGuard data plane (wg_netif + wg_lwip + wg_*.c)   | 40       |
 | Vendored BLAKE2s + HKDF + Salsa20 + NaCl-box                 | 12       |

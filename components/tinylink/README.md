@@ -1,7 +1,8 @@
 # tinylink component
 
 The protocol implementation: control plane (ts2021 Noise IK over TLS,
-HTTP/2 via nghttp2, register + MapRequest long-poll), data plane
+HTTP/2 via the in-tree client `h2_core.c` / `hpack.c`, register +
+MapRequest long-poll), data plane
 (WireGuard on a single UDP socket, DISCO, STUN, DERP), the vendored
 constant-time crypto (`src/crypto/`), the lwIP raw-IP netif carrier and
 the TMP117 telemetry app.

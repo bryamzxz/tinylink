@@ -230,11 +230,11 @@ esp_err_t tinylink_long_poll_start(void);
  * and called wg_dataplane_start(), or until timeout_ms elapses.
  *
  * Used by main.c bringup to sequence the DERP supervisor AFTER the
- * long-poll has its TLS conn + nghttp2 session in steady state — if
+ * long-poll has its TLS conn + HTTP/2 session in steady state — if
  * supervised goes first, its alive TLS conn fragments the heap below
  * the contiguous block long-poll's mbedtls cert verify needs, and
  * long-poll repeatedly fails. Waiting for s_dataplane_started=true
- * means: TLS up, Noise IK done, h2 session allocated, first
+ * means: TLS up, Noise IK done, h2 session started, first
  * MapRequest fired, first netmap parsed, WG netif up, our HostInfo
  * (with PreferredDERP region) advertised to the control plane.
  *
