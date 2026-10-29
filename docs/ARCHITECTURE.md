@@ -30,6 +30,9 @@ primitives we did, see [`SECURITY-MODEL.md`](SECURITY-MODEL.md).
 |     app_nvs_init / app_wifi_start / app_wifi_wait_connected   |
 |     tinylink_init                                             |
 |     tinylink_wg_socket_init   ← bind WG UDP socket EARLY      |
+|     tinylink_derp_supervised_start ← spawn + connect the home |
+|                                  DERP now, parallel to the    |
+|                                  register (1.3.5)             |
 |     tinylink_stun_probe_start ← STUN probes via WG socket so  |
 |                                  advertised port == NAT map;  |
 |                                  own task, parallel to the    |
@@ -39,8 +42,7 @@ primitives we did, see [`SECURITY-MODEL.md`](SECURITY-MODEL.md).
 |                                  Stream=false + OmitPeers=true|
 |                                  lite update with WorkingUDP  |
 |     tinylink_long_poll_start  ← stream=true read-only poll    |
-|     tinylink_derp_supervised_start                            |
-|     tinylink_telemetry_start                                  |
+|     (telemetry: started by the first netmap)                  |
 |     (endpoint push: no task — flagged by the STUN reprobe,    |
 |      executed by the long-poll on its next reconnect)         |
 |     tinylink_stun_reprobe_start                               |
@@ -759,9 +761,9 @@ or a stack size changes.
 |--------------------|----------|---------|------------------------------------|------------------------------------------------------------|
 | `main`             | 8 KiB    | 1       | `CONFIG_ESP_MAIN_TASK_STACK_SIZE`  | bringup: WiFi, keys, register, dataplane (takes the STUN result), spawns; exits |
 | `tinylink_lp`      | 7 KiB    | IDLE+4  | `tinylink.c::tinylink_long_poll_start` | control conn: ts2021 connect, endpoint push, map long-poll, re-register, wedge restart |
-| `tinylink_derp`    | 10 KiB   | IDLE+3  | `tinylink.c::tinylink_derp_supervised_start` | DERP TLS session: relayed DISCO / WG inject, CMM punch |
+| `tinylink_derp`    | 8 KiB    | IDLE+3  | `tinylink.c::tinylink_derp_supervised_start` | DERP TLS session from boot (1.3.5: connects alongside the register): relayed DISCO / WG inject, CMM punch |
 | `wg_rx`            | 8 KiB    | IDLE+3  | `wg_netif.c::wg_netif_start`       | UDP recv, demux (WG/DISCO/STUN), handshake, decrypt → lwIP  |
-| `wg_tx`            | 7 KiB    | IDLE+2  | `wg_netif.c::wg_netif_start`       | encrypted-frame queue → `sendto` (direct) or DERP relay     |
+| `wg_tx`            | 5 KiB    | IDLE+2  | `wg_netif.c::wg_netif_init`        | encrypted-frame queue → `sendto` (direct) or DERP relay     |
 | `tinylink_stun`    | 5 KiB    | IDLE+2  | `tinylink.c::tinylink_stun_probe_start` | boot STUN probe on the WG socket while the register runs (1.3.5); exits after one probe (≤ 3 s + DNS) |
 | `tinylink_tlm`     | 4.5 KiB  | IDLE+2  | `telemetry.c::telemetry_task_start` | TMP117 sample → JSON → UDP over the tunnel; `/stats`; periodic / GOT_IP-triggered STUN re-probe (flags endpoint push); 60 s stack diag + NVS time floor |
 | `tiT` (lwIP)       | 4.5 KiB  | 18      | `CONFIG_LWIP_TCPIP_TASK_STACK_SIZE`| TCP/IP thread (raised 3 → 4.5 KiB in #104)                 |
@@ -804,8 +806,7 @@ y) and feeds once per loop iteration. Blocking TLS reads feed through
 the `tls_io` poll hook on every WANT_READ/WRITE poll — one 30-s
 `SO_RCVTIMEO` period — so the long-poll and the DERP supervisor feed
 at least every 30 s while idle; long sleeps (Retry-After, reconnect
-ladders, the DERP dataplane wait) go through `tl_wdt_sleep_ms` in 10-s
-slices. `tinylink_tlm` waits in ≤ 5-s slices and feeds on both sides of
+ladders) go through `tl_wdt_sleep_ms` in 10-s slices. `tinylink_tlm` waits in ≤ 5-s slices and feeds on both sides of
 a STUN re-probe, whose worst case (lwIP DNS 7 s × 3 servers + the 3-s
 response wait ≈ 24 s) fits the budget; the re-probe ran on an
 unsubscribed task before 1.3.2. Budget: `CONFIG_ESP_TASK_WDT_TIMEOUT_S=60`, the Kconfig maximum

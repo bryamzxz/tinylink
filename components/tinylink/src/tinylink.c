@@ -496,7 +496,9 @@ esp_err_t tinylink_dataplane_start(void)
 
 /* ---- long-poll MapRequest task ----------------------------------------- */
 
-static bool s_dataplane_started;
+/* Set by long_poll_handler (long-poll task) once the first netmap has
+ * started the data plane; read by the DERP task (handle_disco_relayed). */
+static volatile bool s_dataplane_started;
 
 /* ---- DERP smoke test (M5 step 2a) --------------------------------------
  *
@@ -542,13 +544,11 @@ esp_err_t tinylink_derp_smoke(void)
 /* ---- DERP supervised recv-loop task (M5 step 2b) -----------------------
  *
  * Long-running task: connect+login → run recv loop → close → backoff →
- * repeat. Coexists with the long-poll's TLS conn at steady state but
- * the second handshake competes with mbedtls cert-chain-verify heap,
- * so connect failures are logged and retried with backoff (not fatal).
- *
- * Recv events are currently logged only — wiring relayed WireGuard
- * packets back into wg_demux is M5 step 3 work (depends on DISCO peer
- * registration to know which DERP src maps to which peer index). */
+ * repeat, from boot (round 1.3.5: alongside the register, see
+ * derp_supervised_task). Connect failures are logged and retried with
+ * backoff (not fatal). Relayed frames: DISCO is answered / acted on
+ * here (handle_disco_relayed), WireGuard goes to wg_netif's inject path;
+ * wg_tx sends through it (tinylink_relay_via_derp). */
 
 #if CONFIG_TINYLINK_DERP_SUPERVISED
 
@@ -556,9 +556,9 @@ esp_err_t tinylink_derp_smoke(void)
  * src-pub prefix and slack. */
 #define DERP_SUP_FRAME_CAP 1600
 
-/* Single DERP client owned by the supervisor task. File-scope so
- * tinylink_derp_supervised_start can establish it synchronously
- * before the long-poll claims heap, then hand ownership to the task. */
+/* Single DERP client owned by the supervisor task. File-scope: wg_tx
+ * sends through it (tinylink_relay_via_derp) and the GOT_IP handler
+ * aborts its reads. */
 static derp_client_t s_derp_sup;
 
 /* Latest DERP host the supervisor should connect to. Populated from
@@ -567,9 +567,9 @@ static derp_client_t s_derp_sup;
  * advertise as our HomeDERP — peers send traffic to that region; if
  * we're connected elsewhere the relay can't route it.
  *
- * Initialized to the Kconfig fallback so the first connect attempt
- * (which races against the long-poll's first netmap) doesn't see an
- * empty string. Updated in-place from long_poll_handler each frame. */
+ * Initialized to the Kconfig host, a node of that region: the first
+ * connect runs at boot, before any netmap (round 1.3.5). Updated
+ * in-place from long_poll_handler each frame. */
 static char s_derp_host[TL_DERP_HOSTNAME_LEN] = CONFIG_TINYLINK_DERP_SMOKE_HOST;
 /* Bumped by update_derp_host_from_netmap on every host/port change; the
  * supervisor captures it at connect and its event callback stops the
@@ -819,6 +819,19 @@ static void send_disco_pings_to_cmm_endpoints(const derp_event_t *e)
 static void handle_disco_relayed(const derp_event_t *e,
                                  derp_sup_stats_t *st)
 {
+    /* Before the first netmap (the relay connects at boot since round
+     * 1.3.5) no peer is known, so no DISCO sender can be one: drop it
+     * unopened, like magicsock does for a DiscoKey outside its peer map
+     * — without paying the X25519 to open it (any DERP client that knows
+     * our NodeKey can send us frames), and without answering pings from,
+     * or punching the endpoints of, a node the gate below could not
+     * check yet. A WG frame goes on: wg_netif_inject_packet drops it
+     * until wg_netif_start has configured the peer. */
+    if (!s_dataplane_started && disco_looks_like(e->data, e->data_len)) {
+        ESP_LOGD(TAG, "relayed DISCO before the first netmap dropped");
+        return;
+    }
+
     uint8_t reply[DISCO_HANDLER_REPLY_MAX];
     disco_msg_type_t type = (disco_msg_type_t)0;
     uint8_t peer_disco_pub[DISCO_KEY_LEN] = {0};
@@ -837,8 +850,8 @@ static void handle_disco_relayed(const derp_event_t *e,
      * DiscoKey to match the active WG peer's. Only DISCO message types
      * are gated; the default case below is relayed WireGuard traffic,
      * which wg_netif_inject_packet gates separately by src NodeKey. When
-     * no peer DiscoKey is known yet (early bringup) the gate is
-     * permissive, same as the direct path. */
+     * the WG peer has no DiscoKey the gate is permissive, same as the
+     * direct path (before the first netmap DISCO never gets here). */
     if (type == DISCO_TYPE_PING || type == DISCO_TYPE_PONG ||
         type == DISCO_TYPE_CALLMEMAYBE) {
         uint8_t known_disco[WG_KEY_LEN];
@@ -954,41 +967,50 @@ static int derp_sup_event_cb(const derp_event_t *e, void *ctx)
 
 /* Task entry: own the connect + recv-loop + close + backoff cycle
  * end-to-end. Initial connect lives here (not in the start() caller)
- * so a transient heap shortage at bringup time doesn't tear the
- * supervisor down for the rest of the session — the task simply
- * loops on backoff until heap settles enough for the mbedtls cert
- * chain verify (~12 KiB contiguous). With the post-#32 budget
- * (DYNAMIC_BUFFER=y, SESSION_TICKETS=n) the supervisor's connect
- * peak slips below the largest free block once the long-poll's
- * first reconnect cycle frees its handshake scratch. */
+ * so a failed first connect (DNS, TLS, a relay restarting) doesn't tear
+ * the supervisor down for the rest of the session — the task simply
+ * loops on backoff. */
 static void derp_supervised_task(void *arg)
 {
     (void)arg;
 
-    /* This task is spawned PRE-TLS-bringup (main.c) so the
-     * 12 KiB xTaskCreate stack lands on a still-pristine heap arena.
-     * But we delay the actual TLS handshake to the DERP relay until
-     * the long-poll's first netmap arrives. Two reasons documented
-     * by the previous wait-then-spawn shape, still valid:
+    /* Connect at once (round 1.3.5), alongside the register, instead of
+     * after the first netmap. 1.3.4 logged the login ~1.8 s after the
+     * netmap, so the first WG INIT went out with no relay, the peer's
+     * answer via DERP was lost and the session came up on attempt 2,
+     * ~1.9 s after the netmap — every boot. Now the relay is up first
+     * and the INIT's own DERP copy (B7, wg_netif.c build_and_send_init)
+     * reaches the peer.
      *
-     *   1. Heap order: the long-poll's mbedtls cert verify needs ~12
-     *      KiB contiguous; opening our own TLS conn first fragments
-     *      that arena and the long-poll handshake fails.
-     *   2. Reachability: PreferredDERP region is only known after the
-     *      first MapResponse. Connecting earlier would dial the
-     *      Kconfig-fallback region; the netmap-resolved hostname (read
-     *      by the connect loop below from s_derp_host) wouldn't take
-     *      effect until the next reconnect cycle.
+     * The wait (tinylink_wait_dataplane_ms, 30-s cap, gone) kept two
+     * invariants of the 2026-05 tree; neither holds any more:
      *
-     * 30 s is generous: register + first MapRequest typically lands
-     * in 5-10 s on this hardware. On timeout we still proceed to the
-     * connect loop — best-effort with the fallback host. */
+     *   1. Heap order: with ~11 KiB free then, opening this TLS conn
+     *      first fragmented the arena below the ~12 KiB contiguous the
+     *      long-poll's cert verify needed. 1.3.4 has ~159 KB free and a
+     *      110 KB largest block with every conn up (60-s stack diag;
+     *      163 KB / 110 KB when this task connected after the netmap),
+     *      a handshake's transient is ~12 KiB, and the long-poll's first
+     *      stream rides the register's conn — no long-poll handshake at
+     *      boot is left to protect. This handshake now overlaps the
+     *      register's; the connect line below logs the heap.
+     *   2. Region: our home region is CONFIG_TINYLINK_PREFERRED_DERP,
+     *      compiled in and advertised by us in every MapRequest — known
+     *      before any netmap. The netmap only names its node, and the
+     *      Kconfig host is a node of it (on the sensor the very node the
+     *      DERPMap names: no "derp host updated" line in 1.3.4 boots). If
+     *      the netmap names another node, update_derp_host_from_netmap
+     *      bumps s_derp_host_gen and derp_sup_event_cb leaves the stream
+     *      at the next DERP frame (server keepalive, about once a
+     *      minute) for an immediate reconnect there.
+     *
+     * The login itself only proves the node key (tinylink_init loaded it;
+     * fixed for the boot) — DERP needs no registered node. Nothing on
+     * the receive side needs the netmap either: relayed WG frames are
+     * dropped by wg_netif_inject_packet until wg_netif_start configures
+     * the peer (zero key, IDLE state), relayed DISCO before the first
+     * netmap by handle_disco_relayed. */
     tl_wdt_subscribe();
-    esp_err_t wait_err = tinylink_wait_dataplane_ms(30000);
-    if (wait_err != ESP_OK) {
-        ESP_LOGW(TAG, "derp supervisor: dataplane wait timeout (0x%x) — "
-                      "connecting anyway", wait_err);
-    }
 
     /* Exponential backoff: start at the Kconfig base, double on each
      * consecutive connect failure, cap at 30 s (per WG/Tailscale
@@ -1037,9 +1059,12 @@ static void derp_supervised_task(void *arg)
                               "(after %u attempts)",
                          s_derp_sup.server_version, attempt);
                 attempt = 0;
-                /* A handshake still pending (the boot INIT goes out at
-                 * netmap time, ~2 s before this login) gets its INIT
-                 * relayed now instead of after REKEY_TIMEOUT (B7). */
+                /* A handshake still pending — a relay reconnect during a
+                 * rekey, or a boot whose login took longer than register
+                 * + netmap (1.3.4: every boot, the INIT went out ~2 s
+                 * before this login) — gets its INIT relayed now instead
+                 * of after REKEY_TIMEOUT (B7). Before the first netmap
+                 * there is none: a no-op. */
                 wg_netif_handshake_kick(WG_NETIF_KICK_RELAY_UP);
                 break;
             }
@@ -1152,23 +1177,18 @@ esp_err_t tinylink_derp_supervised_start(void)
      * input on this task is shallower (5 024 B). 8 KiB = 2.8 KB over the
      * static worst case.
      *
-     * This start function MUST be called pre-TLS-bringup (i.e.
-     * BEFORE tinylink_register / dataplane_start / long_poll_start in
-     * main.c::bringup) so the heap arena is still pristine when
-     * xTaskCreate looks for 8 KiB contiguous. The task body itself
-     * waits internally for the first netmap before doing any TLS
-     * work, so this re-ordering does not regress the previous
-     * "DERP handshake after long-poll netmap" invariant — it only
-     * separates `xTaskCreate-needs-pristine-heap` from
-     * `DERP-TLS-needs-netmap`. Without the re-order, xTaskCreate
-     * fails with ESP_ERR_NO_MEM after long-poll fragments the
-     * arena and ALL DERP-dependent features stay dead (observed
-     * across 3 soaks pre-PR). */
+     * Called before the first TLS handshake (main.c::bringup: ahead of
+     * tinylink_register), which since round 1.3.5 is also when the task
+     * connects — its handshake overlaps the register's (see
+     * derp_supervised_task). Spawning here also keeps the 8 KiB stack on
+     * a pristine heap: in the 2026-05 tree, spawned after the
+     * long-poll, xTaskCreate failed with ESP_ERR_NO_MEM in 3 soaks and
+     * every DERP-dependent feature stayed dead. */
     BaseType_t ok = xTaskCreate(derp_supervised_task, "tinylink_derp",
                                 8192, NULL, tskIDLE_PRIORITY + 3, NULL);
     if (ok != pdPASS) {
         ESP_LOGE(TAG, "xTaskCreate(derp supervisor) failed — "
-                      "heap_free=%u largest=%u (need 10 KiB contiguous)",
+                      "heap_free=%u largest=%u (need 8 KiB contiguous)",
                  (unsigned)esp_get_free_heap_size(),
                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
         return ESP_ERR_NO_MEM;
@@ -1712,22 +1732,6 @@ esp_err_t tinylink_long_poll_start(void)
     return ESP_OK;
 }
 
-esp_err_t tinylink_wait_dataplane_ms(uint32_t timeout_ms)
-{
-    /* Cooperative poll: long-poll task runs at higher priority so it
-     * gets to do its handshake + first MapResponse without us blocking
-     * it. We just sleep in coarse 100 ms chunks until the flag flips. */
-    const uint32_t step_ms = 100;
-    uint32_t waited = 0;
-    while (!s_dataplane_started) {
-        if (waited >= timeout_ms) return ESP_ERR_TIMEOUT;
-        vTaskDelay(pdMS_TO_TICKS(step_ms));
-        tl_wdt_feed();
-        waited += step_ms;
-    }
-    return ESP_OK;
-}
-
 bool tinylink_session_up(void)
 {
     return wg_netif_is_up();
@@ -1830,8 +1834,9 @@ esp_err_t tinylink_wg_socket_init(void)
      * supervisor isn't yet connected, so registering this BEFORE
      * tinylink_derp_supervised_start has spawned the supervisor task
      * is safe — the TX worker will just continue with direct sendto.
-     * Once the supervisor's TLS handshake completes (post-netmap),
-     * the callback starts accepting WG transport frames and the TX
+     * Once the supervisor's login completes (at boot, alongside the
+     * register, since round 1.3.5), the callback starts accepting WG
+     * frames — the first INIT's DERP copy included — and the TX
      * worker switches transports when the path-stale watchdog or
      * sendto errno indicates direct UDP is broken. */
 #if CONFIG_TINYLINK_DERP_SUPERVISED
