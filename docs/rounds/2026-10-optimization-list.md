@@ -192,7 +192,8 @@ plain memset (→ B12's in-tree secure-zero).
 ## Suggested order
 
 1.3.1 = Round A (Kconfig, one soak); 1.3.2 = Round B (code, host tests
-+ soak); 1.3.3 = C1–C2 + C4/C6 (data plane + crypto, bench + soak);
++ soak); 1.3.3 = B22 + B18 + C1–C2 + C4/C6 (register, stacks, data plane
++ crypto, bench + soak);
 1.3.4 = D1/D2/D4 (memory, long soak); then 1.4.0 after a clean
 multi-day run. Every round: size report vs the previous one, the 6-h
 soak with stack-diag dumps, `/stats` deltas.
