@@ -2164,13 +2164,19 @@ void wg_netif_stop(void)
             tx_exited = false;
         }
     }
-    /* A worker still inside tx_send_item (e.g. a blocked DERP TLS write)
+    /* Under hs_lock (1.3.3): the DERP task's kicks may still run — they
+     * build INITs from g.handshake and queue the INIT's DERP copy into the
+     * ring (init_queue_relay, which sees tx_slots == NULL afterwards).
+     * A worker still inside tx_send_item (e.g. a blocked DERP TLS write)
      * would touch a freed slot and deleted queues: leak the ring (~6 KB,
      * start-failure path only) rather than risk a use-after-free. */
+    xSemaphoreTake(g.hs_lock, portMAX_DELAY);
     if (tx_exited) {
         tx_ring_destroy();
     }
     g.init_valid = false;
+    wg_handshake_scrub(&g.handshake);
+    xSemaphoreGive(g.hs_lock);
     if (g.tx_done_sem != NULL) {
         vSemaphoreDelete(g.tx_done_sem);
         g.tx_done_sem = NULL;
@@ -2179,17 +2185,17 @@ void wg_netif_stop(void)
         close(g.sock);
         g.sock = -1;
     }
-    wg_handshake_scrub(&g.handshake);
     /* Under g.lock and with a new keypair generation (C2): an RX ticket
      * still in flight on the DERP task fails its commit instead of
-     * recording into a wiped window; its key copy is its own. */
+     * recording into a wiped window; its key copy is its own. The cached
+     * DISCO shared-K goes in the same section (handle_disco_direct
+     * snapshots it under g.lock), so a future wg_netif_start with a
+     * different peer DiscoKey can't accidentally reuse stale K. */
     xSemaphoreTake(g.lock, portMAX_DELAY);
     wg_transport_session_scrub(&g.transport);
-    xSemaphoreGive(g.lock);
-    /* Scrub the cached shared-K so a future wg_netif_start with a
-     * different peer DiscoKey can't accidentally reuse stale K. */
     tl_secure_zero(g.peer_disco_shared_k, sizeof(g.peer_disco_shared_k));
     g.peer_disco_shared_k_valid = false;
+    xSemaphoreGive(g.lock);
     g.initialized = false;
 }
 
