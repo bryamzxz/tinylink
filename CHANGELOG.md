@@ -19,7 +19,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   opens the map stream. That is the prime suspect for the 1.3.2 soak's
   early stream FIN (3 of 8 boots at 47 / 115 / 244 s, mid keep-alive,
   only ever on that first connection); a reboot series on 1.3.2 vs 1.3.3
-  tests it. Now NVS `tl_state/reg_keys` (machine_pub ‖ node_pub, written
+  tests it (result in the hardware section: the FIN stays — B22 is
+  still worth it for not sending the key). Now NVS `tl_state/reg_keys` (machine_pub ‖ node_pub, written
   only when the verdict changes) records that control authorized these
   keys; while it matches, register sends no `Auth` and the auth key is
   not even read out of NVS. Any refusal of that request — not authorized,
@@ -198,9 +199,17 @@ first, then 1.3.3 (`85a3b55`, then `b58273f` with the RX-drop counters).
   `tinylink_derp` 4 068 / 8 192; `wg_tx` 2 212 / 5 120; `esp_timer`
   1 572 / 4 608; `wg_rx` 3 696 — 5 380 on 1.3.2, the C6 frame).
 - **Reboot series, 10 × 5 min:** register without Auth in 10 / 10 boots
-  (0.21 s after the Noise handshake), **0 early stream FINs (3 of 8
-  boots on 1.3.0–1.3.2; p ≈ 0.9 % if nothing had changed) — B22 confirmed
-  as the fix**; WG up 1.9–2.3 s after the netmap except two boots where
+  (0.21 s after the Noise handshake), 0 early stream FINs in the first
+  300 s (3 of 8 boots on 1.3.0–1.3.2, at 47 / 115 / 244 s) — **but the
+  6-h soak's boot connection still got one at 352 s, after a register
+  without Auth: B22 does not remove the FIN** (the series windows were
+  too short to see a later one). What holds across every capture: the
+  FIN only ever hits the boot connection (register + push + netmap),
+  never a later one, mid keep-alive, at a random 47–352 s; it costs one
+  3.7-s reconnect. Leading guess: tailscale.com moving the first map
+  session after a node (re)connects; telling that from "the connection
+  that carried the register" needs a variant that opens a fresh
+  connection for the long-poll — deferred. WG up 1.9–2.3 s after the netmap except two boots where
   the peer answered only the 4th / 2nd INIT (peer-side propagation of
   the new boot's endpoint; the sensor retried on schedule); 20 rekeys,
   0 RX-stale, 0 E-level lines, 0 crashes, heap min 94 404 B. Netmap
