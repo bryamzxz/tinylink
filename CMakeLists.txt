@@ -97,6 +97,19 @@ set(EXCLUDE_COMPONENTS
 
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 
+# mbedTLS user config (round 1.3.2): mbedtls_user_config.h #undefs what
+# esp_config.h enables without a Kconfig (ARIA, CFB/OFB, 3 paddings,
+# PKCS#12; reasons in the header). A build-wide COMPILE_DEFINITION, set
+# before project(): every component's directory scope picks it up
+# (idf_component_register), including mbedTLS's own mbedtls / mbedx509 /
+# mbedcrypto targets, so all translation units that include mbedTLS
+# headers compile the same configuration — the same reach as IDF's own
+# MBEDTLS_CONFIG_FILE. Path from this file's directory, so it follows
+# moves and other checkouts. The bootloader is a separate project and
+# does not see it (bootloader.bin is byte-identical).
+idf_build_set_property(COMPILE_DEFINITIONS
+    "MBEDTLS_USER_CONFIG_FILE=\"${CMAKE_CURRENT_LIST_DIR}/mbedtls_user_config.h\"" APPEND)
+
 project(tinylink)
 
 # An existing sdkconfig always wins over sdkconfig.defaults, so one
