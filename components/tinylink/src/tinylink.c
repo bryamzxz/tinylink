@@ -47,6 +47,7 @@
 #include "stun_boot.h"
 #include "stun_probe.h"
 #include "telemetry.h"
+#include "tl_addr.h"
 #include "tl_bootstat.h"
 #include "ts2021_client.h"
 #include "wg_dataplane.h"
@@ -160,6 +161,7 @@ void tinylink_diag_dump_stacks(void)
 }
 
 static void reg_hint_load(void);
+static void addr_cache_load(void);
 
 esp_err_t tinylink_init(void)
 {
@@ -176,6 +178,7 @@ esp_err_t tinylink_init(void)
         return err;
     }
     reg_hint_load();
+    addr_cache_load();
     s_initialized = true;
     return ESP_OK;
 }
@@ -501,6 +504,123 @@ esp_err_t tinylink_dataplane_start(void)
  * started the data plane; read by the DERP task (handle_disco_relayed). */
 static volatile bool s_dataplane_started;
 
+/* ---- Last-known server addresses (round 1.3.5, tl_addr.h) ---------------
+ *
+ * The home DERP node: the node of CONFIG_TINYLINK_PREFERRED_DERP the
+ * netmap last named — host, DERPPort, its IPv4 and STUN port — restored
+ * from NVS `derp_node` by tinylink_init, else the Kconfig host with no
+ * address. The supervisor dials it (the address first, the name if that
+ * fails) and both STUN probes ask its STUN service, so a boot with a
+ * record does neither through DNS. Written by the long-poll task (each
+ * netmap), read by the DERP, STUN-boot and telemetry tasks: under
+ * s_home_derp_mux, with s_derp_host_gen (bumped when the node moves). */
+static tl_derp_addr_t    s_home_derp;
+static bool              s_home_derp_named;   /* by a netmap (not the boot record) */
+static volatile uint32_t s_derp_host_gen;
+static portMUX_TYPE      s_home_derp_mux = portMUX_INITIALIZER_UNLOCKED;
+
+/* What NVS holds for each record (tl_addr_store compares against it). */
+static tl_addr_blob_t s_derp_nvs;
+
+static void home_derp_get(tl_derp_addr_t *out, uint32_t *gen)
+{
+    portENTER_CRITICAL(&s_home_derp_mux);
+    *out = s_home_derp;
+    if (gen != NULL) *gen = s_derp_host_gen;
+    portEXIT_CRITICAL(&s_home_derp_mux);
+}
+
+static void blob_load(nvs_handle_t h, const char *key, tl_addr_blob_t *m)
+{
+    size_t n = sizeof(m->b);
+    m->len = (nvs_get_blob(h, key, m->b, &n) == ESP_OK && n <= sizeof(m->b)) ? (uint8_t)n : 0;
+}
+
+/* tinylink_init: the records → RAM. Read-only; a missing namespace or
+ * key (first boot with 1.3.5) is the Kconfig DERP host and no addresses. */
+static void addr_cache_load(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(TAI64N_NVS_NS, NVS_READONLY, &h) == ESP_OK) {
+        blob_load(h, TL_ADDR_KEY_DERP, &s_derp_nvs);
+        nvs_close(h);
+    }
+    tl_derp_addr_boot(s_derp_nvs.b, s_derp_nvs.len, CONFIG_TINYLINK_PREFERRED_DERP,
+                      CONFIG_TINYLINK_DERP_SMOKE_HOST, &s_home_derp);
+    char a[TL_IPV4_STRLEN] = "none";
+    if (tl_ipv4_usable(s_home_derp.ipv4)) tl_ipv4_str(s_home_derp.ipv4, a);
+    ESP_LOGI(TAG, "address cache: home DERP node %s (address %s, STUN %u)%s",
+             s_home_derp.host, a, (unsigned)s_home_derp.stun_port,
+             s_derp_nvs.len > 0 ? "" : " — Kconfig, nothing stored");
+}
+
+static int addr_nvs_write(const uint8_t *b, size_t n, const void *ctx)
+{
+    const char *key = (const char *)ctx;
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(TAI64N_NVS_NS, NVS_READWRITE, &h);
+    if (err == ESP_OK) {
+        err = nvs_set_blob(h, key, b, n);
+        if (err == ESP_OK) err = nvs_commit(h);
+        nvs_close(h);
+    }
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "address cache: nvs %s write failed: 0x%x — next boot resolves",
+                 key, err);
+    }
+    return err == ESP_OK ? 0 : -1;
+}
+
+/* Telemetry housekeeping (every 60 s, first ~60 s after the first
+ * netmap): write the records whose bytes changed. Never on the boot path
+ * — an NVS write may erase a 4-KB sector and stall both CPUs for up to
+ * ~0.5 s (tl_time.c) — and only for a change: the DERP record moves
+ * with the DERP map. */
+void tinylink_addr_persist_poll(void)
+{
+    uint8_t b[TL_ADDR_BLOB_MAX];
+    tl_derp_addr_t d;
+    bool named;
+    portENTER_CRITICAL(&s_home_derp_mux);
+    d = s_home_derp;
+    named = s_home_derp_named;
+    portEXIT_CRITICAL(&s_home_derp_mux);
+    const size_t n = named ? tl_derp_addr_encode(&d, b, sizeof(b)) : 0;
+    if (n > 0 && tl_addr_store(&s_derp_nvs, b, n, addr_nvs_write, TL_ADDR_KEY_DERP) == 1) {
+        ESP_LOGI(TAG, "address cache: home DERP node %s stored", d.host);
+    }
+}
+
+/* The netmap's home node → s_home_derp (long-poll task, every netmap
+ * that carries the region). A new host or port moves the supervisor
+ * (s_derp_host_gen; derp_sup_event_cb leaves the stream at the next
+ * DERP frame); a new address or STUN port only applies from the next
+ * connect / probe — the live stream to that host is fine. The NVS copy
+ * follows in tinylink_addr_persist_poll. */
+static void update_derp_host_from_netmap(const tl_netmap_t *nm)
+{
+    tl_derp_addr_t next;
+    if (!tl_derp_addr_from_netmap(nm, CONFIG_TINYLINK_PREFERRED_DERP, &next)) return;
+    portENTER_CRITICAL(&s_home_derp_mux);
+    const unsigned diff = tl_derp_addr_diff(&s_home_derp, &next);
+    s_home_derp = next;
+    s_home_derp_named = true;
+    if (diff & TL_DERP_MOVED) s_derp_host_gen++;
+    const uint32_t gen = s_derp_host_gen;
+    portEXIT_CRITICAL(&s_home_derp_mux);
+    if (diff & TL_DERP_MOVED) {
+        ESP_LOGI(TAG, "derp host updated to region %d node: %s:%u (gen %u)",
+                 CONFIG_TINYLINK_PREFERRED_DERP, next.host,
+                 next.port ? next.port : 443u, (unsigned)gen);
+    }
+    if (diff & TL_DERP_ADDR) {
+        char a[TL_IPV4_STRLEN] = "none";
+        if (tl_ipv4_usable(next.ipv4)) tl_ipv4_str(next.ipv4, a);
+        ESP_LOGI(TAG, "derp node %s: address %s, STUN %u (DERP map)",
+                 next.host, a, (unsigned)next.stun_port);
+    }
+}
+
 /* ---- DERP smoke test (M5 step 2a) --------------------------------------
  *
  * One-shot synchronous connect+login against a configured DERP server.
@@ -529,7 +649,7 @@ esp_err_t tinylink_derp_smoke(void)
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
 
     derp_client_t c = {0};
-    esp_err_t err = derp_client_connect_login(&c, host, 443,
+    esp_err_t err = derp_client_connect_login(&c, host, 443, NULL,
                                               s_keys.node_priv,
                                               s_keys.node_pub);
     if (err == ESP_OK) {
@@ -562,24 +682,17 @@ esp_err_t tinylink_derp_smoke(void)
  * aborts its reads. */
 static derp_client_t s_derp_sup;
 
-/* Latest DERP host the supervisor should connect to. Populated from
- * the netmap's derp_regions[] using CONFIG_TINYLINK_PREFERRED_DERP as
- * the region selector, so the supervisor lands at the same region we
- * advertise as our HomeDERP — peers send traffic to that region; if
- * we're connected elsewhere the relay can't route it.
- *
- * Initialized to the Kconfig host, a node of that region: the first
- * connect runs at boot, before any netmap (round 1.3.5). Updated
- * in-place from long_poll_handler each frame. */
-static char s_derp_host[TL_DERP_HOSTNAME_LEN] = CONFIG_TINYLINK_DERP_SMOKE_HOST;
-/* Bumped by update_derp_host_from_netmap on every host/port change; the
- * supervisor captures it at connect and its event callback stops the
- * stream when it moves, so a control-plane reroute reaches a LIVE
- * connection within one server keepalive instead of waiting for the
- * stream to die on its own (2026-09). */
-static volatile uint32_t s_derp_host_gen;
+/* The supervisor connects to s_home_derp (above): the node of
+ * CONFIG_TINYLINK_PREFERRED_DERP, the region we advertise as our
+ * HomeDERP — peers send traffic to that region; if we're connected
+ * elsewhere the relay can't route it. Before any netmap it is the NVS
+ * record or the Kconfig host, a node of that region: the first connect
+ * runs at boot (round 1.3.5). s_derp_conn_gen is the s_derp_host_gen
+ * captured at connect; the event callback stops the stream when the
+ * two differ, so a control-plane reroute reaches a LIVE connection
+ * within one server keepalive instead of waiting for the stream to die
+ * on its own (2026-09). */
 static uint32_t          s_derp_conn_gen;
-static uint16_t          s_derp_port;      /* 0 → DERP default 443 */
 
 
 typedef struct {
@@ -955,8 +1068,10 @@ static int derp_sup_event_cb(const derp_event_t *e, void *ctx)
         break;
     }
     if (s_derp_host_gen != s_derp_conn_gen) {
-        ESP_LOGI(TAG, "derp supervisor: preferred relay changed — leaving %s",
-                 s_derp_host);
+        tl_derp_addr_t node;
+        home_derp_get(&node, NULL);
+        ESP_LOGI(TAG, "derp supervisor: preferred relay changed — leaving for %s",
+                 node.host);
         return 1;   /* derp_client_run returns ESP_OK; supervisor reconnects */
     }
     return 0;
@@ -1039,20 +1154,24 @@ static void derp_supervised_task(void *arg)
 
     for (;;) {
         /* Connect with backoff — runs at boot too, not just on
-         * reconnect. Re-read s_derp_host every iteration so a netmap
-         * update that changes the preferred region's host steers the
-         * NEXT reconnect to the right relay. */
+         * reconnect. Re-read the home node every iteration so a netmap
+         * update that changes the preferred region's host (or the
+         * node's address) steers the NEXT reconnect to the right relay.
+         * Host and generation are read together: a move that lands after
+         * this snapshot still differs from s_derp_conn_gen. */
         for (;;) {
             attempt++;
-            const char *host = s_derp_host;
-            ESP_LOGI(TAG, "derp supervisor: connect attempt #%u to %s "
+            tl_derp_addr_t node;
+            home_derp_get(&node, &s_derp_conn_gen);
+            char a[TL_IPV4_STRLEN] = "no address";
+            if (tl_ipv4_usable(node.ipv4)) tl_ipv4_str(node.ipv4, a);
+            ESP_LOGI(TAG, "derp supervisor: connect attempt #%u to %s (%s) "
                           "(heap_free=%u largest=%u)",
-                     attempt, host,
+                     attempt, node.host, a,
                      (unsigned)esp_get_free_heap_size(),
                      (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
-            s_derp_conn_gen = s_derp_host_gen;
-            esp_err_t cerr = derp_client_connect_login(&s_derp_sup, host,
-                                                       s_derp_port,
+            esp_err_t cerr = derp_client_connect_login(&s_derp_sup, node.host,
+                                                       node.port, node.ipv4,
                                                        s_keys.node_priv,
                                                        s_keys.node_pub);
             if (cerr == ESP_OK) {
@@ -1159,14 +1278,16 @@ esp_err_t tinylink_derp_supervised_start(void)
 {
 #if CONFIG_TINYLINK_DERP_SUPERVISED
     if (!s_initialized) return ESP_ERR_INVALID_STATE;
-    /* s_derp_host is initialized from the Kconfig fallback at file
-     * scope and updated to the netmap-derived hostname for our
-     * advertised PreferredDERP region by long_poll_handler. */
-    const char *host = s_derp_host;
-    if (host == NULL || host[0] == '\0') {
+    /* An empty Kconfig host disables the relay, whatever NVS holds. The
+     * task dials s_home_derp: the NVS record or this host until a
+     * netmap names our PreferredDERP region's node (long_poll_handler). */
+    if (CONFIG_TINYLINK_DERP_SMOKE_HOST[0] == '\0') {
         ESP_LOGI(TAG, "derp supervisor: disabled (empty host)");
         return ESP_OK;
     }
+    tl_derp_addr_t node;
+    home_derp_get(&node, NULL);
+    const char *host = node.host;
 
     /* Spawn the task. 8 KiB stack (round 1.3.3, B18; 10 KiB before):
      * tools/stack_worst.py puts the static worst case at 5 424 B — the
@@ -1201,35 +1322,6 @@ esp_err_t tinylink_derp_supervised_start(void)
     return ESP_OK;
 #endif
 }
-
-#if CONFIG_TINYLINK_DERP_SUPERVISED
-/* Walk the netmap's DERP region table for the region matching our
- * advertised PreferredDERP and copy the first node's hostname into
- * s_derp_host. No-op if PreferredDERP isn't represented in the
- * parsed netmap (region_id mismatch or region has no nodes). The
- * supervisor task reads s_derp_host on every connect attempt so the
- * next reconnect picks up the change. */
-static void update_derp_host_from_netmap(const tl_netmap_t *nm)
-{
-    const int want = CONFIG_TINYLINK_PREFERRED_DERP;
-    if (want <= 0) return;
-    for (size_t i = 0; i < nm->n_derp_regions; i++) {
-        const tl_derp_region_t *r = &nm->derp_regions[i];
-        if (r->region_id != want || r->n_nodes == 0) continue;
-        const char *h = r->nodes[0].hostname;
-        if (h[0] == '\0') continue;
-        const uint16_t port = r->nodes[0].port;
-        if (strcmp(s_derp_host, h) == 0 && s_derp_port == port) return;  /* unchanged */
-        snprintf(s_derp_host, sizeof(s_derp_host), "%s", h);
-        s_derp_port = port;
-        s_derp_host_gen++;
-        ESP_LOGI(TAG, "derp host updated to region %d node: %s:%u (gen %u)",
-                 want, s_derp_host, port ? port : 443u,
-                 (unsigned)s_derp_host_gen);
-        return;
-    }
-}
-#endif
 
 /* Cache the latest netmap PEERS for path-stale active probing.
  * tl_peer_t[TL_MAX_PEERS] is ~1 KiB; the full tl_netmap_t was ~7.5 KiB
@@ -1433,9 +1525,7 @@ static esp_err_t long_poll_handler(const tl_netmap_t *nm, void *ctx)
         }
     }
     const bool peers_changed = merge_peers(nm);
-#if CONFIG_TINYLINK_DERP_SUPERVISED
-    update_derp_host_from_netmap(nm);
-#endif
+    update_derp_host_from_netmap(nm);   /* STUN uses it without the supervisor too */
     if (!s_dataplane_started) {
         if (s_self_addrs_count == 0 || s_last_peers_count == 0) {
             return ESP_OK;   /* wait for self + peers (first full map) */
@@ -1792,7 +1882,10 @@ void tinylink_get_stats(tinylink_stats_t *out)
     out->endpoint_pushes    = s_stat_ep_pushes;
 #if CONFIG_TINYLINK_DERP_SUPERVISED
     out->derp_connected = s_derp_sup.connected;
-    snprintf(out->derp_host, sizeof(out->derp_host), "%s", s_derp_host);
+    tl_derp_addr_t node;
+    home_derp_get(&node, NULL);
+    _Static_assert(sizeof(out->derp_host) == sizeof(node.host), "derp_host size");
+    memcpy(out->derp_host, node.host, sizeof(out->derp_host));
 #endif
     out->public_valid = tinylink_get_public_endpoint(out->public_v4, &out->public_port);
     wg_netif_stats_t ws;
@@ -1903,6 +1996,44 @@ static void tinylink_endpoint_push_async(void)
  * STUN answers the sensor in ~40 ms; a dead server costs this much. */
 #define STUN_PROBE_TIMEOUT_MS 3000
 
+/* Where a STUN probe goes (round 1.3.5): the home DERP node's STUN
+ * service (UDP 3478, tailcfg STUNPort) at the address the DERP map gave
+ * — no DNS, and the server netcheck itself asks — else
+ * CONFIG_TINYLINK_STUN_HOST, resolved: when no record has the address
+ * yet (the first boot with 1.3.5, a map without IPv4) or the last probe
+ * to the DERP node went unanswered (UDP 3478 filtered on the way?). An
+ * unanswered probe sends the next one to the other server and an answer
+ * keeps it, so both probes stay on one server — on a NAT whose mapping
+ * depends on the destination, switching servers would read as an
+ * endpoint change and push it (a control-stream recycle). The boot task
+ * and then the telemetry task use it; an abandoned boot probe can still
+ * be finishing during the first re-probe, which at worst sends one probe
+ * to the other server. */
+static volatile bool s_stun_use_kconfig;
+
+static esp_err_t stun_server_pick(struct sockaddr_in *out, bool *derp)
+{
+    tl_derp_addr_t node;
+    home_derp_get(&node, NULL);
+    uint8_t  ip[4];
+    uint16_t port = 0;
+    *derp = !s_stun_use_kconfig && tl_derp_addr_stun(&node, ip, &port);
+    if (*derp) {
+        memset(out, 0, sizeof(*out));
+        out->sin_family = AF_INET;
+        out->sin_port   = htons(port);
+        memcpy(&out->sin_addr.s_addr, ip, sizeof(ip));
+        return ESP_OK;
+    }
+    return stun_probe_resolve(CONFIG_TINYLINK_STUN_HOST,
+                              (uint16_t)CONFIG_TINYLINK_STUN_PORT, out);
+}
+
+static void stun_server_note(bool derp, bool answered)
+{
+    if (!answered) s_stun_use_kconfig = derp;
+}
+
 /* --- STUN reprobe via the live WG socket -------------------------------
  *
  * Once rx_task owns g.sock, we cannot recvfrom on it from another task
@@ -1991,12 +2122,14 @@ static esp_err_t stun_reprobe_via_wg_socket(uint32_t timeout_ms,
         return ESP_ERR_NO_MEM;
     }
 
-    /* DNS-resolve the STUN server. lwIP getaddrinfo can block briefly
-     * — the re-probe on the telemetry task (IDLE+2) is the only caller,
-     * so a synchronous DNS lookup here is safe. */
+    /* The home DERP node's STUN, or the Kconfig server resolved (lwIP
+     * getaddrinfo can block — the re-probe on the telemetry task
+     * (IDLE+2) is the only caller, so a synchronous DNS lookup here is
+     * safe). */
     struct sockaddr_in dest;
-    if (stun_probe_resolve(CONFIG_TINYLINK_STUN_HOST,
-                           (uint16_t)CONFIG_TINYLINK_STUN_PORT, &dest) != ESP_OK) {
+    bool derp = false;
+    if (stun_server_pick(&dest, &derp) != ESP_OK) {
+        stun_server_note(false, false);
         return ESP_FAIL;
     }
 
@@ -2039,6 +2172,7 @@ static esp_err_t stun_reprobe_via_wg_socket(uint32_t timeout_ms,
     }
     s_stun_pending.in_flight = false;
     xSemaphoreGive(s_stun_pending.mutex);
+    stun_server_note(derp, err == ESP_OK);
     return err;
 }
 
@@ -2229,11 +2363,17 @@ esp_err_t tinylink_stun_reprobe_start(void)
  * neither reads nor publishes. */
 
 /* After the register: how long the endpoint push waits for the probe.
- * Its request went out ≥ 2.4 s earlier (the register's TLS + Noise +
- * request) and Google STUN answers the sensor in ~40 ms, so a probe
- * still busy here is resolving a lost DNS answer (lwIP retries after
- * 1, 2, 3 s) or retransmitting; 300 ms covers an answer on the wire and
- * bounds what the slow tail costs the boot. */
+ * With the home DERP node's address cached (round 1.3.5, the normal
+ * boot) the probe needs no DNS: its request leaves right after the WG
+ * socket bind and the answer is one RTT away, while the register over
+ * :80 answers ~0.7 s after got-ip — so the probe has normally finished
+ * when this wait starts (no "waited" line). What 300 ms still covers: an
+ * answer to the 500-ms retransmission on a fast register, and a cold
+ * boot (no record yet: CONFIG_TINYLINK_STUN_HOST through DNS, which on
+ * the sensor's network lost answers in 12 of 30 boots — lwIP resends
+ * after 1, 2, 4, 7 s — and those probes are abandoned, as in 1.3.5
+ * before the cache). Raising it would only buy those tails back on the
+ * boot path. */
 #define STUN_BOOT_WAIT_MS  300
 
 /* One select() of the probe at most: how late an abandoned probe
@@ -2331,14 +2471,21 @@ static esp_err_t stun_boot_exchange(int sock, const struct sockaddr_in *server)
     }
 }
 
-/* The probe: DNS, then the exchange while still wanted. Runs on the
- * boot task, or inline on main if that could not be spawned. */
+/* The probe: the server (the home DERP node's STUN at its cached
+ * address, else DNS — stun_server_pick), then the exchange while still
+ * wanted. Runs on the boot task, or inline on main if that could not be
+ * spawned. */
 static void stun_boot_run(SemaphoreHandle_t done)
 {
     struct sockaddr_in server;
-    esp_err_t err = stun_probe_resolve(CONFIG_TINYLINK_STUN_HOST,
-                                       (uint16_t)CONFIG_TINYLINK_STUN_PORT, &server);
+    bool derp = false;
+    esp_err_t err = stun_server_pick(&server, &derp);
     tl_wdt_feed();
+    if (derp) {
+        const uint8_t *ip = (const uint8_t *)&server.sin_addr.s_addr;
+        ESP_LOGI(TAG, "stun probe: home DERP node at %u.%u.%u.%u:%u (no DNS)",
+                 ip[0], ip[1], ip[2], ip[3], (unsigned)ntohs(server.sin_port));
+    }
     if (err == ESP_OK) {
         xSemaphoreTake(s_stun_boot_mx, portMAX_DELAY);
         const bool mine = stun_boot_claim(&s_stun_boot);
@@ -2346,6 +2493,9 @@ static void stun_boot_run(SemaphoreHandle_t done)
         err = mine ? stun_boot_exchange(wg_netif_get_socket(), &server)
                    : ESP_ERR_TIMEOUT;
     }
+    /* Abandoned counts as unanswered: the re-probe then asks the other
+     * server once wg_rx runs. */
+    stun_server_note(derp, err == ESP_OK);
     xSemaphoreTake(s_stun_boot_mx, portMAX_DELAY);
     const bool awaited = stun_boot_finish(&s_stun_boot);
     xSemaphoreGive(s_stun_boot_mx);

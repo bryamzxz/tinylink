@@ -70,12 +70,21 @@ typedef struct {
  * On ESP_OK the conn is fully established and stashed in *out — the
  * caller owns it and must release with derp_client_close().
  *
+ * server_v4 (round 1.3.5, tl_addr.h): the node's IPv4 from the DERP map
+ * (NULL or 0.0.0.0 = none). When given it is dialed first, with a 3-s
+ * budget, and the certificate is still verified against server_host
+ * (the SNI and mbedtls' hostname check are server_host's); if that
+ * fails for any reason, server_host is resolved and dialed in the same
+ * call, as without an address. The TLS session is resumed by
+ * server_host:port either way.
+ *
  * Identity is the device's NodePrivate/NodePublic (the same WireGuard
  * key the control plane already knows about). Memory budget for the
  * login: 1 esp-tls (~12 KiB transient heap during TLS handshake) +
  * ~512 B stack scratch. */
 esp_err_t derp_client_connect_login(derp_client_t *out,
                                     const char *server_host, uint16_t port,
+                                    const uint8_t server_v4[4],
                                     const uint8_t client_priv[DERP_KEY_LEN],
                                     const uint8_t client_pub[DERP_KEY_LEN]);
 

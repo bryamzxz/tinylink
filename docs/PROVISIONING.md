@@ -29,7 +29,7 @@ deliberately not enabled (eFuse burns are irreversible; see
 | `tl_creds`  | provisioner | WiFi credentials + Tailscale auth key           |
 | `tl_keys`   | firmware    | Curve25519 identities, generated on first boot  |
 | `tl_pin`    | firmware    | Pinned control plane public key (TOFU / fallback) |
-| `tl_state`  | firmware    | TAI64N floor for WireGuard handshake timestamps |
+| `tl_state`  | firmware    | TAI64N floor for WireGuard handshake timestamps, clock floor, register hint, last-known server addresses (`derp_node`, round 1.3.5) |
 
 You only need to populate `tl_creds`. The firmware fills the other
 namespaces by itself.

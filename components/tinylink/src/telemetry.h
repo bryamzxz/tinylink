@@ -10,8 +10,9 @@
 //
 // Since 1.3.2 the same task also runs the periodic STUN re-probe
 // (tinylink_stun_reprobe_poll, formerly its own 3 KiB task) and the 60-s
-// housekeeping (stack diag, NVS time floor), so it exists in every build:
-// with CONFIG_TINYLINK_TELEMETRY_ENABLE=n it does only those.
+// housekeeping (stack diag, NVS time floor, since 1.3.5 the address
+// cache), so it exists in every build: with
+// CONFIG_TINYLINK_TELEMETRY_ENABLE=n it does only those.
 
 #pragma once
 
@@ -45,6 +46,11 @@ void telemetry_kick(void);
  * INT64_MAX while tinylink_stun_reprobe_start hasn't armed it). Called
  * only from the telemetry task; may block for one probe. */
 int64_t tinylink_stun_reprobe_poll(int64_t now_us);
+
+/* Provided by tinylink.c: write the address-cache records (tl_addr.h)
+ * whose bytes changed to NVS. Called only from the 60-s housekeeping,
+ * so an NVS write never lands on the boot path. */
+void tinylink_addr_persist_poll(void);
 
 #ifdef __cplusplus
 }
