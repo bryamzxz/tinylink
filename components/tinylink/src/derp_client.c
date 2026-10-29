@@ -422,9 +422,25 @@ esp_err_t derp_client_run(derp_client_t *c,
     }
 }
 
-esp_err_t derp_client_send_packet(derp_client_t *c,
-                                  const uint8_t dst_pub[DERP_KEY_LEN],
-                                  const uint8_t *packet, size_t plen)
+/* True when the conn's socket can take a frame without blocking: lwIP's
+ * select() marks a TCP socket writable only above TCP_SNDLOWAT free
+ * send-buffer bytes (≈ 2.9 KB here), more than one DERP frame + TLS
+ * record (≤ ~1.6 KB). Caller holds c->write_lock. */
+static bool socket_writable_now(derp_client_t *c)
+{
+    int fd = -1;
+    if (esp_tls_get_conn_sockfd(c->tls, &fd) != ESP_OK || fd < 0) return false;
+    fd_set wfds;
+    FD_ZERO(&wfds);
+    FD_SET(fd, &wfds);
+    struct timeval tv = { 0, 0 };
+    return select(fd + 1, NULL, &wfds, NULL, &tv) == 1;
+}
+
+static esp_err_t send_packet(derp_client_t *c,
+                             const uint8_t dst_pub[DERP_KEY_LEN],
+                             const uint8_t *packet, size_t plen,
+                             bool no_wait)
 {
     if (c == NULL || c->tls == NULL || !c->connected || c->write_lock == NULL) {
         return ESP_ERR_INVALID_STATE;
@@ -437,17 +453,37 @@ esp_err_t derp_client_send_packet(derp_client_t *c,
     /* FrameSendPacket payload = dstPub[32] || packet[plen], one frame
      * written under the write lock so the recv loop's pongs cannot land
      * inside it. */
-    xSemaphoreTake(c->write_lock, portMAX_DELAY);
+    if (xSemaphoreTake(c->write_lock, no_wait ? 0 : portMAX_DELAY) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
     /* Re-validate under the lock: derp_client_close may have torn the
      * connection down between the unlocked pre-check above and here. */
     if (c->tls == NULL || !c->connected) {
         xSemaphoreGive(c->write_lock);
         return ESP_ERR_INVALID_STATE;
     }
+    if (no_wait && !socket_writable_now(c)) {
+        xSemaphoreGive(c->write_lock);
+        return ESP_ERR_TIMEOUT;
+    }
     int rc = write_frame_locked(c, DERP_FRAME_SEND_PACKET, dst_pub,
                                 packet, plen);
     xSemaphoreGive(c->write_lock);
     return (rc == 0) ? ESP_OK : ESP_FAIL;
+}
+
+esp_err_t derp_client_send_packet(derp_client_t *c,
+                                  const uint8_t dst_pub[DERP_KEY_LEN],
+                                  const uint8_t *packet, size_t plen)
+{
+    return send_packet(c, dst_pub, packet, plen, false);
+}
+
+esp_err_t derp_client_try_send_packet(derp_client_t *c,
+                                      const uint8_t dst_pub[DERP_KEY_LEN],
+                                      const uint8_t *packet, size_t plen)
+{
+    return send_packet(c, dst_pub, packet, plen, true);
 }
 
 #endif /* ESP_PLATFORM */

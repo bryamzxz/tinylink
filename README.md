@@ -5,7 +5,7 @@
 **A clean-room, single-peer Tailscale-compatible node for the bare ESP32 — no PSRAM, ~916 KiB of flash, pure C.**
 
 [![CI](https://github.com/bryamzxz/tinylink/actions/workflows/build.yml/badge.svg)](https://github.com/bryamzxz/tinylink/actions/workflows/build.yml)
-[![Firmware](https://img.shields.io/badge/firmware-1.3.1-yellow)](CHANGELOG.md)
+[![Firmware](https://img.shields.io/badge/firmware-1.3.2-yellow)](CHANGELOG.md)
 [![Target](https://img.shields.io/badge/target-ESP32--WROOM%20(no%20PSRAM)-orange)](#hardware)
 [![Framework](https://img.shields.io/badge/ESP--IDF-v5.5-e7352c)](docs/BUILDING.md)
 [![Host tests](https://img.shields.io/badge/host%20KATs-546%20%C2%B7%200%20fail-brightgreen)](#testing)
@@ -115,6 +115,7 @@ What works today, verified on real hardware:
 | 16 | To-95 round (2026-09-04, part 3) | done — NTP-synced certificate date validation, `PeersRemoved` + delta merge, WG handshake lock + roam on authenticated packets, `/stats` over UDP, AEAD placement measured cold. Declared scope ≈ 95 %; the last 5 % is the owner checklist in `docs/ROADMAP.md` |
 | 17 | Upstream sync 1.3.0 (2026-10-28) | done — smoke + 30-min soak clean on the sensor; capver 148 (TSMP disco-key advert, upstream's exact Retry-After), headscale delta frames (expired/deleted node re-registers, peer key rotation applied, patches by NodeID), ESP-IDF v5.5.6, `docs/esp32/` vendor reference, firmware 1.3.0 (work line toward 1.4.0) |
 | 18 | Optimization round A 1.3.1 (2026-10-28) | done — smoke clean on the sensor, boot to WG 16.6 → 13.6 s; Kconfig set: global -Os + -O2 hot-path islands, common-CA bundle, Log V2, DHCP ARP probe really off, no FreeRTOS timer task, brown-out L6, 500 kbaud console, Wi-Fi awake until the WG session is up; image −132 KB (−13.8 %) |
+| 19 | Optimization round B 1.3.2 (2026-10-28) | code done, hardware smoke pending — no esp_http_client / cJSON / float printf, Noise + NaCl on the in-tree AEAD (TLS now AES-GCM), first WG INIT no longer lost, cached DISCO / handshake keys, one shared control buffer, 1 DERP region; image −64 KB (−20.5 % since 1.3.0) |
 
 Two further 2026-05-12 rounds — sdkconfig perf-trim (#76–#80) and DERP
 outbound (#82–#83: supervisor spawn + lossless relay fallback during

@@ -496,9 +496,15 @@ static int send_to_peer(const uint8_t *buf, size_t len,
          * Models upstream tailscale magicsock noteBadEndpoint
          * (endpoint.go:1634-1641). */
         if (errno == ENETUNREACH || errno == EHOSTUNREACH) {
+            /* Under g.lock: since 1.3.2 this also runs on the DERP task
+             * (call-me-maybe re-send), racing handle_transport's locked
+             * write of the same 64-bit field. Callers hold at most
+             * hs_lock (order hs_lock → g.lock). */
+            xSemaphoreTake(g.lock, portMAX_DELAY);
             g.last_transport_recv_us =
                 now_us() - (WG_RX_STALE_THRESHOLD_MS + 1) * 1000LL;
             g.last_path_probe_us = 0;
+            xSemaphoreGive(g.lock);
         }
         return -1;
     }
@@ -1483,7 +1489,7 @@ static void tx_send_item(const wg_tx_item_t *it, int64_t now)
          * later) declines — dropped silently, the login kick re-sends. */
         if (g.relay_cb != NULL) {
             peer_static_snapshot(dst_pub);
-            (void)g.relay_cb(dst_pub, it->buf, it->len, g.relay_cb_user);
+            (void)g.relay_cb(dst_pub, it->buf, it->len, true, g.relay_cb_user);
         }
         return;
     }
@@ -1515,7 +1521,7 @@ static void tx_send_item(const wg_tx_item_t *it, int64_t now)
         g.last_direct_rx_us < g.last_handshake_completed_us;
     if (path_stale) {
         peer_static_snapshot(dst_pub);
-        esp_err_t rerr = g.relay_cb(dst_pub, it->buf, it->len,
+        esp_err_t rerr = g.relay_cb(dst_pub, it->buf, it->len, false,
                                     g.relay_cb_user);
         if (rerr == ESP_OK) {
             g.relayed_stale++;
@@ -1533,7 +1539,10 @@ static void tx_send_item(const wg_tx_item_t *it, int64_t now)
     if (dual) {
         if (n < 0) ESP_LOGW(TAG, "tx sendto: errno=%d", errno);
         peer_static_snapshot(dst_pub);
-        if (g.relay_cb(dst_pub, it->buf, it->len, g.relay_cb_user) != ESP_OK) {
+        /* Best effort: a stalled DERP conn must not hold up the
+         * direct path, which this item already used above. */
+        if (g.relay_cb(dst_pub, it->buf, it->len, true,
+                       g.relay_cb_user) != ESP_OK) {
             g.relay_errors++;
         }
         return;
@@ -1547,7 +1556,7 @@ static void tx_send_item(const wg_tx_item_t *it, int64_t now)
          * (i.e. errno arrived before the watchdog tripped). */
         if (!path_stale && g.relay_cb != NULL) {
             peer_static_snapshot(dst_pub);
-            esp_err_t rerr = g.relay_cb(dst_pub, it->buf, it->len,
+            esp_err_t rerr = g.relay_cb(dst_pub, it->buf, it->len, false,
                                         g.relay_cb_user);
             if (rerr == ESP_OK) {
                 g.relayed_errno++;
@@ -1725,7 +1734,13 @@ esp_err_t wg_netif_start(const struct wg_netif_peer_config *peer)
     g.rekey_in_flight = false;
     g.last_handshake_completed_us = 0;
     g.last_transport_recv_us = 0;  /* watchdog disarmed until session up */
-    if (kick_off_handshake() != 0) return ESP_FAIL;
+    /* Under hs_lock like every other INIT build: when the first netmap
+     * is late the DERP supervisor is already up, and its B7 kicks
+     * (init_resend) read g.init_msg while this writes it. */
+    xSemaphoreTake(g.hs_lock, portMAX_DELAY);
+    const int kick_rc = kick_off_handshake();
+    xSemaphoreGive(g.hs_lock);
+    if (kick_rc != 0) return ESP_FAIL;
 
     BaseType_t ok = xTaskCreate(rx_task, "wg_rx",
                                 WG_RX_TASK_STACK_BYTES, NULL,

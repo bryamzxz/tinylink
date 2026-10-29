@@ -7,6 +7,138 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Optimization round B 1.3.2 (2026-10-28, branch `feat/opt-1.3.2`)
+
+Round B of `docs/rounds/2026-10-optimization-list.md` — the code items,
+built in four parallel branches (control plane, crypto, data plane,
+system), merged, then reviewed as a whole. Image **826 768 → 762 535 B
+(−64 233 B; −196 714 B / −20.5 % since 1.3.0)**; static DRAM 108 220 →
+95 884 B (−12.3 KB); IRAM 73 867 → 73 935 B. Host suite 633 → **881 OK,
+0 FAIL** (CI floor 881), ASan + UBSan clean, 0 compiler warnings.
+**Hardware smoke pending.** B18 (stack trims from soak data) is left
+for after the 1.3.2 soak.
+
+#### Control plane (`feat/r132-ctl`, −42.1 KB)
+
+- **B1 — no esp_http_client** (−21.9 KB): the TOFU `GET /key` runs on
+  esp_tls like ts2021 / DERP, with a host-tested HTTP/1.1 response
+  parser (`tl_http1.h`: Content-Length, chunked, read-to-EOF). Same
+  timeouts, Host header, capver query, status handling and body cap;
+  redirects are no longer followed (neither tailscale.com nor headscale
+  redirects `/key`). `esp_http_client` and `tcp_transport` excluded.
+  Only runs without an NVS pin — not exercised on the deployed sensor.
+- **B2 — no cJSON** (−5.0 KB): RegisterRequest built with snprintf + a
+  JSON-escaping writer, responses read with jsmn; byte-identical to
+  cJSON's output (goldens + 50 000-case fuzz). `json` excluded.
+- **B3 — float printf/scanf stubs** (−15.4 KB): the audit found one
+  linked float format, an ESP-MESH debug line in the Wi-Fi blob (mesh
+  unused); the stubs print `?` and fail soft.
+- **B8 — TCP_NODELAY** on the control and DERP sockets; one TLS write
+  per DERP frame and per Noise record (was 3 writes → Nagle waited an
+  RTT per relayed packet). New 1.5 KB static DERP send buffer.
+- **B9** — the first HTTP/2 request goes out without waiting for the
+  server's SETTINGS ACK (−1 RTT per control connect).
+- **B15 — one shared 33 KiB control buffer** (`ctrl_buf.h`, −5.1 KB
+  static; the 32 KiB MapResponse cap is kept): register request /
+  response, the stream request and the netmap body never overlap; a
+  claim guard logs `control buffer busy` if they ever would. The
+  register request (it carries the auth key) is scrubbed after sending.
+- Frames: `register_emit` 2 432 → 288 B, `mapreq_push_endpoints`
+  1 344 → 64 B, `ts2021_connect` 1 712 → 688 B.
+
+#### Crypto (`feat/r132-crypto`, −25.0 KB)
+
+- **B4** — ts2021 Noise records and the NaCl box run on the in-tree IRAM
+  ChaCha20-Poly1305 / Poly1305 (Noise nonce: 4 zero bytes + 64-bit
+  **big-endian** counter); mbedTLS ChaCha20 / Poly1305 off. Byte
+  identity proved against an independent OpenSSL generator and the old
+  mbedTLS path (`test_noise_ik`, RFC 8439 vectors). Side effect: TLS
+  now negotiates **ECDHE-ECDSA-AES128-GCM-SHA256** (hardware AES) — in
+  1.3.1 it was ECDHE-ECDSA-CHACHA20-POLY1305 in software, contrary to
+  the old comments (verified with IDF's mbedTLS 3.6.7 against
+  controlplane and derp16b); key exchange X25519 in both.
+- **B5** — `mbedtls_user_config.h` (repo root, build-wide, project-
+  relative): ARIA, CFB / OFB, three paddings and PKCS#12 out; XTS stays
+  (nvs_flash compiles its encrypted-partition code), PKCS#5 stays (WPA2
+  passphrase). Applied to all 170 TUs that include mbedTLS headers.
+- **B6** — -O2 per source: mbedcrypto bignum / bignum_core / ecp /
+  ecp_curves, MPI glue and the AES-GCM record path (≈ 99 % of a
+  profiled handshake); tinylink crypto, WG data plane + handshake,
+  DISCO, DERP, keys, TMP117; everything else -Os.
+- **B12** — `chacha20_init` and the zero pad out of flash; in-tree IRAM
+  `tl_secure_zero` (memset + compiler barrier) replaces the flash-
+  resident mbedTLS zeroize and the remaining plain-memset secret
+  scrubs.
+
+#### Data plane (`feat/r132-dp`, +3.1 KB flash, −2.9 KB static)
+
+- **B7 — the first WG INIT is no longer lost**: while a handshake is
+  pending the *same* INIT bytes are re-sent on DERP login (via DERP), on
+  CallMeMaybe (direct + DERP while no direct path is confirmed) and on a
+  matched pong; new INITs are copied via DERP until a direct path is
+  verified. Copies are not new attempts (the peer drops duplicates as
+  replays — wireguard-go / magicsock behaviour); the old pong
+  "fast INIT" that built a new INIT 500 ms apart is gone. RX/TX waits
+  run to the next timer deadline. Expected WG-up − netmap ≈ 2.0–2.3 s
+  (was 5.4 s).
+- **B10** — the direct-path DISCO pong is sealed with the cached shared
+  key: ~20 ms → ~50 µs per ping; deepest direct-DISCO wg_rx chain
+  5 696 → ~3 250 B.
+- **B11** — static-static DH and both mac1 keys computed once per
+  identity (recomputed on peer / local key or PSK change): −20 ms per
+  INIT / rekey; INIT bytes pinned to the from-scratch path in a test.
+- **B13** — `wg_lwip_linkoutput` frame 1 568 → 32 B (chained pbufs, rare
+  with `LWIP_NETIF_TX_SINGLE_PBUF`, go through a noinline `pbuf_clone`
+  path under the core lock): tiT ICMP-reply chain ≈ 2 590 → 1 040 B.
+- **B14** — TX queue is a 4-slot ring of indices (same capacity and
+  drop semantics): −2 × 1.5 KB copies per packet, −3.1 KB static.
+- **B21** — one clock read per loop, WDT feed ≤ 1/s, idle wakes ≈ 3/s →
+  0.3/s, demux switch on the first byte (also closes a 1-in-2³² chance
+  per handshake of misrouting a session to the STUN handler), public
+  nonce built with word stores.
+
+#### System (`feat/r132-sys`, −5.9 KB static, ≈ +9 KB heap expected)
+
+- **B16** — only the PreferredDERP region of the DERPMap is stored,
+  matched on RegionID (never position): 28 → 1 region, −6 KB BSS.
+- **B17** — the STUN re-probe task is folded into the telemetry task
+  (−3.5 KB heap); with telemetry disabled the task still runs the
+  re-probe, stack diag and time floor.
+- **B19** — `/stats` gains `heap_min` and `"boots":{total, brownout,
+  panic, task_wdt, int_wdt}` (RTC no-init record with magic + FNV
+  check; restarts at zero after a power loss). The reply buffer is
+  768 → 896 B (worst case 862 B, host-tested).
+- **B20** — the NVS time floor is written once a sync lands ≥ 1 day past
+  the stored value (daily in steady state; still immediate after a
+  long power-off). Fewer 4 KB erases that stall both CPUs.
+
+#### Integration review — fixed before flashing
+
+An independent review of the merged diff (cross-branch interactions,
+lock graph, per-task worst-case stacks from the objdump frames) found
+no crash or deadlock; confirmed the B4 nonce, B5 on every mbedTLS TU,
+B9 against both x/net `http2.Server` front ends, the B15 claim order
+and that B7 never builds INITs faster than REKEY_TIMEOUT. Fixed:
+- **B7 × B8: a half-open DERP conn could stall all TX for up to
+  120 s.** B7 relays while the direct path may be fine (INIT copies,
+  dual send), and a relay write blocks under the DERP write lock for up
+  to 4 × 30 s of send timeouts — with wg_tx sending one item at a time,
+  direct traffic queued behind it. Redundant copies now go through
+  `derp_client_try_send_packet`: lock with a zero timeout and a
+  zero-timeout `select()` (lwIP reports writable only above
+  TCP_SNDLOWAT ≈ 2.9 KB free, more than a frame needs), else declined.
+  The relay callback gained a `best_effort` flag; the RX-stale and
+  sendto-errno relays still wait.
+- The first INIT in `wg_netif_start` is built under `hs_lock` (a late
+  first netmap lets the DERP supervisor's B7 kicks read `g.init_msg`
+  concurrently).
+- The ENETUNREACH backdate of `last_transport_recv_us` in
+  `send_to_peer` takes `g.lock` (it now also runs on the DERP task).
+Worst-case stack use per task after the merge (frames + 512 B
+overhead): wg_rx 73 % (uncached DISCO → donna), tinylink_tlm ≈ 70 %
+(/stats → sendto → encrypt; STUN 2.5 KiB, NVS write 1.3 KiB), tiT 61 %,
+tinylink_derp 54 %, wg_tx 39 %, tinylink_lp / main 31 %.
+
 ### Optimization round A 1.3.1 (2026-10-28, branch `feat/opt-1.3.1`)
 
 Round A of `docs/rounds/2026-10-optimization-list.md` — the Kconfig /

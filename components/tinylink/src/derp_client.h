@@ -115,6 +115,19 @@ esp_err_t derp_client_send_packet(derp_client_t *c,
                                   const uint8_t dst_pub[DERP_KEY_LEN],
                                   const uint8_t *packet, size_t plen);
 
+/* Same frame, never blocking (round 1.3.2), for redundant copies — B7's
+ * DERP copies of a handshake INIT and the DERP half of the dual send,
+ * both made while the direct path may be fine. Declines with
+ * ESP_ERR_TIMEOUT when another writer holds the lock or the socket is
+ * not writable right now (select() with a zero timeout: lwIP reports
+ * writable only above TCP_SNDLOWAT ≈ 2.9 KB free, more than one frame +
+ * TLS record needs, so the write cannot block). A half-open DERP conn
+ * can then never park the wg_tx task — the blocking variant above can
+ * wait out 4 × 30 s of send timeouts. Other returns as above. */
+esp_err_t derp_client_try_send_packet(derp_client_t *c,
+                                      const uint8_t dst_pub[DERP_KEY_LEN],
+                                      const uint8_t *packet, size_t plen);
+
 #ifdef __cplusplus
 }
 #endif

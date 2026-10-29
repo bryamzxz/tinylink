@@ -1002,6 +1002,7 @@ static void derp_supervised_task(void *arg)
 esp_err_t tinylink_relay_via_derp(const uint8_t *dst_node_pub,
                                   const uint8_t *packet,
                                   size_t len,
+                                  bool best_effort,
                                   void *user)
 {
     (void)user;  /* registered with user=NULL; supervisor lives in BSS */
@@ -1023,9 +1024,11 @@ esp_err_t tinylink_relay_via_derp(const uint8_t *dst_node_pub,
     if (!s_derp_sup.connected) {
         return ESP_ERR_INVALID_STATE;
     }
-    return derp_client_send_packet(&s_derp_sup, dst_node_pub, packet, len);
+    return best_effort
+        ? derp_client_try_send_packet(&s_derp_sup, dst_node_pub, packet, len)
+        : derp_client_send_packet(&s_derp_sup, dst_node_pub, packet, len);
 #else
-    (void)dst_node_pub; (void)packet; (void)len;
+    (void)dst_node_pub; (void)packet; (void)len; (void)best_effort;
     return ESP_ERR_NOT_SUPPORTED;
 #endif
 }

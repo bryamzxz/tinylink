@@ -222,11 +222,19 @@ uint64_t wg_netif_get_tx_drops(void);
  * The callback may be invoked from the TX worker context — must not
  * call back into wg_netif_send_plaintext or block longer than ~100 ms.
  *
+ * `best_effort` (round 1.3.2) marks a redundant copy — B7's DERP copy
+ * of a handshake INIT, or the DERP half of the dual send while the
+ * direct path is unproven: the callee must not block at all and may
+ * decline (ESP_ERR_TIMEOUT) when the relay cannot take it at once. A
+ * relay the TX worker depends on (RX-stale path, sendto errno) passes
+ * false and may wait for the relay's write lock.
+ *
  * cb=NULL (the default) disables all relay paths; the TX worker only
  * does direct UDP sendto. */
 typedef esp_err_t (*wg_netif_relay_fn)(const uint8_t *dst_node_pub,
                                        const uint8_t *packet,
                                        size_t len,
+                                       bool best_effort,
                                        void *user);
 void wg_netif_set_relay_callback(wg_netif_relay_fn cb, void *user);
 

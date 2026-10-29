@@ -294,6 +294,9 @@ esp_err_t tinylink_derp_supervised_start(void);
  *   ESP_ERR_NOT_SUPPORTED if CONFIG_TINYLINK_DERP_SUPERVISED=n
  *   ESP_FAIL on TLS write error
  *
+ * `best_effort` = a redundant copy (wg_netif_relay_fn): never blocks,
+ * ESP_ERR_TIMEOUT when the DERP conn cannot take it at once.
+ *
  * Wired into wg_netif via wg_netif_set_relay_callback at startup. The
  * signature matches wg_netif_relay_fn so it can be registered
  * directly. Safe to call from any task; serialized by the DERP client's
@@ -301,6 +304,7 @@ esp_err_t tinylink_derp_supervised_start(void);
 esp_err_t tinylink_relay_via_derp(const uint8_t *dst_node_pub,
                                   const uint8_t *packet,
                                   size_t len,
+                                  bool best_effort,
                                   void *user);
 
 /* Bring up the WireGuard UDP socket early — bind only, no handshake.
