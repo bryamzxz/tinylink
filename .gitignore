@@ -55,3 +55,6 @@ tools/test/test_*
 
 # Editor / local Claude Code settings
 .claude/
+
+# ESP32 vendor PDFs (Espressif / Cadence copyright) — fetched by docs/esp32/fetch-docs.sh
+docs/esp32/pdf/
