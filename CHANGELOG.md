@@ -220,8 +220,23 @@ first, then 1.3.3 (`85a3b55`, then `b58273f` with the RX-drop counters).
   between 03:13 and 03:26, across two firmware versions, and none in the
   20 rekeys after 03:32: an environmental window (the collector after
   its 02:00 reboot, or the path), not a 1.3.3 regression. The RX-drop
-  counters above were added to name the cause next time. 6-h soak
-  running.
+  counters above were added to name the cause next time.
+- **Soak (`b58273f`, 365 min):** 0 resets / panics / WDT / brown-outs;
+  195 rekeys, 0 RX-stale (the RX-drop counters never fired), 17 rekeys
+  needed a REKEY_TIMEOUT retry (three needed 3–4 INITs, all within the
+  180-s session lifetime — lossy direct path in the morning; candidate:
+  copy rekey INITs to DERP from the 2nd attempt, as B7 does for the
+  cold handshake); 4 306 telemetry packets, 72 STUN re-probes, DERP
+  logged in once with 0 errors; one stream FIN on the boot connection
+  at 352 s (above). **heap_free min / last 93 604 / 94 668 B (75 024 /
+  76 588 on 1.3.2), largest block never below 77 824 B (59 392).**
+  Stack lows (B free): `tinylink_lp` 4 992 of 12 288, `tinylink_derp`
+  4 032 of 8 192, `wg_tx` 2 900 of 5 120, `esp_timer` 3 028 of 4 608,
+  `wg_rx` 4 392 of 8 192, `tinylink_tlm` 2 632, `tiT` 2 776 — all within
+  `stack_worst.py`'s static bounds. Side note: the device's uptime ran
+  1.3 % ahead of the host clock (21 761 s against 21 473 s) — light
+  sleep re-bases esp_timer on the internal RC slow clock; harmless
+  (protocol timers 1.3 % early, wall time from NTP).
 
 ### Optimization round B 1.3.2 (2026-10-28, branch `feat/opt-1.3.2`)
 
