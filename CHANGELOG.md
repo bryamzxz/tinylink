@@ -16,10 +16,11 @@ headscale `89fa72e0..2d220b2e` (330 commits, 0.29.6,
 plus the owner's decisions: capver **148**, firmware **1.3.0** (1.3.x is
 the work line, 1.4.0 the next stable), ESP-IDF **v5.5.6**. Every
 finding, decision and constraint is kept in
-`docs/rounds/2026-10-upstream-sync.md`. Host suite **623 strict OK, 0
-FAIL** (+53), ASan + UBSan clean. Flash 946 037 → 958 013 B (+6 088 B
-from IDF 5.5.6, +5 888 B from the round's code); BSS 93 048 → 94 320 B
-(+128 IDF, +1 144 code). Compiler warnings: 0. **Hardware smoke still
+`docs/rounds/2026-10-upstream-sync.md`. Host suite **633 strict OK, 0
+FAIL** (+63), ASan + UBSan clean. Image 946 037 → 959 249 B (+6 056 B
+from IDF 5.5.6, +7 156 B from the round's code incl. the review fixes and
+the S1/S2 security fixes); BSS 93 048 → 94 320 B (+128 IDF, +1 144
+code). Compiler warnings: 0. **Hardware smoke still
 pending owner approval** — capver changes the Noise prologue.
 
 #### 1 — Capver 148 (= Tailscale v1.104), every step honoured
