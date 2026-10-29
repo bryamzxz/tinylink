@@ -226,10 +226,10 @@ static esp_err_t bringup(void)
     }
 #endif
 
-    /* Long-poll FIRST so its TLS conn + nghttp2 session land on a
-     * fresh heap. The long-poll task runs at priority IDLE+4 (higher
-     * than this bringup task) so it preempts here and starts its
-     * handshake immediately. */
+    /* Long-poll FIRST so its TLS conn lands on a fresh heap (the
+     * HTTP/2 session needs none since 1.3.4). The long-poll task runs
+     * at priority IDLE+4 (higher than this bringup task) so it preempts
+     * here and starts its handshake immediately. */
     err = tinylink_long_poll_start();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "long-poll start failed: 0x%x", err);
@@ -255,6 +255,12 @@ static esp_err_t bringup(void)
 void app_main(void)
 {
     esp_err_t err = bringup();
+    /* The main task is gone before the first 60-s stack diag, so its
+     * peak is logged here: 8 KiB since round 1.3.4 (D4), sized from
+     * tools/stack_worst.py (see sdkconfig.defaults). */
+    ESP_LOGI(TAG, "main stack: hwm=%u B free of %u",
+             (unsigned)uxTaskGetStackHighWaterMark(NULL),
+             (unsigned)CONFIG_ESP_MAIN_TASK_STACK_SIZE);
     if (err != ESP_OK) {
 #if CONFIG_TINYLINK_CONTROL_WEDGE_RESTART_S > 0
         /* Unattended-deployment stance (paired with the long-poll's

@@ -11,6 +11,8 @@ idf_component_register(
         "src/tls_io.c"
         "src/ts2021_client.c"
         "src/h2_client.c"
+        "src/h2_core.c"
+        "src/hpack.c"
         "src/register.c"
         "src/mapreq.c"
         "src/wg_dataplane.c"
@@ -56,7 +58,6 @@ idf_component_register(
         lwip
         mbedtls
     PRIV_REQUIRES
-        espressif__nghttp
         esp_timer
 )
 
@@ -77,7 +78,9 @@ idf_component_register(
 #    to save 63 B.
 # Everything else is control plane, per-netmap or once-per-minute code
 # at -Os: ts2021_client / noise_ik (record glue; the AEAD itself is in
-# IRAM), h2_client, tls_io, register, control_key, json_helpers,
+# IRAM), h2_client / h2_core / hpack (round 1.3.4, D1: per record and per
+# response header block, not per packet), tls_io, register, control_key,
+# json_helpers,
 # mapreq (netmap parse, ~4 ms), wg_dataplane (peer selection per
 # netmap), stun / stun_probe, tinylink (bring-up, supervisors, thin
 # DERP dispatch), telemetry (1/min), tl_time, tinylink_bench: the

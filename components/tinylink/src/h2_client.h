@@ -2,9 +2,10 @@
 // Copyright (c) 2026 Bryam (bryamzxz)
 //
 // Minimal HTTP/2 client over a ts2021 Noise channel. Single-stream,
-// synchronous, no server push, no HPACK dynamic-table indexing.
-// Used by register.c for /machine/register and (later) by the M2 map
-// streamer for /machine/map.
+// synchronous, no server push, no HPACK dynamic-table indexing. Used by
+// register.c for /machine/register and by mapreq.c for /machine/map
+// (endpoint push and the long-poll stream). Since round 1.3.4 (D1) it
+// runs on the in-tree engine (h2_core.h / hpack.h) instead of nghttp2.
 
 #pragma once
 
@@ -64,23 +65,19 @@ esp_err_t h2_post_json_stream(ts2021_conn_t *conn,
                               int *status_out,
                               h2_data_callback cb, void *cb_ctx);
 
-/* Build the persistent nghttp2 session bound to `conn`. Called once at
- * the end of ts2021_connect, while the LP TLS conn is the only one
- * alive and the heap has a contiguous ~24 KiB free block for the
- * ~10–14 KiB nghttp2_session struct. Sends the client preface + our
- * SETTINGS and returns without waiting for the server's (round 1.3.2):
- * the first request follows immediately, and the server's SETTINGS /
- * ACK are processed by that request's recv loop.
+/* Start the persistent HTTP/2 session bound to `conn` (state embedded in
+ * the conn, no heap). Called once at the end of ts2021_connect. Sends
+ * the client preface + our SETTINGS and returns without waiting for the
+ * server's (round 1.3.2): the first request follows immediately, and the
+ * server's SETTINGS / ACK are processed by that request's recv loop.
  *
  * Returns ESP_OK on success; on failure the conn must be torn down.
- * Idempotent: calling twice on the same conn frees the prior session
- * before allocating the new one. */
+ * Idempotent: calling twice on the same conn starts a fresh session. */
 esp_err_t h2_session_init(ts2021_conn_t *conn);
 
 /* Tear down the persistent session bound to `conn`. Safe to call on a
- * conn that never had h2_session_init() succeed (no-op). Must be
- * called BEFORE esp_tls_conn_destroy so the nghttp2 cleanup doesn't
- * touch a destroyed TLS context. */
+ * conn that never had h2_session_init() succeed (no-op). Called before
+ * esp_tls_conn_destroy; sends nothing. */
 void h2_session_destroy(ts2021_conn_t *conn);
 
 #ifdef __cplusplus

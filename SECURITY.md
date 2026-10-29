@@ -41,8 +41,10 @@ In scope:
 
 Out of scope:
 
-- Bugs in upstream dependencies (`espressif/nghttp` (nghttp2), `mbedtls`,
-  ESP-IDF). Please report those upstream; we will track and pull in fixes.
+- Bugs in upstream dependencies (`mbedtls`, ESP-IDF). Please report those
+  upstream; we will track and pull in fixes. (The HTTP/2 client is in-tree
+  since 1.3.4 — `components/tinylink/src/h2_core.c`, `hpack.c` — and in
+  scope.)
 - Side-channel attacks requiring physical access beyond what the threat model
   in [`docs/SECURITY-MODEL.md`](docs/SECURITY-MODEL.md) covers.
 - Recovery of key material by reading the flash: NVS is stored in

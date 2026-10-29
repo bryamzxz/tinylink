@@ -8,9 +8,10 @@
 // Wire format constants come from upstream
 // `tailscale/control/controlbase/messages.go` and
 // `tailscale/control/controlhttp/{client,controlhttpcommon}.go`.
-// h2_client.c sits on top of ts2021_send / ts2021_recv to carry HTTP/2
-// frames; do not call ts2021_send with raw HTTP/1.1 bytes — the control
-// plane serves HTTP/2 (prior knowledge) after the Upgrade.
+// h2_client.c sits on top of ts2021_send / ts2021_tx_send /
+// ts2021_recv_record to carry HTTP/2 frames; do not send raw HTTP/1.1
+// bytes — the control plane serves HTTP/2 (prior knowledge) after the
+// Upgrade.
 
 #pragma once
 
@@ -21,8 +22,7 @@
 #include "esp_err.h"
 #include "esp_tls.h"
 
-#include "nghttp2/nghttp2.h"
-
+#include "h2_core.h"
 #include "noise_ik.h"
 #include "tinylink.h"  /* TINYLINK_CAPVER — single source of truth */
 
@@ -52,6 +52,12 @@
  * space and distinct from TLS_IO_ERR_IDLE_TIMEOUT (-0x10000). */
 #define TS2021_ERR_READ_ABORTED (-0x10001)
 #define TS2021_RECORD_PLAINTEXT_MAX (TS2021_MAX_MESSAGE - TS2021_HEADER_LEN - NOISE_TAGLEN)
+/* The records we send (round 1.3.4, D4): header + ciphertext ≤ 2 048 B,
+ * CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN, so each one is one TLS record. */
+#define TS2021_TX_RECORD_MAX        2048
+#define TS2021_TX_PLAINTEXT_MAX     (TS2021_TX_RECORD_MAX - TS2021_HEADER_LEN - NOISE_TAGLEN)
+/* ts2021_send's stack record: the HTTP/2 control frames (H2_CTL_CAP). */
+#define TS2021_SMALL_PLAINTEXT_MAX  64
 
 /* EarlyPayload sentinel sent (optionally) by the server before HTTP/2
  * begins: 5-byte magic || BE32 length || JSON-encoded tailcfg.EarlyNoise.
@@ -76,54 +82,47 @@ typedef struct {
     noise_ik_state_t  noise;
     bool              connected;
 
-    /* Plaintext that has been decrypted but not yet returned to a
-     * ts2021_recv() caller (e.g. the 9 EarlyPayload bytes that turned out
-     * to be plain HTTP/2). */
-    uint8_t  rx_residual[TS2021_RECORD_PLAINTEXT_MAX];
-    size_t   rx_residual_len;
-    size_t   rx_residual_off;
+    /* (Round 1.3.4, D5: the 4 077-B `rx_residual` copy is gone. The
+     * HTTP/2 bytes that follow the Noise handshake — after the optional
+     * EarlyPayload — stay in h2_rx below as the window
+     * [h2_rx_off, h2_rx_len), parsed before the first request.) */
 
     /* ---- Persistent HTTP/2 session state (M5 step 2c) ----
      *
-     * The session is created once by h2_session_init() at the end of
-     * ts2021_connect (when only the long-poll TLS conn is alive and
-     * ~24 KiB of contiguous heap is still available) and torn down by
-     * h2_session_destroy() at the start of ts2021_close. This avoids
-     * the per-request session_client_new/del cycle that returned
-     * NGHTTP2_ERR_NOMEM (-901) once a second TLS conn (the DERP
-     * supervisor) had fragmented the heap.
-     *
-     * All h2_* fields below live in this struct so the nghttp2
-     * callbacks (which receive `ts2021_conn_t *` as user_data) can
-     * persist state across requests without heap allocs. */
-    nghttp2_session *h2;
+     * One session per ts2021 conn, started by h2_session_init() at the
+     * end of ts2021_connect and dropped by h2_session_destroy() in
+     * ts2021_close; requests run on it one after the other (register,
+     * endpoint push, then the map stream). Since round 1.3.4 (D1) it is
+     * the in-tree engine (h2_core.h), embedded here — no heap: the
+     * nghttp2 session (10–14 KiB, plus a 16 KiB send chunk) had to be
+     * allocated while the heap was still unfragmented, which is why it
+     * was created at connect time. */
+    h2_core_t        h2;
     bool             h2_goaway;          /* server sent GOAWAY → reconnect */
 
-    /* Decrypted-Noise plaintext ring fed into nghttp2's recv_cb. Lives
-     * in BSS via the file-scope ts2021_conn_t in tinylink.c — sized at
-     * one Noise record so the codec can stage one frame at a time. */
-    uint8_t  h2_rx[TS2021_RECORD_PLAINTEXT_MAX];
+    /* The record ring: each Noise record's ciphertext is read into it
+     * and decrypted in place, and the engine parses it where it lies;
+     * between records a request is built and sealed in it, ≤ 2 KiB per
+     * record (round 1.3.4, D4: no record buffer on any stack). Lives in
+     * BSS via the file-scope ts2021_conn_t in tinylink.c. One ciphertext
+     * long, which also covers a plaintext plus the up-to-4 EarlyPayload
+     * magic bytes that consume_early_payload may have to put back in
+     * front of it (D5): TS2021_MAX_MESSAGE ≥ 4 080 + 4. Word-aligned so
+     * the AEAD runs its aligned loops. */
+    uint8_t  h2_rx[TS2021_MAX_MESSAGE] __attribute__((aligned(4)));
     size_t   h2_rx_len;
     size_t   h2_rx_off;
 
-    /* One-shot permission token for h2_recv_cb. Set by h2_drive_request
-     * before each session_recv; recv_cb consumes it on the first refill
-     * and returns NGHTTP2_ERR_WOULDBLOCK on subsequent ones so
-     * session_recv unwinds and queued outbound frames (notably
-     * SETTINGS_ACK) flush. Without this the server's idle timeout
-     * (~31 s) closes us before we send ACK. */
-    bool     h2_may_refill;
-
-    /* Body cursor for the in-flight POST. Cleared after each request. */
+    /* Body of the in-flight POST (borrowed). Cleared after each request. */
     const uint8_t *h2_req_body;
     size_t         h2_req_body_len;
-    size_t         h2_req_body_off;
 
-    /* Response status + per-stream tracking, written by the nghttp2
-     * callbacks. Cleared at the start of each h2_drive_request. */
+    /* Response status + stream outcome, written by the engine hooks
+     * (h2_client.c). Cleared at the start of each request.
+     * h2_stream_error is the HTTP/2 code the stream closed with (0 = a
+     * normal end). */
     int      h2_status;
     int32_t  h2_stream_id;
-    bool     h2_stream_closed;
     int      h2_stream_error;
 
     /* Retry-After of the current response (capver 147): `present` =
@@ -153,14 +152,26 @@ esp_err_t ts2021_connect(ts2021_conn_t *out,
                          const uint8_t machine_pub[NOISE_DHLEN],
                          const uint8_t control_pub[NOISE_DHLEN]);
 
-/* Encrypt and write `data` as one Noise transport record (msg type 4). */
+/* Encrypt and write `data` as Noise transport records (msg type 4) of
+ * ≤ TS2021_SMALL_PLAINTEXT_MAX bytes, sealed in a small stack record:
+ * for the HTTP/2 control frames, which may go out while h2_rx still
+ * holds a record being parsed. */
 esp_err_t ts2021_send(ts2021_conn_t *c,
                       const uint8_t *data, size_t data_len);
 
-/* Read up to out_max plaintext bytes. Drains rx_residual first, then
- * reads + decrypts the next record. Returns ESP_OK with *out_len set. */
-esp_err_t ts2021_recv(ts2021_conn_t *c,
-                      uint8_t *out, size_t out_max, size_t *out_len);
+/* Bulk send through the ring (round 1.3.4, D4): ts2021_tx_buf lends
+ * h2_rx (cap TS2021_TX_PLAINTEXT_MAX; only while nothing in it is left
+ * to parse — it drops the window), ts2021_tx_send seals its first `len`
+ * bytes in place and writes them as one record. */
+uint8_t  *ts2021_tx_buf(ts2021_conn_t *c, size_t *cap);
+esp_err_t ts2021_tx_send(ts2021_conn_t *c, size_t len);
+
+/* Read the next record into h2_rx and decrypt it in place: on ESP_OK
+ * the plaintext is h2_rx[0..*len), and so is the window (h2_rx_off 0,
+ * h2_rx_len *len). Bytes left over from the connect (the start of the
+ * HTTP/2 stream) are the window ts2021_connect returns with — the
+ * caller drains it before reading a record. */
+esp_err_t ts2021_recv_record(ts2021_conn_t *c, size_t *len);
 
 void ts2021_close(ts2021_conn_t *c);
 

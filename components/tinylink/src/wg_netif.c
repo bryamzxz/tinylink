@@ -1991,7 +1991,7 @@ esp_err_t wg_netif_update_peer_keys(const uint8_t static_pub[WG_KEY_LEN],
     if (static_pub == NULL) return ESP_ERR_INVALID_ARG;
 
     /* X25519 + HSalsa20 for the new DISCO shared key runs here, in the
-     * caller's task (the long-poll task, 24 KiB stack) and outside both
+     * caller's task (the long-poll task, 7 KiB stack) and outside both
      * locks, so neither the swap nor wg_rx waits ~20 ms on it
      * (X25519 also needs ~1 KiB of stack; 2.7 KiB before 1.3.3). */
     uint8_t k[WG_KEY_LEN];

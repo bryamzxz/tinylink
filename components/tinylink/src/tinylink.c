@@ -404,7 +404,7 @@ static esp_err_t register_node(bool force_auth)
         reg_hint_store(false);
     }
 
-    /* Keep the conn on success: since M5-2c the nghttp2 session is
+    /* Keep the conn on success: since M5-2c the HTTP/2 session is
      * persistent per ts2021 conn, so the next request (the boot-time
      * endpoint push, then the map stream — or, on the in-place
      * re-register path, the push the long-poll runs right after) rides
@@ -1667,7 +1667,8 @@ static void long_poll_task(void *arg)
 esp_err_t tinylink_long_poll_start(void)
 {
     if (!s_initialized) return ESP_ERR_INVALID_STATE;
-    /* 12 KiB stack (round 1.3.3, B18; 24 KiB since #99 was reverted).
+    /* 7 KiB stack (round 1.3.4, D4; 12 KiB since 1.3.3's B18, 24 KiB
+     * from #99's revert until then).
      *
      * History: a 20 KiB trim (#99, sized off a 100 s smoke that peaked
      * at 11 040 B) met a 20 004-B lifetime peak ~18 min into a soak and
@@ -1680,16 +1681,22 @@ esp_err_t tinylink_long_poll_start(void)
      * nghttp2_session_recv with a 4 KiB inbound buffer → the Noise record
      * decrypt), which the boot smoke never ran on this task (boot connects
      * on the main task). 92c09dd (connect reuses the idle h2_rx buffer)
-     * and 1.3.1's 512-B nghttp2 inbound buffer removed both frames.
+     * and 1.3.1's 512-B nghttp2 inbound buffer removed both frames. 1.3.3
+     * then had 7 856 B static (map stream → nghttp2 → the record
+     * decrypt's 4 144-B frame, `ct[4096]`), 7 284 B measured over the 6-h
+     * 1.3.2 soak (the tool is ≥ measured on every task of 1.3.2).
      *
-     * Today: static worst case 7 856 B (map stream → nghttp2_session_recv
-     * → the Noise record decrypt's ct[4096] → mbedtls_ssl_read → an
-     * AES-GCM error log), 7 284 B measured over the 6-h 1.3.2 soak (the
-     * tool is ≥ measured on every task of 1.3.2). 12 KiB = 4.4 KB over
-     * the static worst case; the 1.3.3 soak's stack-diag dumps confirm
-     * it. Moving ct[4096] / rec[4096] off this stack would cut ~4 KB more. */
+     * Today: D4 decrypts each record in place in h2_rx and seals sends
+     * there in ≤ 2 KiB records, so neither `ct` nor the 4 096-B send
+     * record is on any stack. Static worst case 4 864 B (1.3.4 with D1,
+     * D2, D4: map stream → long_poll_handler → wg_dataplane_start →
+     * netif / lwIP → the Wi-Fi TX path → a driver log); a reconnect's
+     * TLS handshake reaches 4 672 B, and the recursions the tool costs
+     * once stay under it at their bounds (jsmn_skip_d's 65 levels:
+     * 3 472 B; the ESP MPI multiply split, ≤ 2 levels deep: 4 832 B).
+     * 7 KiB = 2.3 KB over the static worst case. */
     BaseType_t ok = xTaskCreate(long_poll_task, "tinylink_lp",
-                                12288, NULL, tskIDLE_PRIORITY + 4, NULL);
+                                7168, NULL, tskIDLE_PRIORITY + 4, NULL);
     if (ok != pdPASS) {
         ESP_LOGE(TAG, "xTaskCreate(long_poll) failed");
         return ESP_ERR_NO_MEM;

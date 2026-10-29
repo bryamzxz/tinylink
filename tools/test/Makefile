@@ -31,9 +31,9 @@ TARGETS := test_blake2s test_curve25519 test_x25519 test_mapresp \
            test_disco_handler test_disco_prober test_retry_after \
            test_backoff test_keys_regen test_skip_value test_jsmn_split \
            test_tai64n test_nacl_box test_tsmp test_tl_date test_stats test_noise_ik \
-           test_http1 test_ctrl_json
+           test_http1 test_ctrl_json test_ts2021 test_hpack test_h2_core
 
-all: $(TARGETS)
+all: $(TARGETS) $(H2_INTEROP)
 
 # /stats: RTC boot-counter record + worst-case JSON line. Header-only;
 # host_include/esp_err.h stands in for ESP-IDF's under tinylink.h.
@@ -151,6 +151,74 @@ test_noise_ik: test_noise_ik.c $(NOISE_SRCS) $(TL_SRC)/noise_ik.h $(CRYPTO)/secu
                host_include/esp_err.h host_include/esp_log.h
 	$(CC) $(CFLAGS) -I$(TL_SRC) -I$(CRYPTO) -Ihost_include -o $@ test_noise_ik.c $(NOISE_SRCS)
 
+# ts2021 record layer after the Noise handshake (round 1.3.4: D5's
+# EarlyPayload window). Includes ts2021_client.c over a fake esp_tls;
+# host_include/ supplies esp_tls.h, lwip/sockets.h and friends.
+TS2021_DEFS := -DCONFIG_TINYLINK_CONTROL_HOST='"controlplane.test"' \
+               -DCONFIG_TINYLINK_CONTROL_PORT=443 -DCONFIG_TINYLINK_STREAM_IDLE_TIMEOUT_S=120
+test_ts2021: test_ts2021.c $(TL_SRC)/ts2021_client.c $(TL_SRC)/ts2021_client.h \
+             $(TL_SRC)/tls_io.c $(NOISE_SRCS) host_include/esp_tls.h
+	$(CC) $(CFLAGS) $(TS2021_DEFS) -I$(TL_SRC) -I$(TL_INC) -I$(CRYPTO) -Ihost_include -o $@ \
+	    test_ts2021.c $(TL_SRC)/tls_io.c $(NOISE_SRCS)
+
+# In-tree HTTP/2 client (round 1.3.4, D1): HPACK (RFC 7541 Appendix C,
+# Huffman, fuzz) and the frame / connection engine against a scripted
+# peer. Platform-independent sources, no shims.
+H2_SRCS := $(TL_SRC)/h2_core.c $(TL_SRC)/hpack.c
+test_hpack: test_hpack.c $(TL_SRC)/hpack.c $(TL_SRC)/hpack.h
+	$(CC) $(CFLAGS) -I$(TL_SRC) -o $@ test_hpack.c $(TL_SRC)/hpack.c
+
+test_h2_core: test_h2_core.c $(H2_SRCS) $(TL_SRC)/h2_core.h $(TL_SRC)/hpack.h
+	$(CC) $(CFLAGS) -I$(TL_SRC) -o $@ test_h2_core.c $(H2_SRCS)
+
+# HTTP/2 interop against nghttp2's server side, in memory: the firmware
+# stack (h2_client.c → h2_core → ts2021_client.c, Noise records over a
+# fake esp_tls) as test_h2_interop, and the 1.3.4 nghttp2 client
+# (ref/h2_134/) on the same scenarios as test_h2_ref. nghttp2 comes from
+# NGHTTP2_COMPONENT — by default the managed component the firmware built
+# against until D1 (idf.py fetched it into managed_components/; any IDF
+# project with espressif/nghttp has one) — compiled here for the host;
+# else the system library (pkg-config libnghttp2); else both are skipped
+# with a notice (CI's host job has neither).
+NGHTTP2_COMPONENT ?= ../../managed_components/espressif__nghttp
+NG_LIB_DIR := test_nghttp2_host
+NG_COMP := $(abspath $(NGHTTP2_COMPONENT))
+ifneq ($(wildcard $(NG_COMP)/nghttp2/lib/nghttp2_session.c),)
+  NG_SRC_DIR := $(NG_COMP)/nghttp2/lib
+  NG_CFLAGS  := -I$(NG_SRC_DIR)/includes -I$(NG_COMP)/port/include
+  NG_LIBS    := $(NG_LIB_DIR)/libnghttp2_host.a
+  NG_DEP     := $(NG_LIBS)
+  H2_INTEROP := test_h2_interop test_h2_ref
+else ifneq ($(shell pkg-config --exists libnghttp2 2>/dev/null && echo y),)
+  NG_CFLAGS  := $(shell pkg-config --cflags libnghttp2)
+  NG_LIBS    := $(shell pkg-config --libs libnghttp2)
+  NG_DEP     :=
+  H2_INTEROP := test_h2_interop test_h2_ref
+else
+  H2_INTEROP :=
+endif
+
+$(NG_LIB_DIR)/libnghttp2_host.a:
+	mkdir -p $(NG_LIB_DIR)
+	cd $(NG_LIB_DIR) && for f in $(NG_SRC_DIR)/*.c; do \
+	    $(CC) -O1 -w $(EXTRA_CFLAGS) -DHAVE_ARPA_INET_H -DHAVE_NETINET_IN_H -DHAVE_TIME_H \
+	        -DHAVE_CLOCK_GETTIME $(NG_CFLAGS) -I$(NG_SRC_DIR) -c $$f || exit 1; done
+	ar rcs $@ $(NG_LIB_DIR)/*.o
+
+H2_STACK := $(TL_SRC)/h2_client.c $(H2_SRCS) $(TL_SRC)/ts2021_client.c $(TL_SRC)/tls_io.c $(NOISE_SRCS)
+test_h2_interop: test_h2_interop.c $(H2_STACK) $(TL_SRC)/h2_client.h $(TL_SRC)/ts2021_client.h $(NG_DEP)
+	$(CC) $(CFLAGS) $(TS2021_DEFS) $(NG_CFLAGS) -I$(TL_SRC) -I$(TL_INC) -I$(CRYPTO) -Ihost_include \
+	    -o $@ test_h2_interop.c $(H2_STACK) $(NG_LIBS)
+
+# The reference: nghttp2's deprecated ssize_t callback API, and atoi
+# from an IDF header the host lacks — compiled as it was, warnings off
+# for those two only.
+test_h2_ref: test_h2_interop.c ref/h2_134/h2_client.c ref/h2_134/h2_client.h \
+             ref/h2_134/ts2021_client.h $(NG_DEP)
+	$(CC) $(CFLAGS) -DH2_REF -Wno-deprecated-declarations -include stdlib.h $(TS2021_DEFS) \
+	    $(NG_CFLAGS) -Iref/h2_134 -I$(TL_SRC) -I$(TL_INC) -I$(CRYPTO) -Ihost_include \
+	    -o $@ test_h2_interop.c ref/h2_134/h2_client.c $(NG_LIBS)
+
 # WG handshake initiator (step 3a). Pulls in the crypto stack +
 # wg_proto.c + wg_handshake.c. Uses host fallback for time(2) /
 # clock_gettime(2) — the ESP_PLATFORM branches in wg_proto.c are
@@ -263,7 +331,7 @@ test_wg_transport: test_wg_transport.c \
 	    $(CRYPTO)/chacha20.c $(CRYPTO)/poly1305_donna.c \
 	    $(CRYPTO)/chacha20poly1305.c
 
-.PHONY: all test asan clean mbedtls-ref $(addsuffix .run,$(TARGETS))
+.PHONY: all test asan clean mbedtls-ref h2_interop.run $(addsuffix .run,$(TARGETS))
 
 # ---- Optional: the pre-1.3.2 mbedTLS path as a reference ----------------
 # Not part of `make test` (CI has no ESP-IDF). Needs IDF_PATH (or
@@ -328,7 +396,26 @@ test: test_blake2s.run test_curve25519.run test_x25519.run test_mapresp.run \
       test_retry_after.run test_backoff.run test_keys_regen.run \
       test_skip_value.run test_jsmn_split.run test_tai64n.run \
       test_nacl_box.run test_tsmp.run test_tl_date.run test_stats.run test_noise_ik.run \
-      test_http1.run test_ctrl_json.run
+      test_http1.run test_ctrl_json.run test_ts2021.run test_hpack.run test_h2_core.run \
+      h2_interop.run
+
+test_hpack.run: test_hpack
+	$(RUNNER) ./test_hpack
+
+test_h2_core.run: test_h2_core
+	$(RUNNER) ./test_h2_core
+
+ifneq ($(H2_INTEROP),)
+h2_interop.run: test_h2_interop test_h2_ref
+	$(RUNNER) ./test_h2_interop
+	$(RUNNER) ./test_h2_ref
+else
+h2_interop.run:
+	@echo "h2 interop: skipped — no nghttp2 (set NGHTTP2_COMPONENT=<espressif__nghttp dir> or install libnghttp2)"
+endif
+
+test_ts2021.run: test_ts2021
+	$(RUNNER) ./test_ts2021
 
 test_http1.run: test_http1
 	$(RUNNER) ./test_http1
@@ -424,5 +511,5 @@ test_retry_after.run: test_retry_after
 	$(RUNNER) ./test_retry_after
 
 clean:
-	rm -f $(TARGETS) test_aead_mbedtls test_noise_ik_mbedtls
-	rm -rf $(MBEDTLS_REF)
+	rm -f $(TARGETS) test_aead_mbedtls test_noise_ik_mbedtls test_h2_interop test_h2_ref
+	rm -rf $(MBEDTLS_REF) $(NG_LIB_DIR)

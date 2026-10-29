@@ -717,7 +717,7 @@ sizes once M1–M5 are all landed.
 | Component                                                    | Flash KB |
 |--------------------------------------------------------------|----------|
 | mbedTLS minimal preset + curve25519 + bundle (no chachapoly) | 250      |
-| nghttp2 (espressif/nghttp managed component)                 | 60       |
+| HTTP/2 client, in-tree since 1.3.4 (was nghttp2, 60)         | 10       |
 | lwIP + WiFi + FreeRTOS                                       | 180      |
 | In-tree WireGuard data plane (wg_netif + wg_lwip + wg_*.c)   | 40       |
 | Vendored BLAKE2s + HKDF + Salsa20 + NaCl-box                 | 12       |
@@ -748,16 +748,18 @@ or a stack size changes.
 
 | Task               | Stack    | Prio    | Where                              | Role                                                       |
 |--------------------|----------|---------|------------------------------------|------------------------------------------------------------|
-| `main`             | 24 KiB   | 1       | `CONFIG_ESP_MAIN_TASK_STACK_SIZE`  | bringup: WiFi, keys, register, STUN, dataplane, spawns; exits |
-| `tinylink_lp`      | 24 KiB   | IDLE+4  | `tinylink.c::tinylink_long_poll_start` | control conn: ts2021 connect, endpoint push, map long-poll, re-register, wedge restart |
+| `main`             | 8 KiB    | 1       | `CONFIG_ESP_MAIN_TASK_STACK_SIZE`  | bringup: WiFi, keys, register, STUN, dataplane, spawns; exits |
+| `tinylink_lp`      | 7 KiB    | IDLE+4  | `tinylink.c::tinylink_long_poll_start` | control conn: ts2021 connect, endpoint push, map long-poll, re-register, wedge restart |
 | `tinylink_derp`    | 10 KiB   | IDLE+3  | `tinylink.c::tinylink_derp_supervised_start` | DERP TLS session: relayed DISCO / WG inject, CMM punch |
 | `wg_rx`            | 8 KiB    | IDLE+3  | `wg_netif.c::wg_netif_start`       | UDP recv, demux (WG/DISCO/STUN), handshake, decrypt → lwIP  |
 | `wg_tx`            | 7 KiB    | IDLE+2  | `wg_netif.c::wg_netif_start`       | encrypted-frame queue → `sendto` (direct) or DERP relay     |
 | `tinylink_tlm`     | 4.5 KiB  | IDLE+2  | `telemetry.c::telemetry_task_start` | TMP117 sample → JSON → UDP over the tunnel; `/stats`; periodic / GOT_IP-triggered STUN re-probe (flags endpoint push); 60 s stack diag + NVS time floor |
 | `tiT` (lwIP)       | 4.5 KiB  | 18      | `CONFIG_LWIP_TCPIP_TASK_STACK_SIZE`| TCP/IP thread (raised 3 → 4.5 KiB in #104)                 |
 
-Application task stacks total ≈ 54 KiB (the 24 KiB `main` stack is
-returned to the heap when `app_main` returns). The STUN re-probe had its
+Application task stacks total ≈ 36.5 KiB (the 8 KiB `main` stack is
+returned to the heap when `app_main` returns; 1.3.4's D4 took
+`tinylink_lp` 12 → 7 KiB and `main` 24 → 8 KiB, sized from
+`tools/stack_worst.py`). The STUN re-probe had its
 own 3 KiB task, `tinylink_stun_re`, until 1.3.2; it now runs on
 `tinylink_tlm` (−3.4 KiB heap: stack + TCB + wake semaphore), which
 exists in every build — with `CONFIG_TINYLINK_TELEMETRY_ENABLE=n` it
@@ -771,11 +773,14 @@ path stands ≥ 176 B shallower than in 1.3.1 (one 688-B frame then), and
 the STUN path (~1.8 KB on its own task) ≈ 1.9 KB here, well under the
 `/stats`/sample paths (≈ 3.3 KB, ≤ 1.3.1's measured 3.5 KB peak). A
 GOT_IP wakes the loop at once, except while `select()` serves `/stats`:
-then the ≤ 5-s wait slice bounds the delay. The long-poll's 24 KiB is
-the one to watch: its measured lifetime peak is 20 KiB, dominated by
-`ts2021_connect` (9 888 B frame) → `recv_record_plaintext` (4 176 B) →
-mbedTLS handshake; see `docs/ROADMAP.md` § "Buffer diet" for the
-planned trim.
+then the ≤ 5-s wait slice bounds the delay. The long-poll's stack is
+the one to watch: its lifetime peak was 20 KiB in 2026-05, dominated by
+`ts2021_connect` (9 888 B frame) → the record decrypt (4 176 B) →
+mbedTLS handshake. Those buffers are gone (92c09dd; the record decrypt's
+4 KiB `ct` since 1.3.4's D4, which decrypts in place in `h2_rx`), and
+its static worst case is 4 864 B against 7 KiB (see
+`tinylink_long_poll_start`); the 60-s `stack diag` line shows its
+high-water mark.
 
 There is no dedicated endpoint-push task any more (2026-09): the push
 runs on `tinylink_lp` — see item 9 below.

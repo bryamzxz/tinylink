@@ -1158,6 +1158,11 @@ def main():
     ap.add_argument('--no-cut', action='store_true',
                     help='keep the runtime-infeasible edges listed in CUT')
     args = ap.parse_args()
+    # linked_members tells compiled-here archives (graph from .ci) from
+    # precompiled ones by path prefix: a relative --build made every
+    # project archive "precompiled", duplicating each function and losing
+    # the task entries (round 1.3.4, D4).
+    args.build = os.path.abspath(args.build)
     args.elf = args.elf or os.path.join(args.build, 'tinylink.elf')
     args.map = args.map or os.path.join(args.build, 'tinylink.map')
     args.objdump = os.path.join(args.toolchain, 'xtensa-esp32-elf-objdump')
@@ -1375,8 +1380,8 @@ def project_config():
           'run is main-task only'),
         R('derp_run_loop', r'\bsend\(', ['derp_send_frame_locked'],
           'derp_client.c:415'),
-        R('data_chunk_cb', r'h2_cb', ['mapreq.c:stream_chunk_cb'],
-          'h2_post_stream(.., stream_chunk_cb): mapreq_run_stream only'),
+        R('h2_io_on_data', r'h2_cb', ['mapreq.c:stream_chunk_cb'],
+          'h2_post_json_stream(.., stream_chunk_cb): mapreq_run_stream only'),
         # round 1.3.4 (D2): the streaming parser's framing calls the frame
         # handler back, which calls the netmap handler
         R('mapresp_stream_feed', r'on_frame', ['mapreq.c:stream_frame'],
@@ -1484,26 +1489,9 @@ def project_config():
         R(None, r'crt_bundle_attach', ['tl_crt_bundle_attach'],
           'cfg.crt_bundle_attach in ts2021/derp/control_key'),
         R(None, r'set_server_cfg', [], 'server side only'),
-        # ---- nghttp2 (session callbacks set in h2_client.c:252-257) ----------
-        R(None, r'callbacks\.send_callback\(', ['h2_client.c:send_cb'], ''),
-        R(None, r'callbacks\.recv_callback\(', ['h2_client.c:recv_cb'], ''),
-        R(None, r'callbacks\.on_header_callback\(', ['h2_client.c:header_cb'], ''),
-        R(None, r'callbacks\.on_data_chunk_recv_callback\(',
-          ['h2_client.c:data_chunk_cb'], ''),
-        R(None, r'callbacks\.on_stream_close_callback\(',
-          ['h2_client.c:stream_close_cb'], ''),
-        R(None, r'callbacks\.on_frame_recv_callback\(',
-          ['h2_client.c:frame_recv_cb'], ''),
-        R(None, r'callbacks(\.|->)', [], 'NULL in the h2_client.c callback set'),
-        R(None, r'read_callback\(', ['h2_client.c:data_provider_read'],
-          'h2_client.c:369'),
-        R(r'nghttp2_mem_\w+', r'mem->|free_func\(',
-          [r're:default_(malloc|free|calloc|realloc)'], 'nghttp2_mem_default'),
-        R(r'bubble_up|bubble_down|nghttp2_pq_\w+', r'less\(',
-          ['nghttp2_session.c:stream_less'], 'nghttp2_session.c:641'),
-        R('nghttp2_map_each', r'func\(',
-          ['nghttp2_session.c:free_streams', 'nghttp2_session.c:find_stream_on_goaway_func',
-           r're:update_(local|remote)_initial_window_size_func'], 'nghttp2_session.c'),
+        # ---- in-tree HTTP/2 (round 1.3.4, D1; nghttp2's callback set before) --
+        R(None, r'\bfn\(ctx, &f\)', ['h2_core.c:field_cb'],
+          'hpack_dec_feed(.., field_cb, h): h2_core.c block_bytes only'),
         # ---- lwIP ------------------------------------------------------------
         R('tcpip_send_msg_wait_sem', r'fn\(', [r're:lwip_netconn_do_\w+'],
           'netconn API messages, run in the caller under LOCK_TCPIP_CORE'),
@@ -1751,14 +1739,14 @@ def project_config():
             # pointers each: the task-scoped RULES above resolve them better)
             'mbedtls_asn1_traverse_sequence_of': r'\bcb\(',
             'mbedtls_asn1_get_sequence_of': '*',
-            'nghttp2_map_each': r'func\(', 'tlsf_walk_pool': r'pool_walker',
+            'tlsf_walk_pool': r'pool_walker',
             'multi_heap_walk': '*', 'esp_netif_find_if': '*',
             'heap_caps_walk': '*',
         },
         'RULES': rules,
         'CUT': cut,
         'TASKS': [
-            {'name': LP, 'alloc': 24576, 'entry': ['long_poll_task'],
+            {'name': LP, 'alloc': 7168, 'entry': ['long_poll_task'],
              'variants': [
                  # the map stream: ensure_control_conn (TLS + Noise connect),
                  # mapreq_run_stream (h2 stream, netmap handler, data plane
@@ -1778,6 +1766,9 @@ def project_config():
              'cut': UDP_ONLY},
             {'name': TIT, 'alloc': 4608, 'entry': ['tcpip_thread']},
             {'name': TMR, 'alloc': 6144, 'entry': ['timer_task']},
+            # bringup (app_main): register, dataplane start, spawns; exits.
+            # CONFIG_ESP_MAIN_TASK_STACK_SIZE (round 1.3.4, D4)
+            {'name': 'main', 'alloc': 8192, 'entry': ['main_task']},
         ],
     }
 

@@ -22,7 +22,7 @@ honest. None of it is official Tailscale documentation — see the published
    App: TMP117 telemetry (UDP, JSON)         ← M3
    ────────────────────────────────────────
    MapResponse: JSON, LE32-framed stream     ← M2
-   HTTP/2 inside Noise (nghttp2)             ← M2
+   HTTP/2 inside Noise (in-tree, 1.3.4)      ← M2
    ────────────────────────────────────────
    /machine/register: HTTP/1.1 inside Noise  ← M1 (current)
    ts2021: Noise IK + HTTP Upgrade in TLS    ← M1
@@ -90,9 +90,13 @@ note in this doc that called the prologue "the single byte `0x01`" was wrong;
 that byte appears in the cleartext init header, not in the Noise prologue.
 
 After the upgrade and the optional EarlyPayload, the inner protocol is
-**HTTP/2** (per `tailscale/control/ts2021/`). tinylink wraps
-`ts2021_send` / `ts2021_recv` with nghttp2 (espressif/nghttp managed
-component) in `components/tinylink/src/h2_client.c`. SETTINGS sent by
+**HTTP/2** (per `tailscale/control/ts2021/`). tinylink runs its own
+client over the ts2021 records: `components/tinylink/src/h2_core.c`
+(frames, flow control, the stream) + `hpack.c`, bound to the conn by
+`h2_client.c` (round 1.3.4; nghttp2 until then). Each received record is
+decrypted in place in the conn's 4 KiB record buffer and parsed there;
+requests are sealed in the same buffer and sent as records of ≤ 2 048 B
+(header + ciphertext), one TLS record each (D4). SETTINGS sent by
 the client disable HPACK dynamic-table indexing
 (`SETTINGS_HEADER_TABLE_SIZE = 0`) and server push
 (`SETTINGS_ENABLE_PUSH = 0`) for one-shot request semantics. Since 1.3.2
@@ -124,8 +128,9 @@ The current upstream client reads the payload but no caller of
 `types/key/chal.go` are referenced only in tests). tinylink therefore
 **drains and discards** the EarlyPayload — it skips the magic, the `BE32`
 length, and that many JSON bytes (which themselves may span further
-records), leaving whatever follows as the HTTP/2 residual replayed to
-nghttp2. The `NodeKeyChallenge` is dropped on the floor.
+records), leaving whatever follows in the record buffer as the start of
+the HTTP/2 stream (no copy since 1.3.4, D5). The `NodeKeyChallenge` is
+dropped on the floor.
 
 ## /machine/register (M1)
 

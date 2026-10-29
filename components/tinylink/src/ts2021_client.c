@@ -203,27 +203,37 @@ static esp_err_t read_record_frame(esp_tls_t *tls, uint8_t *type_out,
     return ESP_OK;
 }
 
-/* Decrypt one record into a caller buffer. */
-static esp_err_t recv_record_plaintext(ts2021_conn_t *c,
-                                       uint8_t *out, size_t out_max,
-                                       size_t *out_len)
+/* Read the next transport record into the conn's record ring and
+ * decrypt it there (round 1.3.4, D4): the ciphertext goes straight into
+ * h2_rx and is opened in place, where it used to land in a 4 096-B `ct`
+ * stack array on every task that reads the control conn (the deepest
+ * frame of the long-poll). The plaintext is h2_rx[0..*len); a failed
+ * tag leaves ciphertext only, never plaintext. Every caller has drained
+ * the ring before it asks for the next record. */
+static esp_err_t recv_record(ts2021_conn_t *c, size_t *len)
 {
     uint8_t  type;
-    uint8_t  ct[TS2021_MAX_MESSAGE];
     size_t   ct_len = 0;
-    if (read_record_frame(c->tls, &type, ct, sizeof(ct), &ct_len) != ESP_OK) {
+    c->h2_rx_off = 0;
+    c->h2_rx_len = 0;
+    if (read_record_frame(c->tls, &type, c->h2_rx, sizeof(c->h2_rx), &ct_len) != ESP_OK) {
         return ESP_FAIL;
     }
     if (type == TS2021_MSG_ERROR) {
         ESP_LOGE(TAG, "control plane error: %.*s",
-                 (int)(ct_len > 200 ? 200 : ct_len), (const char *)ct);
+                 (int)(ct_len > 200 ? 200 : ct_len), (const char *)c->h2_rx);
         return ESP_FAIL;
     }
     if (type != TS2021_MSG_RECORD) {
         ESP_LOGE(TAG, "unexpected post-handshake frame type 0x%02x", type);
         return ESP_FAIL;
     }
-    return noise_ik_decrypt(&c->noise, out, out_max, ct, ct_len, out_len);
+    if (noise_ik_decrypt(&c->noise, c->h2_rx, sizeof(c->h2_rx), c->h2_rx, ct_len,
+                         len) != ESP_OK) {
+        return ESP_FAIL;
+    }
+    c->h2_rx_len = *len;
+    return ESP_OK;
 }
 
 /* After the Noise handshake the server may send an optional
@@ -243,69 +253,74 @@ static esp_err_t recv_record_plaintext(ts2021_conn_t *c,
  * 5-byte magic record as HTTP/2 data, desyncing the stream so the server
  * closed the connection (h2_session_init -> EOF).
  *
- * We read records into `rec` and consume them byte-wise. Whatever remains
- * unconsumed once the header (and any JSON) is dealt with becomes the
- * HTTP/2 residual replayed to nghttp2. */
+ * Records are read into the conn's h2_rx ring and consumed byte-wise.
+ * Whatever is left once the header (and any JSON) is dealt with stays
+ * there as the window [h2_rx_off, h2_rx_len) — the first HTTP/2 bytes,
+ * which the HTTP/2 layer parses before it reads another record. Until
+ * round 1.3.4 (D5) that tail was copied into a second 4 077-B buffer,
+ * `rx_residual`. */
+
+/* The stream turned out to start with HTTP/2 at rec[off] (the first byte
+ * that differs from the magic), after `matched` bytes that equal the
+ * magic's first `matched` bytes. Those may have come from earlier
+ * records (a record boundary inside the magic), so they are not
+ * necessarily in front of rec[off]; but their value is known — the magic
+ * itself — so put them back in front of the tail: the window becomes
+ * magic[0..matched) || rec[off..len). matched ≤ 4 and len ≤ 4 080 (the
+ * plaintext of the largest record read_record_frame accepts), so the
+ * result fits the 4 096-B ring. */
+static void keep_http2_start(ts2021_conn_t *c, size_t off, size_t len,
+                             size_t matched)
+{
+    _Static_assert(sizeof(c->h2_rx) >= TS2021_MAX_MESSAGE - NOISE_TAGLEN +
+                                       TS2021_EARLY_PAYLOAD_MAGIC_LEN - 1,
+                   "h2_rx must hold a record plus a put-back magic prefix");
+    uint8_t *rec = c->h2_rx;
+    memmove(rec + matched, rec + off, len - off);
+    memcpy(rec, TS2021_EARLY_PAYLOAD_MAGIC, matched);
+    c->h2_rx_off = 0;
+    c->h2_rx_len = matched + (len - off);
+}
+
 static esp_err_t consume_early_payload(ts2021_conn_t *c)
 {
-    /* Record scratch: borrow the conn's h2_rx ring. It is unused until
-     * h2_session_init runs at the very end of ts2021_connect, and it is
-     * exactly one record long. Saves 4 077 B of stack on the connect
-     * path (this function is inlined into ts2021_connect, whose frame
-     * was 9 888 B). rx_residual is a different buffer, so the copies
-     * below never overlap. */
+    /* Record scratch: the conn's h2_rx ring, where recv_record reads
+     * and decrypts each record. It is idle until h2_session_init runs at
+     * the very end of ts2021_connect. Saves 4 077 B of stack on the
+     * connect path (this function is inlined into ts2021_connect). */
     uint8_t *rec = c->h2_rx;
-    const size_t rec_cap = sizeof(c->h2_rx);
     size_t  rec_len = 0, rec_off = 0;
 
     /* 1) Read up to the 9-byte early-payload header from the record stream.
-     *    Bail to the "no early payload" path the instant the first 5 bytes
-     *    fail to match the magic — those bytes are HTTP/2. */
+     *    Bail to the "no early payload" path at the first of the 5 magic
+     *    bytes that does not match — from there on the bytes are HTTP/2
+     *    (a frame header's first byte is 0x00 for any frame we accept, so
+     *    in practice that is the very first byte). */
     uint8_t hdr[TS2021_EARLY_PAYLOAD_HDR_LEN];
     size_t  hdr_have = 0;
-    bool    is_early = true;
 
     while (hdr_have < TS2021_EARLY_PAYLOAD_HDR_LEN) {
         if (rec_off == rec_len) {
-            if (recv_record_plaintext(c, rec, rec_cap, &rec_len) != ESP_OK)
-                return ESP_FAIL;
+            if (recv_record(c, &rec_len) != ESP_OK) return ESP_FAIL;
             rec_off = 0;
             if (rec_len == 0) continue;  /* empty record: pull the next one */
         }
-        size_t avail = rec_len - rec_off;
-        size_t take  = TS2021_EARLY_PAYLOAD_HDR_LEN - hdr_have;
-        if (take > avail) take = avail;
-        memcpy(hdr + hdr_have, rec + rec_off, take);
-        hdr_have += take;
-        rec_off  += take;
-
-        if (hdr_have >= TS2021_EARLY_PAYLOAD_MAGIC_LEN &&
-            memcmp(hdr, TS2021_EARLY_PAYLOAD_MAGIC,
-                   TS2021_EARLY_PAYLOAD_MAGIC_LEN) != 0) {
-            is_early = false;
-            break;
+        const uint8_t b = rec[rec_off];
+        if (hdr_have < TS2021_EARLY_PAYLOAD_MAGIC_LEN &&
+            b != (uint8_t)TS2021_EARLY_PAYLOAD_MAGIC[hdr_have]) {
+            /* No early payload: the bytes taken so far (a magic prefix)
+             * plus the rest of this record are the first HTTP/2 bytes,
+             * in order. */
+            keep_http2_start(c, rec_off, rec_len, hdr_have);
+            return ESP_OK;
         }
-    }
-
-    if (!is_early) {
-        /* No early payload: the header bytes we pulled plus whatever is left
-         * in the current record are the first HTTP/2 bytes, in order. */
-        size_t tail = rec_len - rec_off;
-        if (hdr_have + tail > sizeof(c->rx_residual)) {
-            ESP_LOGE(TAG, "early-payload residual overflow (%u)",
-                     (unsigned)(hdr_have + tail));
-            return ESP_FAIL;
-        }
-        memcpy(c->rx_residual, hdr, hdr_have);
-        if (tail > 0) memcpy(c->rx_residual + hdr_have, rec + rec_off, tail);
-        c->rx_residual_len = hdr_have + tail;
-        c->rx_residual_off = 0;
-        return ESP_OK;
+        hdr[hdr_have++] = b;
+        rec_off++;
     }
 
     /* 2) Magic matched and we have all 9 header bytes — parse the BE32 JSON
      *    length and skip that many bytes (which may span further records),
-     *    leaving anything after the JSON as the HTTP/2 residual. */
+     *    leaving anything after the JSON as the start of HTTP/2. */
     uint32_t ep_len = ((uint32_t)hdr[5] << 24) | ((uint32_t)hdr[6] << 16) |
                       ((uint32_t)hdr[7] <<  8) |  (uint32_t)hdr[8];
     if (ep_len > 64 * 1024) {
@@ -318,8 +333,7 @@ static esp_err_t consume_early_payload(ts2021_conn_t *c)
     size_t to_skip = ep_len;
     while (to_skip > 0) {
         if (rec_off == rec_len) {
-            if (recv_record_plaintext(c, rec, rec_cap, &rec_len) != ESP_OK)
-                return ESP_FAIL;
+            if (recv_record(c, &rec_len) != ESP_OK) return ESP_FAIL;
             rec_off = 0;
             if (rec_len == 0) continue;
         }
@@ -333,16 +347,10 @@ static esp_err_t consume_early_payload(ts2021_conn_t *c)
         }
     }
 
-    /* Residual = whatever is left in the current record after the JSON. */
-    size_t residual = rec_len - rec_off;
-    if (residual > sizeof(c->rx_residual)) {
-        ESP_LOGE(TAG, "early-payload post-JSON residual overflow (%u)",
-                 (unsigned)residual);
-        return ESP_FAIL;
-    }
-    if (residual > 0) memcpy(c->rx_residual, rec + rec_off, residual);
-    c->rx_residual_len = residual;
-    c->rx_residual_off = 0;
+    /* Whatever is left in the current record after the JSON — served by
+     * offset, no copy. */
+    c->h2_rx_off = rec_off;
+    c->h2_rx_len = rec_len;
     return ESP_OK;
 }
 
@@ -479,8 +487,8 @@ esp_err_t ts2021_connect(ts2021_conn_t *out,
     }
     ESP_LOGI(TAG, "ts2021: Noise IK handshake complete");
 
-    /* Skip optional EarlyPayload, leaving rx_residual primed with the
-     * first 0..N HTTP/2 plaintext bytes. */
+    /* Skip optional EarlyPayload, leaving the h2_rx window primed with
+     * the first 0..N HTTP/2 plaintext bytes. */
     if (consume_early_payload(out) != ESP_OK) {
         ts2021_close(out);
         return ESP_FAIL;
@@ -490,13 +498,9 @@ esp_err_t ts2021_connect(ts2021_conn_t *out,
      * flush can ride ts2021_send (which guards on c->connected). */
     out->connected = true;
 
-    /* Allocate the persistent nghttp2 session NOW, while only this
-     * (long-poll) TLS conn is alive and the heap still has a single
-     * contiguous ~24 KiB block. nghttp2_session_client_new2 wants
-     * ~10–14 KiB in one malloc; if we deferred this until first
-     * request, a second TLS conn (DERP supervisor) could already
-     * have fragmented the heap and the call would return -901
-     * NGHTTP2_ERR_NOMEM. */
+    /* Start the HTTP/2 session: client preface + SETTINGS (no heap since
+     * round 1.3.4, D1 — the nghttp2 session it replaced needed a
+     * 10–14 KiB block, which is why this runs at connect time). */
     if (h2_session_init(out) != ESP_OK) {
         ESP_LOGE(TAG, "h2_session_init failed");
         ts2021_close(out);
@@ -505,58 +509,84 @@ esp_err_t ts2021_connect(ts2021_conn_t *out,
     return ESP_OK;
 }
 
+/* Seal rec[4..4 + len) in place (the tag lands right behind it) and
+ * write rec[1..4) header + ciphertext in ONE esp_tls write (round 1.3.2,
+ * B8): one TLS record per Noise record, since both senders below keep a
+ * record ≤ MBEDTLS_SSL_OUT_CONTENT_LEN (TS2021_TX_RECORD_MAX, round
+ * 1.3.4, D4). The separate 3-byte header write used to be a TLS record
+ * and a TCP segment of its own, held by Nagle until the previous one was
+ * ACKed. rec + 4 is word-aligned when rec is: the AEAD's aligned path. */
+#ifdef CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN
+_Static_assert(TS2021_TX_RECORD_MAX <= CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN,
+               "a sent Noise record must fit one TLS record");
+#endif
+
+static esp_err_t seal_and_write(ts2021_conn_t *c, uint8_t *rec, size_t len)
+{
+    size_t ct_len = 0;
+    if (noise_ik_encrypt(&c->noise, rec + 4, len + NOISE_TAGLEN, rec + 4, len,
+                         &ct_len) != ESP_OK) {
+        return ESP_FAIL;
+    }
+    rec[1] = TS2021_MSG_RECORD;
+    rec[2] = (uint8_t)((ct_len >> 8) & 0xFF);
+    rec[3] = (uint8_t)( ct_len       & 0xFF);
+    return tls_write_full(c->tls, rec + 1, TS2021_HEADER_LEN + ct_len);
+}
+
 esp_err_t ts2021_send(ts2021_conn_t *c,
                       const uint8_t *data, size_t data_len)
 {
     if (c == NULL || !c->connected) return ESP_ERR_INVALID_STATE;
-    if (data_len > TS2021_RECORD_PLAINTEXT_MAX) return ESP_ERR_INVALID_SIZE;
-
-    /* Header + ciphertext built back to back and written ONCE (round
-     * 1.3.2, B8): one esp_tls write = one TLS record per Noise record
-     * (two only for a > 2 KiB record — MBEDTLS_SSL_OUT_CONTENT_LEN),
-     * where the separate 3-byte header write used to be a TLS record and
-     * a TCP segment of its own, held by Nagle until the previous one was
-     * ACKed. Same stack array as before plus the 3 header bytes. */
-    uint8_t  rec[TS2021_HEADER_LEN + TS2021_RECORD_PLAINTEXT_MAX + NOISE_TAGLEN];
-    size_t   ct_len = 0;
-    if (noise_ik_encrypt(&c->noise, rec + TS2021_HEADER_LEN,
-                         sizeof(rec) - TS2021_HEADER_LEN,
-                         data, data_len, &ct_len) != ESP_OK) {
-        return ESP_FAIL;
-    }
-    if (ct_len > 0xFFFF) return ESP_ERR_INVALID_SIZE;
-
-    rec[0] = TS2021_MSG_RECORD;
-    rec[1] = (uint8_t)((ct_len >> 8) & 0xFF);
-    rec[2] = (uint8_t)( ct_len       & 0xFF);
-    return tls_write_full(c->tls, rec, TS2021_HEADER_LEN + ct_len);
+    if (data == NULL && data_len != 0) return ESP_ERR_INVALID_ARG;
+    /* The HTTP/2 control frames (≤ H2_CTL_CAP = 64 B) go through this
+     * small stack record, so they can go out while the ring still holds
+     * a record being parsed; a longer write is split. Until round 1.3.4
+     * (D4) every write was sealed into a 4 096-B stack array; requests
+     * now take ts2021_tx_buf / ts2021_tx_send. */
+    uint8_t rec[4 + TS2021_SMALL_PLAINTEXT_MAX + NOISE_TAGLEN] __attribute__((aligned(4)));
+    size_t off = 0;
+    do {
+        size_t n = data_len - off;
+        if (n > TS2021_SMALL_PLAINTEXT_MAX) n = TS2021_SMALL_PLAINTEXT_MAX;
+        if (n) memcpy(rec + 4, data + off, n);
+        const esp_err_t err = seal_and_write(c, rec, n);
+        if (err != ESP_OK) return err;
+        off += n;
+    } while (off < data_len);
+    return ESP_OK;
 }
 
-esp_err_t ts2021_recv(ts2021_conn_t *c,
-                      uint8_t *out, size_t out_max, size_t *out_len)
+uint8_t *ts2021_tx_buf(ts2021_conn_t *c, size_t *cap)
+{
+    _Static_assert(sizeof(c->h2_rx) >= 1 + TS2021_TX_RECORD_MAX,
+                   "h2_rx must hold a TX record at offset 1");
+    c->h2_rx_off = 0;
+    c->h2_rx_len = 0;
+    *cap = TS2021_TX_PLAINTEXT_MAX;
+    return c->h2_rx + 4;
+}
+
+esp_err_t ts2021_tx_send(ts2021_conn_t *c, size_t len)
 {
     if (c == NULL || !c->connected) return ESP_ERR_INVALID_STATE;
-    if (out == NULL || out_len == NULL) return ESP_ERR_INVALID_ARG;
+    if (len > TS2021_TX_PLAINTEXT_MAX) return ESP_ERR_INVALID_SIZE;
+    return seal_and_write(c, c->h2_rx, len);
+}
 
-    /* Drain residual first. */
-    if (c->rx_residual_off < c->rx_residual_len) {
-        size_t avail = c->rx_residual_len - c->rx_residual_off;
-        size_t take  = (out_max < avail) ? out_max : avail;
-        memcpy(out, c->rx_residual + c->rx_residual_off, take);
-        c->rx_residual_off += take;
-        *out_len = take;
-        return ESP_OK;
-    }
-
-    return recv_record_plaintext(c, out, out_max, out_len);
+esp_err_t ts2021_recv_record(ts2021_conn_t *c, size_t *len)
+{
+    if (c == NULL || !c->connected) return ESP_ERR_INVALID_STATE;
+    if (len == NULL) return ESP_ERR_INVALID_ARG;
+    return recv_record(c, len);
 }
 
 void ts2021_close(ts2021_conn_t *c)
 {
     if (c == NULL) return;
-    /* Free the persistent H2 session BEFORE the TLS context: nghttp2
-     * may call into our send_cb during shutdown (RST_STREAM/GOAWAY
-     * frames it had queued), and that path dereferences c->tls. */
+    /* Drop the H2 session before the TLS context (it sends nothing on
+     * the way out; the order is kept so it never could touch a destroyed
+     * TLS context). */
     h2_session_destroy(c);
     if (c->tls != NULL) {
         esp_tls_conn_destroy(c->tls);
