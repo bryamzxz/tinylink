@@ -31,7 +31,7 @@ implementation, which is the authoritative reference for wire format.
 | M14| Audit + optimization round (2026-09-04)       | done — endpoint-push stack overflow fixed (task removed, −12.6 KiB BSS), headscale `/key` capver gate, TSMP drop, DERP close race, Xtensa-tuned AEAD, backoff consolidation, provisioning contract, ASan CI. See "M14" + "Improvement list" below | v0.8   | landed   |
 | M15| Road-to-100 round (2026-09-04, part 2)        | done — netmap parsed one value at a time (−30 KiB BSS, no tailnet-size ceiling), task WDT for app tasks, capver 142, connect-path stack diet, DERP live relay switch, IP-change recycle + WiFi backoff, conn kept after register, flash trims, 3 new KAT suites, firmware 1.2.0 | v1.2   | landed   |
 | M16| To-95 round (2026-09-04, part 3)              | done — NTP-synced certificate date validation, `PeersRemoved` + delta merge, WG handshake lock + roam on authenticated packets, `/stats` over UDP, AEAD placement measured cold. Declared scope ≈ 95 %; the last 5 % is the owner checklist below | v1.2   | landed   |
-| M17| Upstream sync 1.3.0 (2026-10-28)              | code done, HW smoke pending — capver 148 (TSMP disco advert, exact Retry-After), headscale delta frames (expired/deleted self re-registers, peer NodeKey/DiscoKey rotation applied, patches by NodeID, removal-/DERPMap-only frames), ESP-IDF v5.5.6, `docs/esp32/`, hskey provisioning, firmware 1.3.0. See "M17" below | v1.3   | in review |
+| M17| Upstream sync 1.3.0 (2026-10-28)              | done, HW smoke + 30-min soak clean — capver 148 (TSMP disco advert, exact Retry-After), headscale delta frames (expired/deleted self re-registers, peer NodeKey/DiscoKey rotation applied, patches by NodeID, removal-/DERPMap-only frames), ESP-IDF v5.5.6, `docs/esp32/`, hskey provisioning, firmware 1.3.0. See "M17" below | v1.3   | in review |
 | —  | Next rounds                                   | queued — see "Execution queue" below (M13 checklist 3–5 → task WDT → SNTP → buffer diet → /stats → OTA; eFuse encryption explicitly out) | —      | queued   |
 
 End-to-end verification on hardware (sensor-cali next to router,
@@ -1086,9 +1086,10 @@ decision: `docs/rounds/2026-10-upstream-sync.md`; per-item detail in
 - [x] ESP-IDF v5.5.6 (stay on 5.5; v6.x rejected for now — see BUILDING).
 - [x] `docs/esp32/` — exact part identity + cited vendor digest.
 - [x] `nvs_provision.py` accepts headscale `hskey-` keys.
-- [ ] **Hardware**: tailscale.com A/B smoke for capver 148 (owner
-  approval before flashing), then the headscale test list in the round
-  report (delete / expire / peer restart / peer re-auth / roam).
+- [x] **Hardware**: tailscale.com smoke (180 s) + 30-min soak for
+  capver 148 on the deployed sensor, 2026-10-28 — clean (CHANGELOG).
+- [ ] Headscale test list in the round report (delete / expire / peer
+  restart / peer re-auth / roam) — needs a headscale instance.
 - [ ] Deferred: apply *received* TSMP adverts (needs a stack-safe
   context for X25519), home-DERP fallback when the preferred region
   leaves the DERPMap, lazy early-payload read.

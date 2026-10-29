@@ -261,6 +261,24 @@ Host suite 633 OK / 0 FAIL, CI floor 633. Pending design item:
 NodeKey rotation on expiry (upstream regenerates; tinylink re-sends the
 same key) — candidate for a later round.
 
+### Hardware (2026-10-28, owner-approved app-only flash)
+
+Backups: `~/tinylink-backups/sensor-cali_ota0_pre130_20261028-200515.bin`
++ `…_otadata_pre130_…` (entry 0: seq 1, VALID, CRC ok → `ota_0`).
+`build_v556/tinylink.bin` → 0x20000, hash verified.
+- Smoke `smoke130_20261028-200644.log` (180 s): clean except one
+  server-side TCP FIN on the long-poll at +54.9 s (no GOAWAY),
+  reconnect + full netmap 7 s later.
+- Soak `soak130_20261028-201313.log` (30.5 min, fresh boot — opening
+  the port resets this board): 0 stream ends, 16 rekeys, 0 panics / WDT
+  / E lines, heap_free ≥ 59 860, HWMs unchanged. Verdict: no capver-148
+  regression (M16 on capver 142 had 2 stream ends in 3.2 h).
+- `/stats` not reachable from the workstation (single-peer session with
+  Servidor1 only); Servidor1's ssh host key does not verify from here.
+- Still open on hardware: headscale delete / expire / peer key rotation
+  / re-auth / roam (needs a headscale instance), multi-hour soak (runs
+  on 1.3.1).
+
 ## Optimization track (Goal 2)
 
 Agents running (CPU/crypto/data-plane; memory/footprint/boot/power;

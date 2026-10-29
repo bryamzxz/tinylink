@@ -20,8 +20,9 @@ finding, decision and constraint is kept in
 FAIL** (+63), ASan + UBSan clean. Image 946 037 → 959 249 B (+6 056 B
 from IDF 5.5.6, +7 156 B from the round's code incl. the review fixes and
 the S1/S2 security fixes); BSS 93 048 → 94 320 B (+128 IDF, +1 144
-code). Compiler warnings: 0. **Hardware smoke still
-pending owner approval** — capver changes the Noise prologue.
+code). Compiler warnings: 0. Flashed to the deployed sensor (app
+partition only) after owner approval: 180-s smoke + 30-min soak clean,
+hardware section at the end of this entry.
 
 #### 1 — Capver 148 (= Tailscale v1.104), every step honoured
 
@@ -172,6 +173,33 @@ validation, stopped sessions reset after 5 s only if we stop reading,
 `/machine/set-dns` (never called), CertDomains / https cap / logtail
 `Debug` (skipped), SSH policy changes (skipped), DERP admission still
 by NodeKey, no Retry-After on any path tinylink uses.
+
+#### Hardware (deployed sensor, app partition only; the 1.2.0 `ota_0` + `otadata` read back to `~/tinylink-backups/` first)
+
+`build_v556/tinylink.bin` written to 0x20000 at 460 800 baud, hash
+verified; `otadata` untouched (seq 1 → `ota_0`). Against
+controlplane.tailscale.com with capver **148** in the Noise prologue:
+
+- **180-s boot smoke:** `boots:1 panics:0 wdt:0`, register 200 at
+  +8.8 s, initial netmap at +11.2 s (body 25 971 B, 179/640 tokens,
+  4 peers, 28 DERP regions), DERP login at +13.6 s, WG session up at
+  +16.6 s (the known lost first INIT → one retry), rekey at +128.6 s,
+  telemetry every 5 s. One long-poll stream end at +54.9 s:
+  `tls_read_full failed: -1` = TCP FIN from the server, no GOAWAY, no
+  idle timeout; reconnected and re-parsed the full netmap 7 s later.
+- **30-min soak** (a fresh boot — opening the port resets this board):
+  `boots:1 panics:0 wdt:0 stream_ended:0`, 16 rekeys, 1 boot handshake
+  retry, 0 rx-stale / roams / DERP errors, 6 STUN re-probes, 361
+  telemetry datagrams, 33 keep-alive frames, 0 E-level lines; heap_free
+  ≥ 59 860 B, largest block ≥ 47 104 B. Stack HWMs unchanged from the
+  smoke (`tinylink_tlm` 572 B, `wifi` 616, `wg_rx` 2 052,
+  `tinylink_lp` 13 488 free).
+- The single FIN is not a capver-148 signal: none in the 30-min run,
+  and the 1.2.0 (capver 142) M16 soak saw two server-side stream ends
+  in 3.2 h. The multi-hour soak runs on 1.3.1, which carries all of
+  this code.
+- `/stats` could not be queried from the workstation: the single-peer
+  dataplane only holds a session with Servidor1 (by design).
 
 ### To-95 round (2026-09-04, part 3, branch `feat/to-95`)
 
