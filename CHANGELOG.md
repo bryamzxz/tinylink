@@ -114,7 +114,8 @@ parsing (`feat/r134-map`) — on top of 1.3.3. Image 763 328 → **707 088 B
 table); no nghttp2 session per connect; `tinylink_lp` 12 → 7 KiB and the
 main task 24 → 8 KiB of stack. Host suite 1 006 → **1 330 OK** (CI floor
 1 330; CI now installs libnghttp2 as the HTTP/2 interop peer), ASan +
-UBSan clean, 0 warnings. Not yet on the sensor.
+UBSan clean, 0 warnings. On the sensor: smoke + 10-boot series
+(hardware section); the 6-h soak runs on 1.3.5, which contains all of it.
 
 #### Control transport (`feat/r134-ctl`)
 
@@ -189,6 +190,49 @@ UBSan clean, 0 warnings. Not yet on the sensor.
   finding — its fixture `tools/iram_check_neg.c` plants 8 violations,
   all caught, including `(type & 0xff) == 4`, which GCC compiles to an
   `l8ui`. Static DRAM −10 240 B.
+
+#### Review
+
+An independent review ran the firmware's HTTP/2 stack (`h2_client.c` →
+`h2_core.c` / `hpack.c` → `ts2021_client.c`, real Noise records cut at
+random sizes) against Go's x/net/http2 `ServeConn` (`-tags
+http2legacy`, tailscale.com's path), net/http h2c (headscale's) and
+python-h2 (padding, PRIORITY, unknown frame types, PINGs): ~1.6 GB
+through Go byte-exact with both windows staying in 12.7 K…65 535,
+request bodies up to 250 KB, 80 000 real Go HPACK blocks at random
+splits, all 256 Huffman symbols, GOAWAY / RST_STREAM / 1xx / trailers /
+CONTINUATION, ~29 M libFuzzer runs under ASan + UBSan (whole vs
+byte-split input, flow-control invariants at every frame). Nothing that
+Go or headscale can trigger; four minor deviations only a non-Go server
+reaches (a 1xx's Retry-After carried to the final response — fixed in
+1.3.5; a graceful GOAWAY covering our stream still returns at once, as
+with nghttp2; a table-size update > 0 before our SETTINGS is a
+COMPRESSION_ERROR; how much of an over-long body reaches the caller
+depends on record cuts).
+
+#### Hardware (deployed sensor, app partition only; the 1.3.3 `ota_0` + `otadata` read back to `~/tinylink-backups/` first)
+
+Backup byte-identical to the flashed 1.3.3 (`b58273f`), otadata seq 1 /
+CRC OK; flashed `26b589d`.
+
+- **Smoke** (180 s): `register … (known node, no auth)`; **heap_free
+  158 968 B (94 884 on 1.3.3, +64 KB), largest block 110 592 B
+  (77 824)** — the static DRAM above, no nghttp2 session, and the two
+  smaller stacks; `main stack: hwm=4260 B free of 8192`; `stream peak:
+  body=25923 elem=2825 (cap=8192)`, `mapresp peak: tokens=179/640`;
+  netmap 1.04 s after the stream request; no stream / decrypt /
+  protocol / IRAM / stack error. Stack use (B of alloc): `tinylink_lp`
+  2 708 / 7 168 (7 280 / 12 288 on 1.3.3), `tinylink_derp` 4 108 /
+  8 192, `wg_tx` 2 216 / 5 120, `esp_timer` 1 576 / 4 608, `wg_rx`
+  3 612 / 8 192.
+- **Reboot series, 10 × 5 min:** register without Auth 10 / 10, 0
+  RX-stale, 0 crashes, heap min 158 748 B; WG up 15.0–25.3 s after
+  reset (Wi-Fi association 3–9 s; the serial STUN probe 0.04–7.09 s;
+  netmap 1.06–11.11 s after the stream request, server side). Two
+  boot-connection FINs (236 s, 77 s; the known 1.3.x pattern) — both
+  reconnects ran the in-tree client's TLS + Noise + HTTP/2 path on the
+  7-KiB long-poll stack: `tinylink_lp` 3 444 B used (static worst case
+  4 864), netmap 4.7 s after the drop, heap unchanged.
 
 ### Optimization round 1.3.3 (in progress, branch `feat/opt-1.3.3`)
 
