@@ -23,11 +23,13 @@
 //
 // Why not mbedtls_platform_zeroize: it is an out-of-line call into flash
 // (mbedcrypto's platform_util.c), made 2–3 times per WireGuard packet by
-// the IRAM AEAD — a cache miss on every cold packet. Inlined, the scrub
-// lives wherever its caller lives (IRAM for TL_HOT_ATTR code): GCC
-// expands a small constant-size memset into word stores, larger or
-// variable ones call newlib's memset, which the ESP32 runs from mask ROM
-// (esp32.rom.libc-funcs.ld) — never from flash.
+// the IRAM AEAD — a cache miss on every cold packet. On the target
+// tl_secure_zero() is now a small function in IRAM (secure_zero.c,
+// TL_HOT_ATTR) whose memset is newlib's, which the ESP32 runs from mask
+// ROM (esp32.rom.libc-funcs.ld) — never from flash. Out of line rather
+// than inlined on purpose: inlined into chacha20poly1305_decrypt (wg_rx's
+// deepest crypto frame) it cost a register spill, 144 → 160 B. The host
+// build inlines the same body.
 
 #pragma once
 
@@ -39,11 +41,20 @@ extern "C" {
 #endif
 
 static inline __attribute__((always_inline))
-void tl_secure_zero(void *buf, size_t len)
+void tl_secure_zero_inline(void *buf, size_t len)
 {
     memset(buf, 0, len);
     __asm__ __volatile__("" : : "r"(buf) : "memory");
 }
+
+#ifdef ESP_PLATFORM
+void tl_secure_zero(void *buf, size_t len);   /* secure_zero.c, IRAM */
+#else
+static inline void tl_secure_zero(void *buf, size_t len)
+{
+    tl_secure_zero_inline(buf, len);
+}
+#endif
 
 #ifdef __cplusplus
 }

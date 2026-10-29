@@ -48,8 +48,10 @@ int nacl_box_compute_shared(uint8_t k[NACL_BOX_KEY_LEN],
  * the same IRAM code the WireGuard AEAD uses. Byte-identical to the
  * mbedtls_poly1305_mac() it replaced in round 1.3.2 (RFC 8439 §2.5 both;
  * tools/test: libsodium vectors + the mbedTLS differential). The context
- * holds r and the pad s, so it is scrubbed. */
-static void onetimeauth(uint8_t mac[NACL_BOX_TAG_LEN],
+ * holds r and the pad s, so it is scrubbed. noinline: the 144-byte
+ * context then lives only in this frame, not in nacl_box() /
+ * nacl_box_open_after_shared() across the XSalsa20 call (wg_rx stack). */
+static __attribute__((noinline)) void onetimeauth(uint8_t mac[NACL_BOX_TAG_LEN],
                         const uint8_t *m, size_t mlen,
                         const uint8_t key[32])
 {
