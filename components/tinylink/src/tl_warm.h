@@ -631,11 +631,14 @@ static inline bool tl_warm_reg_reused(bool known, bool retried_with_auth)
 /* ---- The crash guard and the restart mark (RTC no-init memory) ----------
  *
  * RTC slow memory survives every reset but a power loss (tl_bootstat.h).
- * `attempt`: a warm start ran and no netmap confirmed it yet — set before
- * its bring-up, cleared when the netmap confirms it, when the bring-up
- * fails, or by a planned restart. A boot that finds it set after any
- * reset but a software one (panic, a WDT, a brown-out…) counts a crash:
- * the record is erased and that boot starts cold; after
+ * `attempt`: a warm start ran and has not settled yet — set before its
+ * bring-up, cleared once it settled (the netmap confirmed it, its changes
+ * were applied to the session and the housekeeping after them stored the
+ * record for the next boot: tl_warm_sm_settle), when the bring-up fails,
+ * or by a planned restart. A boot that finds it set after any reset but
+ * a software one (panic, a WDT, a brown-out…) counts a crash: the record
+ * is erased and that boot starts cold. A long-poll that gave up waiting
+ * for a hung warm start counts one too (tl_warm_rtc_hung). After
  * TL_WARM_RTC_MAX_CRASHES the warm start stays off until a power cycle,
  * so a fault on the warm path costs a cold boot in between, then
  * nothing. `skip`: a planned restart out of a warm start (or for a self
@@ -717,6 +720,55 @@ static inline void tl_warm_rtc_restart(tl_warm_rtc_t *r)
     tl_warm_rtc_seal(r);
 }
 
+/* The long-poll's restart out of a warm start that never let go of the
+ * gate: the next boot is cold, and it counts as a crash — a warm start
+ * that hangs every time is switched off like one that crashes. */
+static inline void tl_warm_rtc_hung(tl_warm_rtc_t *r)
+{
+    if (r->crashes < TL_WARM_RTC_MAX_CRASHES) r->crashes++;
+    tl_warm_rtc_restart(r);
+}
+
+/* ---- The boot's load (tinylink_init) ------------------------------------
+ *
+ * The RTC marks first, whatever follows; after a crash the record is
+ * erased and not read. `read`: 0 = a blob in b / *n, 1 = none (no
+ * namespace, no key, NVS unusable), -1 = one too long to be a record. */
+typedef struct {
+    int  (*erase)(void *ctx);                            /* 0 = erased */
+    int  (*read)(uint8_t *b, size_t *n, void *ctx);
+    void  *ctx;
+} tl_warm_io_t;
+
+typedef enum {
+    TL_WARM_LOAD_NONE = 0,
+    TL_WARM_LOAD_OK,
+    TL_WARM_LOAD_BAD,           /* another layout, or damaged: no record */
+    TL_WARM_LOAD_ERASED,        /* after a crash */
+    TL_WARM_LOAD_ERASE_FAILED,  /* after a crash: not read all the same */
+} tl_warm_load_t;
+
+static inline tl_warm_load_t tl_warm_load(tl_warm_rtc_t *rtc, int reset_reason,
+                                          tl_warm_nvs_t *m, const tl_warm_io_t *io,
+                                          tl_warm_rtc_verdict_t *verdict)
+{
+    bool erase = false;
+    memset(m, 0, sizeof(*m));
+    *verdict = tl_warm_rtc_boot(rtc, reset_reason, &erase);
+    if (erase) {
+        return io->erase(io->ctx) == 0 ? TL_WARM_LOAD_ERASED : TL_WARM_LOAD_ERASE_FAILED;
+    }
+    uint8_t b[TL_WARM_BLOB_MAX + 1];
+    size_t  n = sizeof(b);
+    const int rc = io->read(b, &n, io->ctx);
+    if (rc > 0) return TL_WARM_LOAD_NONE;
+    if (rc == 0 && tl_warm_decode(b, n, &m->rec)) {
+        m->valid = true;
+        return TL_WARM_LOAD_OK;
+    }
+    return TL_WARM_LOAD_BAD;
+}
+
 /* ---- Does this boot warm-start? ----------------------------------------- */
 
 typedef enum {
@@ -757,8 +809,9 @@ static inline tl_warm_go_t tl_warm_go(const tl_warm_go_in_t *in)
 /* ---- The warm session's state machine -----------------------------------
  *
  * tinylink.c holds one, under a spinlock (the main task starts it, the
- * long-poll task feeds it netmap frames, the telemetry task the bound),
- * and the tables the data plane starts from (s_self_addrs, s_last_peers). */
+ * long-poll task feeds it netmap frames, the telemetry and long-poll
+ * tasks check the bound, the telemetry task settles it), and the tables
+ * the data plane starts from (s_self_addrs, s_last_peers). */
 
 enum { TL_WARM_ST_OFF = 0, TL_WARM_ST_PENDING, TL_WARM_ST_CONFIRMED };
 
@@ -767,6 +820,7 @@ typedef struct {
     bool     seeded;         /* the tables hold the record, not a netmap */
     bool     restart;        /* the long-poll erases the record and restarts */
     bool     bound_fired;    /* the bound claimed the pending session */
+    bool     unsettled;      /* confirmed, the crash guard's mark still set */
     uint32_t pending_s;      /* boot second + 1 of the unconfirmed start, 0 = none */
     uint32_t written;        /* the running record's (the age once SNTP synced) */
 } tl_warm_sm_t;
@@ -779,22 +833,26 @@ typedef struct {
 } tl_warm_tables_t;
 
 /* The warm start begins (before relay_boot_join): a crash from here on
- * until the netmap confirms is the guard's. */
-static inline void tl_warm_sm_begin(tl_warm_sm_t *sm, tl_warm_rtc_t *rtc,
-                                    const tl_warm_rec_t *r, tl_warm_tables_t *t)
+ * until it settled is the guard's. Then tl_warm_seed (outside the
+ * spinlock: it formats the strings). */
+static inline void tl_warm_sm_begin(tl_warm_sm_t *sm, tl_warm_rtc_t *rtc)
 {
     memset(sm, 0, sizeof(*sm));
     rtc->attempt = 1;
     tl_warm_rtc_seal(rtc);
-    /* What wg_dataplane_start is given: the record's addresses and its
-     * peer, as the netmap's strings (tl_warm_peer_to). */
+    sm->seeded = true;
+}
+
+/* What wg_dataplane_start is given: the record's addresses and its peer,
+ * as the netmap's strings (tl_warm_peer_to). */
+static inline void tl_warm_seed(const tl_warm_rec_t *r, tl_warm_tables_t *t)
+{
     for (unsigned i = 0; i < r->n_self && i < TL_MAX_PEER_ADDRESSES; i++) {
         tl_warm_cidr_str(&r->self[i], &t->self[i]);
     }
     *t->n_self = r->n_self;
     tl_warm_peer_to(&r->peer, &t->peers[0]);
     *t->n_peers = 1;
-    sm->seeded = true;
 }
 
 /* wg_dataplane_start's outcome. A failure leaves the tables as a cold
@@ -853,9 +911,10 @@ typedef struct {
 
 /* A netmap frame (after the merge into the tables) while the session
  * waits. `was`: the record it runs on. `*why`: diff bits, and the
- * TL_WARM_WHY_* of a restart. */
-static inline tl_warm_act_t tl_warm_sm_netmap(tl_warm_sm_t *sm, tl_warm_rtc_t *rtc,
-                                              const tl_warm_rec_t *was,
+ * TL_WARM_WHY_* of a restart. A confirmation leaves the crash guard's
+ * mark set: the netmap's changes are applied to the session after it
+ * (tl_warm_sm_settle). */
+static inline tl_warm_act_t tl_warm_sm_netmap(tl_warm_sm_t *sm, const tl_warm_rec_t *was,
                                               const tl_warm_nm_t *in, unsigned *why)
 {
     *why = 0;
@@ -873,9 +932,7 @@ static inline tl_warm_act_t tl_warm_sm_netmap(tl_warm_sm_t *sm, tl_warm_rtc_t *r
         if (!(*why & TL_WARM_RESTART)) {
             sm->state     = TL_WARM_ST_CONFIRMED;
             sm->pending_s = 0;
-            rtc->attempt  = 0;
-            rtc->crashes  = 0;
-            tl_warm_rtc_seal(rtc);
+            sm->unsettled = true;
             return TL_WARM_ACT_CONFIRM;
         }
     }
@@ -884,9 +941,10 @@ static inline tl_warm_act_t tl_warm_sm_netmap(tl_warm_sm_t *sm, tl_warm_rtc_t *r
     return TL_WARM_ACT_RESTART;
 }
 
-/* The telemetry task's housekeeping: true = end the pending session
- * (erase, restart) — the bound passed, or, the clock synced, the record
- * reads older than TL_WARM_MAX_AGE_S. Claims it against the netmap. */
+/* The bound (telemetry housekeeping, long-poll loop): end the pending
+ * session (erase, restart) — the bound passed, or, the clock synced, the
+ * record reads older than TL_WARM_MAX_AGE_S. Claims it against the
+ * netmap. */
 #define TL_WARM_BOUND_TIME 1
 #define TL_WARM_BOUND_AGE  2
 static inline int tl_warm_sm_bound(tl_warm_sm_t *sm, uint32_t now_s, uint32_t max_s,
@@ -906,11 +964,70 @@ static inline int tl_warm_sm_bound(tl_warm_sm_t *sm, uint32_t now_s, uint32_t ma
     return why;
 }
 
+/* The long-poll's poll (after each stream, and each pass of its loop) —
+ * the netmap's restart, then the bound: the telemetry task checks the
+ * bound too, and with no telemetry task the long-poll still ends a
+ * pending session no netmap confirms. */
+#define TL_WARM_POLL_NETMAP 3
+static inline int tl_warm_sm_poll(tl_warm_sm_t *sm, bool long_poll, uint32_t now_s,
+                                  uint32_t max_s, bool synced, int64_t now_unix)
+{
+    if (long_poll && sm->restart) return TL_WARM_POLL_NETMAP;
+    return tl_warm_sm_bound(sm, now_s, max_s, synced, now_unix);
+}
+
 /* The data plane came up from a netmap (the cold path): the record's
  * refresh may run (tl_warm_refresh_due's `fresh`). */
 static inline void tl_warm_sm_cold(tl_warm_sm_t *sm)
 {
     if (sm->state == TL_WARM_ST_OFF) sm->state = TL_WARM_ST_CONFIRMED;
+}
+
+/* A netmap of this boot runs the data plane: the warm session confirmed,
+ * or a cold one started (the modem's sleep and the STUN re-probe wait
+ * for it, besides tinylink.c's own cold-path flag). */
+static inline bool tl_warm_sm_seen(const tl_warm_sm_t *sm)
+{
+    return sm->state == TL_WARM_ST_CONFIRMED;
+}
+
+/* The record's refresh may run (tl_warm_store's `fresh`): a netmap of
+ * this boot runs the data plane and control was heard within
+ * TL_WARM_FRESH_S (uptime seconds; a byte heard after `now_s` was read
+ * is heard now). */
+#define TL_WARM_FRESH_S 600u
+static inline bool tl_warm_sm_fresh(const tl_warm_sm_t *sm, uint32_t now_s,
+                                    uint32_t control_rx_s)
+{
+    return tl_warm_sm_seen(sm) &&
+           (now_s <= control_rx_s || now_s - control_rx_s < TL_WARM_FRESH_S);
+}
+
+/* The housekeeping's store pass after a confirmation ran (`store_rc`
+ * tl_warm_store's: written, or nothing due) — the netmap's changes are
+ * in the session and the record matches it: the crash guard's mark goes,
+ * and with it the crash count. A failed write settles at the next pass
+ * (the mirror holds the record then). True when it settled now. */
+static inline bool tl_warm_sm_settle(tl_warm_sm_t *sm, tl_warm_rtc_t *rtc, int store_rc)
+{
+    if (sm->state != TL_WARM_ST_CONFIRMED || !sm->unsettled || store_rc < 0) return false;
+    sm->unsettled = false;
+    rtc->attempt  = 0;
+    rtc->crashes  = 0;
+    tl_warm_rtc_seal(rtc);
+    return true;
+}
+
+/* The netmap's DiscoKey for the session's peer against the one the
+ * session runs with (wg_dataplane.c): none in the netmap clears it — a
+ * cold start from that netmap would run the peer without one. */
+enum { TL_WARM_DISCO_SAME = 0, TL_WARM_DISCO_NEW, TL_WARM_DISCO_GONE };
+static inline int tl_warm_disco_delta(bool has_now, const uint8_t now[TINYLINK_KEY_LEN],
+                                      bool has_cur, const uint8_t cur[TINYLINK_KEY_LEN])
+{
+    if (!has_now) return has_cur ? TL_WARM_DISCO_GONE : TL_WARM_DISCO_SAME;
+    return (!has_cur || memcmp(now, cur, TINYLINK_KEY_LEN) != 0) ? TL_WARM_DISCO_NEW
+                                                                : TL_WARM_DISCO_SAME;
 }
 
 #ifdef __cplusplus

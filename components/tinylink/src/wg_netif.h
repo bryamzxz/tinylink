@@ -104,6 +104,11 @@ esp_err_t wg_netif_update_peer_endpoint(uint32_t v4_be, uint16_t port);
 esp_err_t wg_netif_update_peer_keys(const uint8_t static_pub[WG_KEY_LEN],
                                     const uint8_t *disco_pub);
 
+/* The peer's DiscoKey is gone from the netmap (round 1.3.9): the session
+ * runs as one started without it — no DISCO pre-filter key, no cached
+ * NaCl key, no TSMP advert, the path unmanaged. Long-poll task. */
+esp_err_t wg_netif_clear_peer_disco(void);
+
 /* The peer's tailnet IPv4 (network order) changed — the destination of
  * the TSMP disco advert (round 1.3.9). With the session up the advert
  * goes again at once: the one after the last handshake carried the old

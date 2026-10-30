@@ -73,8 +73,10 @@ menu "tinylink core"
             even if the erase fails). Not used: a record no netmap stood
             behind for 30 days (it is refreshed daily while current), and
             after a reset (panic, WDT, brown-out) during a warm start
-            before its netmap — the record is erased; after two such
-            resets the warm start stays off until a power cycle.
+            before it settled (its netmap applied and the next boot's
+            record stored, within about a minute of the netmap) or after
+            a warm start that hung — the record is erased; after two
+            such failures the warm start stays off until a power cycle.
 
             Trade-off: until that netmap arrives the device trusts the
             previous boot's peer binding — this NodeKey and this DiscoKey
