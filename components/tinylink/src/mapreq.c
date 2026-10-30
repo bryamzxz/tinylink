@@ -11,10 +11,12 @@
 #ifdef ESP_PLATFORM
 #include "esp_log.h"
 #include "esp_heap_caps.h"
+#include "esp_random.h"
 #include "esp_system.h"
 #include "freertos/FreeRTOS.h"
 #include "sdkconfig.h"
 #include "h2_client.h"
+#include "h2_retry_after.h"
 #include "tinylink.h"   /* tinylink_get_public_endpoint */
 #endif
 
@@ -1367,11 +1369,11 @@ static int stream_chunk_cb(const uint8_t *data, size_t len, void *ctx)
 
 /* The endpoint push riding with the stream has its outcome (round
  * 1.3.7, B1): the push's own log line, at the time it lands — the stream
- * goes on. */
+ * goes on — then the caller's on_push. */
 static void push_side_done(const h2_side_result_t *r, void *ctx)
 {
+    const mapreq_push_fn on_push = *(const mapreq_push_fn *)ctx;
     const int status = r->status;
-    *(int *)ctx = status > 0 ? status : -1;
     if (status == 200) {
         ESP_LOGI(TAG, "endpoint push: HTTP 200 (with the map stream)");
     } else if (status == 429 || status == 503) {
@@ -1383,12 +1385,14 @@ static void push_side_done(const h2_side_result_t *r, void *ctx)
         ESP_LOGW(TAG, "endpoint push: stream reset (HTTP/2 error 0x%x)",
                  (unsigned)r->stream_error);
     }
+    on_push(status, h2_rate_limit_wait_ms(status, r->retry_after_present,
+                                          r->retry_after_s, esp_random()));
 }
 
 static esp_err_t run_stream_in(ts2021_conn_t *conn,
                                const tinylink_keys_t *keys,
                                mapreq_handler_t on_netmap, void *ctx,
-                               uint8_t *buf, int *push_status)
+                               uint8_t *buf, mapreq_push_fn on_push)
 {
     /* MapRequest from the buffer's tail, MapResponse elements collected at
      * offset 0 — disjoint: nghttp2 (until 1.3.4) could still be reading
@@ -1410,13 +1414,12 @@ static esp_err_t run_stream_in(ts2021_conn_t *conn,
 
     int status = 0;
     esp_err_t err = ESP_ERR_INVALID_SIZE;
-    if (push_status != NULL) {
+    if (on_push != NULL) {
         /* The endpoint push goes as a second HTTP/2 stream ahead of the
          * map stream, in the same burst (round 1.3.7, B1) — upstream's
          * updateRoutine runs its lite update alongside the poll the same
          * way. Its body sits in the element area: h2_post_json_stream_side
          * sends it whole before the first response byte can land there. */
-        *push_status = 0;
         const int push_len = build_request_body(keys, /*stream=*/false,
                                                 /*omit_peers=*/true,
                                                 (char *)buf, TL_CTRL_REQ_CAP);
@@ -1424,7 +1427,7 @@ static esp_err_t run_stream_in(ts2021_conn_t *conn,
         err = h2_post_json_stream_side(conn, "/machine/map",
                                        CONFIG_TINYLINK_CONTROL_HOST,
                                        buf, (size_t)push_len,
-                                       push_side_done, push_status,
+                                       push_side_done, &on_push,
                                        (const uint8_t *)body, (size_t)body_len,
                                        &status, stream_chunk_cb, &s);
         if (err == ESP_ERR_INVALID_SIZE) {
@@ -1433,8 +1436,10 @@ static esp_err_t run_stream_in(ts2021_conn_t *conn,
              * other as before 1.3.7. The push's body went where the
              * stream's was. */
             err = push_endpoints_in(conn, keys, buf);
-            *push_status = err == ESP_OK ? 200 : conn->h2_status;
             if (err != ESP_OK && conn->h2_status == 0) return err;   /* unanswered */
+            on_push(err == ESP_OK ? 200 : conn->h2_status,
+                    h2_rate_limit_wait_ms(conn->h2_status, conn->h2_retry_after_present,
+                                          conn->h2_retry_after_s, esp_random()));
             body_len = build_request_body(keys, true, false, body, TL_CTRL_REQ_CAP);
             if (body_len < 0) return ESP_ERR_INVALID_SIZE;
             err = ESP_ERR_INVALID_SIZE;
@@ -1477,14 +1482,14 @@ static esp_err_t run_stream_in(ts2021_conn_t *conn,
 esp_err_t mapreq_run_stream(ts2021_conn_t *conn,
                             const tinylink_keys_t *keys,
                             mapreq_handler_t on_netmap, void *ctx,
-                            int *push_status)
+                            mapreq_push_fn on_push)
 {
     if (conn == NULL || keys == NULL || on_netmap == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
     uint8_t *buf = tl_ctrl_buf_claim("map stream");
     if (buf == NULL) return ESP_ERR_INVALID_STATE;
-    esp_err_t err = run_stream_in(conn, keys, on_netmap, ctx, buf, push_status);
+    esp_err_t err = run_stream_in(conn, keys, on_netmap, ctx, buf, on_push);
     tl_ctrl_buf_release();
     return err;
 }
