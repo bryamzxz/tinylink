@@ -415,7 +415,7 @@ double roam was followed by a 30-s WireGuard blackout). Image 716 688 →
 ~1.9 KB more heap in use (the re-send ring). Host suite 1 592 → **1 791 OK** (CI
 floor 1 791), ASan + UBSan clean, 0 warnings. Static worst cases: `wg_rx`
 5 648 / 8 192, `wg_tx` 3 440 / 5 120, `tinylink_tlm` 3 712 / 4 608,
-`tinylink_derp` 5 152 / 8 192. Not yet on the sensor.
+`tinylink_derp` 5 152 / 8 192. Hardware section at the end of this entry.
 
 - **Path selection by proof (`wg_path.h`).** Direct-only only after a
   pong to our own ping, kept by the peer's passive keepalives (it
@@ -472,6 +472,40 @@ floor 1 791), ASan + UBSan clean, 0 warnings. Static worst cases: `wg_rx`
   with only our direct WireGuard toward the peer blocked, the first
   episode loses 3–6 frames older than the 40-s re-send window (later
   episodes lose none).
+
+#### Hardware (deployed sensor, app partition only; the 1.3.5 `ota_0` + `otadata` read back to `~/tinylink-backups/` first)
+
+Backup byte-identical to the flashed 1.3.5 (`b497bde`), otadata seq 1 /
+CRC OK; flashed `827c1b9` (reports `gf7d95e1`, the pre-rewrite hash).
+
+- **Smoke (180 s) + 5 × 2 min:** register without Auth 6 / 6, 0 E lines,
+  0 crashes; WG up 1.94–2.41 s after got-ip (4.14 s once, the netmap
+  3.7 s after the request, server side); heap 159 064 B free, largest
+  block 110 592 B.
+- **Soak (`827c1b9`, 211 min; a 28-min first run ended when the capture
+  host rebooted, the second was cut to flash 1.3.7):** 0 resets /
+  panics / WDT / brown-outs; 112 rekeys (16 needed a REKEY_TIMEOUT
+  retry), 2 486 telemetry packets. Path selection: 30 lapses of the
+  direct path — 25 doubts settled by the peer's own WireGuard 1.3–13.1 s
+  later (no rekey), 2 "undelivered" (DERP only, direct re-confirmed by a
+  pong 23–33 s later), 3 "dead" (no pong in 5 s → DERP only,
+  re-confirmed 5.1–45.5 s later); 33 direct-only frames re-sent via
+  DERP; **1 endpoint roam** (the peer's restart; 149 in 6 h on 1.3.5).
+  **3 RX-stale:** two with the direct path answering DISCO and nothing
+  from the peer's WireGuard on either path (`seen direct=0 derp=0`),
+  fixed by the forced rekey in ~130 ms — the 1.3.5 soak's post-rekey
+  silences, which path selection cannot see; the third the peer's
+  nightly restart at 02:00 (DERP `peer-gone`, the peer back with a new
+  DiscoKey 48 s later, session up 6.3 s after that, on the 5-s INIT
+  retry). One WAN event at 00:12: the DERP server's stream ended (TLS
+  read error) and the reconnect **resumed the TLS session in 157 ms** —
+  the first resumption seen on the sensor (full handshakes 1.45–4.19 s);
+  the control stream went silent for 120 s and reconnected; heap dipped
+  to 142 540 B for that minute, 158.9 KB otherwise, largest block
+  110 592 B throughout. Stack lows (B free): `tinylink_lp` 4 412 of
+  7 168, `tinylink_derp` 4 616 of 8 192, `wg_rx` 3 980 of 8 192, `wg_tx`
+  2 780 of 5 120, `tinylink_tlm` 2 628 of 4 608, `esp_timer` 3 024 of
+  4 608.
 
 ### Optimization round 1.3.5 — boot and reconnect latency (in progress, branch `feat/opt-1.3.5`)
 
