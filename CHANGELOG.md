@@ -16,9 +16,9 @@ the servers' keep-alives, under tickless idle + light sleep (DFS 240/80)
 and `MIN_MODEM`. There is no power meter on it, so the proxies are time
 in light sleep and light-sleep exits per second: this round adds a
 diagnostic that measures them, removes the telemetry task's surplus
-wakes, and prepares the knobs to A/B. Image 725 536 → **725 840 B
-(+304)**, IRAM and static DRAM ±0. Host suite 1 791 → **1 911 OK** (CI
-floor 1 911), ASan + UBSan clean, 0 warnings. `tinylink_tlm` static
+wakes, and prepares the knobs to A/B. Image 725 536 → **725 936 B
+(+400)**, IRAM and static DRAM ±0. Host suite 1 791 → **1 916 OK** (CI
+floor 1 916), ASan + UBSan clean, 0 warnings. `tinylink_tlm` static
 worst case 3 712 → 3 728 / 4 608 (also with the diagnostic on). Not
 yet on the sensor.
 
@@ -39,7 +39,10 @@ yet on the sensor.
   slept again for the rest; the 60-s housekeeping and the 5-min STUN
   re-probe each kept their own phase and paid the same twice.
   `tlm_sched.h`: samples on a fixed grid (5.000 s apart; 5.01–5.02 s
-  before), a wake within 1/16 of the period (≤ 1 s) of the sample's
+  before; a grid instant reached late — a STUN probe blocked through
+  it — is dropped rather than sent ms after the late one, the grid
+  starts at the first sample), a wake within 1/16 of the period (≤ 1 s)
+  of the sample's
   instant is the sample's, a sample due just past the 5-s `/stats`
   slice replaces it (a drift-shortened slice otherwise crept earlier
   every period until one cost a wake), and the housekeeping and the
@@ -49,7 +52,8 @@ yet on the sensor.
   ≤ 1 s early. `tinylink_stun_reprobe_poll` gains the early window.
   Replayed with the loop's code and lwIP's tick rounding:
   **1 546–1 554 → 721 wakes per hour** at 1.25–1.47 % drift (789 → 720
-  without drift), −0.23 wakes/s. `test_tlm_sched` (56).
+  without drift), −0.23 wakes/s. `test_tlm_sched` (61). The `/stats`
+  slice that bounds a GOT_IP re-probe can now stretch to 6 s.
 - **Wakeup audit, steady state** (estimates from the code and the soak
   rhythm; the diagnostic below measures them), wakes/s 1.3.6 → 1.3.7:
   Wi-Fi beacons under `MIN_MODEM` 9.8 at DTIM 1 / 3.3 at DTIM 3 (the
@@ -86,11 +90,13 @@ yet on the sensor.
   (`PM_PROFILING`, `ESP_TIMER_PROFILING`) are not used: they print with
   `%lld`, which the ROM's newlib-nano printf cannot format, and full
   printf needs more stack on tasks with ~1 KB free (`wifi`). Cost:
-  +2 640 B image, +72 B IRAM, +1 128 B static DRAM, ~100 B heap. No
+  +2 784 B image, +72 B IRAM, +1 128 B static DRAM, ~100 B heap. No
   extra wake (it rides the 60-s dump); per sleep two 32-B callbacks
   inside `vApplicationSleep` (one esp_timer list read; the PM subtracts
   the enter callback's time from the sleep), one esp_timer read per
-  context switch, three log lines a minute. `test_pwr_diag` (64).
+  context switch, three log lines a minute. Run time is matched by task
+  number, not handle (a recreated `wg_rx` can reuse the address).
+  `test_pwr_diag` (64).
 - **A/B fragments, prepared, not decided (`tools/power/`, stack after
   `sdkconfig.power-diag`).** Sizes against the default image:
   `ab-wifi-active20` (`ESP_WIFI_SLP_DEFAULT_MIN_ACTIVE_TIME` 50 → 20 ms:
@@ -124,6 +130,15 @@ yet on the sensor.
   router's entry fresh, inside ARP's own wake);
   `PM_LIGHTSLEEP_RTC_OSC_CAL_INTERVAL` > 1 (10 RC cycles ≈ 67 µs per
   sleep against RC drift); the per-sample log line at DEBUG (soak greps).
+- **Review.** An independent review (and a 20 000-case randomised
+  replay of the loop: periods 0.5–600 s, 0–3 % drift, 100 / 1 000 Hz,
+  kicks, STUN blocks to 24 s) found no spin, WDT or lateness path; fixed:
+  a sample reached late was followed by the next one 10–72 ms later, the
+  grid started at boot (a 600-s period's second sample came 560 s after
+  the first), a recreated task could read as a counter wrap in the cpu
+  line, a half-registered callback pair blocked arming for good, two
+  "≤ 5 s" comments. Left: the stack-diag snapshot shared with the
+  wedge-restart dump (pre-existing; only the dump before `esp_restart`).
 
 ### Optimization round 1.3.6 — data-plane path selection (in progress, branch `feat/opt-1.3.6`)
 

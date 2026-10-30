@@ -164,22 +164,25 @@ static void test_fmt(void)
 static void test_tasks(void)
 {
     static tl_pwr_tasks_t a, b;
-    static int k[TL_PWR_MAX_TASKS + 3];
+    static uint32_t k[TL_PWR_MAX_TASKS + 3];
+    for (unsigned i = 0; i < TL_PWR_MAX_TASKS + 3; i++) k[i] = 100u + i;   /* task numbers */
     memset(&a, 0, sizeof(a));
     memset(&b, 0, sizeof(b));
-    ok("tasks/first-seen-whole", tl_pwr_task_delta(&a, &b, &k[0], 5000) == 5000);
-    ok("tasks/second-new", tl_pwr_task_delta(&a, &b, &k[1], 70) == 70 && b.n == 2);
+    ok("tasks/first-seen-whole", tl_pwr_task_delta(&a, &b, k[0], 5000) == 5000);
+    ok("tasks/second-new", tl_pwr_task_delta(&a, &b, k[1], 70) == 70 && b.n == 2);
     a = b;
     memset(&b, 0, sizeof(b));
-    ok("tasks/delta", tl_pwr_task_delta(&a, &b, &k[0], 8000) == 3000);
-    ok("tasks/wrap", tl_pwr_task_delta(&a, &b, &k[2], 10) == 10);
+    ok("tasks/delta", tl_pwr_task_delta(&a, &b, k[0], 8000) == 3000);
+    /* A task recreated after the last dump (wg_rx after a data-plane
+     * restart) has a new number: its whole counter, not a wrap. */
+    ok("tasks/recreated-new-number", tl_pwr_task_delta(&a, &b, k[2], 10) == 10);
     a.last[1] = 0xFFFFFFF0u;
-    ok("tasks/counter-wrap", tl_pwr_task_delta(&a, &b, &k[1], 0x10u) == 0x20u);
-    ok("tasks/gone-dropped", b.n == 3 && b.key[0] == &k[0] && b.key[1] == &k[2]);
+    ok("tasks/counter-wrap", tl_pwr_task_delta(&a, &b, k[1], 0x10u) == 0x20u);
+    ok("tasks/gone-dropped", b.n == 3 && b.key[0] == k[0] && b.key[1] == k[2]);
     memset(&b, 0, sizeof(b));
     int capped = 1;
     for (int i = 0; i < TL_PWR_MAX_TASKS + 3; i++) {
-        capped &= tl_pwr_task_delta(&a, &b, &k[i], 1) <= 1 || i < 3;
+        capped &= tl_pwr_task_delta(&a, &b, k[i], 1) <= 1 || i < 3;
     }
     ok("tasks/table-capped", b.n == TL_PWR_MAX_TASKS && capped);
 }

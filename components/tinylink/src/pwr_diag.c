@@ -75,6 +75,10 @@ static void pwr_arm(int64_t now, TickType_t tick)
     };
     const esp_err_t err = esp_pm_light_sleep_register_cbs(&cfg);
     if (err != ESP_OK) {
+        /* NO_MEM can leave the enter callback registered without the
+         * exit one; undo it so the next dump's retry is not refused as a
+         * duplicate. */
+        (void)esp_pm_light_sleep_unregister_cbs(&cfg);
         ESP_LOGW(TAG, "pwr diag: light-sleep callbacks not registered: 0x%x", err);
         return;
     }
@@ -96,7 +100,7 @@ void tl_pwr_diag_dump(const TaskStatus_t *snap, unsigned n)
         static const tl_pwr_tasks_t none;      /* nothing seen before */
         s_tasks[s_cur].n = 0;
         for (unsigned i = 0; i < n && i < TL_PWR_MAX_TASKS; i++) {
-            (void)tl_pwr_task_delta(&none, &s_tasks[s_cur], snap[i].xHandle,
+            (void)tl_pwr_task_delta(&none, &s_tasks[s_cur], (uint32_t)snap[i].xTaskNumber,
                                     snap[i].ulRunTimeCounter);
         }
         __atomic_store_n(&s_busy, false, __ATOMIC_RELEASE);
@@ -127,7 +131,8 @@ void tl_pwr_diag_dump(const TaskStatus_t *snap, unsigned n)
     uint64_t busy = 0;
     if (n > TL_PWR_MAX_TASKS) n = TL_PWR_MAX_TASKS;
     for (unsigned i = 0; i < n; i++) {
-        s_delta[i] = tl_pwr_task_delta(prev, next, snap[i].xHandle, snap[i].ulRunTimeCounter);
+        s_delta[i] = tl_pwr_task_delta(prev, next, (uint32_t)snap[i].xTaskNumber,
+                                       snap[i].ulRunTimeCounter);
         if (!tl_pwr_is_idle(snap[i].pcTaskName)) busy += s_delta[i];
     }
     s_cur ^= 1u;

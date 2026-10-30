@@ -169,18 +169,21 @@ static inline int tl_pwr_fmt_bins(char *out, size_t cap, const tl_pwr_counts_t *
     return (int)at;
 }
 
-/* Run-time counters per task between two dumps, keyed by task handle. */
+/* Run-time counters per task between two dumps, keyed by FreeRTOS's task
+ * number (xTaskNumber, unique per created task): a handle can come back
+ * for a new task at the same address (wg_rx / wg_tx after a data-plane
+ * restart), which would inherit the old counter and read as a wrap. */
 typedef struct {
-    const void *key[TL_PWR_MAX_TASKS];
-    uint32_t    last[TL_PWR_MAX_TASKS];
-    unsigned    n;
+    uint32_t key[TL_PWR_MAX_TASKS];
+    uint32_t last[TL_PWR_MAX_TASKS];
+    unsigned n;
 } tl_pwr_tasks_t;
 
 /* Delta of one task's run-time counter since the previous dump (its whole
  * counter the first time it is seen), recorded into `next` for the next
  * dump. Tasks gone since then simply drop out of `next`. */
 static inline uint32_t tl_pwr_task_delta(const tl_pwr_tasks_t *prev, tl_pwr_tasks_t *next,
-                                         const void *key, uint32_t counter)
+                                         uint32_t key, uint32_t counter)
 {
     uint32_t base = 0;
     for (unsigned i = 0; i < prev->n; i++) {

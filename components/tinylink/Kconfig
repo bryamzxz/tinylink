@@ -61,7 +61,7 @@ menu "tinylink core"
             ended them (an esp_timer alarm vs a FreeRTOS timeout),
             sleep-length bins, RTOS-tick drift against esp_timer, and
             run time per task (src/pwr_diag.h has the format). The
-            first dump only arms it. Cost (round 1.3.7): +2.6 KB
+            first dump only arms it. Cost (round 1.3.7): +2.8 KB
             image, +72 B IRAM, +1.1 KB static DRAM; no extra wake, but
             the run-time stats add an esp_timer read to every context
             switch and the callbacks run in every idle-to-sleep

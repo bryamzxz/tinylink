@@ -171,10 +171,28 @@ static run_t run_old(int64_t period, int32_t drift_ppm, int64_t span)
 static void test_helpers(void)
 {
     ok("grid/next", tlm_next_on_grid(S(100), S(5), S(101)) == S(105));
-    ok("grid/late-under-period-keeps-grid", tlm_next_on_grid(S(100), S(5), S(104)) == S(105));
-    ok("grid/at-instant-rebases", tlm_next_on_grid(S(100), S(5), S(105)) == S(110));
-    ok("grid/far-behind-rebases", tlm_next_on_grid(S(100), S(5), S(117)) == S(122));
+    ok("grid/early-wake-keeps-instant", tlm_next_on_grid(S(100), S(5), S(100) - MS(60)) == S(105));
+    ok("grid/half-period-kept", tlm_next_on_grid(S(100), S(5), S(102) + MS(500)) == S(105));
+    ok("grid/close-instant-dropped", tlm_next_on_grid(S(100), S(5), S(104)) == S(110));
+    ok("grid/at-instant-dropped", tlm_next_on_grid(S(100), S(5), S(105)) == S(110));
+    ok("grid/far-behind-stays-on-grid", tlm_next_on_grid(S(100), S(5), S(117)) == S(120));
     ok("grid/first-sample", tlm_next_on_grid(0, S(5), S(40)) == S(45));
+    ok("grid/first-sample-long-period", tlm_next_on_grid(0, S(600), S(40)) == S(640));
+    /* Review of 1.3.7: a sample reached late (a STUN probe blocked
+     * through its instant) must not be followed by the next one a few ms
+     * later. Every lateness up to three periods, P = 0.5 s … 600 s. */
+    static const int64_t periods[] = { MS(500), S(5), S(30), S(600) };
+    int spaced = 1, on_grid = 1;
+    for (unsigned i = 0; i < sizeof(periods) / sizeof(periods[0]); i++) {
+        const int64_t p = periods[i], g = S(1000);
+        for (int64_t late = -tlm_slack_us(p); late < 3 * p; late += p / 97 + 1) {
+            const int64_t now = g + late, next = tlm_next_on_grid(g, p, now);
+            spaced  &= next - now >= p / 2;
+            on_grid &= (next - g) % p == 0 && next > g;
+        }
+    }
+    ok("grid/no-burst-after-late-sample", spaced);
+    ok("grid/stays-on-grid", on_grid);
     ok("slack/5s", tlm_slack_us(S(5)) == MS(312) + 500);
     ok("slack/capped", tlm_slack_us(S(600)) == TLM_SLACK_MAX_US);
     ok("slack/zero", tlm_slack_us(0) == 0 && tlm_slack_us(-5) == 0);

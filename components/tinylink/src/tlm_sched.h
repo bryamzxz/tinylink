@@ -51,13 +51,17 @@ static inline int64_t tlm_slack_us(int64_t period_us)
     return s < TLM_SLACK_MAX_US ? s : TLM_SLACK_MAX_US;
 }
 
-/* The next instant of a fixed grid: one period after the previous one,
- * or one period from now if the task fell a whole period behind (a long
- * STUN probe): missed instants are dropped, not replayed in a burst. */
+/* The next instant of a fixed grid after the one at prev_us, at least
+ * half a period from now: an instant the task reaches late (a STUN probe
+ * blocked through it) is dropped, not sent a few ms after the late one.
+ * prev_us 0 (none yet) starts the grid one period from now. */
 static inline int64_t tlm_next_on_grid(int64_t prev_us, int64_t period_us, int64_t now_us)
 {
-    const int64_t next = prev_us + period_us;
-    return next > now_us ? next : now_us + period_us;
+    if (prev_us <= 0 || period_us <= 0) return now_us + (period_us > 0 ? period_us : 0);
+    int64_t next = prev_us + period_us;
+    const int64_t floor_us = now_us + period_us / 2;
+    while (next < floor_us) next += period_us;   /* ≤ 1 step unless far behind */
+    return next;
 }
 
 /* How early the housekeeping or a re-probe may run: one sample period

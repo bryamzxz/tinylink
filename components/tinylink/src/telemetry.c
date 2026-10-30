@@ -32,7 +32,8 @@
 static const char *TAG = "telemetry";
 
 /* Longest single wait of the loop. While select() serves /stats nothing
- * can wake it early (lwIP loopback is compiled out), so 5 s bounds how
+ * can wake it early (lwIP loopback is compiled out), so 5 s — 6 s when a
+ * sample due just past it takes its place (tlm_sched.h) — bounds how
  * late a GOT_IP-requested STUN re-probe starts, and adds no wake-ups at
  * the default 5-s telemetry period. The notification wait is woken by
  * telemetry_kick and only needs to keep the task WDT (60 s) fed — also

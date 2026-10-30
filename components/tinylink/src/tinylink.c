@@ -2320,7 +2320,7 @@ static void stun_reprobe_on_got_ip(void *arg, esp_event_base_t base,
      * immediate re-probe. The kick wakes the telemetry task right away
      * while it is not serving /stats (before the WG netif is up, or a
      * build without it); a /stats select() takes it within one ≤ 5-s
-     * wait slice. */
+     * wait slice (≤ 6 s when a sample stretches it, telemetry.c). */
     s_stun_reprobe_now = true;
     telemetry_kick();
     /* A new L3 identity (DHCP handed us a different address after a
