@@ -222,9 +222,9 @@ response headers the map stream has a shorter, first-response deadline
 (round 1.3.8): 15 s from the request, doubled after each expiry up to
 the idle budget, twice the last answer's time after an answer; an
 expiry recycles the conn without counting as a transport failure (the
-second in a row does). A poll after a map stream the server ended
-cleanly gets the whole idle budget instead, its expiries counting as
-nothing, until a stream is answered. Every request carries upstream's `Ts-Lb:
+second in a row does). The first poll after a map stream the server
+ended cleanly gets the whole idle budget instead, its expiry counting
+as nothing; the polls after it the rules above. Every request carries upstream's `Ts-Lb:
 nodekey:<hex>` load-balancer hint (`tailcfg.LBHeader`). Persistent HTTP
 4xx (non-429) rejections additionally trigger an in-place re-register
 with the stored authkey (tinylink-specific: the headless equivalent of
