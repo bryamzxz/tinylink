@@ -215,7 +215,15 @@ conn tolerates at most `CONFIG_TINYLINK_STREAM_IDLE_TIMEOUT_S`
 (default 120 s ≈ two missed KeepAlives) of consecutive silence, then
 the stream is declared dead and the long-poll reconnects with a **full
 fresh Noise handshake** (never resumed), exponential-backoff-capped at
-30 s — same recovery shape as upstream `mapRoutine`. Persistent HTTP
+30 s — same recovery shape as upstream `mapRoutine`; after a stream
+that stayed up ≥ 10 s the redial goes at once (round 1.3.8, as
+upstream's 5–15 ms after a poll that delivered a netmap). Before its
+response headers the map stream has a shorter, first-response deadline
+(round 1.3.8): 15 s from the request, doubled after each expiry up to
+the idle budget, twice the last answer's time after an answer; an
+expiry recycles the conn without counting as a transport failure (the
+second in a row does). Every request carries upstream's `Ts-Lb:
+nodekey:<hex>` load-balancer hint (`tailcfg.LBHeader`). Persistent HTTP
 4xx (non-429) rejections additionally trigger an in-place re-register
 with the stored authkey (tinylink-specific: the headless equivalent of
 upstream's `NeedsLogin`), and one hour of *total* control silence is a
