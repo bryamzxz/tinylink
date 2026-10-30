@@ -68,6 +68,31 @@ static uint8_t  s_resp_streak;
 static int64_t  s_resp_since_us;
 static bool     s_repoll;
 
+/* The last map stream was ended by the server (END_STREAM after its 200)
+ * and no stream has been answered since (round 1.3.8 review). Every poll
+ * that followed such an end in the 1.3.0–1.3.7 captures was slow on the
+ * server's side — first frame after 59, 104, 108 s, twice nothing within
+ * 120 s and the fresh conn after that 26 / 55 s — so the delay is the
+ * server's and not obviously per request: cutting such a poll only
+ * resubmits it, and the 60-s alternative would have cut three of those
+ * five answers (the 59-s one by 1 s). Until an answer, polls get
+ * TS2021_RESP_TIMEOUT_MAX_MS — the stream budget, what 1.3.7 gave them —
+ * and their expiries leave the ladder, the streak and the conn's
+ * failure accounting alone (no :443 / re-resolve). After a boot, a FIN,
+ * an error or a recycle, TS2021_RESP_TIMEOUT_MS and the ladder. */
+static bool     s_after_clean;
+
+/* The first-response deadline for the streaming request going out now;
+ * *patient: it follows a clean server end. */
+static uint32_t resp_ms_now(bool *patient)
+{
+    *patient = s_after_clean;
+    if (!s_after_clean) return s_resp_ms;
+    ESP_LOGI(TAG, "map stream after a clean server end: %u ms for its answer",
+             (unsigned)TS2021_RESP_TIMEOUT_MAX_MS);
+    return TS2021_RESP_TIMEOUT_MAX_MS;
+}
+
 static uint32_t resp_ms_after(int64_t took_us)
 {
     const int64_t twice_ms = took_us > 0 ? took_us / 500 : 0;
@@ -172,6 +197,7 @@ void h2_io_on_status(void *io, int status)
     const int64_t took_us = esp_timer_get_time() - s_resp_since_us;
     s_resp_ms = resp_ms_after(took_us);
     s_resp_streak = 0;
+    s_after_clean = false;
     ESP_LOGI(TAG, "map stream answered: HTTP %d in %u ms", status,
              (unsigned)(took_us > 0 ? took_us / 1000 : 0));
     h2_side_t *side = s_side;
@@ -578,18 +604,25 @@ esp_err_t h2_post_json(ts2021_conn_t *conn,
  * one doubled — the second expiry in a row on, the conn counts as failed
  * like any young conn that dies (ts2021_close: a :80 one sends the next
  * dial to :443, one at the cached address re-resolves the name), so a
- * stall that persists also tries the other port and a fresh address. */
-static esp_err_t resp_deadline_done(ts2021_conn_t *conn, uint32_t ms, esp_err_t err)
+ * stall that persists also tries the other port and a fresh address.
+ * Not for a poll after a clean server end (`patient`, s_after_clean),
+ * which a server ending the stream it answered starts. */
+static esp_err_t resp_deadline_done(ts2021_conn_t *conn, uint32_t ms, bool patient,
+                                    esp_err_t err)
 {
     if (conn->req_idle != 0) {
         const esp_err_t derr = ts2021_request_deadline(conn, 0);
         if (err == ESP_OK) err = derr;   /* not usable for a stream at 2-s polls */
     }
     s_repoll = false;
-    if (conn->resp_expired) {
+    if (conn->resp_expired && !patient) {
         s_resp_ms = ms < TS2021_RESP_TIMEOUT_MAX_MS / 2 ? 2 * ms : TS2021_RESP_TIMEOUT_MAX_MS;
         if (s_resp_streak < UINT8_MAX) s_resp_streak++;
         if (s_resp_streak >= 2) conn->io_failed = true;
+    }
+    if (err == ESP_OK && conn->h2_status == 200 && conn->h2.s.closed &&
+        conn->h2_stream_error == 0 && !conn->h2_cb_stop) {
+        s_after_clean = true;   /* END_STREAM from the server */
     }
     return err;
 }
@@ -615,12 +648,13 @@ esp_err_t h2_post_json_stream(ts2021_conn_t *conn,
     /* Its response headers within s_resp_ms of the request, or the conn
      * is recycled (round 1.3.8, C1); from them on the stream budget only
      * (h2_io_on_status ends the deadline), as upstream's watchdog. */
-    const uint32_t ms = s_resp_ms;
+    bool patient;
+    const uint32_t ms = resp_ms_now(&patient);
     s_resp_since_us = esp_timer_get_time();
     s_repoll = false;
     esp_err_t err = ts2021_response_deadline(conn, ms, s_resp_since_us);
     if (err == ESP_OK) err = h2_drive_request(conn, path, authority, body_len, NULL);
-    err = resp_deadline_done(conn, ms, err);
+    err = resp_deadline_done(conn, ms, patient, err);
 
     *status_out = conn->h2_status;
 
@@ -670,7 +704,8 @@ esp_err_t h2_post_json_stream_side(ts2021_conn_t *conn,
      * first-response deadline, counted from the burst (round 1.3.8, C1;
      * side_closed). */
     const uint32_t ms = s_req_ms;
-    const uint32_t resp_ms = s_resp_ms;
+    bool patient;
+    const uint32_t resp_ms = resp_ms_now(&patient);
     s_resp_since_us = esp_timer_get_time();
     s_repoll = false;
     h2_side_t side = { .body = side_body, .len = side_len,
@@ -688,7 +723,7 @@ esp_err_t h2_post_json_stream_side(ts2021_conn_t *conn,
     }
     /* Either deadline off; a stream unanswered past its own counted as
      * in h2_post_json_stream. */
-    err = resp_deadline_done(conn, resp_ms, err);
+    err = resp_deadline_done(conn, resp_ms, patient, err);
     if (!s_one_stream && conn->h2.peer_max_streams < 2u) {
         s_one_stream = true;   /* the limit came after the burst */
         ESP_LOGW(TAG, "server allows %u stream(s) at a time — side requests "

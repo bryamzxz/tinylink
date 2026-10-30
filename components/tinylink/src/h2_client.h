@@ -50,7 +50,10 @@ esp_err_t h2_post_json(ts2021_conn_t *conn,
  * no response headers in time and ESP_FAIL comes back with
  * conn->resp_expired set, the conn to be recycled; the next stream gets
  * twice as long, up to the stream budget, and one after an answer twice
- * that answer's time (one I line `map stream answered: HTTP N in M ms`).
+ * that answer's time (one I line `map stream answered: HTTP N in M ms`);
+ * a stream after one the server ended (END_STREAM after its 200) gets the
+ * stream budget, until a stream is answered (`map stream after a clean
+ * server end: N ms for its answer`).
  *
  * Used by the M2 long-poll MapRequest loop: the body is a single
  * MapRequest with `Stream:true`, and the response is a sequence of

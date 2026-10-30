@@ -234,10 +234,16 @@ void ts2021_abort_reads(void)
     s_abort_reads = true;
 }
 
-/* A one-shot request past its deadline (ts2021_request_deadline). */
-static bool req_overdue(const ts2021_conn_t *c)
+/* A one-shot request past its deadline (ts2021_request_deadline). The
+ * map stream's first-response deadline (round 1.3.8) is not overdue while
+ * received bytes wait unread: they are read first — the answer may be
+ * among them (a deadline armed late, when a side request closes, with
+ * the stream's 200 in the next record; review). Only the authenticated
+ * server can keep bytes waiting, and only by sending. */
+static bool req_overdue(ts2021_conn_t *c)
 {
-    return c->req_deadline_us != 0 && esp_timer_get_time() > c->req_deadline_us;
+    if (c->req_deadline_us == 0 || esp_timer_get_time() <= c->req_deadline_us) return false;
+    return !(c->resp_wait && ts2021_rx_ready(c));
 }
 
 /* Transport shims for tls_io_*: esp_tls on :443, the socket on :80
