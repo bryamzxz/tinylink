@@ -88,10 +88,11 @@ menu "tinylink core"
         bool "TLS: offer the ECDHE-RSA suites first (RSA certificate chain)"
         default y
         help
-            Round 1.3.8. The Tailscale servers (DERP, controlplane on
-            :443, the first-boot /key fetch) serve an ECDSA chain to a
-            ClientHello that lists an ECDHE-ECDSA suite and an RSA chain
-            to one that does not: leaf RSA-2048 <- YR2 <- Root YR <- ISRG
+            Round 1.3.8, for the DERP and control (:443) connects; the
+            first-boot /key fetch, whose TLS alone vouches for the
+            control key it pins, keeps the full offer. The Tailscale
+            servers serve an ECDSA chain to a ClientHello that lists an
+            ECDHE-ECDSA suite and an RSA chain to one that does not: leaf RSA-2048 <- YR2 <- Root YR <- ISRG
             Root X1 instead of leaf P-256 <- YE2 <- Root YE <- ISRG Root
             X2 <- X1. Verifying the RSA chain and its ServerKeyExchange is
             four RSA public-key operations (exponent 65537, on the RSA
@@ -100,8 +101,9 @@ menu "tinylink core"
             same X25519 ECDHE and AES-128-GCM records; the server is
             authenticated by RSA-2048 (about 112-bit) instead of P-256
             (about 128-bit). A server that refuses the offer is dialled
-            again at once with the full mbedTLS offer, and asked with it
-            directly for 6 h (src/tls_offer.h).
+            again at once with the full mbedTLS offer (not after a
+            certificate for another name), and asked with it directly
+            for 6 h (src/tls_offer.h).
 
     config TINYLINK_TLS_X25519_INTREE
         bool "TLS: X25519 ECDHE on the in-tree Curve25519"
@@ -125,14 +127,16 @@ menu "tinylink core"
             Round 1.3.8. Every TLS connect that keeps a session (the DERP
             client, the control conn on :443) also writes it, serialized
             by mbedTLS, into one of two records in RTC slow memory (1.1
-            KB), which survives a software, panic or watchdog reset but
-            not a power-on: the first connect to that server after such a
-            reset resumes (one round trip, no chain verify, no ECDHE)
-            instead of a full handshake. Same bounds as the RAM copy
-            (host:port, 24 h of master-secret age on the RTC timer, a
-            failed connect clears it), plus a checksum against the
-            garbage RTC memory holds after a power-on. Never written to
-            flash: src/tls_rtc.h has why.
+            KB). After a software, panic, interrupt-WDT or task-WDT
+            reset — the ones that keep RTC memory and the RTC timer — the
+            first connect to that server resumes (one round trip, no
+            chain verify, no ECDHE) instead of a full handshake. Same
+            bounds as the RAM copy (host:port, 24 h of master-secret age
+            on the RTC timer, a failed connect clears it), plus a
+            checksum against garbage and a refusal when the RTC timer
+            reads earlier than the record's last write; any other boot,
+            and an expired record, are scrubbed at the boot's first use.
+            Never written to flash: src/tls_rtc.h has why.
 
     config TINYLINK_TLS_MPI_MUL_SW
         bool "TLS: bignum multiplication in software (RSA exponentiation stays on the accelerator)"

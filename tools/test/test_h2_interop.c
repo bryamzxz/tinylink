@@ -461,6 +461,8 @@ esp_err_t esp_tls_get_error_handle(esp_tls_t *t, esp_tls_error_handle_t *h)
     *h = NULL;
     return ESP_FAIL;
 }
+void *esp_tls_get_ssl_context(esp_tls_t *t) { (void)t; return NULL; }
+uint32_t mbedtls_ssl_get_verify_result(const mbedtls_ssl_context *ssl) { (void)ssl; return 0xFFFFFFFFu; }
 
 struct esp_tls {
     uint8_t c2s[64 * 1024];      /* client bytes not yet cut into records */

@@ -11,7 +11,9 @@
 //    resumes a session whose suite is listed); NULL list = mbedTLS's
 //    default (full) offer;
 //  - the fallback fires only after the RSA offer and only on a TLS
-//    handshake failure (not a timeout, not a TCP failure): the esp_tls is
+//    handshake failure (not a timeout, not a TCP failure) whose verdict is
+//    not a certificate for another name (an expired / unanchored RSA chain
+//    or no verdict at all — an alert — does retry): the esp_tls is
 //    destroyed and replaced, the retry carries the full offer and no
 //    session; a failed esp_tls_init ends it;
 //  - only a successful full retry is remembered, per host:port, for 6 h;
@@ -26,6 +28,7 @@
 struct esp_tls {
     esp_tls_last_error_t err;
     int                  id;
+    uint32_t             verify;   /* the failed handshake's X.509 verdict */
 };
 
 static int64_t s_now = 1000000;
@@ -39,6 +42,7 @@ esp_tls_t *esp_tls_init(void)
     if (s_init_fail) return NULL;
     esp_tls_t *t = calloc(1, sizeof(*t));
     t->id = ++s_inits;
+    t->verify = 0xFFFFFFFFu;   /* mbedTLS: no verdict yet */
     s_live[t->id % 8] = t;
     return t;
 }
@@ -51,6 +55,13 @@ int esp_tls_conn_destroy(esp_tls_t *t)
         s_destroys++;
     }
     return 0;
+}
+
+/* The fake SSL context is the esp_tls itself. */
+void *esp_tls_get_ssl_context(esp_tls_t *t) { return t; }
+uint32_t mbedtls_ssl_get_verify_result(const mbedtls_ssl_context *ssl)
+{
+    return ((const esp_tls_t *)(const void *)ssl)->verify;
 }
 
 esp_err_t esp_tls_get_error_handle(esp_tls_t *t, esp_tls_error_handle_t *h)
@@ -77,6 +88,7 @@ static bool is_rsa_list(const int *l)
  * full one with `full_rc`. One "dial" as the callers do it. */
 typedef struct {
     int rsa_rc, rsa_err, full_rc;
+    uint32_t rsa_verify;   /* 0 = leave the context's "no verdict" */
     int dials, rsa_dials, full_dials;
     bool last_had_session;
 } server_t;
@@ -88,6 +100,7 @@ static int dial(server_t *sv, esp_tls_t *t, const esp_tls_cfg_t *cfg)
     if (cfg->ciphersuites_list != NULL) {
         sv->rsa_dials++;
         if (sv->rsa_rc != 1) t->err.last_error = sv->rsa_err;
+        if (sv->rsa_verify != 0) t->verify = sv->rsa_verify;
         return sv->rsa_rc;
     }
     sv->full_dials++;
@@ -181,6 +194,26 @@ int main(void)
               s_destroys == destroys + 1 && t->err.last_error == 0);
         check("fallback: full offer, no session",
               cfg.ciphersuites_list == NULL && cfg.client_session == NULL);
+        /* the verdict decides (review, 1.3.8) */
+        t->err.last_error = ESP_ERR_MBEDTLS_SSL_HANDSHAKE_FAILED;
+        t->verify = MBEDTLS_X509_BADCERT_CN_MISMATCH;
+        check("fallback: name mismatch -> no retry",
+              !tls_offer_fallback(TLS_OFFER_RSA, &t, &cfg, H, 443) && t != NULL);
+        t->verify = MBEDTLS_X509_BADCERT_CN_MISMATCH | MBEDTLS_X509_BADCERT_NOT_TRUSTED;
+        check("fallback: unanchored cert for another name -> no retry",
+              !tls_offer_fallback(TLS_OFFER_RSA, &t, &cfg, H, 443) && t != NULL);
+        cfg.ciphersuites_list = (const int *)1;
+        t->verify = MBEDTLS_X509_BADCERT_EXPIRED;
+        check("fallback: expired RSA leaf -> retry",
+              tls_offer_fallback(TLS_OFFER_RSA, &t, &cfg, H, 443) && t != NULL &&
+              cfg.ciphersuites_list == NULL);
+        t->err.last_error = ESP_ERR_MBEDTLS_SSL_HANDSHAKE_FAILED;
+        t->verify = MBEDTLS_X509_BADCERT_NOT_TRUSTED;
+        check("fallback: RSA chain not anchored -> retry",
+              tls_offer_fallback(TLS_OFFER_RSA, &t, &cfg, H, 443) && t != NULL);
+        t->err.last_error = ESP_ERR_MBEDTLS_SSL_HANDSHAKE_FAILED;   /* verify 0xFFFFFFFF: */
+        check("fallback: no verdict (alert, bundle callback) -> retry",
+              tls_offer_fallback(TLS_OFFER_RSA, &t, &cfg, H, 443) && t != NULL);
         t->err.last_error = ESP_ERR_MBEDTLS_SSL_HANDSHAKE_FAILED;
         s_init_fail = 1;
         check("fallback: esp_tls_init failure -> no retry",
@@ -225,6 +258,13 @@ int main(void)
         rc = connect_like_derp(&down, &memo, H, 443, NULL, &used, &t);
         check("seq both fail: two dials, nothing remembered",
               rc == -1 && down.dials == 2 && memo.host[0] == '\0');
+        esp_tls_conn_destroy(t);
+
+        server_t other = { .rsa_rc = -1, .rsa_err = ESP_ERR_MBEDTLS_SSL_HANDSHAKE_FAILED,
+                           .rsa_verify = MBEDTLS_X509_BADCERT_CN_MISMATCH, .full_rc = 1 };
+        rc = connect_like_derp(&other, &memo, H, 443, NULL, &used, &t);
+        check("seq another server at the address: one dial, nothing remembered",
+              rc == -1 && other.dials == 1 && used == TLS_OFFER_RSA && memo.host[0] == '\0');
         esp_tls_conn_destroy(t);
 
         server_t slow = { .rsa_rc = 0, .rsa_err = ESP_ERR_ESP_TLS_CONNECTION_TIMEOUT, .full_rc = 1 };

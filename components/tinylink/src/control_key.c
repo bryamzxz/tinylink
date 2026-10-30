@@ -18,7 +18,6 @@
 #include "tl_http1.h"
 #include "tl_time.h"
 #include "tls_io.h"
-#include "tls_offer.h"
 
 static const char *TAG = "ctrl_key";
 
@@ -128,10 +127,13 @@ static esp_err_t https_get_key(uint8_t *buf, tl_http1_resp_t *resp)
         .crt_bundle_attach = tl_crt_bundle_attach,
         .timeout_ms        = KEY_TIMEOUT_MS,
     };
-    /* ECDHE-RSA first, the full offer once if refused (round 1.3.8,
-     * tls_offer.h); a one-shot, so nothing to remember. */
-    const tls_offer_t offer = tls_offer_apply(&cfg, NULL, CONFIG_TINYLINK_CONTROL_HOST,
-                                              (uint16_t)port);
+    /* The full mbedTLS offer, ECDSA chain (round 1.3.8 review): this
+     * fetch is the one TLS connect whose server authentication is all
+     * that stands behind what gets trusted — the control key it returns
+     * is pinned, and the Noise IK of every later connect rests on it. It
+     * runs once per pin (a first boot), so its ~1.5 s of P-384 / P-256
+     * verifies buys P-256 server authentication instead of the RSA-2048
+     * the DERP and control :443 connects accept (tls_offer.h). */
     esp_tls_t *tls = esp_tls_init();
     if (tls == NULL) return ESP_ERR_NO_MEM;
     esp_err_t err  = ESP_OK;
@@ -139,17 +141,9 @@ static esp_err_t https_get_key(uint8_t *buf, tl_http1_resp_t *resp)
     size_t    len  = 0;
     bool      eof  = false;
     uint32_t  idle = 0;
-    int       dial = esp_tls_conn_new_sync(CONFIG_TINYLINK_CONTROL_HOST,
-                                           (int)strlen(CONFIG_TINYLINK_CONTROL_HOST),
-                                           port, &cfg, tls);
-    if (dial != 1 && tls_offer_fallback(offer, &tls, &cfg, CONFIG_TINYLINK_CONTROL_HOST,
-                                        (uint16_t)port)) {
-        dial = esp_tls_conn_new_sync(CONFIG_TINYLINK_CONTROL_HOST,
-                                     (int)strlen(CONFIG_TINYLINK_CONTROL_HOST),
-                                     port, &cfg, tls);
-    }
-    if (tls == NULL) return ESP_ERR_NO_MEM;
-    if (dial != 1) {
+    if (esp_tls_conn_new_sync(CONFIG_TINYLINK_CONTROL_HOST,
+                              (int)strlen(CONFIG_TINYLINK_CONTROL_HOST),
+                              port, &cfg, tls) != 1) {
         ESP_LOGE(TAG, "TLS connect to %s:%d failed",
                  CONFIG_TINYLINK_CONTROL_HOST, port);
         err = ESP_FAIL;
