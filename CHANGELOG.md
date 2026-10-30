@@ -7,6 +7,127 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Optimization round 1.3.7 (in progress, branch `feat/opt-1.3.7`)
+
+#### Wi-Fi association (`feat/r137-wifi`)
+
+Wi-Fi was 60–80 % of the boot. Over 68 captured boots of 1.3.1–1.3.6
+(all hardware resets — the serial DTR pulse; `boots=1 … RTC record
+restarted` every time): STA start 0.37–0.43 s; the connect scan walked
+channels 1..11 at ~110 ms each before the AP answered on 11 (+1.21–1.30
+s); 140–170 ms more to the auth frame; every association refused once
+(`comeback time 1100 (TUs)`: the AP still held the old PMF association,
++1.13 s); then the 4-way handshake took 10–30 ms (16 boots), exactly 2.0 s
+(30) or died at exactly 3.0 s with reason 15 (22), the retry adding a
+0.40–0.63 s backoff, a 2.28–2.29-s rescan and a 10–40 ms handshake.
+got-ip 3.02–3.15 / 5.00–5.39 / 8.75–9.23 s after reset (medians 3.05 /
+5.05 / 8.88), DHCP 110–420 ms of it (median 130). Image 725 536 →
+**728 176 B (+2 640)**; static DRAM 57 644 → 57 700 B (+56), IRAM ±0,
+RTC slow +20 B; the diagnostic build (below) 731 504 B. Host suite 1 791
+→ **1 848 OK** (CI floor 1 848), ASan + UBSan clean, 0 warnings. Static
+worst cases: `esp_timer` 3 248 → 3 328 / 4 608 (the station config on the
+re-apply path), `tinylink_tlm` 3 712 / 4 608 unchanged (the NVS write
+from the hook is not its deepest path), the rest unchanged. Not yet on
+the sensor.
+
+- **W1 — the last AP's channel first (`main/wifi_hint.h`).** Channel +
+  BSSID of the last AP joined, bound to a hash of the SSID: an RTC no-init
+  copy written at every connect (software / panic / WDT resets) and NVS
+  `tl_state/wifi_ap` (12 B) written from the 60-s housekeeping only when
+  it differs (`tinylink_set_persist_hook`, new; a day of housekeeping or
+  100 reboots on the same AP: 0 flash writes in the tests). At start
+  `sta.channel` = the record: the driver scans that channel first, then
+  1..N without it (IDF wifi.rst), and WIFI_FAST_SCAN ends at the first
+  match — a moved AP costs one extra dwell (~110 ms), never a lock-out.
+  `bssid_set` stays off: no gain on the hinted channel, and a replaced AP
+  would turn every attempt into NO_AP_FOUND after a full scan;
+  `failure_retry_cnt` / `sort_method` need WIFI_ALL_CHANNEL_SCAN (a full
+  scan every time). Any failed attempt drops the hint (scan 1..N) until
+  the next connect, which rewrites the record whatever channel / BSSID it
+  landed on; a lost working link keeps it. Logs: `wifi hint: channel N
+  first (RTC | NVS record)`, `wifi hint: AP on channel N — in RTC now…`,
+  `wifi hint: channel N stored`. Expected −1.2 s on every cold boot (scan
+  1.21 s → one dwell) and on every reconnect.
+- **W2 — the 2-s / 3-s handshake, and an immediate retry.** The 3.0-s
+  failure is raised locally (`run -> init (0xf00)`: reason 15, no frame;
+  an AP deauth reads 0xfc0) at exactly 3.000 s after `assoc -> run`; the
+  blob's own handshake timers (1 / 10 / 30 s by its log strings) report
+  204 (IDF wifi.rst), so the one source that fits is wpa.c's deauth on the
+  4th M1 (MAX_EAPOL_RETRIES 3, its `wpa_printf` compiled out). Then the AP
+  re-sends M1 every second and does not take our M2 for 0, 1, 2 or ≥ 3
+  periods after the comeback — its old PMF association (likely a stale
+  pairwise key) not yet gone. Nothing in the station config changes that
+  (PMF, auth threshold and power save left alone); the diagnostic build
+  below confirms or kills the hypothesis. What the station did next cost 3 s: the driver blacklists the
+  BSSID (libnet80211 `cnx_add_to_blacklist`), so after the backoff the
+  rescan saw the AP at once (its FT-PSK line came first), walked every
+  channel for 2.29 s and only then took it anyway ("no ap found, connect
+  to ap in blacklist") — and finished the handshake in 10–40 ms in 22 of
+  22 boots. Now the first 4-way timeout (15 / 204) after an association
+  with the recorded AP is retried at once, the config re-applied
+  (`wifi_set_config_process` calls `cnx_clear_blacklist` first thing; its
+  PMK cache, keyed by SSID + passphrase, should spare a second PBKDF2),
+  the hint kept: it found the right AP, the handshake is what failed. One
+  per failure streak; a second failure takes the old ladder without the
+  hint. `disconnected (reason 15), retry now — 4-way timeout after
+  association: config re-applied, channel 11 first`. Expected on the 32 %
+  of hard resets that hit it: got-ip ~4.8 s (8.9 s); if the AP is still
+  not ready ~3 s after the comeback, ~0.6 s worse than before.
+- **`CONFIG_TINYLINK_WIFI_DIAG` (default n, out of the default image).**
+  Links the supplicant's EAPOL path through `-Wl,--wrap` (`wpa_sm_rx_eapol`,
+  `wpa_ether_send`, `eapol_txcb`, `esp_wifi_internal_issue_disconnect`):
+  every M1 / M3 handed to wpa.c with its replay counter, ANonce byte and
+  wpa.c's verdict, every M2 / M4 sent and whether the AP ACKed it, a
+  supplicant-raised disconnect, plus connect / disconnect (reason, RSSI) /
+  retry / got-ip — into a 64-entry ring on the Wi-Fi task, printed as
+  `wifi_diag: t=<ms> …` from the event handler at each disconnect and at
+  got-ip. `CONFIG_TINYLINK_WIFI_DIAG_SNIFF` adds promiscuous capture of
+  the frames addressed to the station until got-ip: auth / (re)assoc
+  response status, the AP's (protected) SA Query, deauth / disassoc
+  reasons, every unprotected EAPOL frame on the air (MAC retries
+  included) and protected data frames before our keys exist (a M1
+  encrypted with a stale key). Reading it: the AP ignoring our M2 shows as
+  `rx M1 rc=1…4` one second apart, each followed by `tx M2` and `txdone M2
+  … ok`, then `rx M3` (the 2-s boots) or `supplicant disconnect, reason
+  15` (the 3-s ones); a lost or late M1 as a first `rx M1` ~2 s after
+  `assoc -> run`, with the sniffer's `air M1` / `air protected data`
+  before it (dropped / stale key) or nothing (sent late).
+- **W3 — DHCP INIT-REBOOT (`CONFIG_LWIP_DHCP_RESTORE_LAST_IP`).** The
+  last bound address is re-requested (REQUEST / ACK) instead of DISCOVER /
+  OFFER / REQUEST / ACK, at boot and at every re-association (esp_netif
+  stops the client on each disconnect). Flash is written only on change:
+  esp_netif stores at each bind whose address differs from its last one
+  and `nvs_set_u32` skips an equal value (nvs_storage.cpp writeItem →
+  cmpItem; `nvs_commit` is a no-op). A NAK falls back to DISCOVER at once;
+  a server without our lease must stay silent (RFC 2131 §4.3.2), costing
+  the two REBOOTING tries (1 + 2 s). Nothing else in the client waits
+  (ARP / ACD checks already off since 1.3.1, no start delay). Expected
+  ~−60 ms of the 130-ms median. Makes `idf-patches/0001–0002`
+  load-bearing: on a stock v5.5.6 the WG netif's `netif_set_addr` reaches
+  `dhcp_ip_addr_store` with no DHCP data.
+- **W4 — PMK cache in RTC: rejected.** The driver derives the PMK at every
+  boot (WIFI_STORAGE_RAM keeps the credentials off `nvs.net80211`), on
+  the Wi-Fi task between the scan match and the auth frame: 4096 × 2
+  HMAC-SHA1 in software (fastpbkdf2 forces SW SHA on the ESP32), 32.98 M
+  instructions under QEMU `-icount` — at the CPI of the same build's
+  ChaCha20 (1.17) and X25519 (1.23) against the 1.3.3 on-chip bench,
+  **161–169 ms at 240 MHz**, i.e. the whole observed 140–170-ms gap. An
+  RTC copy only survives software / panic / WDT resets, of which the 68
+  boots had none (and those resets skip the comeback anyway); flash is
+  out. Not done but measured as the next step: deriving the PMK on CPU 1
+  from app start, in parallel with Wi-Fi init (~60 ms) and the hinted
+  scan, and handing the driver the 64-hex PSK — ~−100 ms on every boot,
+  at the cost of an IDF-internal `pbkdf2_sha1` call and the hex-PSK path.
+
+Expected on the hardware-reset series: got-ip ~1.8 / 3.8 / 4.8 s for the
+three handshake outcomes (3.05 / 5.05 / 8.88), mean ~3.6 s (5.8 s, −37 %);
+after a software restart (no comeback) ~0.7 s. What the series must
+show: `wifi hint: channel 11 first (NVS record)` from the second boot on,
+`init -> auth` ~0.55 s after reset (1.76 s), the immediate retry's `init
+-> auth` within ~50 ms of its `disconnected (reason 15)` line (~170 ms if
+the re-applied config cost a PBKDF2), and no `wifi hint: channel …
+stored` once the record is in NVS.
+
 ### Optimization round 1.3.6 — data-plane path selection (in progress, branch `feat/opt-1.3.6`)
 
 What the 1.3.5 hardware runs showed about the direct path: any
