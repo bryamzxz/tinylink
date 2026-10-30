@@ -1113,6 +1113,66 @@ static void sc_side(void)
 }
 #endif
 
+#ifndef H2_REF
+/* Round 1.3.7 review. A server that allows one stream at a time
+ * (SETTINGS_MAX_CONCURRENT_STREAMS 1): known before the burst, the pair
+ * sends nothing and the caller goes one request after the other on the
+ * same conn; learned after a pair went out (its map stream refused),
+ * remembered for the next conn. */
+static void sc_side_one_stream(void)
+{
+    nghttp2_settings_entry one[] = { { NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS, 1 } };
+
+    srv_new(0);
+    nghttp2_submit_settings(S.ng, NGHTTP2_FLAG_NONE, one, 1);
+    conn_up(true);
+    S.sc = SC_STREAM;
+    fill_mapresponses(1, 3000);
+    res_t r = stream_side();
+    check("one_stream_server_pair_not_sent",
+          r.err == ESP_ERR_INVALID_SIZE && S.nreq == 0 && s_side_calls == 0 && disarmed() &&
+          !s_conn.req_expired && S.bad == 0);
+    /* mapreq's fallback: the push alone, then the stream, same conn */
+    S.sc = SC_HEADERS_ONLY;
+    res_t rp = post("/machine/map", kPushBody, sizeof(kPushBody) - 1, 256);
+    S.sc = SC_STREAM;
+    res_t rs = stream(kRegBody, sizeof(kRegBody) - 1);
+    check("one_stream_server_push_then_stream",
+          rp.err == ESP_OK && rp.status == 200 && rs.err == ESP_OK && rs.status == 200 &&
+          rs.len == S.resp_len && memcmp(s_sbuf, S.resp, S.resp_len) == 0 &&
+          S.nreq == 2 && S.sid[0] == 1 && S.sid[1] == 3 && S.bad == 0);
+    conn_down();
+    /* remembered: the next conn's pair is not tried */
+    srv_new(0);
+    conn_up(true);
+    S.sc = SC_STREAM;
+    r = stream_side();
+    check("one_stream_server_remembered", r.err == ESP_ERR_INVALID_SIZE && S.nreq == 0);
+    conn_down();
+    h2_client_forget_limits();
+
+    /* The limit arrives after the burst: the server refuses the map
+     * stream, the side request is answered; the next pair is not tried. */
+    srv_new(0);
+    conn_up(true);   /* the default preface (250) left over … */
+    nghttp2_submit_settings(S.ng, NGHTTP2_FLAG_NONE, one, 1);   /* … then 1 */
+    S.sc = SC_STREAM;
+    S.sc_req[0] = SC_HEADERS_ONLY;
+    fill_mapresponses(1, 3000);
+    r = stream_side();
+    const bool refused = r.status != 200 && s_conn.h2.peer_max_streams == 1;
+    conn_down();
+    srv_new(0);
+    conn_up(true);
+    S.sc = SC_STREAM;
+    res_t r2 = stream_side();
+    check("one_stream_learned_late_then_alone",
+          refused && r2.err == ESP_ERR_INVALID_SIZE && S.nreq == 0);
+    conn_down();
+    h2_client_forget_limits();
+}
+#endif
+
 static void sc_small_server_window(void)
 {
     /* The server lets us send 100 bytes per stream: the 2-KiB body of the
@@ -1261,6 +1321,7 @@ int main(void)
 #ifndef H2_REF
     sc_deadline_backoff();
     sc_side();
+    sc_side_one_stream();
 #endif
     if (s_fails == 0) printf("\nALL OK\n");
     return s_fails ? 1 : 0;

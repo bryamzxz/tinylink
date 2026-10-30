@@ -1425,9 +1425,10 @@ static esp_err_t run_stream_in(ts2021_conn_t *conn,
                                        (const uint8_t *)body, (size_t)body_len,
                                        &status, stream_chunk_cb, &s);
         if (err == ESP_ERR_INVALID_SIZE) {
-            /* A server window under the push's size (never seen): push,
-             * then the stream, one after the other as before 1.3.7. The
-             * push's body went where the stream's was. */
+            /* A server window under the push's size (never seen), or one
+             * stream at a time: push, then the stream, one after the
+             * other as before 1.3.7. The push's body went where the
+             * stream's was. */
             err = push_endpoints_in(conn, keys, buf);
             *push_status = err == ESP_OK ? 200 : conn->h2_status;
             if (err != ESP_OK && conn->h2_status == 0) return err;   /* unanswered */

@@ -93,6 +93,7 @@ enum {
     H2C_ERR_PROTO = -2,  /* connection error: GOAWAY sent, conn dead */
     H2C_ERR_STATE = -3,  /* not now: GOAWAY received, dead, busy     */
     H2C_ERR_SIZE  = -4,  /* request headers do not fit one frame     */
+    H2C_ERR_STREAMS = -5,  /* a pair over the server's stream limit  */
 };
 
 typedef struct {
@@ -138,6 +139,7 @@ typedef struct {
     uint32_t peer_initial_win;
     uint32_t peer_max_frame;
     uint32_t peer_enable_connect;
+    uint32_t peer_max_streams;  /* SETTINGS_MAX_CONCURRENT_STREAMS; ~0 = none yet */
 
     /* frame parser */
     uint8_t  fh[H2_FRAME_HDR_LEN];
@@ -215,8 +217,11 @@ typedef struct {
  * The side request must go out whole now (windows, the lent buffer;
  * side->body need not outlive the call): if it cannot, nothing is sent
  * but the staged control frames and H2C_ERR_SIZE comes back with no ID
- * spent. side NULL = h2c_request. H2C_ERR_STATE also while the previous
- * side stream is still open. */
+ * spent. Nothing at all is sent, H2C_ERR_STREAMS, when the server's
+ * SETTINGS_MAX_CONCURRENT_STREAMS is known to be under 2 (RFC 9113
+ * §5.1.2). A failed send of the staged frames is H2C_ERR_IO, the
+ * session then dead. side NULL = h2c_request. H2C_ERR_STATE also while
+ * the previous side stream is still open. */
 int  h2c_request_pair(h2_core_t *h, const h2_req_t *side, const h2_req_t *req);
 /* Parse received bytes (any split). Consumes all of them; returns
  * H2C_ERR_PROTO on a connection error (GOAWAY already sent). */

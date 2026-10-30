@@ -1004,6 +1004,95 @@ static int client_with_pair(void)
     return h2c_request_pair(&s_h, &side, &req);
 }
 
+/* Round 1.3.7 review: SETTINGS_MAX_CONCURRENT_STREAMS and the rollback's
+ * own send failure. */
+static void test_side_limits(void)
+{
+    static const uint16_t mcs[] = { H2_SET_MAX_CONCURRENT_STREAMS };
+    const h2_req_t side = { kPushHdrs, 6, (const uint8_t *)"push", 4 };
+    const h2_req_t req = { kMapHdrs, 6, kHello, 5 };
+    frm_t f[8];
+
+    /* A server that allows one stream: the pair sends nothing at all,
+     * spends no ID; the plain request still goes on stream 1. */
+    io_reset();
+    h2c_init(&s_h, &s_io);
+    (void)h2c_start(&s_h);
+    check("max_streams_unknown_is_unlimited", s_h.peer_max_streams == 0xffffffffu);
+    srv_reset();
+    static const uint32_t one[] = { 1 };
+    settings(1, mcs, one);
+    int rc = feed(0);
+    s_io.out_len = 0;
+    s_io.sends = 0;
+    rc |= h2c_request_pair(&s_h, &side, &req);
+    check("max_streams_1_pair_refused_nothing_sent",
+          rc == H2C_ERR_STREAMS && s_h.peer_max_streams == 1 && s_io.sends == 0 &&
+          s_h.next_id == 1 && !s_h.side.open && !s_h.s.open && !s_h.dead);
+    rc = h2c_request(&s_h, kMapHdrs, 6, kHello, 5);
+    int n = out_frames(f, 8);
+    check("max_streams_1_single_request_stream1",
+          rc == H2C_OK && n == 2 && f[0].type == H2_HEADERS && f[0].sid == 1 && s_h.s.open);
+    /* … the limit staged with the request's ACK: the same. */
+    io_reset();
+    h2c_init(&s_h, &s_io);
+    (void)h2c_start(&s_h);
+    srv_reset();
+    settings(1, mcs, one);
+    s_io.in_feed = true;
+    rc = h2c_feed_staged(&s_h, s_srv, s_srv_len);
+    s_io.in_feed = false;
+    s_io.out_len = 0;
+    s_io.sends = 0;
+    rc |= h2c_request_pair(&s_h, &side, &req);
+    check("max_streams_1_staged_refused", rc == H2C_ERR_STREAMS && s_io.sends == 0 &&
+          s_h.ctl_len > 0 && s_h.next_id == 1);
+    /* Two (or none advertised) are enough; 0 refuses the pair as well. */
+    static const uint32_t two[] = { 2 }, zero[] = { 0 };
+    io_reset();
+    h2c_init(&s_h, &s_io);
+    (void)h2c_start(&s_h);
+    srv_reset();
+    settings(1, mcs, two);
+    rc = feed(0);
+    rc |= h2c_request_pair(&s_h, &side, &req);
+    check("max_streams_2_pair_goes", rc == H2C_OK && s_h.side.open && s_h.s.open &&
+          s_h.next_id == 5);
+    io_reset();
+    h2c_init(&s_h, &s_io);
+    (void)h2c_start(&s_h);
+    srv_reset();
+    settings(1, mcs, zero);
+    rc = feed(0);
+    check("max_streams_0_pair_refused",
+          h2c_request_pair(&s_h, &side, &req) == H2C_ERR_STREAMS && rc == H2C_OK);
+    /* Lowered under the open streams after the burst: recorded, nothing
+     * closed (§5.1.2 — the server refuses what is over it). */
+    (void)client_with_pair();
+    srv_reset();
+    settings(1, mcs, one);
+    rc = feed(0);
+    check("max_streams_lowered_after_burst", rc == H2C_OK && s_h.peer_max_streams == 1 &&
+          s_h.side.open && s_h.s.open);
+
+    /* The rollback's control frames cannot be sent: the session is dead
+     * and the caller hears H2C_ERR_IO, not "nothing sent, intact". */
+    io_reset();
+    h2c_init(&s_h, &s_io);
+    (void)h2c_start(&s_h);
+    srv_reset();
+    static const uint16_t iw[] = { H2_SET_INITIAL_WINDOW_SIZE };
+    static const uint32_t tiny[] = { 3 };
+    settings(1, iw, tiny);
+    s_io.in_feed = true;
+    rc = h2c_feed_staged(&s_h, s_srv, s_srv_len);   /* its ACK stays staged */
+    s_io.in_feed = false;
+    s_io.fail_send = s_io.sends + 1;
+    rc |= h2c_request_pair(&s_h, &side, &req);
+    check("rollback_flush_failure_reported", rc == H2C_ERR_IO && s_h.dead &&
+          s_h.next_id == 1 && !s_h.side.open && !s_h.s.open);
+}
+
 static void test_side_stream(void)
 {
     /* The burst: one send, side first on the lower ID, both bodies whole. */
@@ -1371,6 +1460,7 @@ int main(void)
     test_response_checks();
     test_connection_errors();
     test_side_stream();
+    test_side_limits();
     test_structured_fuzz();
     test_garbage_fuzz();
     if (s_fails == 0) printf("\nALL OK\n");

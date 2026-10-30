@@ -216,6 +216,14 @@ typedef struct {
     bool           armed;    /* sent, not closed yet: under the deadline */
 } h2_side_t;
 
+/* A server that allows one stream at a time (SETTINGS_MAX_CONCURRENT_
+ * STREAMS < 2), seen on any conn: the side request then goes before its
+ * stream, alone (ESP_ERR_INVALID_SIZE to the caller), on every later
+ * conn too — a limit that arrives after a pair went out is only learned
+ * from the refusal of its second stream. Servers do not change it per
+ * conn; a reboot forgets it. */
+static bool s_one_stream;
+
 /* The side stream closed: its deadline ends (the stream polls at the
  * stream budget from here), and the caller hears how — at once, not
  * when the stream ends hours later. */
@@ -292,9 +300,15 @@ static esp_err_t h2_drive_request(ts2021_conn_t *conn,
                                side->body, side->len };
     }
     int rc = h2c_request_pair(h, side != NULL ? &side_req : NULL, &req);
-    if (rc == H2C_ERR_SIZE && side != NULL) {
+    if ((rc == H2C_ERR_SIZE || rc == H2C_ERR_STREAMS) && side != NULL) {
         /* Nothing of either request went out; the session is intact. */
-        ESP_LOGW(TAG, "side request does not fit the opening burst");
+        if (rc == H2C_ERR_STREAMS) {
+            s_one_stream = true;
+            ESP_LOGW(TAG, "server allows %u stream(s) at a time — the side "
+                          "request goes alone, first", (unsigned)h->peer_max_streams);
+        } else {
+            ESP_LOGW(TAG, "side request does not fit the opening burst");
+        }
         return ESP_ERR_INVALID_SIZE;
     }
     if (rc != H2C_OK) {
@@ -449,6 +463,13 @@ esp_err_t h2_post_json_stream(ts2021_conn_t *conn,
     return err;
 }
 
+#ifndef ESP_PLATFORM
+void h2_client_forget_limits(void)
+{
+    s_one_stream = false;
+}
+#endif
+
 esp_err_t h2_post_json_stream_side(ts2021_conn_t *conn,
                                    const char *path,
                                    const char *authority,
@@ -462,6 +483,7 @@ esp_err_t h2_post_json_stream_side(ts2021_conn_t *conn,
         side_cb == NULL || cb == NULL || status_out == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
+    if (s_one_stream) return ESP_ERR_INVALID_SIZE;   /* nothing sent */
 
     h2_request_reset(conn);
     conn->h2_req_body     = body;
@@ -486,6 +508,11 @@ esp_err_t h2_post_json_stream_side(ts2021_conn_t *conn,
         if (conn->req_expired) {
             s_req_ms = ms < TS2021_REQ_TIMEOUT_MAX_MS / 2 ? 2 * ms : TS2021_REQ_TIMEOUT_MAX_MS;
         }
+    }
+    if (!s_one_stream && conn->h2.peer_max_streams < 2u) {
+        s_one_stream = true;   /* the limit came after the burst */
+        ESP_LOGW(TAG, "server allows %u stream(s) at a time — side requests "
+                      "go alone from now on", (unsigned)conn->h2.peer_max_streams);
     }
 
     *status_out = conn->h2_status;

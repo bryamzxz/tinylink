@@ -77,9 +77,11 @@ esp_err_t h2_post_json_stream(ts2021_conn_t *conn,
  * then on under the stream budget.
  *
  * `side_body` need only live through the call's opening burst — it goes
- * out whole there; when it cannot (a server window under its size),
+ * out whole there; when it cannot (a server window under its size, or a
+ * server that allows one stream at a time — remembered for later conns),
  * nothing is sent and ESP_ERR_INVALID_SIZE comes back with the session
- * intact. Otherwise the returns of h2_post_json_stream. */
+ * intact: send the two one after the other. Otherwise the returns of
+ * h2_post_json_stream. */
 typedef void (*h2_side_fn_t)(int status, int stream_error, void *ctx);
 
 esp_err_t h2_post_json_stream_side(ts2021_conn_t *conn,
@@ -90,6 +92,11 @@ esp_err_t h2_post_json_stream_side(ts2021_conn_t *conn,
                                    const uint8_t *body, size_t body_len,
                                    int *status_out,
                                    h2_data_callback cb, void *cb_ctx);
+
+#ifndef ESP_PLATFORM
+/* Host tests: forget a one-stream server (h2_post_json_stream_side). */
+void h2_client_forget_limits(void);
+#endif
 
 /* Start the persistent HTTP/2 session bound to `conn` (state embedded in
  * the conn, no heap). Called once at the end of ts2021_connect. Sends

@@ -48,7 +48,8 @@ extern "C" {
 /* Lite endpoint update: POST /machine/map with `Stream:false` AND
  * `OmitPeers:true`. Since round 1.3.7 the long-poll sends it with the
  * stream request (mapreq_run_stream's push_status); this one-shot form
- * is the fallback for a server window it does not fit. Per upstream
+ * is the fallback for a server window it does not fit or a server that
+ * allows one stream at a time. Per upstream
  * tailscale/control/controlclient/auto.go:249-251, this is the only
  * MapRequest shape the modern (CapVer >= 68) control plane treats as
  * a writable Hostinfo / NetInfo / Endpoints push. The server is
