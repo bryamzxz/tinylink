@@ -1374,6 +1374,11 @@ static void push_side_done(const h2_side_result_t *r, void *ctx)
 {
     const mapreq_push_fn on_push = *(const mapreq_push_fn *)ctx;
     const int status = r->status;
+    if (r->goaway) {
+        ESP_LOGI(TAG, "endpoint push: refused by GOAWAY (not processed)");
+        on_push(MAPREQ_PUSH_GOAWAY, 0);
+        return;
+    }
     if (status == 200) {
         ESP_LOGI(TAG, "endpoint push: HTTP 200 (with the map stream)");
     } else if (status == 429 || status == 503) {

@@ -77,8 +77,10 @@ esp_err_t h2_post_json_stream(ts2021_conn_t *conn,
  * one-shot request deadline (h2_post_json) — a conn that answers neither
  * is cut. Once the stream has answered, the conn is under the stream
  * budget only; a side request still unanswered at its deadline is then
- * cancelled (RST_STREAM CANCEL, `expired`; checked as records arrive)
- * and the stream goes on. Either expiry doubles the next deadline.
+ * cancelled (RST_STREAM CANCEL, `expired`; checked as records arrive,
+ * once those already received are read) and the stream goes on — one
+ * whose final response is in is never late. Either expiry doubles the
+ * next deadline.
  *
  * `side_body` need only live through the call's opening burst — it goes
  * out whole there; when it cannot (a server window under its size, or a
@@ -90,6 +92,7 @@ typedef struct {
     int  status;         /* final :status; 0: reset, refused or cancelled */
     int  stream_error;   /* the HTTP/2 code it closed with               */
     bool expired;        /* cancelled by us: no answer within its deadline */
+    bool goaway;         /* refused by a GOAWAY: not processed, the conn ends */
     bool retry_after_present;
     int  retry_after_s;  /* h2_parse_retry_after_seconds; 0 = invalid     */
 } h2_side_result_t;

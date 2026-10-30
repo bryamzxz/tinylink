@@ -79,6 +79,7 @@ enum {
     SC_GOAWAY_REFUSE, SC_RST_AFTER_HEADERS, SC_RST_BEFORE, SC_PADDING,
     SC_BIG_HEADER, SC_TRAILERS, SC_1XX, SC_EOF_MID, SC_HEADERS_ONLY,
     SC_DEFER,                    /* no answer until the stream's pause_at */
+    SC_HDRS_HOLD,                /* 200 + content-length 10, the body never */
 };
 
 typedef struct {
@@ -104,6 +105,9 @@ typedef struct {
     int      padded_frames;
     int32_t  cur;
     int      bad;                /* server-side protocol trouble */
+    int      rsts;               /* RST_STREAM frames from the client */
+    size_t   answer_side_at;     /* answer SC_DEFER's stream once resp_off is here */
+    bool     keep_deferred;      /* SC_DEFER's stream unanswered past pause_at too */
 } srv_t;
 
 static srv_t S;
@@ -137,10 +141,24 @@ static int on_data(nghttp2_session *s, uint8_t fl, int32_t sid, const uint8_t *d
     return 0;
 }
 
+static nghttp2_ssize srv_read_never(nghttp2_session *s, int32_t sid, uint8_t *buf, size_t len,
+                                    uint32_t *flags, nghttp2_data_source *src, void *ud)
+{
+    (void)s; (void)sid; (void)buf; (void)len; (void)flags; (void)src; (void)ud;
+    return NGHTTP2_ERR_DEFERRED;
+}
+
 static nghttp2_ssize srv_read(nghttp2_session *s, int32_t sid, uint8_t *buf, size_t len,
                               uint32_t *flags, nghttp2_data_source *src, void *ud)
 {
     (void)src; (void)ud;
+    if (S.answer_side_at && S.deferred && S.resp_off >= S.answer_side_at) {
+        /* the side's answer in the same batch as this stream data */
+        nghttp2_nv h[] = { { (uint8_t *)":status", (uint8_t *)"200", 7, 3, 0 } };
+        nghttp2_submit_response2(s, S.deferred, h, 1, NULL);
+        S.deferred = 0;
+        S.answer_side_at = 0;
+    }
     if (S.hold) return NGHTTP2_ERR_DEFERRED;
     if (S.pause_at && S.resp_off == S.pause_at && !S.paused && !S.acted) {
         S.paused = true;
@@ -221,6 +239,12 @@ static void respond(int32_t sid)
         nghttp2_submit_response2(S.ng, sid, h, 1, NULL);
         return;
     }
+    case SC_HDRS_HOLD: {
+        nghttp2_data_provider2 never = { .read_callback = srv_read_never };
+        nghttp2_nv h[] = { NV(":status", "200"), NV("content-length", "10") };
+        nghttp2_submit_response2(S.ng, sid, h, 2, &never);
+        return;
+    }
     case SC_GOAWAY_REFUSE:
         nghttp2_submit_goaway(S.ng, NGHTTP2_FLAG_NONE, 0, NGHTTP2_NO_ERROR, NULL, 0);
         return;
@@ -265,6 +289,7 @@ static int on_frame_recv(nghttp2_session *s, const nghttp2_frame *f, void *ud)
 {
     (void)s; (void)ud;
     if (f->hd.type == NGHTTP2_PING && (f->hd.flags & NGHTTP2_FLAG_ACK)) S.ping_acks++;
+    if (f->hd.type == NGHTTP2_RST_STREAM) S.rsts++;
     if ((f->hd.type == NGHTTP2_DATA || f->hd.type == NGHTTP2_HEADERS) &&
         (f->hd.flags & NGHTTP2_FLAG_END_STREAM)) {
         /* A per-request scenario answers without a data provider (the
@@ -363,9 +388,11 @@ static size_t srv_output(void)
             S.paused = false;
             if (S.deferred != 0) {
                 /* the side request's late answer, mid-stream */
-                nghttp2_nv h[] = { NV(":status", "200") };
-                nghttp2_submit_response2(S.ng, S.deferred, h, 1, NULL);
-                S.deferred = 0;
+                if (!S.keep_deferred) {
+                    nghttp2_nv h[] = { NV(":status", "200") };
+                    nghttp2_submit_response2(S.ng, S.deferred, h, 1, NULL);
+                    S.deferred = 0;
+                }
                 nghttp2_session_resume_data(S.ng, S.cur);
             } else if (S.sc == SC_PING) {
                 nghttp2_submit_ping(S.ng, NGHTTP2_FLAG_NONE, (const uint8_t *)"keepaliv");
@@ -465,6 +492,11 @@ static long sock_poll_ms(void)
     socklen_t tl = sizeof(tv);
     if (s_sock_fd < 0 || getsockopt(s_sock_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, &tl) != 0) return -1;
     return (long)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+}
+/* Received and not yet read: the sealed server bytes waiting here. */
+ssize_t esp_tls_get_bytes_avail(esp_tls_t *t)
+{
+    return (ssize_t)(t->s2c_len - t->s2c_off);
 }
 esp_err_t esp_tls_get_conn_sockfd(esp_tls_t *t, int *fd)
 {
@@ -1052,7 +1084,7 @@ static void sc_side(void)
     r = stream_side();
     check("side_reset_status0_code", r.err == ESP_OK && r.status == 200 && s_side_calls == 1 &&
           s_side_status == 0 && s_side_err == NGHTTP2_INTERNAL_ERROR && r.len == S.resp_len &&
-          disarmed());
+          disarmed() && !s_side_res.goaway);
     conn_down();
 
     /* Answered mid-stream: the stream's first bytes under the deadline's
@@ -1222,8 +1254,10 @@ static void sc_side_late_push(void)
     conn_up(true);
     S.sc = SC_STREAM;
     S.sc_req[0] = SC_DEFER;   /* never answered */
+    S.keep_deferred = true;
     fill_mapresponses(4, 9000);
     S.chunk = 4000;
+    S.pause_at = 12000;       /* the stream goes on past what is received */
     s_clock_jump_at = 1;
     s_reads_short = s_reads_stream = s_reads_other = 0;
     res_t r = stream_side_clock();
@@ -1265,6 +1299,71 @@ static void sc_side_late_push(void)
     S.sc = SC_HEADERS_ONLY;
     (void)post("/machine/map", kRegBody, 10, 256);
     conn_down();
+    /* Second review. The push's final 200 is in, its body is not, when
+     * its deadline passes: answered, so not cancelled, and the next
+     * deadline not doubled. */
+    srv_new(0);
+    conn_up(true);
+    S.sc = SC_STREAM;
+    S.sc_req[0] = SC_HDRS_HOLD;
+    fill_mapresponses(4, 9000);
+    S.chunk = 4000;
+    s_clock_jump_at = 1;
+    r = stream_side_clock();
+    check("late_push_final_headers_not_cancelled",
+          r.err == ESP_OK && r.status == 200 && r.len == S.resp_len && s_side_calls == 0 &&
+          S.rsts == 0 && !s_conn.req_expired && S.bad == 0);
+    conn_down();
+    s_now_us = 0;
+    const int p3 = silent_post();
+    check("late_push_final_headers_deadline_not_doubled", p3 == base);
+    srv_new(0);
+    conn_up(true);
+    S.sc = SC_HEADERS_ONLY;
+    (void)post("/machine/map", kRegBody, 10, 256);
+    conn_down();
+
+    /* The deadline passes in the stream callback while the push's answer
+     * already sits received, unread (the same server batch): read first,
+     * kept — at every record split. */
+    int kept = 0;
+    for (int run = 0; run < 20; run++) {
+        s_now_us = 0;
+        srv_new(0);
+        conn_up(true);
+        S.sc = SC_STREAM;
+        S.sc_req[0] = SC_DEFER;
+        fill_mapresponses(4, 9000);
+        S.chunk = 3000;
+        S.answer_side_at = 9000;
+        s_clock_jump_at = 1;
+        r = stream_side_clock();
+        if (r.err == ESP_OK && r.status == 200 && r.len == S.resp_len && s_side_calls == 1 &&
+            s_side_status == 200 && !s_side_res.expired && S.rsts == 0 && S.bad == 0) kept++;
+        conn_down();
+    }
+    s_now_us = 0;
+    const int p4 = silent_post();
+    check("late_push_buffered_answer_read_first_20_runs", kept == 20 && p4 == base);
+    srv_new(0);
+    conn_up(true);
+    S.sc = SC_HEADERS_ONLY;
+    (void)post("/machine/map", kRegBody, 10, 256);
+    conn_down();
+
+    /* Refused by a GOAWAY below its ID: not processed, `goaway` set (the
+     * caller sends it again with the reconnect, not after a wait). */
+    srv_new(0);
+    conn_up(true);
+    S.sc = SC_STREAM;
+    S.sc_req[0] = SC_GOAWAY_REFUSE;
+    fill_mapresponses(1, 3000);
+    r = stream_side();
+    check("side_goaway_refused_flagged",
+          s_side_calls == 1 && s_side_status == 0 && s_side_err == NGHTTP2_REFUSED_STREAM &&
+          s_side_res.goaway && !s_side_res.expired);
+    conn_down();
+
     /* No answer to either: the conn is cut at the deadline, as before
      * (silent_pair in sc_side). */
 }

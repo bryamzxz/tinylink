@@ -78,10 +78,13 @@ esp_err_t mapreq_push_endpoints(ts2021_conn_t *conn,
 #define MAPREQ_STREAM_RECYCLE ((esp_err_t)0x7e01)
 typedef esp_err_t (*mapreq_handler_t)(const tl_netmap_t *nm, void *ctx);
 
-/* The endpoint push's outcome: its HTTP status (only 200 means pushed),
- * or 0 — reset by the server, or cancelled unanswered at its deadline
- * while the stream runs. wait_ms: the server's rate-limit wait for it
- * (429, or 503 with a Retry-After: h2_rate_limit_wait_ms), else 0. */
+/* The endpoint push's outcome: its HTTP status (only 200 means pushed);
+ * 0 — reset by the server, or cancelled unanswered at its deadline
+ * while the stream runs; MAPREQ_PUSH_GOAWAY — refused unprocessed by a
+ * GOAWAY, the conn ending (RFC 9113 §8.7: safe to send again at once on
+ * the next). wait_ms: the server's rate-limit wait for it (429, or 503
+ * with a Retry-After: h2_rate_limit_wait_ms), else 0. */
+#define MAPREQ_PUSH_GOAWAY (-1)
 typedef void (*mapreq_push_fn)(int status, uint32_t wait_ms);
 
 /* on_push non-NULL: the endpoint push (mapreq_push_endpoints' lite

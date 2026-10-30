@@ -44,6 +44,7 @@ int esp_tls_conn_new_sync(const char *hostname, int hostlen, int port,
                           const esp_tls_cfg_t *cfg, esp_tls_t *tls);
 ssize_t esp_tls_conn_read(esp_tls_t *tls, void *data, size_t datalen);
 ssize_t esp_tls_conn_write(esp_tls_t *tls, const void *data, size_t datalen);
+ssize_t esp_tls_get_bytes_avail(esp_tls_t *tls);
 int esp_tls_conn_destroy(esp_tls_t *tls);
 esp_err_t esp_tls_get_conn_sockfd(esp_tls_t *tls, int *sockfd);
 esp_err_t esp_tls_plain_tcp_connect(const char *host, int hostlen, int port,

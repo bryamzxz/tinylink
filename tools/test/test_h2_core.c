@@ -1022,6 +1022,66 @@ static int client_with_pair(void)
     return h2c_request_pair(&s_h, &side, &req);
 }
 
+/* Second review of round 1.3.7: what a server may still send on the
+ * side stream it was cancelled on — its DATA credited to the connection
+ * window, every frame type ignored. */
+static void cancel_side_flow_control(int mode)
+{
+    char nm[96];
+    (void)client_with_pair();          /* side = stream 1, map = stream 3 */
+    int rc = h2c_cancel_side(&s_h);
+    s_io.out_len = 0; s_io.sends = 0;
+    srv_reset();
+    static const char *const ok[] = { ":status", "200" };
+    static uint8_t blob[16000];
+    memset(blob, 'x', sizeof(blob));
+    /* The side's answer was already in flight: HEADERS + 4 x 16000 B of
+     * DATA on the cancelled stream 1 (64 000 B, within its 65 535 window
+     * at the server), then the map stream's 4 x 16000 B. Without
+     * connection-level credit for the ignored DATA the conn window
+     * (65 535) is exceeded -> FLOW_CONTROL_ERROR. */
+    headers(1, 0, ok, 1);
+    for (int i = 0; i < 4; i++) data(1, 0, blob, sizeof(blob));
+    headers(3, 0, ok, 1);
+    for (int i = 0; i < 4; i++) data(3, 0, blob, sizeof(blob));
+    rc |= feed(mode);
+    snprintf(nm, sizeof(nm), "cancel_side_data_conn_window_credited_mode%d", mode);
+    check(nm, rc == H2C_OK && !s_h.dead && sent_goaway() == -1 &&
+              wu_sum(0) >= 64000u && s_io.data_len == 64000 && s_h.s.open &&
+              s_h.conn_recv_win >= 0 &&
+              (int64_t)s_h.conn_recv_win == (int64_t)H2_DEFAULT_WINDOW - 128000 + (int64_t)wu_sum(0));
+    snprintf(nm, sizeof(nm), "cancel_side_no_wu_for_stream1_mode%d", mode);
+    check(nm, wu_sum(1) == 0 && sent_rst(1) == -1);
+}
+
+static void cancel_side_late_frames(int mode)
+{
+    char nm[96];
+    (void)client_with_pair();
+    int rc = h2c_cancel_side(&s_h);
+    s_io.out_len = 0; s_io.sends = 0;
+    srv_reset();
+    static const char *const ok[] = { ":status", "200" };
+    static const char *const ra[] = { ":status", "429", "retry-after", "5" };
+    /* everything a server may still send on a stream we reset */
+    frame_u32(H2_WINDOW_UPDATE, 1, 100);
+    uint8_t b[256];
+    size_t l = block(b, ra, 2);
+    frame(H2_HEADERS, 0, 1, b, l / 2);                 /* split over CONTINUATION */
+    frame(H2_CONTINUATION, H2_F_END_HEADERS, 1, b + l / 2, l - l / 2);
+    data(1, H2_F_END_STREAM, "x", 1);
+    frame_u32(H2_RST_STREAM, 1, H2_NO_ERROR);
+    uint8_t prio[5] = { 0, 0, 0, 0, 16 };
+    frame(H2_PRIORITY, 0, 1, prio, 5);
+    headers(3, 0, ok, 1);
+    data(3, 0, "map", 3);
+    rc |= feed(mode);
+    snprintf(nm, sizeof(nm), "cancel_side_late_frames_ignored_mode%d", mode);
+    check(nm, rc == H2C_OK && !s_h.dead && sent_goaway() == -1 && sent_rst(1) == -1 &&
+              s_io.n_side_status == 0 && s_io.status == 200 && s_io.data_len == 3 &&
+              s_h.s.open && !s_h.side.open && s_h.side.close_err == H2_CANCEL);
+}
+
 /* Round 1.3.7 review: SETTINGS_MAX_CONCURRENT_STREAMS, the rollback's
  * own send failure, and cancelling the side stream. */
 static void test_side_limits_cancel(void)
@@ -1517,6 +1577,10 @@ int main(void)
     test_connection_errors();
     test_side_stream();
     test_side_limits_cancel();
+    for (int mode = 0; mode < 3; mode++) {
+        cancel_side_flow_control(mode);
+        cancel_side_late_frames(mode);
+    }
     test_structured_fuzz();
     test_garbage_fuzz();
     if (s_fails == 0) printf("\nALL OK\n");

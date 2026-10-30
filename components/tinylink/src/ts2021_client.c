@@ -1021,6 +1021,18 @@ esp_err_t ts2021_connect(ts2021_conn_t *out,
     return err;
 }
 
+bool ts2021_rx_ready(ts2021_conn_t *c)
+{
+    if (c == NULL || !c->connected) return false;
+    int fd = c->plain ? c->sock : -1;
+    if (!c->plain) {
+        if (esp_tls_get_bytes_avail(c->tls) > 0) return true;
+        if (esp_tls_get_conn_sockfd(c->tls, &fd) != ESP_OK) return false;
+    }
+    uint8_t b;
+    return fd >= 0 && recv(fd, &b, 1, MSG_PEEK | MSG_DONTWAIT) == 1;
+}
+
 esp_err_t ts2021_request_deadline(ts2021_conn_t *c, uint32_t ms)
 {
     if (c == NULL || !c->connected) return ESP_ERR_INVALID_STATE;

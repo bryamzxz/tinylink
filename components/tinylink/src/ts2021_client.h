@@ -282,6 +282,12 @@ esp_err_t ts2021_tx_send(ts2021_conn_t *c, size_t len);
  * caller drains it before reading a record. */
 esp_err_t ts2021_recv_record(ts2021_conn_t *c, size_t *len);
 
+/* Has the conn received bytes not read yet — TLS plaintext buffered in
+ * mbedTLS, or anything in the socket's receive buffer? Never blocks
+ * (MSG_PEEK | MSG_DONTWAIT); false on any error. The next
+ * ts2021_recv_record then has (at least the start of) a record. */
+bool ts2021_rx_ready(ts2021_conn_t *c);
+
 void ts2021_close(ts2021_conn_t *c);
 
 /* Ask the task blocked in a ts2021 record read (the long-poll) to give
