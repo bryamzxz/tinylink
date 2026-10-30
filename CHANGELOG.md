@@ -7,6 +7,106 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Optimization round 1.3.9 (in progress, branch `feat/opt-1.3.9`)
+
+#### DERP close vs the task watchdog (`feat/r139-derp`)
+
+A reviewer's finding, confirmed by reading the code, not seen on the
+sensor: the DERP write lock was waited for with `portMAX_DELAY` by tasks
+subscribed to the 60-s task WDT, while the other writer could hold it
+for 4 × 30 s. The supervisor (`tinylink_derp`) closes after its stream
+read gives up — 4 silent 30-s polls, or the next poll after a GOT_IP
+with a new address — fed last by that poll's `tls_io` hook, then waits
+in `derp_client_close` for the lock; wg_tx in a waiting write on the
+same stalled conn (a RELAY-mode frame, the re-send, since 1.3.8 a held
+INIT copy, a frame whose sendto failed) holds it until its own 4 polls
+of `SO_SNDTIMEO` end, feeding only itself. The close outlives the budget
+whenever that write began blocking more than 60 s after the last byte
+the supervisor received — in an uplink outage with the Wi-Fi up, RELAY
+mode at one frame per sample fills lwIP's send queue (16 segments,
+5 760 B) a minute or two after the stall, sooner behind a re-send — and
+the board resets (`PANIC=y`). The same wait sat in the supervisor's
+pongs (`derp_send_frame_locked`) and DISCO pongs behind wg_tx, and in
+wg_tx behind those. Image 745 840 →
+**746 560 B (+720)**; static DRAM 58 676 → 58 684 B (+8), IRAM ±0. Host
+suite 2 318 → **2 399 OK** (CI floor 2 399), ASan + UBSan clean, 0
+warnings; the new test TSan-clean on 1, 2 and 16 CPUs. Static worst
+cases unchanged: `wg_tx` 3 440 / 5 120, `tinylink_derp` 5 248 / 8 192.
+Not yet on the sensor.
+
+- **Every wait for the lock feeds (`derp_wlock.h`).** Writers wait in
+  1-s slices with a feed after each and leave without the lock, as
+  refused, once the conn they set out for is closing or replaced (a
+  connect count: a frame that waited behind a dying write never lands on
+  the next conn). `connected` is the writers' abort flag: a frame's
+  write stops at its next poll once a close began. The close drops it,
+  gives a writer mid-frame 1 s to end it, then cuts the socket
+  (`shutdown(SHUT_RDWR)`: with `LWIP_NETCONN_FULLDUPLEX` lwIP fails a
+  blocked send at once with `ERR_CLSD`; the fd stays allocated until the
+  destroy, the TCP close is the one `close()` would do) and takes the
+  lock in fed slices — always: the TLS context is still freed under it.
+  A refused shutdown leaves the writer to its next poll (≤ 30 s). A cut
+  frame is a failed one, which its sender handles as before (kept for
+  the re-send, a refused INIT copy, the direct send). `connect_login` no
+  longer memsets the struct, which zeroed the lock handle for an instant
+  under a sender; the flag and the count are atomics.
+- **A failed write closes the conn to frames.** It may leave part of a
+  TLS record on the stream, and mbedtls flushes that record's tail on
+  the next write and reports the new frame as written
+  (`ssl_write_real`, `out_left != 0`). Until now the conn stayed up: the
+  next waiting write sat out another 4 × 30 s, and one that got through
+  was reported sent and never went (a relayed sample lost, or the held
+  INIT behind a failed re-send frame left to its 5-s retry). Now the
+  conn takes no more frames (the relay reads as down, so INITs go as in
+  1.3.7) and the reader leaves at its next poll (`abort_reads`), then
+  the supervisor reconnects; the login kick re-sends first. No shutdown
+  from wg_tx: lwIP's TCP close and the Wi-Fi TX under it would run on
+  its 5-KiB stack (+288 B static worst).
+- **Ordering, as 1.3.8 relies on it:** a frame reported sent is whole on
+  the conn it was written to; nothing is written after a cut or failed
+  frame on that conn; a frame never moves to the next conn while
+  waiting. Unchanged (pre-existing): a relay call that starts after a new
+  login completed goes on the new conn — between two wg_tx queue items,
+  past the backoff and a full TLS login; the stress below, reconnecting
+  in ≤ 1 ms, saw it once in ~60 rounds.
+- **The other lock users:** the smoke and `connect_on`'s failure closes
+  run with no writer admitted (one take); `tinylink.c` reads the flag
+  through `derp_client_is_connected`. The pong and relay writes share
+  one `send_frame`. `tools/stack_worst.py` knows `derp_tls_write` and
+  the re-send's relay site (`tx_rescue`, unresolved and costed 0 B
+  before): the re-send's path 3 008 → 2 992 B, a relayed frame 2 912 →
+  2 896, the pong 3 104 → 3 152, the DISCO pong 4 336 → 4 320, the close
+  3 696 → 3 712.
+- **Test (`test_derp_wlock`, +81):** the protocol over pthreads and the
+  real `tls_io_write_full`, with a fake conn that keeps mbedtls's write
+  semantics (a record copied once and flushed across calls, WANT_WRITE
+  after a poll, the tail-flush above); every thread counts its waits and
+  feeds. Forced: a close against a writer whose poll never ends here
+  (cut after the grace, fed, done in ms), a refused shutdown (one poll,
+  not four), no writer (one take), a writer done within the grace (not
+  cut), a waiter behind a stalled holder (fed each slice, leaves
+  unwritten), a waiter parked while its conn is replaced (refused by
+  the count with the next conn up), a failed write (the next frame
+  refused; under 1.3.8's rule reported sent and absent from the wire).
+  Seeded stress, 60 rounds of closes, reconnects, stalls and refused
+  shutdowns at random instants: no use after free, no frame reported
+  sent that is not whole on its conn, none twice or elsewhere, per-writer
+  order, every lock wait fed and bounded. Mutants that fail it: no cut,
+  no count check, no feed in the wait, no abort flag, an unbounded close
+  wait, a failed write leaving the conn up.
+- On the sensor, a close that had to cut a writer logs `DERP close: a
+  write still held the conn after 1000 ms — cut, the lock free after N
+  ms` (N ≈ 1 000), usually with esp-tls's `write error :-0x004E:` from
+  the cut write; a write that failed on its own `DERP write failed
+  (-0x10000) — no more frames on this conn, reconnecting`, then
+  `derp supervisor: stream ended 0xffffffff` within 30 s and a reconnect.
+  Neither in a healthy run; no `task_wdt` reset after a DERP stall.
+- **Residual (pre-existing, every TLS writer):** one `esp_tls_conn_write`
+  can span two 30-s sends — a partial one, then one that moves nothing —
+  so a holder's own feeds can be ~61 s apart. lwIP's 16-segment queue
+  limit binds before the 5 760-B buffer at the sensor's frame sizes,
+  which makes the partial send unlikely; not addressed here.
+
 ### Optimization round 1.3.8 — TLS handshake, WireGuard silence, stalled polls, PSK (in progress, branch `feat/opt-1.3.8`)
 
 Four parallel tracks on top of 1.3.7 plus a register retry ladder;
