@@ -17,9 +17,9 @@ The DERP TLS full handshake was on the boot's critical path: on the
 logs a full handshake took 1.72 s: 1.15 s from the connect attempt to
 `Certificate validated` (two ~60-ms round trips plus the chain verify),
 0.57 s from there to `TLS up` (one round trip plus the ServerKeyExchange
-verify and both ECDHE halves). Image 731 952 → **735 200 B (+3 248)**;
-static DRAM 58 116 → 58 292 B (+176), IRAM ±0, RTC slow +1 140 B. Host
-suite 2 092 → **2 164 OK** (CI floor 2 164), ASan + UBSan clean, 0
+verify and both ECDHE halves). Image 731 952 → **735 680 B (+3 728)**;
+static DRAM 58 116 → 58 292 B (+176), IRAM ±0, RTC slow +1 156 B. Host
+suite 2 092 → **2 184 OK** (CI floor 2 184), ASan + UBSan clean, 0
 warnings. Static stack worst cases unchanged (`tinylink_derp` 5 248 /
 8 192, `tinylink_lp` 5 168 / 7 168); the DERP connect subtree 4 400 →
 4 352 B, `ts2021_connect` 4 832 unchanged. Not yet on the sensor.
@@ -53,12 +53,16 @@ warnings. Static stack worst cases unchanged (`tinylink_derp` 5 248 /
   ECDHE-ECDSA suite listed they serve leaf RSA-2048 ← YR2 (RSA-2048) ←
   Root YR (RSA-4096) ← ISRG Root X1 (in the common bundle) and sign the
   ServerKeyExchange rsa_pkcs1_sha256; ECDHE stays X25519, records
-  AES-128-GCM. The DERP, control (:443) and TOFU `/key` connects offer
+  AES-128-GCM. The DERP and control (:443) connects offer
   TLS_ECDHE_RSA_WITH_AES_{128,256}_GCM only: four RSA public-exponent
-  operations instead of four ECDSA verifies. A handshake failure on that
-  offer (an ECDSA-only server, a chain the bundle does not anchor —
-  esp-tls `ESP_ERR_MBEDTLS_SSL_HANDSHAKE_FAILED`, not a TCP failure or a
-  timeout) redials at once with the full mbedTLS offer and no session; a
+  operations instead of four ECDSA verifies. The TOFU `/key` fetch keeps
+  the full offer (ECDSA chain, P-256 server authentication): its TLS is
+  all that vouches for the control key it pins, and it runs once per pin,
+  so ~1.5 s there is cheap defence in depth (review). A handshake failure
+  on the RSA offer (an ECDSA-only server, a chain the bundle does not
+  anchor — esp-tls `ESP_ERR_MBEDTLS_SSL_HANDSHAKE_FAILED`, not a TCP
+  failure or a timeout) redials at once with the full mbedTLS offer and
+  no session — unless the verdict is a certificate for another name; a
   success there makes that host:port take the full offer directly for 6
   h. A saved session is offered under the suite family it was made in.
   Log: `TLS up to … (full handshake, RSA offer, N ms)`. **Security:** the
@@ -106,13 +110,15 @@ warnings. Static stack worst cases unchanged (`tinylink_derp` 5 248 /
   serialized by mbedTLS (`mbedtls_ssl_session_save`: master secret,
   ticket, suite, server-certificate digest, behind a version /
   configuration header `mbedtls_ssl_session_load` checks) into one of two
-  564-B records in RTC slow memory; the first connect to that host:port
-  after a software / panic / watchdog reset resumes (157 ms on the
-  sensor, 1.3.6 soak) instead of a full handshake. Same bounds as the RAM
-  copy: host:port, 24 h of master-secret age counted on the RTC timer
-  (which runs through those resets), a failed connect clears it, plus an
-  FNV checksum against the garbage RTC memory holds after a power-on or
-  an EN reset, and one restore per record per boot. Log: `tls_resume: TLS
+  572-B records in RTC slow memory; the first connect to that host:port
+  after a software, panic, interrupt-WDT or task-WDT reset resumes (157
+  ms on the sensor, 1.3.6 soak) instead of a full handshake. Same bounds
+  as the RAM copy: host:port, 24 h of master-secret age counted on the
+  RTC timer (which runs through those resets), a failed connect clears
+  it, plus an FNV checksum against garbage, a refusal when the RTC timer
+  reads earlier than the record's last write, and one restore per record
+  per boot. Any other boot, and expired or garbage records, are zeroed by
+  a sweep before the first TLS connect (`tinylink_init`). Log: `tls_resume: TLS
   session for … from RTC memory (master secret N s old)`. +2 272 B
   (mbedTLS's session (de)serializer). **NVS rejected:** NVS is not
   encrypted here; a TLS 1.2 master secret at rest there would let anyone
@@ -121,6 +127,25 @@ warnings. Static stack worst cases unchanged (`tinylink_derp` 5 248 /
   flash write (a sector erase stalls both CPUs 70–500 ms), and after the
   RSA offer a cold boot's full handshake costs ~0.1 s more than a resumed
   one.
+- **Review (independent, no medium / high findings; all fixed).** (1) Low,
+  demonstrated on the host: esp_clk restarts the RTC timer from 0 when
+  its calibration register reads 0 (an RTC-domain reset — the
+  bootloader's RTC WDT stage, a brown-out, maybe EN) while RTC slow
+  memory can survive, so a session made 23 h earlier restored as "2 s
+  old" and was offered 46 h after its handshake. Now the record carries
+  its last-write time (refused when the RTC timer reads earlier), only
+  the four warm reset reasons restore, and a master secret older than
+  the RTC time is not saved instead of clamped (`test_tls_rtc`, 52
+  checks). (2) The full-offer retry fired on every handshake failure,
+  including a certificate for another name (a stale cached address, an
+  impostor): no retry when the RSA attempt's verify result — read from
+  the SSL context, since esp-tls's own capture needs the peer certificate
+  this build does not keep — has `BADCERT_CN_MISMATCH`; an alert, an
+  unanchored, expired or policy-failing RSA chain still retries (separate
+  certificates, renewals and hierarchy). (3) Expired records kept their
+  master secret until looked up and an overwrite left the previous
+  ticket's tail: the boot sweep, and a seal zeroes the tail. (4) `/key`
+  back on the full offer (above).
 - **Rejected after the RSA offer.** Anchoring the ECDSA chain at the
   served X2 (bundle name + key) to skip its X1 cross-sign: one RSA-4096,
   2.9 M instructions, ECDSA path only. Memoizing verified signatures
