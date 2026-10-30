@@ -22,6 +22,7 @@
 
 #include "h2_core.h"
 #include "h2_retry_after.h"
+#include "tl_bodystat.h"
 #include "tl_time.h"
 #include "ts2021_client.h"
 
@@ -85,6 +86,14 @@ static bool     s_repoll;
  * TS2021_RESP_TIMEOUT_MS and the ladder, so a server that never answers
  * still meets the :443 / re-resolve escalation (second review). */
 static bool     s_after_clean;
+
+/* The map stream's first response body, timed (round 1.3.9,
+ * tl_bodystat.h): armed by the stream's final 200 (h2_io_on_status), fed
+ * by the record reads of h2_drive_request and the stream's DATA, logged
+ * once — by mapreq when the stream's first message is complete
+ * (h2_map_body_done), else when the stream ends (body_left). Same task
+ * and same single stream as the deadline state above; no lock. */
+static tl_bodystat_t s_body;
 
 /* The first-response deadline for the streaming request going out now;
  * *patient: it is the first poll after a clean server end (and takes the
@@ -200,10 +209,16 @@ void h2_io_on_status(void *io, int status)
      * a while (the first netmap's data-plane start, the relay wait) — and
      * before the flush that ends this feed: no read or write fails on
      * either deadline any more. */
-    const int64_t took_us = esp_timer_get_time() - s_resp_since_us;
+    const int64_t now_us = esp_timer_get_time();
+    const int64_t took_us = now_us - s_resp_since_us;
     s_resp_ms = resp_ms_after(took_us);
     s_resp_streak = 0;
     s_after_clean = false;
+    if (status == 200) {
+        tl_bodystat_arm(&s_body, now_us, took_us);
+    } else {
+        tl_bodystat_disarm(&s_body);   /* an error body is no MapResponse */
+    }
     ESP_LOGI(TAG, "map stream answered: HTTP %d in %u ms", status,
              (unsigned)(took_us > 0 ? took_us / 1000 : 0));
     h2_side_t *side = s_side;
@@ -266,6 +281,7 @@ int h2_io_on_data(void *io, const uint8_t *data, size_t len)
     ts2021_conn_t *conn = (ts2021_conn_t *)io;
 
     if (conn->h2_cb != NULL) {
+        if (tl_bodystat_armed(&s_body)) tl_bodystat_data(&s_body, esp_timer_get_time(), len);
         /* A negative return stops the stream: the engine delivers no
          * more DATA and h2_drive_request returns. */
         if (conn->h2_cb(data, len, conn->h2_cb_ctx) < 0) {
@@ -479,6 +495,9 @@ static esp_err_t h2_drive_request(ts2021_conn_t *conn,
      * push more of the request body if the server opened its window. */
     while (!h->s.closed && !h->s.stop) {
         size_t got = 0;
+        /* While the map body is timed: how long this read blocks. */
+        const bool timed = tl_bodystat_armed(&s_body);
+        const int64_t read_us = timed ? esp_timer_get_time() : 0;
         if (ts2021_recv_record(conn, &got) != ESP_OK) {
             /* A requested recycle (ts2021_abort_reads), a one-shot
              * request past its deadline or a stream unanswered past its
@@ -492,6 +511,7 @@ static esp_err_t h2_drive_request(ts2021_conn_t *conn,
             }
             return ESP_FAIL;
         }
+        if (timed) tl_bodystat_read(&s_body, esp_timer_get_time() - read_us);
         rc = h2c_feed(h, conn->h2_rx, got);
         conn->h2_rx_off = got;
         if (rc == H2C_OK) rc = h2c_pump(h);
@@ -612,6 +632,30 @@ esp_err_t h2_post_json(ts2021_conn_t *conn,
     return err;
 }
 
+/* The one `map body:` line of the stream (tl_bodystat.h); the timing
+ * ends with it. Incomplete: N is the DATA bytes that came. */
+static void body_log(bool complete, size_t body_len)
+{
+    tl_bodystat_report_t r;
+    tl_bodystat_report(&s_body, esp_timer_get_time(), &r);
+    tl_bodystat_disarm(&s_body);
+    ESP_LOGI(TAG, TL_BODYSTAT_LINE, complete ? "" : "incomplete, ",
+             TL_BODYSTAT_ARGS(complete ? body_len : r.bytes, &r));
+}
+
+void h2_map_body_done(size_t body_len)
+{
+    if (tl_bodystat_armed(&s_body)) body_log(true, body_len);   /* else not the first */
+}
+
+/* The stream is over with its first message incomplete — an idle conn, a
+ * GOAWAY, a reset, an oversized frame, a recycle mid-body: each has its
+ * own line (W / E, I for a requested recycle), this one stays I. */
+static void body_left(void)
+{
+    if (tl_bodystat_armed(&s_body)) body_log(false, 0);
+}
+
 /* A streaming request is over: its first-response deadline off if it is
  * still on (or its socket polls still short), and on an expiry the next
  * one doubled — the second expiry in a row on, the conn counts as failed
@@ -667,6 +711,7 @@ esp_err_t h2_post_json_stream(ts2021_conn_t *conn,
     s_repoll = false;
     esp_err_t err = ts2021_response_deadline(conn, ms, s_resp_since_us);
     if (err == ESP_OK) err = h2_drive_request(conn, path, authority, body_len, NULL);
+    body_left();
     err = resp_deadline_done(conn, ms, patient, err);
 
     *status_out = conn->h2_status;
@@ -682,6 +727,11 @@ esp_err_t h2_post_json_stream(ts2021_conn_t *conn,
 void h2_client_forget_limits(void)
 {
     s_one_stream = false;
+}
+
+const tl_bodystat_t *h2_client_bodystat(void)
+{
+    return &s_body;
 }
 #endif
 
@@ -728,6 +778,7 @@ esp_err_t h2_post_json_stream_side(ts2021_conn_t *conn,
     s_side = &side;
     if (err == ESP_OK) err = h2_drive_request(conn, path, authority, body_len, &side);
     s_side = NULL;
+    body_left();
     if (side.armed || err == ESP_ERR_INVALID_SIZE) {
         /* Left with the side request unanswered (or never sent). */
         if (conn->req_expired) {

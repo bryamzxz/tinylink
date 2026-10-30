@@ -2000,6 +2000,110 @@ static void test_e2e_patience_once(void)
     /* (the clean end's answer had reset the ladder to its base) */
     check("e2e_recycle_in_the_patient_poll_ends_the_patience", aborted && base2);
 }
+
+/* Round 1.3.9: the `map body:` timing (tl_bodystat.h) through the real
+ * client — armed by the stream's 200, every record read and DATA byte
+ * after it counted, ended by the stream's first message
+ * (h2_map_body_done; a second call is a no-op) or else by the stream's
+ * end; the body of a 429 is never timed. */
+static uint32_t      s_mb_len, s_mb_got;
+static int           s_mb_done;
+static bool          s_mb_armed_seen;
+static tl_bodystat_t s_mb_at_done;
+
+static int e2e_body_cb(const uint8_t *b, size_t n, void *ctx)
+{
+    (void)b; (void)ctx;
+    s_mb_armed_seen |= tl_bodystat_armed(h2_client_bodystat());
+    s_mb_got += (uint32_t)n;
+    if (s_mb_got >= s_mb_len && s_mb_done++ == 0) {
+        s_mb_at_done = *h2_client_bodystat();
+        h2_map_body_done(s_mb_len - 4);
+        h2_map_body_done(s_mb_len - 4);
+    }
+    return 0;
+}
+
+static void e2e_frame_hdr(uint8_t *f, size_t len, uint8_t type, uint8_t flags)
+{
+    f[0] = (uint8_t)(len >> 16); f[1] = (uint8_t)(len >> 8); f[2] = (uint8_t)len;
+    f[3] = type; f[4] = flags;
+    f[5] = 0; f[6] = 0; f[7] = 0; f[8] = 1;   /* stream 1 */
+}
+
+/* The answer to stream 1: the SETTINGS ACK's rest (see e2e_answer_and_end)
+ * and HEADERS — `status`: 200 indexed, else a literal with :status's name
+ * index — in one record, then n_data DATA frames of `each` bytes in
+ * records of their own, END_STREAM on the last. */
+static bool e2e_answer_body(int status, int n_data, size_t each)
+{
+    static uint8_t in[16384];
+    uint8_t pt[1100];
+    size_t inn = 0, n = 0;
+    static const uint8_t ack_rest[] = { 0x00, 0x00, 0x04, 0x01, 0x00, 0x00, 0x00, 0x00 };
+    memcpy(pt, ack_rest, sizeof(ack_rest));
+    n = sizeof(ack_rest) + 9;
+    pt[n++] = 0x20;                          /* table size update to 0 */
+    if (status == 200) {
+        pt[n++] = 0x88;
+    } else {
+        pt[n++] = 0x08; pt[n++] = 3;
+        pt[n++] = (uint8_t)('0' + status / 100);
+        pt[n++] = (uint8_t)('0' + status / 10 % 10);
+        pt[n++] = (uint8_t)('0' + status % 10);
+    }
+    e2e_frame_hdr(pt + sizeof(ack_rest), n - sizeof(ack_rest) - 9, 0x01, 0x04);
+    put_record(in, &inn, pt, n);
+    for (int i = 0; i < n_data && each + 9 <= sizeof(pt); i++) {
+        e2e_frame_hdr(pt, each, 0x00, i == n_data - 1 ? 0x01 : 0x00);
+        memset(pt + 9, 'x', each);
+        put_record(in, &inn, pt, 9 + each);
+    }
+    return write(s_srv_fd, in, inn) == (ssize_t)inn;
+}
+
+static esp_err_t e2e_body_stream(int status, int n_data, size_t each, uint32_t msg_len,
+                                 int *st)
+{
+    s_mb_len = msg_len;
+    s_mb_got = 0;
+    s_mb_done = 0;
+    s_mb_armed_seen = false;
+    memset(&s_mb_at_done, 0, sizeof(s_mb_at_done));
+    boot_reset();
+    script(ESP_OK, RP_OK, false, 1, RP_OK);
+    esp_err_t err = dial(true);
+    if (err == ESP_OK && !e2e_answer_body(status, n_data, each)) err = ESP_FAIL;
+    if (err == ESP_OK) {
+        err = h2_post_json_stream(&s_conn, "/machine/map", CONFIG_TINYLINK_CONTROL_HOST,
+                                  (const uint8_t *)"{\"Stream\":true}", 15, st,
+                                  e2e_body_cb, NULL);
+    }
+    ts2021_close(&s_conn);
+    return err;
+}
+
+static void test_e2e_map_body(void)
+{
+    int st = 0;
+    /* the message is the three DATA records: HEADERS' read + 3 */
+    esp_err_t err = e2e_body_stream(200, 3, 1000, 3000, &st);
+    check("e2e_map_body_timed_to_its_first_message",
+          err == ESP_OK && st == 200 && s_mb_done == 1 && tl_bodystat_armed(&s_mb_at_done) &&
+          s_mb_at_done.bytes == 3000 && s_mb_at_done.reads == 4 && s_mb_at_done.first_us != 0 &&
+          s_mb_at_done.stall_us == TL_BODY_STALL_MIN_MS * 1000u &&
+          !tl_bodystat_armed(h2_client_bodystat()));
+    /* the stream ends with the message 2 000 B short: disarmed at the end */
+    err = e2e_body_stream(200, 3, 1000, 5000, &st);
+    check("e2e_map_body_incomplete_ends_with_the_stream",
+          err == ESP_OK && st == 200 && s_mb_done == 0 && s_mb_armed_seen && s_mb_got == 3000 &&
+          !tl_bodystat_armed(h2_client_bodystat()));
+    /* a 429's body: never armed */
+    err = e2e_body_stream(429, 1, 10, 6, &st);
+    check("e2e_map_body_not_for_an_error_status",
+          err == ESP_OK && st == 429 && s_mb_got == 10 && !s_mb_armed_seen &&
+          !tl_bodystat_armed(h2_client_bodystat()));
+}
 #endif
 
 int main(void)
@@ -2010,6 +2114,7 @@ int main(void)
     curve25519_derive_pub(s_control_pub, kControlPriv);
     test_e2e_resp_deadline();
     test_e2e_patience_once();
+    test_e2e_map_body();
     if (s_srv_fd >= 0) close(s_srv_fd);
     if (s_fails == 0) printf("\nALL OK\n");
     return s_fails ? 1 : 0;
