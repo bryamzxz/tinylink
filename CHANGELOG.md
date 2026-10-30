@@ -26,7 +26,7 @@ independent reviews of the warm start (no high; one medium each, fixed).
   netmap at 3.80 s (body 968 ms, no stall), session up 3.99 s, `tx
   seq=0` 90 ms later; `warm start: record stored for the next boot` at
   60 s.
-- **Warm boots** (7): the warm start fired 50–220 ms after the register
+- **Warm boots** (7): the warm start fired 60–220 ms after the register
   every time and the netmap confirmed it every time (no `netmap
   differs`, no restart). got-ip → session up median **1.55 s**, mean
   2.34 s (cold, 18 boots of the A/B: median 2.17–2.20 s, mean
