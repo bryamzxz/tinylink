@@ -32,9 +32,14 @@
 // secret would then look seconds old (review, 1.3.8). So a record is used
 // only after a software, panic, interrupt-WDT or task-WDT reset
 // (tls_resume.c), and never when the RTC timer reads earlier than the
-// record's last write (or its birth). The boot's first use sweeps the
-// records: garbage, a record a cold boot cannot use, an expired one — all
-// zeroed, master secret included, instead of waiting to be looked up. The
+// record's last write (or its birth). Every boot sweeps the records
+// first thing (tinylink_bootstat_record, before anything can restart):
+// garbage, a record a cold boot cannot use, an expired one — all zeroed,
+// master secret included, instead of waiting to be looked up. The gate
+// needs the sweep on every boot: a cold boot that restarted before
+// sweeping would hand its records to the next, software-reset boot, and
+// a record last written before an RTC-timer restart passes the time
+// check once the new timer has run past that write (review 138b). The
 // checksum is against garbage (after a power-on the bytes are random), not
 // against an attacker: writing RTC memory needs code execution already.
 //

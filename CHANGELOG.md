@@ -411,7 +411,7 @@ logs a full handshake took 1.72 s: 1.15 s from the connect attempt to
 0.57 s from there to `TLS up` (one round trip plus the ServerKeyExchange
 verify and both ECDHE halves). Image 731 952 → **735 680 B (+3 728)**;
 static DRAM 58 116 → 58 292 B (+176), IRAM ±0, RTC slow +1 156 B. Host
-suite 2 092 → **2 184 OK** (CI floor 2 184), ASan + UBSan clean, 0
+suite 2 092 → **2 185 OK** (CI floor 2 185), ASan + UBSan clean, 0
 warnings. Static stack worst cases unchanged (`tinylink_derp` 5 248 /
 8 192, `tinylink_lp` 5 168 / 7 168); the DERP connect subtree 4 400 →
 4 352 B, `ts2021_connect` 4 832 unchanged. Not yet on the sensor.
@@ -448,9 +448,12 @@ warnings. Static stack worst cases unchanged (`tinylink_derp` 5 248 /
   AES-128-GCM. The DERP and control (:443) connects offer
   TLS_ECDHE_RSA_WITH_AES_{128,256}_GCM only: four RSA public-exponent
   operations instead of four ECDSA verifies. The TOFU `/key` fetch keeps
-  the full offer (ECDSA chain, P-256 server authentication): its TLS is
-  all that vouches for the control key it pins, and it runs once per pin,
-  so ~1.5 s there is cheap defence in depth (review). A handshake failure
+  the full mbedTLS offer: its TLS is all that vouches for the control key
+  it pins, and it runs once per pin, so it is not narrowed for speed —
+  controlplane answers that offer with its ECDSA chain (P-256 leaf, ~1.5
+  s once). The offer still lists the RSA suites, so a server may answer
+  with an RSA chain, verified against the bundle all the same: "ECDSA-
+  capable", not "P-256 enforced" (review). A handshake failure
   on the RSA offer (an ECDSA-only server, a chain the bundle does not
   anchor — esp-tls `ESP_ERR_MBEDTLS_SSL_HANDSHAKE_FAILED`, not a TCP
   failure or a timeout) redials at once with the full mbedTLS offer and
@@ -510,7 +513,8 @@ warnings. Static stack worst cases unchanged (`tinylink_derp` 5 248 /
   it, plus an FNV checksum against garbage, a refusal when the RTC timer
   reads earlier than the record's last write, and one restore per record
   per boot. Any other boot, and expired or garbage records, are zeroed by
-  a sweep before the first TLS connect (`tinylink_init`). Log: `tls_resume: TLS
+  a sweep first thing in every boot (`tinylink_bootstat_record`, before
+  anything can restart). Log: `tls_resume: TLS
   session for … from RTC memory (master secret N s old)`. +2 272 B
   (mbedTLS's session (de)serializer). **NVS rejected:** NVS is not
   encrypted here; a TLS 1.2 master secret at rest there would let anyone
@@ -527,7 +531,7 @@ warnings. Static stack worst cases unchanged (`tinylink_derp` 5 248 /
   old" and was offered 46 h after its handshake. Now the record carries
   its last-write time (refused when the RTC timer reads earlier), only
   the four warm reset reasons restore, and a master secret older than
-  the RTC time is not saved instead of clamped (`test_tls_rtc`, 52
+  the RTC time is not saved instead of clamped (`test_tls_rtc`, 53
   checks). (2) The full-offer retry fired on every handshake failure,
   including a certificate for another name (a stale cached address, an
   impostor): no retry when the RSA attempt's verify result — read from
@@ -537,7 +541,15 @@ warnings. Static stack worst cases unchanged (`tinylink_derp` 5 248 /
   certificates, renewals and hierarchy). (3) Expired records kept their
   master secret until looked up and an overwrite left the previous
   ticket's tail: the boot sweep, and a seal zeroes the tail. (4) `/key`
-  back on the full offer (above).
+  back on the full offer (above). A second pass: (5) Low, demonstrated:
+  the sweep ran in `tinylink_init`, after Wi-Fi; a cold boot without
+  Wi-Fi restarts from bringup 60 s later — a software reset, i.e. warm —
+  so a record last written before an RTC-timer restart, once the new
+  timer had run past that write, came back (a 23-h secret as "80 s
+  old"). The sweep now runs first thing in every boot
+  (`tinylink_bootstat_record`); suite test
+  `glue_cold_boot_then_sw_restart_not_restored`. (6) The `/key` wording
+  above: the full offer is ECDSA-capable, not P-256-enforced.
 - **Rejected after the RSA offer.** Anchoring the ECDSA chain at the
   served X2 (bundle name + key) to skip its X1 cross-sign: one RSA-4096,
   2.9 M instructions, ECDSA path only. Memoizing verified signatures

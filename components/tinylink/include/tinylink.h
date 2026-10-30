@@ -165,9 +165,11 @@ typedef struct {
 void tinylink_get_stats(tinylink_stats_t *out);
 
 /* Count this boot in the RTC boot counters (by esp_reset_reason()) and
- * log them. Call first thing in app_main, before anything that can
- * reset again, so a boot that dies early still records why the previous
- * one ended. Idempotent; tinylink_get_stats calls it too. */
+ * log them, and scrub the TLS sessions kept in RTC memory unless this is
+ * a warm reset (round 1.3.8). Call first thing in app_main, before
+ * anything that can reset again, so a boot that dies early still records
+ * why the previous one ended and cannot pass a cold boot's sessions on to
+ * a software-reset boot. Idempotent; tinylink_get_stats calls it too. */
 void tinylink_bootstat_record(void);
 
 /* Load the persisted TAI64N floor from NVS namespace "tl_state" key

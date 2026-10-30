@@ -22,7 +22,10 @@
 //    that looked 2 s old; only a warm reset restores, and the boot sweep
 //    zeroes everything else (cold boot, expired, garbage) at once; a
 //    master secret older than the RTC time is not saved; a seal zeroes the
-//    previous session's tail.
+//    previous session's tail;
+//  - review 138b: with the sweep first thing in every boot, a cold boot
+//    that restarts before any TLS (no Wi-Fi) does not pass its records on
+//    to the software-reset boot after it.
 
 #include "../../components/tinylink/src/tls_resume.c"
 
@@ -388,6 +391,39 @@ int main(void)
           tls_resume_keep(&slot, e, &t, kDerp, 443) == TLS_RESUME_RESUMED &&
           tls_rtc_find(s_rtc, TLS_RTC_RECS, kDerp, 443) == TLS_RTC_RECS);
     s_rtc_base = 5000000000ull;
+
+    /* review 138b: every boot sweeps first thing (tinylink_bootstat_record).
+     * Epoch A: power-on, a DERP full handshake at 20 s (last write 20 s),
+     * up 23 h. Then an RTC-domain reset (timer from 0, RTC memory kept)
+     * and boot B finds no Wi-Fi: bringup fails, esp_restart 92 s later,
+     * no TLS at all. Boot C is a software reset (warm): by then the new
+     * RTC timer (100 s) is past the record's last write, so only the
+     * sweep boot B ran at its start keeps the 23-h secret from coming
+     * back as "80 s old". */
+    entry_free(slot);
+    slot = NULL;
+    memset(s_rtc, 0, sizeof(s_rtc));
+    new_boot(&slot, false);
+    s_rtc_base = 0;
+    s_now = 0;
+    tls_resume_boot();                                   /* boot A, first thing */
+    s_now = 20LL * 1000000;
+    conn(&t, 0xA5, s_ticket, sizeof(s_ticket));
+    tls_resume_keep(&slot, tls_resume_take(&slot, kDerp, 443), &t, kDerp, 443);
+    s_now = 23LL * 3600 * 1000000;
+    new_boot(&slot, false);                              /* boot B: RTC-domain reset */
+    s_rtc_base = 0;
+    s_now = 0;
+    tls_resume_boot();                                   /* first thing, before any restart */
+    s_now = 92LL * 1000000;                              /* no Wi-Fi, esp_restart */
+    new_boot(&slot, true);                               /* boot C: ESP_RST_SW */
+    s_rtc_base = 92ULL * 1000000;
+    s_now = 0;
+    tls_resume_boot();
+    s_now = 8LL * 1000000;
+    check("glue_cold_boot_then_sw_restart_not_restored",
+          tls_resume_take(&slot, kDerp, 443) == NULL &&
+          tls_rtc_find(s_rtc, TLS_RTC_RECS, kDerp, 443) == TLS_RTC_RECS);
 
     entry_free(slot);
     entry_free(ctl);
