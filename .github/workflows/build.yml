@@ -48,12 +48,14 @@ jobs:
       # propagates that. `pipefail` makes the tee'd pipeline carry make's
       # status (without it a compile error or a crashing binary still
       # produced a green step); the OK floor guards against a silently
-      # truncated run.
+      # truncated run. `-O` keeps each binary's output whole: under -j two
+      # binaries' lines could interleave mid-line and the OK count come
+      # up one short of the floor (seen locally, round 1.3.9).
       - name: Run host suite
         shell: bash
         run: |
           set -o pipefail
-          make -j"$(nproc)" -C tools/test test 2>&1 | tee /tmp/host-tests.log
+          make -j"$(nproc)" -O -C tools/test test 2>&1 | tee /tmp/host-tests.log
           ok=$(grep -cE '^\[.*\] OK$' /tmp/host-tests.log || true)
           fails=$(grep -c 'FAIL' /tmp/host-tests.log || true)
           echo "summary: OK=$ok FAIL=$fails (floor $HOST_TESTS_MIN_OK)"
