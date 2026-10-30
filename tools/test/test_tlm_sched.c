@@ -208,6 +208,13 @@ static void test_helpers(void)
     ok("wake/no-anchor", tlm_wake_at(S(60), INT64_MAX, S(5)) == S(60));
     ok("wake/nothing-due", tlm_wake_at(INT64_MAX, S(57), S(5)) == INT64_MAX);
     ok("wake/both-max", tlm_wake_at(INT64_MAX, INT64_MAX, S(5)) == INT64_MAX);
+    /* 1.3.9: the first sample of a boot waits for the session. */
+    ok("hold/session-up-sends", !tlm_hold(true, S(10), S(10)));
+    ok("hold/early-wake-held", tlm_hold(false, S(10) - MS(60), S(10)));
+    ok("hold/until-session", tlm_hold(false, S(10) + MS(150), S(10)));
+    ok("hold/bounded", tlm_hold(false, S(10) + TLM_HOLD_MAX_US - 1, S(10)) &&
+                       !tlm_hold(false, S(10) + TLM_HOLD_MAX_US, S(10)));
+    ok("hold/bound-below-period", TLM_HOLD_MAX_US + TLM_HOLD_POLL_US < S(5) / 2);
 }
 
 static void test_one_wake_per_sample(void)

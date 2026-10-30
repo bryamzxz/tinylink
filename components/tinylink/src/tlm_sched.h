@@ -86,6 +86,22 @@ static inline int64_t tlm_wake_at(int64_t due_us, int64_t anchor_us, int64_t ear
     return (anchor_us <= due_us && due_us - anchor_us <= early_us) ? anchor_us : due_us;
 }
 
+/* Round 1.3.9: a due sample waits for the WireGuard session. The WG
+ * netif — and with it telemetry_start — comes up at the netmap, the
+ * session one handshake later (80–200 ms on the sensor), and the first
+ * sample of every boot went out in between and was lost (`sendto
+ * failed: errno=-1`, every 1.3.x boot log). Held at most TLM_HOLD_MAX_US
+ * past its instant, re-checked every TLM_HOLD_POLL_US: a session still
+ * down by then (the cold-handshake fallback) gets the old behaviour —
+ * send, fail, next instant. */
+#define TLM_HOLD_MAX_US  (2LL * 1000LL * 1000LL)
+#define TLM_HOLD_POLL_US (100LL * 1000LL)
+
+static inline bool tlm_hold(bool session_up, int64_t now_us, int64_t due_us)
+{
+    return !session_up && now_us - due_us < TLM_HOLD_MAX_US;
+}
+
 #ifdef __cplusplus
 }
 #endif

@@ -28,6 +28,7 @@
 #include "tmp117.h"
 #include "tl_wdt.h"
 #include "tl_time.h"
+#include "wg_netif.h"
 
 static const char *TAG = "telemetry";
 
@@ -298,14 +299,19 @@ static void telemetry_task(void *arg)
 #if CONFIG_TINYLINK_TELEMETRY_ENABLE
         if (s_tunnel_up && sensor_ok && sock >= 0) {
             const int64_t period = (int64_t)CONFIG_TINYLINK_TELEMETRY_PERIOD_MS * 1000LL;
+            bool held = false;
+            if (next_sample == 0) next_sample = now;   /* the hold counts from here */
             /* Within the slack: this wake is the sample's, though the
              * tick-counted wait ended a little before its instant. */
             if (tlm_due(now, next_sample, tlm_slack_us(period))) {
-                tlm_sample(sock, &dest, &seq);
-                /* On a grid since 1.3.7 (was one period after the
-                 * sample's end: 5.01–5.02 s apart on the sensor). */
-                next_sample = tlm_next_on_grid(next_sample, period, now);
-                now = esp_timer_get_time();
+                held = tlm_hold(wg_netif_is_up(), now, next_sample);
+                if (!held) {
+                    tlm_sample(sock, &dest, &seq);
+                    /* On a grid since 1.3.7 (was one period after the
+                     * sample's end: 5.01–5.02 s apart on the sensor). */
+                    next_sample = tlm_next_on_grid(next_sample, period, now);
+                    now = esp_timer_get_time();
+                }
             }
             early  = tlm_early_us(true, period);
             anchor = next_sample;
@@ -314,6 +320,7 @@ static void telemetry_task(void *arg)
              * end each wait earlier than the last, until one fell
              * outside the slack and cost a wake of its own. */
             if (next_sample < deadline + tlm_slack_us(period)) deadline = next_sample;
+            if (held) deadline = now + TLM_HOLD_POLL_US;   /* tlm_hold */
         }
 #endif
         if (tlm_due(now, next_housekeep, early)) {

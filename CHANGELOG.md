@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Optimization round 1.3.9 (in progress, branch `feat/opt-1.3.9`)
 
+#### The first telemetry sample of a boot
+
+Every 1.3.x boot log has `telemetry: sendto failed: errno=-1` right
+after the netmap: `telemetry_start` runs when the WireGuard netif comes
+up, the session one handshake later (80–200 ms in the 1.3.7–1.3.8 boot
+logs), and the first sample went out in between — `send_plaintext`
+refuses frames until the session is up — and was lost. A due sample now
+waits for the session (`tlm_hold`, `tlm_sched.h`): re-checked every
+100 ms, at most 2 s past its instant, after which a session still down
+(the cold-handshake fallback) gets the old behaviour. The grid keeps its
+instants. Host suite +5 checks (`hold/*` in `test_tlm_sched`). On the
+sensor: no `sendto failed` at boot; `tx seq=0` a few ms after `session
+up`.
+
 #### DERP close vs the task watchdog (`feat/r139-derp`)
 
 A reviewer's finding, confirmed by reading the code, not seen on the
