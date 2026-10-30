@@ -201,16 +201,16 @@ uint64_t wg_netif_get_tx_drops(void);
 /* Relay callback for the encrypted WG transport frame when the direct
  * UDP path is not confirmed. Invoked by the TX worker per the path
  * selection (round 1.3.6, wg_path.h): INSTEAD of sendto while the direct
- * path failed its ping or answered it with WireGuard silent (DERP only),
- * AFTER it (a redundant copy) while the direct path is unconfirmed, and
- * after a sendto that returns errno != 0. Since round 1.3.2 (B7) also
- * for handshake INITs while the direct path is not valid (`packet` is
- * then a 148-B MessageInitiation); since 1.3.6 also for the recent
- * direct-only frames re-sent when a lapse of the direct path is
- * confirmed. The relay is responsible for shipping the bytes to the
- * peer via an alternate transport (e.g. DERP); the WG bytes are already encrypted with the session keys (or
- * are a public handshake message), so the relay just carries opaque
- * ciphertext.
+ * path failed its ping, or WireGuard failed there while DISCO answered
+ * (DERP only); AFTER it (a redundant copy) while the direct path is
+ * unconfirmed; and after a sendto that returns errno != 0. Since round
+ * 1.3.2 (B7) also for handshake INITs while the direct path is not valid
+ * (`packet` is then a 148-B MessageInitiation); since 1.3.6 also for the
+ * recent direct-only frames re-sent when a lapse of the direct path is
+ * confirmed. The relay is responsible for shipping the bytes to the peer
+ * via an alternate transport (e.g. DERP); the WG bytes are already
+ * encrypted with the session keys (or are a public handshake message),
+ * so the relay just carries opaque ciphertext.
  *
  * Arguments:
  *   dst_node_pub:  the peer's WG static public key (also their NodeKey
@@ -254,7 +254,7 @@ void wg_netif_set_relay_callback(wg_netif_relay_fn cb, void *user);
  * relay_errors (it is a relay failure). Two-counter split:
  *
  *   _stale: relay used because the direct path failed its ping, or
- *           answered it with WireGuard silent (DERP only, round 1.3.6;
+ *           WireGuard failed there while DISCO answered (DERP only, 1.3.6;
  *           until 1.3.5: no decrypt in WG_RX_STALE_THRESHOLD_MS).
  *           Direct sendto skipped on success.
  *   _errno: relay used because sendto returned errno != 0. Reactive
@@ -298,8 +298,10 @@ typedef struct {
     uint32_t path_lapses;            /* direct → dual */
     uint32_t path_deaths;            /* dual → DERP only */
     uint32_t path_confirms;          /* → direct (pong) */
-    uint32_t path_silences;          /* pong answered, WG silent: → DERP only */
-    uint32_t silent_rekeys;          /* ...and the rekeys they started */
+    uint32_t path_doubts;            /* lapse answered by DISCO, not WireGuard */
+    uint32_t path_silences;          /* ...nor WireGuard in a 2nd window: DERP only */
+    uint32_t path_undelivered;       /* ...WireGuard answered via DERP only: DERP only */
+    uint32_t silent_rekeys;          /* rekeys the silences started */
     uint32_t rescued;                /* direct-only frames re-sent via DERP */
     uint32_t late_responses;         /* answers to replaced INITs (dropped) */
 } wg_netif_stats_t;

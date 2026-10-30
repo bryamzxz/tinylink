@@ -640,34 +640,44 @@ static bool sockaddr_eq(const struct sockaddr_in *a, const struct sockaddr_in *b
     return a->sin_addr.s_addr == b->sin_addr.s_addr && a->sin_port == b->sin_port;
 }
 
-/* A mode change, copied under g.lock and logged after it — one line per
- * transition (a soak reads the failover times off these). */
+/* A transition (mode, or DUAL's why: a doubt), copied under g.lock and
+ * logged after it — one line per transition (a soak reads the failover
+ * times off these). */
 typedef struct {
     wg_path_mode_t     from, to;
-    wg_path_why_t      why;
-    uint32_t           count;      /* lapses / deaths / silences / confirms so far */
-    uint32_t           ms;         /* unconfirmed for / WG silent for / off direct for */
+    wg_path_why_t      from_why, why;
+    uint32_t           count;      /* lapses / doubts / deaths / silences / ... so far */
+    uint32_t           ms;         /* unconfirmed for / off direct for */
     uint32_t           rtt_ms;
-    bool               rekey;      /* WG-silent: the first of a streak, rekeying */
+    uint32_t           retest_s;   /* RELAY after a failed test: next re-test in */
+    bool               rekey;      /* SILENT: the first of a streak, rekeying */
     struct sockaddr_in ep;
 } path_note_t;
 
-static void path_note_take(path_note_t *n, wg_path_mode_t from)
+/* Under g.lock: did the path move since (from, from_why)? */
+static bool path_moved(wg_path_mode_t from, wg_path_why_t from_why)
 {
-    n->from = from;
-    n->to   = g.path.mode;
-    n->why  = g.path.why;
-    n->ep   = g.peer_addr;
-    n->rtt_ms = g.path.rtt_us / 1000u;
-    n->rekey  = g.path.silent_streak == 1;
+    return g.path.mode != from || g.path.why != from_why;
+}
+
+static void path_note_take(path_note_t *n, wg_path_mode_t from, wg_path_why_t from_why)
+{
+    n->from     = from;
+    n->from_why = from_why;
+    n->to       = g.path.mode;
+    n->why      = g.path.why;
+    n->ep       = g.peer_addr;
+    n->rtt_ms   = g.path.rtt_us / 1000u;
+    n->retest_s = g.path.reprobe_ms / 1000u;
+    n->rekey    = g.path.silent_streak == 1;
     switch (n->to) {
     case WG_PATH_DUAL:
-        n->count = g.path.lapses;
+        n->count = n->why == WG_PATH_WHY_DOUBT ? g.path.doubts_total : g.path.lapses;
         n->ms = (uint32_t)(g.path.unconfirmed_us / 1000);
         break;
     case WG_PATH_RELAY:
-        if (n->why == WG_PATH_WHY_SILENT) {
-            n->count = g.path.silences;
+        if (n->why == WG_PATH_WHY_SILENT || n->why == WG_PATH_WHY_UNDELIVERED) {
+            n->count = n->why == WG_PATH_WHY_SILENT ? g.path.silences : g.path.undelivered;
             n->ms = (uint32_t)(g.path.unconfirmed_us / 1000);
         } else {
             n->count = g.path.deaths;
@@ -686,13 +696,20 @@ static __attribute__((noinline)) void path_note_log(const path_note_t *n)
     char ip[16];
     inet_ntoa_r(n->ep.sin_addr, ip, sizeof(ip));
     const unsigned port = ntohs(n->ep.sin_port);
+    const unsigned s10 = (unsigned)(n->ms / 1000), d10 = (unsigned)(n->ms % 1000 / 100);
     switch (n->to) {
     case WG_PATH_DUAL:
-        /* Only a lapse lands here: a roam logs its own line. */
+        if (n->why == WG_PATH_WHY_DOUBT) {
+            ESP_LOGI(TAG, "direct path to %s:%u answers DISCO (rtt %u ms), but no "
+                          "WireGuard packet from the peer for %u.%u s — via DERP "
+                          "too until one comes (doubt %u)",
+                     ip, port, (unsigned)n->rtt_ms, s10, d10, (unsigned)n->count);
+            break;
+        }
+        /* Otherwise only a lapse lands here: a roam logs its own line. */
         if (n->from != WG_PATH_DIRECT || n->why == WG_PATH_WHY_ENDPOINT) return;
         ESP_LOGI(TAG, "direct path unconfirmed for %u.%u s (%s) — sending via "
-                      "DERP too, pinging %s:%u (lapse %u)",
-                 (unsigned)(n->ms / 1000), (unsigned)(n->ms % 1000 / 100),
+                      "DERP too, pinging %s:%u (lapse %u)", s10, d10,
                  n->why == WG_PATH_WHY_IDLE ? "first data after a pause"
                                             : "no answer to our data",
                  ip, port, (unsigned)n->count);
@@ -700,33 +717,55 @@ static __attribute__((noinline)) void path_note_log(const path_note_t *n)
     case WG_PATH_RELAY:
         if (n->why == WG_PATH_WHY_SILENT) {
             /* rekey: the first of a streak — a fresh session silent too
-             * means WireGuard itself is dropped there, back off. */
-            ESP_LOGW(TAG, "direct path to %s:%u answers DISCO (rtt %u ms) but "
-                          "no WireGuard packet from the peer for %u.%u s — "
-                          "DERP only, %s (silent %u)",
-                     ip, port, (unsigned)n->rtt_ms, (unsigned)(n->ms / 1000),
-                     (unsigned)(n->ms % 1000 / 100),
-                     n->rekey ? "rekeying" : "fresh session silent too, re-probing",
-                     (unsigned)n->count);
+             * means WireGuard itself is dropped there: back off. */
+            ESP_LOGW(TAG, "no WireGuard packet from the peer by either path for "
+                          "%u.%u s, DISCO answers on %s:%u — DERP only, %s, "
+                          "re-testing direct in %u s (silent %u)", s10, d10, ip, port,
+                     n->rekey ? "rekeying" : "a fresh session is silent too",
+                     (unsigned)n->retest_s, (unsigned)n->count);
+            break;
+        }
+        if (n->why == WG_PATH_WHY_UNDELIVERED) {
+            ESP_LOGW(TAG, "direct path to %s:%u: the peer answers only what goes via "
+                          "DERP (%u.%u s since the first unanswered frame) — DERP "
+                          "only, re-testing direct in %u s (undelivered %u)",
+                     ip, port, s10, d10, (unsigned)n->retest_s, (unsigned)n->count);
             break;
         }
         ESP_LOGW(TAG, "direct path to %s:%u dead (no pong in %u.%u s) — "
                       "DERP only, probing every endpoint (%u)",
-                 ip, port, (unsigned)(n->ms / 1000), (unsigned)(n->ms % 1000 / 100),
-                 (unsigned)n->count);
+                 ip, port, s10, d10, (unsigned)n->count);
         break;
     case WG_PATH_DIRECT:
-        if (n->count <= 1) {
+        if (n->from == WG_PATH_DUAL && n->from_why == WG_PATH_WHY_DOUBT) {
+            ESP_LOGI(TAG, "direct path re-confirmed (WireGuard from the peer, "
+                          "%u.%u s off direct) — DERP copies stop (%u)", s10, d10,
+                     (unsigned)n->count);
+        } else if (n->count <= 1) {
             ESP_LOGI(TAG, "direct path confirmed (pong from %s:%u, rtt %u ms)",
                      ip, port, (unsigned)n->rtt_ms);
         } else {
             ESP_LOGI(TAG, "direct path re-confirmed (pong from %s:%u, rtt %u ms) "
                           "after %u.%u s off direct — DERP copies stop (%u)",
-                     ip, port, (unsigned)n->rtt_ms, (unsigned)(n->ms / 1000),
-                     (unsigned)(n->ms % 1000 / 100), (unsigned)n->count);
+                     ip, port, (unsigned)n->rtt_ms, s10, d10, (unsigned)n->count);
         }
         break;
     }
+}
+
+/* The transition a WireGuard packet made (a doubt ended), logged once the
+ * caller dropped g.lock: the note is taken here, in its own frame —
+ * handle_transport sits on the DERP task's deepest chain (into lwIP), and
+ * a note in its frame cost that chain 64 B. The snapshot is a few µs
+ * late; for a log line that is fine. */
+static __attribute__((noinline)) void path_note_after(wg_path_mode_t from,
+                                                      wg_path_why_t from_why)
+{
+    path_note_t note;
+    xSemaphoreTake(g.lock, portMAX_DELAY);
+    path_note_take(&note, from, from_why);
+    xSemaphoreGive(g.lock);
+    path_note_log(&note);
 }
 
 /* WG_PATH_ACT_RESCUE: the relay belongs to wg_tx, so hand it the job with
@@ -1054,9 +1093,15 @@ static bool handle_handshake_response_locked(const uint8_t *buf, size_t len,
     g.prev_local_index = g.transport.local_index;
     wg_transport_session_init(&g.transport, g.local_index, remote_index,
                               send_key, recv_key);
-    /* The peer's response cancelled its pending passive keepalive. */
-    wg_path_on_handshake(&g.path, now);
+    /* The peer's response cancelled its pending passive keepalive; it also
+     * ends a doubt (the peer's WireGuard is alive). */
+    const wg_path_mode_t pfrom = g.path.mode;
+    const wg_path_why_t  pwhy  = g.path.why;
+    const uint32_t path_act = wg_path_on_handshake(&g.path, now);
+    const bool path_noted = path_moved(pfrom, pwhy);
     xSemaphoreGive(g.lock);
+    if (path_noted) path_note_after(pfrom, pwhy);
+    queue_rescue(path_act);
     /* Scrub once the keys are copied into the session. The live Noise
      * material goes; the per-peer cache (static-static DH, mac1 keys)
      * stays for the next rekey (B11) — wg_handshake_init recomputes it
@@ -1239,6 +1284,10 @@ static bool handle_transport(const uint8_t *buf, size_t len,
     rc = wg_transport_rx_commit(&g.transport, &t);
     uint32_t races = 0;
     bool roam = false;
+    uint32_t path_act = 0;
+    bool path_noted = false;
+    wg_path_mode_t pfrom = WG_PATH_DUAL;
+    wg_path_why_t  pwhy  = WG_PATH_WHY_START;
     if (rc == 0) {
         /* Successful decrypt = peer's session keys still match ours.
          * Update the RX-stale watchdog clock under the same lock for both
@@ -1248,8 +1297,11 @@ static bool handle_transport(const uint8_t *buf, size_t len,
         const int64_t tnow = now_us();
         g.last_transport_recv_us = tnow;
         memset(&g.rxd, 0, sizeof(g.rxd));
-        if (t.plen == 0) wg_path_on_keepalive(&g.path, tnow);
-        else             wg_path_on_peer_data(&g.path, tnow);
+        pfrom = g.path.mode;
+        pwhy  = g.path.why;
+        path_act = t.plen == 0 ? wg_path_on_keepalive(&g.path, tnow)
+                               : wg_path_on_peer_data(&g.path, tnow);
+        path_noted = path_moved(pfrom, pwhy);   /* a doubt ended */
         roam = src != NULL && !from_peer && wg_path_may_roam(&g.path, tnow);
     } else if (rc == WG_TRANSPORT_RX_STALE) {
         races = ++g.stat_rx_keypair_race;
@@ -1276,6 +1328,8 @@ static bool handle_transport(const uint8_t *buf, size_t len,
         }
         return false;
     }
+    if (path_noted) path_note_after(pfrom, pwhy);
+    queue_rescue(path_act);   /* the peer answers only what went via DERP */
     if (roam) {
         roam_to(src, "authenticated transport");
     }
@@ -1322,8 +1376,8 @@ static void handle_disco_direct_snap(const uint8_t *buf, size_t len,
  * endpoint, moves it (betterAddr, or the first pong while the current one
  * is not valid) or is kept out — the 1.3.5 roam to every pong flapped
  * between two endpoints of the peer, 41 roams in 2 h — or, answering a
- * lapse while nothing came from the peer, sends the path to DERP and
- * starts a rekey (WG_PATH_PONG_SILENT). A pending INIT is
+ * lapse while nothing came from the peer, puts it in doubt
+ * (WG_PATH_PONG_DOUBT: still both ways, WireGuard decides). A pending INIT is
  * re-sent / refreshed down the path only when the pong changed it (a
  * roam, or the first proof after DUAL / RELAY): B7's boot case is exactly
  * that, and a pong merely re-proving a live path was what replaced INITs
@@ -1338,6 +1392,7 @@ static __attribute__((noinline)) void rx_pong(const struct sockaddr_in *src,
     const struct sockaddr_in was = g.peer_addr;
     const uint32_t was_rtt_ms = g.path.rtt_us / 1000u;
     const wg_path_mode_t from = g.path.mode;
+    const wg_path_why_t from_why = g.path.why;
     const bool was_valid = wg_path_valid(&g.path, now);
     uint32_t act = 0;
     const wg_path_pong_t r = wg_path_on_pong(
@@ -1354,8 +1409,9 @@ static __attribute__((noinline)) void rx_pong(const struct sockaddr_in *src,
         rebuild_peer_sockaddr();
         g.stat_roams++;
     }
-    const bool moved = g.path.mode != from;
-    path_note_take(&note, from);
+    const bool moved = g.path.mode != from;     /* a doubt keeps DUAL */
+    const bool noted = path_moved(from, from_why);
+    path_note_take(&note, from, from_why);
     xSemaphoreGive(g.lock);
 
     char ip[16], was_ip[16];
@@ -1382,7 +1438,7 @@ static __attribute__((noinline)) void rx_pong(const struct sockaddr_in *src,
                  was_ip, (unsigned)ntohs(was.sin_port),
                  note.count > 1 ? "re-" : "", (unsigned)(note.ms / 1000),
                  (unsigned)(note.ms % 1000 / 100), (unsigned)note.count);
-    } else if (moved) {
+    } else if (noted) {
         path_note_log(&note);
     } else if (r == WG_PATH_PONG_KEPT) {
         char src_ip[16];
@@ -1391,21 +1447,8 @@ static __attribute__((noinline)) void rx_pong(const struct sockaddr_in *src,
                  src_ip, (unsigned)ntohs(src->sin_port),
                  (unsigned)(rtt_us / 1000u), ip, (unsigned)ntohs(note.ep.sin_port));
     }
-    queue_rescue(act);   /* moved off a lapsed endpoint, or WG-silent */
-    if (act & WG_PATH_ACT_REKEY) {
-        /* DISCO answers, WireGuard does not: the session is the suspect —
-         * rekey now, not at the RX-stale 30 s (the soak's 30-s silence
-         * ended 60 ms into that rekey). Make-before-break: the old keys
-         * serve until the response. One in flight already (proactive, or
-         * the RX-stale one) does the same. */
-        xSemaphoreTake(g.hs_lock, portMAX_DELAY);
-        if (g.state == WG_NETIF_UP && !g.rekey_in_flight) {
-            g.rekey_attempt = 0;
-            g.stat_silent_rekeys++;
-            start_rekey();
-        }
-        xSemaphoreGive(g.hs_lock);
-    } else if ((roam || moved) && r != WG_PATH_PONG_SILENT) {
+    queue_rescue(act);   /* moved off a lapsed endpoint */
+    if (roam || moved) {
         xSemaphoreTake(g.hs_lock, portMAX_DELAY);
         init_refresh_or_resend(true, false, false, "pong");
         xSemaphoreGive(g.hs_lock);
@@ -1674,9 +1717,10 @@ static __attribute__((noinline)) void rx_path_tick(int64_t now)
     path_note_t note;
     xSemaphoreTake(g.lock, portMAX_DELAY);
     const wg_path_mode_t from = g.path.mode;
+    const wg_path_why_t from_why = g.path.why;
     const uint32_t act = wg_path_tick(&g.path, now);
-    const bool moved = g.path.mode != from;
-    if (moved) path_note_take(&note, from);
+    const bool moved = path_moved(from, from_why);
+    if (moved) path_note_take(&note, from, from_why);
     if (act & WG_PATH_ACT_PROBE) g.last_path_probe_us = now;  /* shared cooldown */
     xSemaphoreGive(g.lock);
     if (moved) path_note_log(&note);
@@ -1685,6 +1729,19 @@ static __attribute__((noinline)) void rx_path_tick(int64_t now)
         g.path_stale_cb(g.path_stale_cb_user);
     }
     queue_rescue(act);
+    if (act & WG_PATH_ACT_REKEY) {
+        /* SILENT: two windows without a WireGuard packet by either path
+         * while DISCO answers — the session is the suspect. Usually the
+         * RX-stale rekey (30 s after the last decrypt) is in flight by
+         * then and does it; make-before-break either way. */
+        xSemaphoreTake(g.hs_lock, portMAX_DELAY);
+        if (g.state == WG_NETIF_UP && !g.rekey_in_flight) {
+            g.rekey_attempt = 0;
+            g.stat_silent_rekeys++;
+            start_rekey();
+        }
+        xSemaphoreGive(g.hs_lock);
+    }
 }
 
 /* The next RX wait in ms. Planned from a fresh clock read, not the
@@ -1981,7 +2038,12 @@ retry_timer:;
         }
         xSemaphoreGive(g.hs_lock);
 
-        rx_path_tick(now);
+        /* A fresh clock: `now` was read before this iteration's packet,
+         * whose handling (roam_to) or the long-poll task's endpoint update
+         * may have stamped the path later — the DUAL tick would ping, see
+         * its deadline still ahead of `now`, and ping again at the next
+         * wake (review of 1.3.6: two pings per endpoint change). */
+        rx_path_tick(now_us());
 
         /* Persistent-keepalive trigger. WG NAT mappings on the
          * outbound path decay after ~30-60 s of idle (CGNAT being the
@@ -2099,10 +2161,12 @@ static void tx_send_item(const wg_tx_item_t *it, int64_t now)
     path_note_t note;
     xSemaphoreTake(g.lock, portMAX_DELAY);
     const wg_path_mode_t from = g.path.mode;
+    const wg_path_why_t from_why = g.path.why;
     const uint32_t act = wg_path_on_send(&g.path, now, it->data, &mode);
-    if (mode != from) path_note_take(&note, from);
+    const bool moved = path_moved(from, from_why);
+    if (moved) path_note_take(&note, from, from_why);
     xSemaphoreGive(g.lock);
-    if (mode != from) path_note_log(&note);
+    if (moved) path_note_log(&note);
     if (act & WG_PATH_ACT_PING) path_ping();   /* a lapse seen first here */
     if (g.relay_cb == NULL) mode = WG_PATH_DIRECT;   /* nothing else to use */
 
@@ -2700,7 +2764,9 @@ void wg_netif_get_stats(wg_netif_stats_t *out)
     out->path_lapses           = g.path.lapses;
     out->path_deaths           = g.path.deaths;
     out->path_confirms         = g.path.confirms;
+    out->path_doubts           = g.path.doubts_total;
     out->path_silences         = g.path.silences;
+    out->path_undelivered      = g.path.undelivered;
     out->silent_rekeys         = g.stat_silent_rekeys;
     xSemaphoreGive(g.lock);
 }

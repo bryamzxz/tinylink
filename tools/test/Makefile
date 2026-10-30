@@ -272,8 +272,9 @@ test_wg_timers: test_wg_timers.c $(TL_SRC)/wg_timers.h
 	$(CC) $(CFLAGS) -I$(TL_SRC) -o $@ test_wg_timers.c
 
 # Data-plane path selection (round 1.3.6): direct / dual / DERP-only,
-# pong rounds, and a simulation of the peer's passive keepalives over
-# healthy, dead, one-way, healing and WireGuard-silent paths. Header-only.
+# pong rounds, late RX wakes, and a simulation of the
+# peer's passive keepalives over healthy, lossy, dead, one-way, healing
+# and WireGuard-silent paths. Header-only.
 test_wg_path: test_wg_path.c $(TL_SRC)/wg_path.h $(TL_SRC)/wg_timers.h
 	$(CC) $(CFLAGS) -I$(TL_SRC) -o $@ test_wg_path.c
 
