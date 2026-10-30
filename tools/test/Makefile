@@ -27,7 +27,7 @@ TL_INC  := ../../components/tinylink/include
 TARGETS := test_blake2s test_curve25519 test_x25519 test_mapresp \
            test_chacha20 test_poly1305 test_chacha20poly1305 \
            test_hkdf_noise test_wg_handshake test_wg_transport \
-           test_wg_demux test_wg_timers test_disco test_stun test_tls_io test_derp \
+           test_wg_demux test_wg_timers test_wg_path test_disco test_stun test_tls_io test_derp \
            test_disco_handler test_disco_prober test_retry_after \
            test_backoff test_keys_regen test_stun_boot test_skip_value test_jsmn_split \
            test_tai64n test_nacl_box test_tsmp test_tl_date test_stats test_noise_ik \
@@ -271,6 +271,12 @@ test_wg_demux: test_wg_demux.c $(TL_SRC)/wg_demux.c $(TL_SRC)/wg_demux.h
 test_wg_timers: test_wg_timers.c $(TL_SRC)/wg_timers.h
 	$(CC) $(CFLAGS) -I$(TL_SRC) -o $@ test_wg_timers.c
 
+# Data-plane path selection (round 1.3.6): direct / dual / DERP-only,
+# pong rounds, and a simulation of the peer's passive keepalives over
+# healthy, dead, one-way, healing and WireGuard-silent paths. Header-only.
+test_wg_path: test_wg_path.c $(TL_SRC)/wg_path.h $(TL_SRC)/wg_timers.h
+	$(CC) $(CFLAGS) -I$(TL_SRC) -o $@ test_wg_path.c
+
 # DISCO codec (Tailscale magicsock NAT-traversal messages). Pulls in the
 # nacl_box wrapper (XSalsa20 + the in-tree poly1305-donna).
 test_disco: test_disco.c \
@@ -419,7 +425,7 @@ asan:
 test: test_blake2s.run test_curve25519.run test_x25519.run test_mapresp.run \
       test_chacha20.run test_poly1305.run test_chacha20poly1305.run \
       test_hkdf_noise.run test_wg_handshake.run test_wg_transport.run \
-      test_wg_demux.run test_wg_timers.run test_disco.run test_stun.run test_tls_io.run \
+      test_wg_demux.run test_wg_timers.run test_wg_path.run test_disco.run test_stun.run test_tls_io.run \
       test_derp.run test_disco_handler.run test_disco_prober.run \
       test_retry_after.run test_backoff.run test_keys_regen.run test_stun_boot.run \
       test_skip_value.run test_jsmn_split.run test_tai64n.run \
@@ -525,6 +531,9 @@ test_wg_demux.run: test_wg_demux
 
 test_wg_timers.run: test_wg_timers
 	$(RUNNER) ./test_wg_timers
+
+test_wg_path.run: test_wg_path
+	$(RUNNER) ./test_wg_path
 
 test_disco.run: test_disco
 	$(RUNNER) ./test_disco
