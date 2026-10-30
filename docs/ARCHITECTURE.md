@@ -552,7 +552,10 @@ control channel:
    doubled after each expiry up to the idle budget, twice the last
    answer's time after an answer; an expiry recycles the conn (one W
    line), and only the second in a row counts as a transport failure
-   for the :80 early-drop and cached-address rules.
+   for the :80 early-drop and cached-address rules. After a map stream
+   the server ended cleanly (END_STREAM), polls get the idle budget and
+   their expiries count as nothing until one is answered; received
+   bytes are always read before the deadline counts as passed.
 2. **Reconnect with fresh handshake + capped backoff** (pre-existing
    RC-2 shape, unchanged): on any stream end the conn is dropped
    entirely and re-established from scratch — `tl_backoff_ms`

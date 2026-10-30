@@ -129,12 +129,13 @@ ended a map stream cleanly, the reconnect's streaming MapRequest got no
 answer at all and sat out the stream's 4 × 30-s budget (`control stream
 silent past 120 s — declaring dead`, twice), the conn after it its
 netmap 26 / 55 s after the request — 152 / 181 s without a netmap.
-Image 731 952 → **732 960 B (+1 008)**; static DRAM 58 116 → 58 212 B
-(+96), IRAM ±0. Host suite 2 092 → **2 117 OK** (CI floor 2 117),
+Image 731 952 → **733 136 B (+1 184)**; static DRAM 58 116 → 58 212 B
+(+96), IRAM ±0. Host suite 2 092 → **2 135 OK** (CI floor 2 135),
 ASan + UBSan clean, 0 warnings. `tools/stack_worst.py`: `tinylink_lp`
-5 168 → 5 184 / 7 168, `main` 5 424 → 5 440 / 8 192 (the seventh
-request header in `h2_drive_request`'s frame), the rest unchanged. Not
-yet on the sensor.
+5 168 → 5 232 / 7 168 (the seventh request header in
+`h2_drive_request`'s frame, the buffered-bytes check under a write),
+`main` 5 424 → 5 440 / 8 192, the rest unchanged. Not yet on the
+sensor.
 
 - **C1 — the map stream's first-response deadline.** Every first
   response in the 1.3.0–1.3.7 captures (`~/tinylink-backups`, 111 conns
@@ -162,9 +163,8 @@ yet on the sensor.
   40 s next time instead of a cut at every reconnect. With the push
   riding along (B1, default off), a push that closes before the stream
   answers hands the conn to the stream's deadline, counted from the
-  burst. If tailscale.com holds every poll until something on its side
-  is done, a recycle only resubmits (a gap of one :80 connect each
-  time); if the stalled poll was lost, it saves up to 105 s. Logs:
+  burst. A poll after a clean server end is the exception (Review
+  below): it keeps the 120 s 1.3.7 gave it. Logs:
   `ts2021: control stream: no response within 15000 ms — recycling the
   conn` (W), `long-poll stream recycled (no response) — reconnecting`
   (I); every stream `h2: map stream answered: HTTP 200 in N ms` (I) —
@@ -178,7 +178,8 @@ yet on the sensor.
   / after the deadline, a body long after the headers, the B1
   hand-over); a reconnect probe (clean end, two unanswered conns, an
   answered one, each EarlyPayload split) 33 / 33.
-- **C2 — a recycle is not a :80 failure; a repeated one is.** The
+- **C2 — a recycle is not a :80 failure; a repeated one is** (outside
+  the polls after a clean server end, whose expiries never are). The
   1.3.5 rule (a :80 conn that fails within 120 s of its handshake sends
   the next dial to :443 — tailscale#13597, upstream's "recent noise
   dial") and the cached-address rule (a young conn there that fails →
@@ -228,6 +229,31 @@ yet on the sensor.
   early-drop rule on a FIN* (1.3.5 series boot 10: FIN at 27 s → :443,
   +1.8 s): kept — it is the #13597 hedge, and upstream's rule is wider
   (any dial within 2 min of the last).
+- **Review.** An independent review found one demonstrated defect and
+  one design risk, both fixed. With the push riding along (B1, default
+  off), a push that closed after the stream's own deadline had passed
+  armed it in the past, and the next read failed before reading the
+  stream's 200 already received behind the push's answer — recycled as
+  "no response", the second time with the :443 / DNS escalation; the
+  first-response deadline now is not past while received bytes wait
+  unread (`ts2021_rx_ready`, the 1.3.7 rule for the push; the one-shot
+  deadline keeps no such grace), the review's demo is a host test. And
+  every poll after a clean server end had been slow on the server's
+  side, so cutting those at 15 / 30 s and then dialing :443 would have
+  only resubmitted them (59 s → ~105 s, 104 s → ~210 s): until a stream
+  is answered, a poll after a map stream the server ended (END_STREAM
+  after its 200) gets the stream budget — 120 s; 60 s would have cut
+  three of the five answers, the 59-s one by 1 s — and its expiries move
+  neither the ladder, the streak nor the conn's failure accounting
+  (`map stream after a clean server end: 120000 ms for its answer`, I);
+  boots, FINs, errors and recycles keep 15 s. So on the two 1.3.7
+  stalls the change from 1.3.7 is the redial at once and no :443
+  detour; the 15-s deadline is for polls that stall without such an
+  end. The "second expiry in a row → :443" rule is now tested end to
+  end (`test_ts2021_e2e`: `h2_post_json_stream` on conns
+  `ts2021_connect` dials, through `ts2021_close`). Tests:
+  `test_h2_interop` +10, `test_ts2021` +1, `test_ts2021_e2e` 7; image
+  +176 B.
 
 #### Wi-Fi (`feat/r138-wifi`)
 
