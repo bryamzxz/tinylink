@@ -7,7 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Optimization round 1.3.9 (in progress, branch `feat/opt-1.3.9`)
+### Optimization round 1.3.9 — ships as 1.4.0 (in progress, branch `feat/opt-1.3.9`)
+
+The last round of the 1.3.x line: the firmware reports **1.4.0**, the
+last release of this work line. What is left is in `docs/BACKLOG.md`.
 
 #### Warm start: WireGuard up before the netmap (`feat/r139-warm`)
 
