@@ -190,7 +190,7 @@ static void test_text(void)
 
     /* Go's canonical forms survive the round trip unchanged. */
     static const char *const cidrs[] = { "192.0.2.10/32", "198.51.100.0/24", "203.0.113.255/31",
-                                         "1.0.0.0/8", "223.255.255.254/32" };
+                                         "10.0.0.0/8", "198.51.100.254/32" };
     all = 1;
     for (size_t i = 0; i < sizeof(cidrs) / sizeof(cidrs[0]); i++) {
         tl_cidr_t out;
@@ -200,7 +200,7 @@ static void test_text(void)
     }
     check("cidr/canonical-round-trip", all);
     static const char *const eps[] = { "203.0.113.7:41641", "198.51.100.9:1", "192.0.2.255:65535",
-                                       "10.0.0.1:41641", "223.255.255.254:53" };
+                                       "10.0.0.1:41641", "192.0.2.254:53" };
     all = 1;
     for (size_t i = 0; i < sizeof(eps) / sizeof(eps[0]); i++) {
         tl_endpoint_t out;
