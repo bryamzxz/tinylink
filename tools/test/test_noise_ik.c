@@ -165,6 +165,62 @@ static void r_seal(const uint8_t k[32], uint64_t n, const uint8_t *pt,
     chacha20poly1305_encrypt(ct, pt, len, NULL, 0, k, nonce);
 }
 
+/* Round 1.3.7, B2: msg1 from precomputed DH (noise_ik_pre_t) is the same
+ * message, with the same transport keys. */
+static void test_precomputed_msg1(const uint8_t s_pub[32], const uint8_t c_pub[32])
+{
+    static noise_ik_state_t st;
+    noise_ik_pre_t pre;
+    uint8_t msg1[NOISE_IK_MSG1_LEN];
+
+    /* e + es + ss ahead: e is the generator's seed, as in the vector */
+    memset(&pre, 0, sizeof(pre));
+    s_rng_calls = 0;
+    check("pre/compute-all",
+          noise_ik_precompute(&pre, kMachinePriv, c_pub, true) == ESP_OK &&
+          pre.have_ss && pre.have_e);
+    noise_ik_init(&st, kMachinePriv, s_pub, c_pub, PROTOCOL_NAME,
+                  (const uint8_t *)PROLOGUE, strlen(PROLOGUE));
+    const unsigned calls = s_rng_calls;
+    check("pre/msg1-all-ahead",
+          noise_ik_write_msg1_pre(&st, msg1, &pre) == ESP_OK && s_rng_calls == calls);
+    check_bytes("pre/msg1-vector", msg1, kMsg1, sizeof(kMsg1));
+    check("pre/split-vector",
+          noise_ik_read_msg2(&st, kMsg2) == ESP_OK &&
+          memcmp(st.k_send, kSplitSend, 32) == 0 && memcmp(st.k_recv, kSplitRecv, 32) == 0);
+
+    /* ss only: e drawn in msg1 */
+    noise_ik_pre_t ss_only;
+    memset(&ss_only, 0, sizeof(ss_only));
+    check("pre/compute-ss-only",
+          noise_ik_precompute(&ss_only, kMachinePriv, c_pub, false) == ESP_OK &&
+          ss_only.have_ss && !ss_only.have_e && memcmp(ss_only.ss, pre.ss, 32) == 0);
+    s_rng_calls = 0;
+    noise_ik_init(&st, kMachinePriv, s_pub, c_pub, PROTOCOL_NAME,
+                  (const uint8_t *)PROLOGUE, strlen(PROLOGUE));
+    check("pre/msg1-ss-ahead", noise_ik_write_msg1_pre(&st, msg1, &ss_only) == ESP_OK);
+    check_bytes("pre/msg1-ss-vector", msg1, kMsg1, sizeof(kMsg1));
+
+    /* the cached ss is used: a wrong one changes only the payload tag */
+    ss_only.ss[7] ^= 0x80;
+    s_rng_calls = 0;
+    noise_ik_init(&st, kMachinePriv, s_pub, c_pub, PROTOCOL_NAME,
+                  (const uint8_t *)PROLOGUE, strlen(PROLOGUE));
+    noise_ik_write_msg1_pre(&st, msg1, &ss_only);
+    check("pre/wrong-ss-tag-only",
+          memcmp(msg1, kMsg1, 80) == 0 && memcmp(msg1 + 80, kMsg1 + 80, 16) != 0);
+
+    /* a low-order server key: nothing computed */
+    static const uint8_t zero[32] = { 0 };
+    noise_ik_pre_t bad;
+    memset(&bad, 0, sizeof(bad));
+    check("pre/low-order-refused",
+          noise_ik_precompute(&bad, kMachinePriv, zero, true) == ESP_FAIL &&
+          !bad.have_ss && !bad.have_e);
+    check("pre/null-args", noise_ik_precompute(NULL, kMachinePriv, c_pub, true) ==
+                           ESP_ERR_INVALID_ARG);
+}
+
 /* --- test ----------------------------------------------------------- */
 
 int main(void)
@@ -372,6 +428,8 @@ int main(void)
                                                   &out_len)
                                      == ESP_ERR_INVALID_ARG);
     }
+
+    test_precomputed_msg1(s_pub, c_pub);
 
     if (s_fails == 0) printf("\nALL OK\n");
     return s_fails ? 1 : 0;

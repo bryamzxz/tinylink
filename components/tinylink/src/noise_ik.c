@@ -162,19 +162,56 @@ esp_err_t noise_ik_init(noise_ik_state_t *st,
     return ESP_OK;
 }
 
+esp_err_t noise_ik_precompute(noise_ik_pre_t *pre,
+                              const uint8_t s_priv[NOISE_DHLEN],
+                              const uint8_t rs[NOISE_DHLEN], bool want_e)
+{
+    if (pre == NULL || s_priv == NULL || rs == NULL) return ESP_ERR_INVALID_ARG;
+    if (!pre->have_ss) {
+        if (curve25519_dh(pre->ss, s_priv, rs) != 0) {
+            tl_secure_zero(pre->ss, sizeof(pre->ss));
+            return ESP_FAIL;
+        }
+        pre->have_ss = true;
+    }
+    if (want_e && !pre->have_e) {
+        if (curve25519_keypair(pre->e_priv, pre->e_pub) != 0 ||
+            curve25519_dh(pre->es, pre->e_priv, rs) != 0) {
+            tl_secure_zero(pre->e_priv, sizeof(pre->e_priv));
+            tl_secure_zero(pre->es, sizeof(pre->es));
+            return ESP_FAIL;
+        }
+        pre->have_e = true;
+    }
+    return ESP_OK;
+}
+
 esp_err_t noise_ik_write_msg1(noise_ik_state_t *st,
                               uint8_t out[NOISE_IK_MSG1_LEN])
+{
+    return noise_ik_write_msg1_pre(st, out, NULL);
+}
+
+esp_err_t noise_ik_write_msg1_pre(noise_ik_state_t *st,
+                                  uint8_t out[NOISE_IK_MSG1_LEN],
+                                  const noise_ik_pre_t *pre)
 {
     if (st == NULL || out == NULL) return ESP_ERR_INVALID_ARG;
 
     /* -> e */
-    if (curve25519_keypair(st->e_priv, st->e_pub) != 0) return ESP_FAIL;
+    uint8_t dh[NOISE_DHLEN];
+    if (pre != NULL && pre->have_e) {
+        memcpy(st->e_priv, pre->e_priv, NOISE_DHLEN);
+        memcpy(st->e_pub, pre->e_pub, NOISE_DHLEN);
+        memcpy(dh, pre->es, NOISE_DHLEN);
+    } else if (curve25519_keypair(st->e_priv, st->e_pub) != 0 ||
+               curve25519_dh(dh, st->e_priv, st->rs) != 0) {
+        return ESP_FAIL;
+    }
     memcpy(out, st->e_pub, NOISE_DHLEN);
     if (mix_hash(st, st->e_pub, NOISE_DHLEN) != ESP_OK) return ESP_FAIL;
 
     /* es: MixKey(DH(e, rs)) */
-    uint8_t dh[NOISE_DHLEN];
-    if (curve25519_dh(dh, st->e_priv, st->rs) != 0) return ESP_FAIL;
     if (mix_key(st, dh, NOISE_DHLEN) != ESP_OK) return ESP_FAIL;
 
     /* s: write EncryptAndHash(s_pub) — 48 bytes (32 + 16 tag). */
@@ -183,7 +220,11 @@ esp_err_t noise_ik_write_msg1(noise_ik_state_t *st,
                          st->s_pub, NOISE_DHLEN) != ESP_OK) return ESP_FAIL;
 
     /* ss: MixKey(DH(s, rs)) */
-    if (curve25519_dh(dh, st->s_priv, st->rs) != 0) return ESP_FAIL;
+    if (pre != NULL && pre->have_ss) {
+        memcpy(dh, pre->ss, NOISE_DHLEN);
+    } else if (curve25519_dh(dh, st->s_priv, st->rs) != 0) {
+        return ESP_FAIL;
+    }
     if (mix_key(st, dh, NOISE_DHLEN) != ESP_OK) return ESP_FAIL;
     tl_secure_zero(dh, sizeof(dh));  /* last use; before the next fallible step */
 
