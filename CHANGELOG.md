@@ -229,6 +229,82 @@ yet on the sensor.
   +1.8 s): kept — it is the #13597 hedge, and upstream's rule is wider
   (any dial within 2 min of the last).
 
+#### Wi-Fi (`feat/r138-wifi`)
+
+With the 1.3.7 channel hint, STA start → auth is ~180 ms on the sensor,
+~170 ms of it the driver's PBKDF2 on the passphrase (1.3.7 W4: 32.98 M
+instructions, 161–169 ms at 240 MHz, on the Wi-Fi task between the scan
+match and the auth frame). Image 731 952 → **738 192 B (+6 240)**; static
+DRAM +176 B (.bss), IRAM ±0; with the option off 732 016 B (+64, the
+credential scrubs). Host suite 2 092 → **2 120 OK** (CI floor 2 120),
+ASan + UBSan clean, 0 warnings; QEMU crypto job: every suite, 133 OK
+lines. Static worst cases: new `wifi_psk` 1 408 / 2 048 B, every other
+task unchanged. Not yet on the sensor.
+
+- **W4b — the PSK derived on CPU 1 (`main/wifi_psk.h`,
+  `CONFIG_TINYLINK_WIFI_EARLY_PSK`, default y).** `app_wifi_start` reads
+  the credentials first (before esp_netif, the event loop and
+  `esp_wifi_init`; they came after) and starts `wifi_psk`, pinned to CPU 1
+  (priority 5, 2-KB stack, exits): PBKDF2-HMAC-SHA1(passphrase, SSID,
+  4096, 32) with the HMAC pad states computed once and every loop block —
+  a 20-B digest after a pad block — through an unrolled SHA-1 with the
+  constant message words folded in (one 3.9-KB copy): 23.8 M instructions
+  against the IDF's 32.98 M (rolled, 61.3 M), ≈ 115–120 ms at 240 MHz at
+  the 1.3.7 CPIs (DFS only starts after got-ip). The STA_START handler
+  waits for it (≤ 200 ms), writes the 64 lowercase hex digits into the
+  station config (`esp_wifi_get_config` / `set_config`, which keeps the
+  channel hint) and connects. In the driver, wpa.c `wpa_set_passphrase`
+  derives only when the profile's PMK is stale
+  (`esp_wifi_sta_get_reset_nvs_pmk_internal`): a password of
+  `os_strlen` 64 goes through `hexstr2bin` into the profile PMK, anything
+  else through `pbkdf2_sha1` (crypto_mbedtls.c → fastpbkdf2 on the
+  ESP32), and both continue with the same
+  `esp_wifi_sta_update_ap_info_internal` — so with WIFI_STORAGE_RAM the
+  hex path stores what the passphrase path did, nothing on flash. The
+  blob's station set_config has no hex check (its "password convert fail"
+  is the SoftAP's) and keeps 64 bytes plus a terminator
+  (`wifi_nvs_validate_sta_password`). Its PMK cache, keyed by SSID +
+  password string, then holds the hex form, so the 1.3.7 re-apply stays a
+  cache hit. Late, refused (a passphrase under 8 or of 64 characters, an
+  SSID of 0 or over 32 B — the driver's business as before), the task not
+  created or set_config failing: the passphrase config set before
+  `esp_wifi_start` stays and the driver derives. `tl_psk_publish` /
+  `tl_psk_claim` give the result one owner; the side that loses scrubs.
+  Scrubbed: `app_wifi_start`'s passphrase buffer and station config, the
+  task's copy, the PMK, the hex digits, the config in `psk_set_config`,
+  and the task's stack frames (a 768-B burn below `psk_task` before it
+  exits — the stack goes back to the heap as is). Not with WPA3-SAE (the
+  commit needs the passphrase; the option depends on
+  `!ESP_WIFI_ENABLE_WPA3_SAE`, off here) nor on a unicore build. The
+  config sits in `psk_set_config`'s own frame, so the sys_evt path under
+  the log call (2 304-B stack) grows by 32 B only.
+- **Verification.** `test_wifi_psk` (28 cases): IEEE 802.11-2020 J.4.1
+  (3), RFC 6070 (c = 4096), OpenSSL edge vectors (63-B passphrase with 32
+  NUL bytes of SSID, 0xff bytes with a 1-B SSID, an 8-B passphrase), a
+  byte-oriented reference PBKDF2 on 30 random length pairs, both
+  compressions against FIPS 180 and the reference, bounds, the hex digits
+  back through hostap's `hexstr2bin`, the hand-off. On the target
+  (`tools/qemu_crypto`, CI): the same suite, plus `psk_qemu.c` —
+  `tl_psk_derive` against the IDF's own `pbkdf2_sha1`, what wpa.c calls,
+  on 36 random passphrase / SSID pairs: byte-identical.
+
+Expected: STA start → auth ~180 → ~40–50 ms on every boot (−130–140 ms,
+got-ip the same): with the credentials read ~270–290 ms after reset the
+PSK is ready at ~390–410 ms, STA start comes at ~377 ms, so the handler
+waits ~15–35 ms, then the hinted scan (~10 ms) and the auth frame.
+Nothing else on STA start → auth is worth 30 ms: the hinted scan is
+10 ms in 13 of 17 boots (60–100 ms in the rest, the AP's probe response;
+a shorter active dwell risks missing it), and PHY calibration (~60 ms,
+before STA start) is now under the derivation, which sets the pace from
+there (auth ≈ max(STA start, PSK ready) + scan). What the series must
+show: `app_wifi: STA start, connecting`, then `wifi psk: derived on CPU 1
+in N ms, waited W ms — PSK to the driver, no PBKDF2 at the auth` (N ≈
+115–125, W ≈ 0–40), `init -> auth` ~10 ms after that line (~180 ms after
+STA start in 1.3.7), got-ip; never `wifi psk: not derived after …` or
+`esp_wifi_set_config failed`. A wrong PSK would read as a reason-15 4-way
+timeout on every attempt and no got-ip — the option off restores the
+driver's derivation.
+
 ### Optimization round 1.3.7 (in progress, branch `feat/opt-1.3.7`)
 
 #### Wi-Fi association (`feat/r137-wifi`)

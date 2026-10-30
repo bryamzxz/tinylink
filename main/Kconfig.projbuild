@@ -326,6 +326,23 @@ menu "tinylink application"
 
     endmenu
 
+    config TINYLINK_WIFI_EARLY_PSK
+        bool "Derive the WPA2 PSK on CPU 1 while the Wi-Fi driver starts"
+        depends on !FREERTOS_UNICORE && !ESP_WIFI_ENABLE_WPA3_SAE
+        default y
+        help
+            Round 1.3.8 (main/wifi_psk.h). The driver runs PBKDF2-HMAC-SHA1
+            on the passphrase (4096 iterations, ~165 ms at 240 MHz) between
+            the scan and the auth frame of every boot's association. With
+            this option the same derivation starts on CPU 1 as soon as the
+            credentials are read, overlapping esp_wifi_init, PHY
+            calibration and STA start on CPU 0; the STA-start handler waits
+            for it (at most 200 ms) and gives the driver the 64-hex-digit
+            PSK, which wpa.c takes without PBKDF2. Late or failed, the
+            driver derives from the passphrase as before. A 64-character
+            password is a PSK already and goes through untouched. Not with
+            WPA3-SAE, which needs the passphrase itself.
+
     config TINYLINK_WIFI_DIAG
         bool "Wi-Fi association diagnostics (EAPOL timeline)"
         default n
