@@ -226,8 +226,9 @@ costs no packet (upstream heartbeats a ping every 3 s). A pong from another endp
 moves a valid current one only if clearly better (upstream `betterAddr`
 points, +20 private, > 15 points and > 25 ms, compared within one ping
 round); an authenticated packet from another source roams only while
-the current one is not valid. A pong replaces the INIT in flight only
-when it changed the path and the INIT is ≥ 2.5 s old.
+the current one is not valid. A late answer to a replaced INIT is
+logged and dropped; a pong replaces the INIT in flight only when it
+changed the path and the INIT is ≥ 2.5 s old.
 
 ## `/stats` (M16, 2026-09)
 

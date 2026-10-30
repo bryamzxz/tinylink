@@ -252,7 +252,7 @@ test_h2_ref: test_h2_interop.c ref/h2_134/h2_client.c ref/h2_134/h2_client.h \
 # clock_gettime(2) — the ESP_PLATFORM branches in wg_proto.c are
 # guarded out at compile time.
 test_wg_handshake: test_wg_handshake.c \
-                  $(TL_SRC)/wg_handshake.c $(TL_SRC)/wg_handshake.h \
+                  $(TL_SRC)/wg_handshake.c $(TL_SRC)/wg_handshake.h $(TL_SRC)/wg_path.h \
                   $(TL_SRC)/wg_proto.c $(TL_SRC)/wg_proto.h \
                   $(CRYPTO)/blake2s.c $(CRYPTO)/curve25519.c $(CRYPTO)/curve25519_fiat32.c \
                   $(CRYPTO)/hkdf_blake2s.c $(CRYPTO)/chacha20.c \

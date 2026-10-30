@@ -141,7 +141,14 @@ static const char *TAG = "wg_netif";
  * are one-offs per path change, so this stays far below any flood.
  * Younger than this, a response may still be in flight — re-send. The
  * bound is WG_INIT_FRESH_AFTER_MS (wg_path.h): 1 s until 1.3.5, 2.5 s
- * since answers to replaced INITs were seen arriving later on the sensor. */
+ * since answers to replaced INITs were seen arriving later on the sensor.
+ *
+ * Keeping the replaced INIT's Noise state to accept such a late answer
+ * was considered and rejected: a responder that got both INITs keeps only
+ * the session of the second (wireguard-go BeginSymmetricSession deletes
+ * the unconfirmed `next` keypair it replaces), so installing the keys of
+ * the first would black-hole our transport until the RX-stale rekey. A
+ * late answer is logged and dropped (handle_handshake_response_locked). */
 
 /* Upper bound on one RX wait. The RX task sleeps until its next timer
  * deadline (wg_timers.h) but no longer than this, so a deadline another
@@ -509,6 +516,11 @@ static struct {
     uint8_t                  rescue_head;
     volatile bool            rescue_queued;
     uint32_t                 stat_rescued;
+    /* The INIT the last new one replaced, and when (hs_lock): an answer
+     * to it arriving afterwards is logged once, then dropped. */
+    uint32_t                 replaced_index;
+    int64_t                  replaced_us;
+    uint32_t                 stat_late_responses;
     uint32_t                 stat_silent_rekeys;   /* rekeys started by a WG-silent pong */
     /* Wi-Fi came back (IP_EVENT_STA_GOT_IP): rx_task re-sends a pending
      * INIT at its next wake. Set by the event task. */
@@ -839,6 +851,11 @@ static int build_and_send_init(void)
 {
     const int64_t now = now_us();
     g.last_handshake_us = now;
+    if (g.init_valid) {
+        /* Unanswered: its answer may still arrive — recognised then. */
+        g.replaced_index = g.local_index;
+        g.replaced_us    = now;
+    }
     g.init_valid = false;
     if (wg_handshake_init(&g.handshake,
                           g.local.static_priv,
@@ -1002,6 +1019,25 @@ static bool handle_handshake_response_locked(const uint8_t *buf, size_t len,
     }
     const struct wg_msg_response *resp = (const struct wg_msg_response *)buf;
 
+    /* The answer to the INIT a newer one replaced (a retry, or B7b's fresh
+     * INIT): its Noise state is gone, and keeping it would not help — see
+     * WG_INIT_FRESH_AFTER_MS. Not authenticated (anyone can echo an index
+     * seen on the wire), hence one line per replaced INIT, then dropped
+     * with the rest; process_response would refuse it on the index. */
+    if (g.replaced_index != 0 && resp->receiver_index == g.replaced_index &&
+        resp->receiver_index != g.local_index) {
+        g.stat_late_responses++;
+        ESP_LOGI(TAG, "handshake response for the replaced INIT idx=0x%08x, "
+                      "%u ms after it was replaced%s — dropped, awaiting "
+                      "idx=0x%08x (late: %u)",
+                 (unsigned)g.replaced_index,
+                 (unsigned)((now_us() - g.replaced_us) / 1000),
+                 via_relay ? " (via DERP)" : "", (unsigned)g.local_index,
+                 (unsigned)g.stat_late_responses);
+        g.replaced_index = 0;
+        return false;
+    }
+
     uint8_t send_key[WG_KEY_LEN], recv_key[WG_KEY_LEN];
     uint32_t remote_index = 0;
     if (wg_handshake_process_response(&g.handshake, resp,
@@ -1033,6 +1069,7 @@ static bool handle_handshake_response_locked(const uint8_t *buf, size_t len,
     g.last_handshake_completed_us = now;
     /* The attempt is answered: no more re-sends of its INIT (B7). */
     g.init_valid = false;
+    g.replaced_index = 0;
     /* Reset RX-stale watchdog clock on handshake (cold or rekey).
      * A fresh session starts with no transport packets seen yet —
      * setting last_transport_recv_us to now gives the watchdog a
@@ -2656,6 +2693,7 @@ void wg_netif_get_stats(wg_netif_stats_t *out)
     out->relay_errors          = g.relay_errors;
     out->last_transport_recv_us = g.last_transport_recv_us;
     out->last_handshake_completed_us = g.last_handshake_completed_us;
+    out->late_responses        = g.stat_late_responses;
     out->rescued               = g.stat_rescued;
     xSemaphoreTake(g.lock, portMAX_DELAY);
     out->path_mode             = (uint8_t)g.path.mode;

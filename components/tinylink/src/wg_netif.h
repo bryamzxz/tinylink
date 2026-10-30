@@ -301,6 +301,7 @@ typedef struct {
     uint32_t path_silences;          /* pong answered, WG silent: → DERP only */
     uint32_t silent_rekeys;          /* ...and the rekeys they started */
     uint32_t rescued;                /* direct-only frames re-sent via DERP */
+    uint32_t late_responses;         /* answers to replaced INITs (dropped) */
 } wg_netif_stats_t;
 
 void wg_netif_get_stats(wg_netif_stats_t *out);

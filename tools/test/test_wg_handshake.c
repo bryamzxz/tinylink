@@ -29,6 +29,7 @@
 
 #include "wg_proto.h"
 #include "wg_handshake.h"
+#include "wg_path.h"
 
 #include "crypto/blake2s.h"
 #include "crypto/chacha20poly1305.h"
@@ -752,12 +753,76 @@ static void test_cached_identity(void) {
     } else { printf("[cache/scrub-drops-cache] OK\n"); }
 }
 
+/* Round 1.3.6, late answers. wg_netif replaces the INIT in flight on a
+ * path event (B7b) only once it is WG_INIT_FRESH_AFTER_MS old — 1 s until
+ * 1.3.5, when answers arriving later were refused on the sensor. An
+ * answer 2 s after its INIT now finds it; past the bound the INIT is
+ * replaced, the old answer is refused (its Noise state is gone — keeping
+ * it was rejected, see wg_netif.c) and the new INIT's answer completes. */
+static void test_late_response(void) {
+    uint8_t ipriv[32], ipub[32], rpriv[32], rpub[32], psk[32] = {0};
+    if (curve25519_keypair(ipriv, ipub) != 0 || curve25519_keypair(rpriv, rpub) != 0) {
+        printf("[late/keypairs] FAIL\n"); fails++; return;
+    }
+    struct sim_responder r;
+    memcpy(r.static_priv, rpriv, 32);
+    memcpy(r.static_pub, rpub, 32);
+    const int64_t t_init = 10000000;   /* µs */
+
+    /* A pong 1.5 s after the INIT: re-send, not replace; the answer at
+     * 2 s completes the handshake. */
+    struct wg_handshake_state st;
+    struct wg_msg_initiation i1;
+    struct wg_msg_response a1;
+    uint8_t sk[32], rk[32];
+    uint32_t ridx = 0;
+    int good = wg_handshake_init(&st, ipriv, ipub, rpub, psk) == 0 &&
+               wg_handshake_create_initiation(&st, 0x11111111, &i1) == 0 &&
+               sim_resp_process_initiation_and_build_response(&r, &i1, &a1, 0xA1, psk) == 0;
+    good &= !wg_init_fresh_due(t_init + 1500000, t_init);
+    good &= wg_handshake_process_response(&st, &a1, sk, rk, &ridx) == 0 && ridx == 0xA1;
+    printf("[late/young-init-kept-answer-taken] %s\n", good ? "OK" : "FAIL");
+    fails += !good;
+
+    /* A pong 3 s after: a new INIT replaces it; the first INIT's answer
+     * is refused, the second's taken. */
+    struct wg_msg_initiation i2, i3;
+    struct wg_msg_response a2, a3;
+    good = wg_handshake_init(&st, ipriv, ipub, rpub, psk) == 0 &&
+           wg_handshake_create_initiation(&st, 0x22222222, &i2) == 0 &&
+           sim_resp_process_initiation_and_build_response(&r, &i2, &a2, 0xA2, psk) == 0;
+    good &= wg_init_fresh_due(t_init + 3000000, t_init);
+    good &= wg_handshake_init(&st, ipriv, ipub, rpub, psk) == 0 &&
+            wg_handshake_create_initiation(&st, 0x33333333, &i3) == 0;
+    good &= wg_handshake_process_response(&st, &a2, sk, rk, &ridx) != 0;
+    printf("[late/replaced-init-answer-refused] %s\n", good ? "OK" : "FAIL");
+    fails += !good;
+    good = sim_resp_process_initiation_and_build_response(&r, &i3, &a3, 0xA3, psk) == 0 &&
+           wg_handshake_process_response(&st, &a3, sk, rk, &ridx) == 0 && ridx == 0xA3;
+    printf("[late/new-init-answer-taken] %s\n", good ? "OK" : "FAIL");
+    fails += !good;
+    /* Even with the old answer's index rewritten to the new INIT's and its
+     * mac1 recomputed, it was sealed for another ephemeral: refused by the
+     * AEAD (the index check is not the only guard). */
+    wg_handshake_init(&st, ipriv, ipub, rpub, psk);
+    wg_handshake_create_initiation(&st, 0x44444444, &i3);
+    a2.receiver_index = 0x44444444;
+    uint8_t mk[WG_HASH_LEN];
+    wg_mac1_key(mk, ipub);
+    wg_keyed_mac16(a2.mac1, mk, (const uint8_t *)&a2, offsetof(struct wg_msg_response, mac1));
+    good = wg_handshake_process_response(&st, &a2, sk, rk, &ridx) != 0;
+    printf("[late/old-answer-new-index-refused] %s\n", good ? "OK" : "FAIL");
+    fails += !good;
+    wg_handshake_scrub(&st);
+}
+
 int main(void) {
     test_initial_constants();
     test_mac1_key();
     test_create_initiation_shape();
     test_full_handshake_roundtrip();
     test_cached_identity();
+    test_late_response();
     if (fails == 0) printf("\nALL OK\n");
     return fails ? 1 : 0;
 }
