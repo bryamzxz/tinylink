@@ -235,7 +235,9 @@ uint64_t wg_netif_get_tx_drops(void);
  * direct path is unproven: the callee must not block at all and may
  * decline (ESP_ERR_TIMEOUT) when the relay cannot take it at once. A
  * relay the TX worker depends on (DERP only, the re-sent frames, sendto
- * errno) passes false and may wait for the relay's write lock.
+ * errno, and since 1.3.8 an INIT whose only copy is the DERP one or that
+ * a DERP login queued behind its re-send) passes false and may wait for
+ * the relay's write lock and send buffer.
  *
  * cb=NULL (the default) disables all relay paths; the TX worker only
  * does direct UDP sendto. */
@@ -245,6 +247,14 @@ typedef esp_err_t (*wg_netif_relay_fn)(const uint8_t *dst_node_pub,
                                        bool best_effort,
                                        void *user);
 void wg_netif_set_relay_callback(wg_netif_relay_fn cb, void *user);
+
+/* Is the relay connected right now (round 1.3.8)? An INIT is held behind
+ * a re-send of the frames its keypair change would cost only while it is
+ * (wg_path_init_route); with the relay down it goes as in 1.3.7. Called
+ * with wg_netif's handshake lock held: must not block. NULL (the
+ * default): connected whenever a relay callback is registered. */
+typedef bool (*wg_netif_relay_up_fn)(void *user);
+void wg_netif_set_relay_state_callback(wg_netif_relay_up_fn cb, void *user);
 
 /* Cumulative count of WG transport frames that the TX worker shipped
  * via the relay callback (DERP fallback) instead of — or in addition
