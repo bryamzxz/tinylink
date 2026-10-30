@@ -33,7 +33,7 @@ TARGETS := test_blake2s test_curve25519 test_x25519 test_mapresp \
            test_backoff test_keys_regen test_stun_boot test_skip_value test_jsmn_split \
            test_tai64n test_nacl_box test_tsmp test_tl_date test_stats test_noise_ik \
            test_http1 test_ctrl_json test_ts2021 test_hpack test_h2_core test_tls_resume \
-           test_addr test_wifi_hint test_pwr_diag test_tlm_sched
+           test_addr test_wifi_hint test_wifi_psk test_pwr_diag test_tlm_sched
 
 all: $(TARGETS) $(H2_INTEROP)
 
@@ -84,6 +84,12 @@ test_addr: test_addr.c $(TL_SRC)/tl_addr.h $(TL_SRC)/netmap.h
 # and a random walk over a simulated driver. Header-only.
 test_wifi_hint: test_wifi_hint.c $(TL_MAIN)/wifi_hint.h
 	$(CC) $(CFLAGS) -I$(TL_MAIN) -o $@ test_wifi_hint.c
+
+# The early WPA2 PSK (round 1.3.8, main/wifi_psk.h): published vectors,
+# a plain reference PBKDF2, bounds, hex digits, scrub, task hand-off.
+# Header-only; tools/qemu_crypto also runs it on the ESP32.
+test_wifi_psk: test_wifi_psk.c $(TL_MAIN)/wifi_psk.h
+	$(CC) $(CFLAGS) -I$(TL_MAIN) -o $@ test_wifi_psk.c
 
 # Depth-bounded JSON value skipper (MapResponse stack-overflow guard). Header-only.
 test_skip_value: test_skip_value.c $(TL_SRC)/jsmn_skip.h $(TL_SRC)/jsmn.h
@@ -451,7 +457,7 @@ test: test_blake2s.run test_curve25519.run test_x25519.run test_mapresp.run \
       test_skip_value.run test_jsmn_split.run test_tai64n.run \
       test_nacl_box.run test_tsmp.run test_tl_date.run test_stats.run test_noise_ik.run \
       test_http1.run test_ctrl_json.run test_ts2021.run test_hpack.run test_h2_core.run \
-      test_tls_resume.run test_addr.run test_wifi_hint.run test_pwr_diag.run \
+      test_tls_resume.run test_addr.run test_wifi_hint.run test_wifi_psk.run test_pwr_diag.run \
       test_tlm_sched.run h2_interop.run
 
 test_tls_resume.run: test_tls_resume
@@ -462,6 +468,9 @@ test_addr.run: test_addr
 
 test_wifi_hint.run: test_wifi_hint
 	$(RUNNER) ./test_wifi_hint
+
+test_wifi_psk.run: test_wifi_psk
+	$(RUNNER) ./test_wifi_psk
 
 test_pwr_diag.run: test_pwr_diag
 	$(RUNNER) ./test_pwr_diag
