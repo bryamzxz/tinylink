@@ -7,6 +7,124 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Optimization round 1.3.7 (in progress, branch `feat/opt-1.3.7`)
+
+#### Steady-state power (`feat/r137-power`)
+
+The sensor idles between a sample every 5 s, a rekey every ~111 s and
+the servers' keep-alives, under tickless idle + light sleep (DFS 240/80)
+and `MIN_MODEM`. There is no power meter on it, so the proxies are time
+in light sleep and light-sleep exits per second: this round adds a
+diagnostic that measures them, removes the telemetry task's surplus
+wakes, and prepares the knobs to A/B. Image 725 536 → **725 840 B
+(+304)**, IRAM and static DRAM ±0. Host suite 1 791 → **1 911 OK** (CI
+floor 1 911), ASan + UBSan clean, 0 warnings. `tinylink_tlm` static
+worst case 3 712 → 3 728 / 4 608 (also with the diagnostic on). Not
+yet on the sensor.
+
+- **Finding: under auto light sleep the RTOS tick runs 1.25–1.47 %
+  ahead of esp_timer.** Log time against the capture's wall clock:
+  22 189 s in 21 900 (1.3.5 soak), 21 897 in 21 600 (1.3.3), 15 920 in
+  15 689 (1.3.2); the 60-s stack diag lands every 60.75 s of log time.
+  `vApplicationSleep` (esp_pm/pm_impl.c) steps the tick count by the
+  whole ticks slept and then forces one more tick, every sleep. So log
+  timestamps overstate time by that much, tick-counted waits
+  (`vTaskDelay`, `SO_RCVTIMEO`, lwIP's timers, whose clock is the tick)
+  are that much shorter, and a tick-counted wait for an esp_timer
+  deadline ends ~1.3 % early. WireGuard, path and telemetry deadlines
+  are esp_timer and keep their length.
+- **Telemetry: one light-sleep exit per sample, was ~2.15.** Its 5-s
+  wait ended ~50–65 ms before the sample's esp_timer deadline (the
+  drift above, net of lwIP select's round-up), found nothing due and
+  slept again for the rest; the 60-s housekeeping and the 5-min STUN
+  re-probe each kept their own phase and paid the same twice.
+  `tlm_sched.h`: samples on a fixed grid (5.000 s apart; 5.01–5.02 s
+  before), a wake within 1/16 of the period (≤ 1 s) of the sample's
+  instant is the sample's, a sample due just past the 5-s `/stats`
+  slice replaces it (a drift-shortened slice otherwise crept earlier
+  every period until one cost a wake), and the housekeeping and the
+  re-probe run at the last sample wake before they are due — ≤ one
+  period early, never late, the housekeeping still every 60 s on
+  average. Without sampling they keep their deadlines and take a wake
+  ≤ 1 s early. `tinylink_stun_reprobe_poll` gains the early window.
+  Replayed with the loop's code and lwIP's tick rounding:
+  **1 546–1 554 → 721 wakes per hour** at 1.25–1.47 % drift (789 → 720
+  without drift), −0.23 wakes/s. `test_tlm_sched` (56).
+- **Wakeup audit, steady state** (estimates from the code and the soak
+  rhythm; the diagnostic below measures them), wakes/s 1.3.6 → 1.3.7:
+  Wi-Fi beacons under `MIN_MODEM` 9.8 at DTIM 1 / 3.3 at DTIM 3 (the
+  AP's setting) → same; lwIP's TCP timer, 250 ms while any TCP conn is
+  open — control and DERP always are — 4 → 4; lwIP's ARP + DHCP coarse
+  timers (both 1 s, started in the same tick and phase-locked; the
+  gratuitous ARP every 60 s runs inside) 1 → 1; telemetry 0.4 → 0.2;
+  housekeeping 0.033 → 0; STUN re-probe 0.007 → 0; `wg_rx`'s 5-s RX
+  cap ~0.1 → ~0.1 and the peer's passive keepalive ~0.1 → ~0.1 (both
+  needed: the cap bounds how late `wg_rx` sees a deadline `wg_tx` or the
+  long-poll moved, the keepalive is 1.3.6's path proof); control and
+  DERP server keep-alives + the 30-s poll after each ~0.07 → same;
+  rekeys ~0.027, call-me-maybe ~0.02, SNTP 1/h → same; `wg_tx` (rides
+  the sample; its 10-s WDT pace only fires without frames), the
+  firmware's esp_timers (`wifi_ps` stopped at `MIN_MODEM`,
+  `wifi_reconn` / `tlm_retry` unarmed), the task WDT (hardware) and the
+  FreeRTOS tick (suppressed while asleep) add none. Total ≈ 15.5 →
+  15.3 (DTIM 1) / 9.0 → 8.8 (DTIM 3): what is left is the AP's beacon
+  rate and lwIP's TCP timer, both A/B items below.
+- **`CONFIG_TINYLINK_POWER_DIAG` (default n,
+  `tools/power/sdkconfig.power-diag`).** Three lines after every 60-s
+  stack diag (the first dump only arms it): `pwr diag: dt=… sleep=…%
+  lslp=… rate=…/s tmr=… rtos=… early=… short=… tick_drift=±… ms` —
+  light-sleep residency and count, split by what ended each sleep, an
+  esp_timer alarm (in steady state the Wi-Fi driver's beacon timers;
+  the ESP32 has no Wi-Fi wake source) or a FreeRTOS timeout (tasks,
+  lwIP) — the hardware cause register says TIMER for both; `pwr diag:
+  slen ms<30/110/260/520/1100/5100/inf tmr=…/… rtos=…/…` (bins that
+  separate a DTIM-1 / DTIM-3 beacon, the 250-ms TCP and 1-s ARP timers,
+  the 5-s waits); `pwr diag: cpu busy=…% tiT=… wifi=… …` (run time per
+  task, % of one core, IDLE tasks left out). From IDF's light-sleep
+  callbacks (`CONFIG_PM_LIGHT_SLEEP_CALLBACKS`) and FreeRTOS run-time
+  stats, both selected. `esp_pm_dump_locks` / `esp_timer_dump`
+  (`PM_PROFILING`, `ESP_TIMER_PROFILING`) are not used: they print with
+  `%lld`, which the ROM's newlib-nano printf cannot format, and full
+  printf needs more stack on tasks with ~1 KB free (`wifi`). Cost:
+  +2 640 B image, +72 B IRAM, +1 128 B static DRAM, ~100 B heap. No
+  extra wake (it rides the 60-s dump); per sleep two 32-B callbacks
+  inside `vApplicationSleep` (one esp_timer list read; the PM subtracts
+  the enter callback's time from the sleep), one esp_timer read per
+  context switch, three log lines a minute. `test_pwr_diag` (64).
+- **A/B fragments, prepared, not decided (`tools/power/`, stack after
+  `sdkconfig.power-diag`).** Sizes against the default image:
+  `ab-wifi-active20` (`ESP_WIFI_SLP_DEFAULT_MIN_ACTIVE_TIME` 50 → 20 ms:
+  the radio stays in RX that long after every frame; ~0.36 frames/s ×
+  50 ms ≈ 1.8 % RX duty at 95–112 mA today; a later reply waits at the
+  AP ≤ one DTIM; ±0 B) — likely the largest; `ab-maxmodem-li3`
+  (`MAX_MODEM`, listen interval 3, new Kconfig: a third of the beacon
+  wakes on a DTIM-1 AP, ≤ ~307 ms more inbound latency, broadcast at
+  skipped DTIMs lost — covered by the 60-s gratuitous ARP; the interval
+  goes into the association request; ±0 B); `ab-tcp-tmr500` (TCP timer
+  500 ms, −2 wakes/s; delayed ACK ≤ 500 ms, initial RTO set to 1–2 s
+  from 1.0–1.5 s; boot-series A/B needed; ±0 B); `ab-pm-iram`
+  (`PM_SLP_IRAM_OPT` + `PM_RTOS_IDLE_OPT`, ~330 µs less awake per sleep
+  per the Kconfig help; they select no Wi-Fi option —
+  `ESP_WIFI_SLP_IRAM_OPT`, the one that broke association here, selects
+  them, not the reverse; +464 B image, **+5 176 B IRAM** (40 869 free),
+  +1 008 B static DRAM); `ab-cpu160` (160 MHz boot and DFS max:
+  `configure_pm` now takes `CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ`; 80 and 160
+  share the 320-MHz PLL, so DFS steps stop retuning it; CPU-bound work
+  ×1.5 — X25519 ~13 → ~20 ms, AEAD ~390 → ~590 µs per MTU; ±0 B);
+  `ab-idle2` (light sleep from 2 idle ticks; ±0 B); `ab-txpower13`
+  (13 dBm cap; the radio transmits < 0.1 % of the time, so it moves the
+  TX peak, not the average — the module's table has 379 mA peak for 11b
+  at 19.5 dBm, 258 mA for MCS7 at 13 dBm; ±0 B).
+- Rejected: `LWIP_DHCP_COARSE_TIMER_SECS` 1 → 10 (shares ARP's wake: 0
+  saved, T0 ±9 s); longer control / DERP polls (−0.017/s against the
+  60-s WDT margin); a longer `wg_rx` cap (needs a wake path into a
+  `recvfrom`-blocked task, e.g. eventfd + `select`, on the data plane
+  under soak) and drift compensation in `wg_recv_timeout_ms` (one extra
+  ~50-ms wake per RX deadline, ~0.009/s); gratuitous ARP off (keeps the
+  router's entry fresh, inside ARP's own wake);
+  `PM_LIGHTSLEEP_RTC_OSC_CAL_INTERVAL` > 1 (10 RC cycles ≈ 67 µs per
+  sleep against RC drift); the per-sample log line at DEBUG (soak greps).
+
 ### Optimization round 1.3.6 — data-plane path selection (in progress, branch `feat/opt-1.3.6`)
 
 What the 1.3.5 hardware runs showed about the direct path: any
