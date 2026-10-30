@@ -7,6 +7,78 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Optimization round 1.3.6 — data-plane path selection (in progress, branch `feat/opt-1.3.6`)
+
+What the 1.3.5 hardware runs showed about the direct path: any
+authenticated datagram on the UDP socket "confirmed" it and stopped the
+DERP copies, though a peer→us packet proves nothing about our sends;
+the failover to DERP waited for the 30-s RX-stale watchdog (42 RX-stale
+events in 47 min while the collector sat behind a worse WAN link, ~30 s
+of telemetry each); and with the peer's two working endpoints on one
+address the sensor roamed on every pong (41 roams in 2 h; one such
+double roam was followed by a 30-s WireGuard blackout). Image 716 688 →
+**725 536 B (+8 848)**; static DRAM 57 412 → 57 644 B (+232), IRAM ±0,
+~1.9 KB more heap in use (the re-send ring). Host suite 1 592 → **1 791 OK** (CI
+floor 1 791), ASan + UBSan clean, 0 warnings. Static worst cases: `wg_rx`
+5 648 / 8 192, `wg_tx` 3 440 / 5 120, `tinylink_tlm` 3 712 / 4 608,
+`tinylink_derp` 5 152 / 8 192. Not yet on the sensor.
+
+- **Path selection by proof (`wg_path.h`).** Direct-only only after a
+  pong to our own ping, kept by the peer's passive keepalives (it
+  answers data it received within KEEPALIVE_TIMEOUT 10 s; 12-s window);
+  a lapse sends direct + DERP with one ping; no pong in 5 s → DERP only,
+  endpoints re-probed 10 → 60 s. Passive evidence instead of upstream's
+  3-s heartbeat + 6.5-s trust (~40 packets a minute): no extra packets
+  in steady state, the failover lands ~12–27 s after a break instead of
+  30 s + the rekey. Above a ~22-s telemetry period (Kconfig allows 600 s)
+  every sample goes direct + DERP with one ping / pong, as upstream's
+  trust expiry does; the default 5-s period is unaffected.
+- **A lapse answered by DISCO but not by WireGuard is a doubt**, still
+  sent both ways, until any WireGuard packet from the peer: one lost
+  keepalive or frame costs a few frames sent both ways and no rekey (0
+  forced rekeys per simulated 6 h at 0.5–2 % loss). Two silent windows →
+  DERP only + make-before-break rekey (24–29 s after the first
+  unanswered frame — no faster than the RX-stale rekey; going under
+  ~16 s without false rekeys needs an in-tunnel probe such as a TSMP
+  ping, not done); WireGuard answering only our DERP copies twice
+  ("undelivered") → DERP only without a rekey, direct re-tests backed
+  off to one a minute (a simulated hour with our direct WireGuard
+  dropped: 0 rekeys, 134 pings). A keepalive proves the direct path only
+  if no frame went via DERP in the 12 s before it.
+- **A confirmed lapse re-sends via DERP the direct-only frames of the
+  last 40 s (≤ 8, `wg_rescue.h`)**, including those whose DERP copy was
+  refused; kept while DERP is down and re-queued at the next login. The
+  peer's replay window drops the copies it already has. 0 frames lost
+  in 200 simulated breaks (3–5 per break on 1.3.5).
+- **No endpoint flapping.** A valid endpoint moves only for a clearly
+  better pong of the same round (upstream's betterAddr scoring, > 15
+  points and ≥ 25 ms, +20 for private addresses); WireGuard packets from
+  another source don't roam it.
+- **Handshake re-sends:** a pong refreshes a pending INIT only when it
+  changed the path and the INIT is ≥ 2.5 s old (was 1 s); a late answer
+  to a replaced INIT is logged once and dropped (keeping the old
+  initiation's keys was rejected: wireguard-go drops the first session
+  when the second INIT lands). The DISCO prober hands back a matched
+  ping's send time, so pongs carry an RTT.
+- One log line per path transition (`direct path unconfirmed …`,
+  `… re-confirmed (pong …)`, doubt / silent / undelivered / dead);
+  `/stats` gains `wg.path` and `wg.lapses` (893 of 896 B worst case).
+- **Review.** An independent review of the first cut found three real
+  defects, each demonstrated: one lost packet on a healthy path was
+  taken as WireGuard silence (forced rekey + DERP only + probe round +
+  8 duplicate re-sends; 9 / 21 / 47 rekeys per 6 h at 0.5 / 1 / 2 %
+  loss), `wg_rx` spun at the tick rate after a late wake in DERP-only
+  mode, and the one-rekey-per-streak rule could be reset by a keepalive
+  answering our DERP copies (120 rekeys / h with WireGuard us→peer
+  dropped on direct only); plus two pings per endpoint change and
+  re-send frames lost while DERP was down. All fixed; each demo is now a
+  host test that fails on the first cut, and a deadline fuzzer (597 055
+  ticks up to 500 ms late, every mode) never saw a deadline at or before
+  `now`. A second pass found no stuck or black-hole state. Known gap:
+  with only our direct WireGuard toward the peer blocked, the first
+  episode loses 3–6 frames older than the 40-s re-send window (later
+  episodes lose none).
+
 ### Optimization round 1.3.5 — boot and reconnect latency (in progress, branch `feat/opt-1.3.5`)
 
 The rest of round D's latency items (D9, D10, a D11 slice), built in three
