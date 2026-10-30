@@ -14,10 +14,14 @@
 // NodeKey, DiscoKey, endpoints and tailnet addresses. Our keys are in
 // NVS already (keys.c).
 //
-// The record, NVS `tl_state` / "warm_rec", binary, 109..141 B:
+// The record, NVS `tl_state` / "warm_rec", binary, 108..141 B:
 //
 //   0   version (TL_WARM_REC_V1: another layout is ignored, not parsed)
-//   1   written, LE32 Unix seconds (0: the clock was not synced)
+//   1   written, LE32 Unix seconds (0: the clock was not synced) — when a
+//       netmap last stood behind the content: its write, or a refresh at
+//       most daily while it is unchanged and control is heard
+//       (tl_warm_refresh_due); a record older than TL_WARM_MAX_AGE_S is
+//       not used
 //   5   our NodeKey's first 8 bytes, 13 the control key's: a record
 //       written under other keys or for another control plane is ignored
 //   21  n_self (1..2), n_addr (0..2), n_ep (1..4), flags (bit 0: DiscoKey)
@@ -40,8 +44,16 @@
 // place at the next boot anyway (endpoint roam, key update), and an
 // endpoint list that churns must not erase a flash sector every minute.
 //
-// Everything here is pure and host-tested (tools/test/test_warm.c); the
-// NVS calls, the locking and the bring-up are in tinylink.c.
+// The decisions around it are here too, as a state machine tinylink.c
+// drives with one call per event (tl_warm_sm_*): whether a boot warm-
+// starts (tl_warm_go: RTC marks, record, keys, age, register, heap), the
+// seeding, the first frame's table reset, what the first netmap does to
+// the warm session (confirm in place, wait, restart cold), the bound and
+// the crash guard (tl_warm_rtc_*). Also the cold start's target pick
+// (tl_warm_target_index, which wg_dataplane.c runs) and the peer-address
+// update rule. Everything here is pure and host-tested
+// (tools/test/test_warm.c); the NVS calls, the locking, the logging and
+// the bring-up are in tinylink.c.
 
 #pragma once
 
@@ -469,17 +481,34 @@ typedef struct {
 /* 0 = written, else failed. */
 typedef int (*tl_warm_write_fn)(const uint8_t *b, size_t n, const void *ctx);
 
+/* An unchanged record is written again to renew `written` — its "a
+ * netmap stood behind it then" — once a day at most, and only while the
+ * netmap is current (`fresh`: the data plane runs on this boot's netmap
+ * and control was heard lately) and the clock is synced (now_unix != 0).
+ * One write a day, so a device up for months does not leave a record
+ * that reads as months old (TL_WARM_MAX_AGE_S) at its next boot. */
+#define TL_WARM_REFRESH_S   86400u
+
+static inline bool tl_warm_refresh_due(uint32_t written, uint32_t now_unix, bool fresh)
+{
+    return fresh && now_unix != 0 && (written == 0 || (now_unix >= written &&
+                                                       now_unix - written >= TL_WARM_REFRESH_S));
+}
+
 /* 0 = nothing due (unchanged, or a soft change held back), 1 = written,
  * -1 = not storable, or the write failed. As tl_addr_store, the mirror
  * takes the record even when the write fails: a broken NVS costs a write
  * attempt per change, not one per housekeeping. */
 static inline int tl_warm_store(tl_warm_nvs_t *m, const tl_warm_rec_t *next,
-                                uint32_t now_unix, int64_t now_us,
+                                uint32_t now_unix, int64_t now_us, bool fresh,
                                 tl_warm_write_fn write, const void *ctx)
 {
     if (!tl_warm_rec_storable(next)) return -1;
     const unsigned d = m->valid ? tl_warm_diff(&m->rec, next) : ~0u;
-    if (!tl_warm_store_due(d, m->valid, m->wrote, now_us, m->last_us)) return 0;
+    if (!tl_warm_store_due(d, m->valid, m->wrote, now_us, m->last_us) &&
+        !(d == 0 && tl_warm_refresh_due(m->rec.written, now_unix, fresh))) {
+        return 0;
+    }
     uint8_t b[TL_WARM_BLOB_MAX];
     tl_warm_rec_t r = *next;
     r.written = now_unix;
@@ -523,6 +552,365 @@ static inline void tl_warm_age_str(char *out, size_t cap, int64_t now_unix, bool
 static inline bool tl_warm_bound_due(uint32_t now_s, uint32_t since_s, uint32_t max_s)
 {
     return now_s >= since_s && now_s - since_s >= max_s;
+}
+
+/* No warm start from a record no netmap stood behind for this long. The
+ * clock before SNTP is the boot's floor (tl_time.c: never ahead of real
+ * time), so floor − written is a lower bound of the age: a record it
+ * already shows too old is refused at the warm start; one it cannot tell
+ * (written 0, or the floor behind it — e.g. a long power-off keeps the
+ * floor at its start) is used, and the pending session ends once SNTP
+ * shows it too old (tl_warm_sm_bound). */
+#define TL_WARM_MAX_AGE_S   (30u * 86400u)
+
+static inline bool tl_warm_too_old(int64_t now_unix, uint32_t written)
+{
+    return written != 0 && now_unix > (int64_t)written &&
+           now_unix - (int64_t)written > (int64_t)TL_WARM_MAX_AGE_S;
+}
+
+/* ---- The cold start's target pick ---------------------------------------
+ *
+ * wg_dataplane.c select_target_peer, the part without I/O: the first peer
+ * with an endpoint reachable without a hairpin — a public IPv4 that is
+ * not our own STUN address (any public one while STUN gave nothing) —
+ * else peers[0] (`*qualified` false). The warm start must run against
+ * the peer this picks from the netmap; the record stores what it picks. */
+
+/* Not 10/8, 172.16/12, 192.168/16, 127/8, 169.254/16, 0/8, 224/3
+ * (wg_dataplane.c ipv4_is_public). */
+static inline bool tl_warm_ipv4_public(const uint8_t ip[4])
+{
+    if (ip[0] == 10 || ip[0] == 127 || ip[0] == 0 || ip[0] >= 224) return false;
+    if (ip[0] == 172 && (ip[1] & 0xF0) == 16) return false;
+    if (ip[0] == 192 && ip[1] == 168) return false;
+    if (ip[0] == 169 && ip[1] == 254) return false;
+    return true;
+}
+
+static inline bool tl_warm_peer_reachable(const tl_peer_t *p, bool have_our,
+                                          const uint8_t our[4])
+{
+    for (size_t i = 0; i < p->n_endpoints && i < TL_MAX_PEER_ENDPOINTS; i++) {
+        tl_warm_ep_t e;
+        if (!tl_warm_ep_parse(p->endpoints[i].str, &e) || !tl_warm_ipv4_public(e.ip)) continue;
+        if (!have_our || memcmp(e.ip, our, 4) != 0) return true;
+    }
+    return false;
+}
+
+static inline size_t tl_warm_target_index(const tl_peer_t *peers, size_t n_peers,
+                                          bool have_our, const uint8_t our[4],
+                                          bool *qualified)
+{
+    for (size_t i = 0; i < n_peers; i++) {
+        if (tl_warm_peer_reachable(&peers[i], have_our, our)) {
+            *qualified = true;
+            return i;
+        }
+    }
+    *qualified = false;
+    return 0;
+}
+
+/* The netmap's first /32 of the session's peer moved (network order; 0 =
+ * none in the list): wg_dataplane_update_peers moves the TSMP advert's
+ * destination. A list without a /32 keeps the last one. */
+static inline bool tl_warm_addr_moved(uint32_t cur_be, uint32_t next_be)
+{
+    return next_be != 0 && next_be != cur_be;
+}
+
+/* The register sent no auth key: the node was known with these keys
+ * (NVS reg_keys) and control did not refuse that (register_node). */
+static inline bool tl_warm_reg_reused(bool known, bool retried_with_auth)
+{
+    return known && !retried_with_auth;
+}
+
+/* ---- The crash guard and the restart mark (RTC no-init memory) ----------
+ *
+ * RTC slow memory survives every reset but a power loss (tl_bootstat.h).
+ * `attempt`: a warm start ran and no netmap confirmed it yet — set before
+ * its bring-up, cleared when the netmap confirms it, when the bring-up
+ * fails, or by a planned restart. A boot that finds it set after any
+ * reset but a software one (panic, a WDT, a brown-out…) counts a crash:
+ * the record is erased and that boot starts cold; after
+ * TL_WARM_RTC_MAX_CRASHES the warm start stays off until a power cycle,
+ * so a fault on the warm path costs a cold boot in between, then
+ * nothing. `skip`: a planned restart out of a warm start (or for a self
+ * address change) — the next boot starts cold, even if the erase failed.
+ * A power-on finds garbage or stale bytes: the record restarts from zero
+ * (both marks and the count go — accepted: a power cycle is also what
+ * re-enables a warm start the guard switched off). */
+#define TL_WARM_RTC_MAGIC        0x544C5732u   /* "TLW2" */
+#define TL_WARM_RTC_MAX_CRASHES  2u
+#define TL_WARM_RST_POWERON      1   /* esp_reset_reason_t, restated for the host */
+#define TL_WARM_RST_SW           3
+
+typedef struct {
+    uint32_t magic;
+    uint8_t  attempt;
+    uint8_t  skip;
+    uint8_t  crashes;
+    uint8_t  pad;
+    uint32_t check;
+} tl_warm_rtc_t;
+
+static inline uint32_t tl_warm_rtc_sum(const tl_warm_rtc_t *r)
+{
+    const uint8_t b[8] = { (uint8_t)r->magic, (uint8_t)(r->magic >> 8),
+                           (uint8_t)(r->magic >> 16), (uint8_t)(r->magic >> 24),
+                           r->attempt, r->skip, r->crashes, r->pad };
+    uint32_t h = 2166136261u;
+    for (unsigned i = 0; i < 8; i++) {
+        h ^= b[i];
+        h *= 16777619u;
+    }
+    return h;
+}
+
+static inline void tl_warm_rtc_seal(tl_warm_rtc_t *r)
+{
+    r->magic = TL_WARM_RTC_MAGIC;
+    r->check = tl_warm_rtc_sum(r);
+}
+
+typedef enum {
+    TL_WARM_RTC_CLEAN = 0,
+    TL_WARM_RTC_RESTARTED,   /* planned restart out of a warm start: this boot cold */
+    TL_WARM_RTC_CRASHED,     /* the last warm start ended in a crash: erase, cold */
+    TL_WARM_RTC_OFF,         /* TL_WARM_RTC_MAX_CRASHES reached: off until power-on */
+} tl_warm_rtc_verdict_t;
+
+/* Once per boot, first thing (tinylink_init), whatever follows: the
+ * marks are consumed here. `*erase`: a crash was found — the record goes. */
+static inline tl_warm_rtc_verdict_t tl_warm_rtc_boot(tl_warm_rtc_t *r, int reset_reason,
+                                                     bool *erase)
+{
+    *erase = false;
+    if (reset_reason == TL_WARM_RST_POWERON || r->magic != TL_WARM_RTC_MAGIC ||
+        r->check != tl_warm_rtc_sum(r) || r->attempt > 1 || r->skip > 1 ||
+        r->crashes > TL_WARM_RTC_MAX_CRASHES || r->pad != 0) {
+        memset(r, 0, sizeof(*r));
+        tl_warm_rtc_seal(r);
+        return TL_WARM_RTC_CLEAN;
+    }
+    const bool crash = r->attempt && reset_reason != TL_WARM_RST_SW;
+    const bool skip  = r->skip;
+    if (crash && r->crashes < TL_WARM_RTC_MAX_CRASHES) r->crashes++;
+    r->attempt = 0;
+    r->skip    = 0;
+    tl_warm_rtc_seal(r);
+    *erase = crash;
+    if (r->crashes >= TL_WARM_RTC_MAX_CRASHES) return TL_WARM_RTC_OFF;
+    if (crash) return TL_WARM_RTC_CRASHED;
+    return skip ? TL_WARM_RTC_RESTARTED : TL_WARM_RTC_CLEAN;
+}
+
+/* A planned restart out of a warm start (or for a self address change):
+ * the next boot is cold; not a crash. */
+static inline void tl_warm_rtc_restart(tl_warm_rtc_t *r)
+{
+    r->attempt = 0;
+    r->skip    = 1;
+    tl_warm_rtc_seal(r);
+}
+
+/* ---- Does this boot warm-start? ----------------------------------------- */
+
+typedef enum {
+    TL_WARM_GO = 0,
+    TL_WARM_NO_RECORD,       /* nothing stored, or nothing this firmware reads */
+    TL_WARM_SKIP_CRASH,      /* the last warm start ended in a crash reset */
+    TL_WARM_SKIP_OFF,        /* the crash guard switched it off */
+    TL_WARM_SKIP_RESTART,    /* the last boot restarted out of one */
+    TL_WARM_OTHER_KEYS,      /* written under another NodeKey / control key */
+    TL_WARM_STALE,           /* no netmap stood behind it for TL_WARM_MAX_AGE_S */
+    TL_WARM_NEEDED_AUTH,     /* the register sent the auth key: maybe a new node */
+    TL_WARM_LOW_HEAP,        /* no room for wg_rx and the telemetry task now */
+} tl_warm_go_t;
+
+typedef struct {
+    tl_warm_rtc_verdict_t rtc;
+    bool     have_rec;
+    bool     keys_ok;
+    bool     reg_reused;     /* tl_warm_reg_reused */
+    bool     heap_ok;
+    int64_t  now_unix;       /* time(NULL), floored before SNTP */
+    uint32_t written;
+} tl_warm_go_in_t;
+
+static inline tl_warm_go_t tl_warm_go(const tl_warm_go_in_t *in)
+{
+    if (in->rtc == TL_WARM_RTC_CRASHED) return TL_WARM_SKIP_CRASH;
+    if (in->rtc == TL_WARM_RTC_OFF) return TL_WARM_SKIP_OFF;
+    if (!in->have_rec) return TL_WARM_NO_RECORD;
+    if (in->rtc == TL_WARM_RTC_RESTARTED) return TL_WARM_SKIP_RESTART;
+    if (!in->keys_ok) return TL_WARM_OTHER_KEYS;
+    if (tl_warm_too_old(in->now_unix, in->written)) return TL_WARM_STALE;
+    if (!in->reg_reused) return TL_WARM_NEEDED_AUTH;
+    if (!in->heap_ok) return TL_WARM_LOW_HEAP;
+    return TL_WARM_GO;
+}
+
+/* ---- The warm session's state machine -----------------------------------
+ *
+ * tinylink.c holds one, under a spinlock (the main task starts it, the
+ * long-poll task feeds it netmap frames, the telemetry task the bound),
+ * and the tables the data plane starts from (s_self_addrs, s_last_peers). */
+
+enum { TL_WARM_ST_OFF = 0, TL_WARM_ST_PENDING, TL_WARM_ST_CONFIRMED };
+
+typedef struct {
+    uint8_t  state;          /* TL_WARM_ST_* */
+    bool     seeded;         /* the tables hold the record, not a netmap */
+    bool     restart;        /* the long-poll erases the record and restarts */
+    bool     bound_fired;    /* the bound claimed the pending session */
+    uint32_t pending_s;      /* boot second + 1 of the unconfirmed start, 0 = none */
+    uint32_t written;        /* the running record's (the age once SNTP synced) */
+} tl_warm_sm_t;
+
+typedef struct {
+    tl_cidr_t *self;         /* [TL_MAX_PEER_ADDRESSES] */
+    size_t    *n_self;
+    tl_peer_t *peers;        /* [TL_MAX_PEERS] */
+    size_t    *n_peers;
+} tl_warm_tables_t;
+
+/* The warm start begins (before relay_boot_join): a crash from here on
+ * until the netmap confirms is the guard's. */
+static inline void tl_warm_sm_begin(tl_warm_sm_t *sm, tl_warm_rtc_t *rtc,
+                                    const tl_warm_rec_t *r, tl_warm_tables_t *t)
+{
+    memset(sm, 0, sizeof(*sm));
+    rtc->attempt = 1;
+    tl_warm_rtc_seal(rtc);
+    /* What wg_dataplane_start is given: the record's addresses and its
+     * peer, as the netmap's strings (tl_warm_peer_to). */
+    for (unsigned i = 0; i < r->n_self && i < TL_MAX_PEER_ADDRESSES; i++) {
+        tl_warm_cidr_str(&r->self[i], &t->self[i]);
+    }
+    *t->n_self = r->n_self;
+    tl_warm_peer_to(&r->peer, &t->peers[0]);
+    *t->n_peers = 1;
+    sm->seeded = true;
+}
+
+/* wg_dataplane_start's outcome. A failure leaves the tables as a cold
+ * boot has them before its netmap (empty), the guard's mark cleared. */
+static inline void tl_warm_sm_started(tl_warm_sm_t *sm, tl_warm_rtc_t *rtc,
+                                      tl_warm_tables_t *t, bool ok, uint32_t now_s,
+                                      uint32_t written)
+{
+    if (!ok) {
+        sm->state  = TL_WARM_ST_OFF;
+        sm->seeded = false;
+        *t->n_self  = 0;
+        *t->n_peers = 0;
+        rtc->attempt = 0;
+        tl_warm_rtc_seal(rtc);
+        return;
+    }
+    sm->state     = TL_WARM_ST_PENDING;
+    sm->pending_s = now_s + 1u;
+    sm->written   = written;
+}
+
+/* Every netmap frame, before the handler takes anything from it. The
+ * first empties the tables the record seeded — the netmap's own replace
+ * them, an omitted Peers too, as in a cold boot. True while a warm
+ * session waits for its netmap: the frame goes to tl_warm_sm_netmap, not
+ * the cold path (which would start the data plane a second time). */
+static inline bool tl_warm_sm_frame(tl_warm_sm_t *sm, tl_warm_tables_t *t)
+{
+    if (sm->seeded) {
+        sm->seeded  = false;
+        *t->n_self  = 0;
+        *t->n_peers = 0;
+    }
+    return sm->state == TL_WARM_ST_PENDING;
+}
+
+typedef enum {
+    TL_WARM_ACT_COLD = 0,    /* no warm session pending: the handler's own path */
+    TL_WARM_ACT_WAIT,        /* a frame before the full netmap */
+    TL_WARM_ACT_CONFIRM,     /* the session stands: update in place (`*diff`) */
+    TL_WARM_ACT_RESTART,     /* erase, restart cold (sm->restart set) */
+    TL_WARM_ACT_LATE,        /* the bound claimed it first: its restart runs */
+} tl_warm_act_t;
+
+/* Why a restart (besides the diff bits): */
+#define TL_WARM_WHY_EXPIRED  0x100u   /* control marks this node expired / deleted */
+#define TL_WARM_WHY_EMPTY    0x200u   /* the full netmap has no self address or no peer */
+
+typedef struct {
+    bool                 expired;      /* self_node_expired(nm) */
+    bool                 have_self;    /* the frame carries the self node */
+    bool                 self0_moved;  /* our netmap address is not the attached one */
+    const tl_warm_rec_t *now;          /* the netmap's: our addresses + the pick (NULL: none) */
+} tl_warm_nm_t;
+
+/* A netmap frame (after the merge into the tables) while the session
+ * waits. `was`: the record it runs on. `*why`: diff bits, and the
+ * TL_WARM_WHY_* of a restart. */
+static inline tl_warm_act_t tl_warm_sm_netmap(tl_warm_sm_t *sm, tl_warm_rtc_t *rtc,
+                                              const tl_warm_rec_t *was,
+                                              const tl_warm_nm_t *in, unsigned *why)
+{
+    *why = 0;
+    if (sm->state != TL_WARM_ST_PENDING) return TL_WARM_ACT_COLD;
+    if (sm->bound_fired) return TL_WARM_ACT_LATE;
+    if (in->expired) {
+        *why = TL_WARM_WHY_EXPIRED;
+    } else if (in->self0_moved) {
+        *why = TL_WARM_D_SELF0 | TL_WARM_D_SELF;
+    } else if (in->now == NULL) {
+        if (!in->have_self) return TL_WARM_ACT_WAIT;
+        *why = TL_WARM_WHY_EMPTY;
+    } else {
+        *why = tl_warm_diff(was, in->now);
+        if (!(*why & TL_WARM_RESTART)) {
+            sm->state     = TL_WARM_ST_CONFIRMED;
+            sm->pending_s = 0;
+            rtc->attempt  = 0;
+            rtc->crashes  = 0;
+            tl_warm_rtc_seal(rtc);
+            return TL_WARM_ACT_CONFIRM;
+        }
+    }
+    sm->restart   = true;
+    sm->pending_s = 0;
+    return TL_WARM_ACT_RESTART;
+}
+
+/* The telemetry task's housekeeping: true = end the pending session
+ * (erase, restart) — the bound passed, or, the clock synced, the record
+ * reads older than TL_WARM_MAX_AGE_S. Claims it against the netmap. */
+#define TL_WARM_BOUND_TIME 1
+#define TL_WARM_BOUND_AGE  2
+static inline int tl_warm_sm_bound(tl_warm_sm_t *sm, uint32_t now_s, uint32_t max_s,
+                                   bool synced, int64_t now_unix)
+{
+    if (sm->state != TL_WARM_ST_PENDING || sm->pending_s == 0 || sm->bound_fired) return 0;
+    int why = 0;
+    if (tl_warm_bound_due(now_s, sm->pending_s - 1u, max_s)) {
+        why = TL_WARM_BOUND_TIME;
+    } else if (synced && tl_warm_too_old(now_unix, sm->written)) {
+        why = TL_WARM_BOUND_AGE;
+    }
+    if (why != 0) {
+        sm->bound_fired = true;
+        sm->pending_s   = 0;
+    }
+    return why;
+}
+
+/* The data plane came up from a netmap (the cold path): the record's
+ * refresh may run (tl_warm_refresh_due's `fresh`). */
+static inline void tl_warm_sm_cold(tl_warm_sm_t *sm)
+{
+    if (sm->state == TL_WARM_ST_OFF) sm->state = TL_WARM_ST_CONFIRMED;
 }
 
 #ifdef __cplusplus

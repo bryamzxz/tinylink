@@ -9,8 +9,13 @@
 // re-encodes to the same bytes), what differs between two records and
 // which of that restarts the warm session, the write-on-change policy
 // over a fake NVS that counts flash writes across simulated reboots
-// (hard changes at once, endpoints / DiscoKey at most hourly), the age
-// in the log line and the bound. Addresses are RFC 5737, keys made up.
+// (hard changes at once, endpoints / DiscoKey at most hourly, a daily
+// refresh), the cold start's target pick and the in-place rules, the RTC
+// crash guard and restart mark over every reset reason, the go / no-go
+// of a boot, the warm session's state machine (seed, first-frame reset,
+// wait / confirm / restart, bound and age, failed start) and boots in a
+// row over a fake NVS and RTC, the age in the log line. Addresses are
+// RFC 5737, keys made up.
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -442,16 +447,23 @@ static void test_cold_equivalence(void)
         r.written = 1700000000u;
         uint8_t b[TL_WARM_BLOB_MAX];
         const size_t n = tl_warm_encode(&r, b, sizeof(b));
-        /* Boot N+1: decode, seed the tables as tinylink.c does. */
+        /* Boot N+1: decode, seed the tables with the warm start's own
+         * call (tl_warm_sm_begin, what tinylink.c runs). */
         tl_warm_rec_t d;
         all &= n > 0 && tl_warm_decode(b, n, &d);
-        tl_cidr_t s2[2];
+        tl_cidr_t s2[TL_MAX_PEER_ADDRESSES];
+        tl_peer_t p2[TL_MAX_PEERS];
+        size_t ns2 = 99, np2 = 99;
         memset(s2, 0x6b, sizeof(s2));
-        for (unsigned i = 0; i < d.n_self; i++) tl_warm_cidr_str(&d.self[i], &s2[i]);
-        tl_peer_t p2;
-        tl_warm_peer_to(&d.peer, &p2);
-        all &= d.n_self == 2 && strcmp(s2[0].str, self[0].str) == 0 &&
-               strcmp(s2[1].str, self[1].str) == 0 && peers_match(&p2, &table[t]);
+        memset(p2, 0x6b, sizeof(p2));
+        tl_warm_tables_t tt = { s2, &ns2, p2, &np2 };
+        tl_warm_sm_t sm;
+        tl_warm_rtc_t rtc;
+        memset(&rtc, 0, sizeof(rtc));
+        tl_warm_sm_begin(&sm, &rtc, &d, &tt);
+        all &= ns2 == 2 && np2 == 1 && sm.seeded && rtc.attempt == 1 &&
+               strcmp(s2[0].str, self[0].str) == 0 && strcmp(s2[1].str, self[1].str) == 0 &&
+               peers_match(&p2[0], &table[t]);
         /* …and the same netmap again confirms it. */
         tl_warm_rec_t again;
         tl_warm_rec_build(self, 2, &table[t], k_self_pub, k_ctl_pub, &again);
@@ -588,21 +600,21 @@ static void test_store(void)
     tl_warm_nvs_t m;
     boot(&m, &f);
     tl_warm_rec_t r = mk_rec();
-    check("store/first-boot-writes", tl_warm_store(&m, &r, 1700000000u, MIN_US, fake_write, &f) == 1 &&
+    check("store/first-boot-writes", tl_warm_store(&m, &r, 1700000000u, MIN_US, false, fake_write, &f) == 1 &&
                                      f.writes == 1 && m.valid && m.rec.written == 1700000000u);
-    check("store/same-no-write", tl_warm_store(&m, &r, 1700000060u, 2 * MIN_US, fake_write, &f) == 0 &&
+    check("store/same-no-write", tl_warm_store(&m, &r, 1700000060u, 2 * MIN_US, false, fake_write, &f) == 0 &&
                                  f.writes == 1);
     tl_warm_rec_t soft = r;
     soft.peer.ep[0].port = 41642;
-    check("store/soft-held-back", tl_warm_store(&m, &soft, 1700000120u, 3 * MIN_US, fake_write, &f) == 0 &&
+    check("store/soft-held-back", tl_warm_store(&m, &soft, 1700000120u, 3 * MIN_US, false, fake_write, &f) == 0 &&
                                   f.writes == 1);
     check("store/soft-after-an-hour",
-          tl_warm_store(&m, &soft, 1700003700u, MIN_US + TL_WARM_SOFT_MIN_US, fake_write, &f) == 1 &&
+          tl_warm_store(&m, &soft, 1700003700u, MIN_US + TL_WARM_SOFT_MIN_US, false, fake_write, &f) == 1 &&
           f.writes == 2);
     tl_warm_rec_t hard = soft;
     hard.peer.node_pub[0] ^= 0xff;
     check("store/hard-at-once",
-          tl_warm_store(&m, &hard, 1700003760u, 2 * MIN_US + TL_WARM_SOFT_MIN_US, fake_write, &f) == 1 &&
+          tl_warm_store(&m, &hard, 1700003760u, 2 * MIN_US + TL_WARM_SOFT_MIN_US, false, fake_write, &f) == 1 &&
           f.writes == 3);
     tl_warm_rec_t back;
     check("store/nvs-holds-last", tl_warm_decode(f.b, f.n, &back) && back.written == 1700003760u &&
@@ -612,21 +624,21 @@ static void test_store(void)
      * write → at once; the next one an hour later. */
     boot(&m, &f);
     check("store/reboot-same-no-write", m.valid &&
-          tl_warm_store(&m, &hard, 1700010000u, MIN_US, fake_write, &f) == 0 && f.writes == 3);
+          tl_warm_store(&m, &hard, 1700010000u, MIN_US, false, fake_write, &f) == 0 && f.writes == 3);
     tl_warm_rec_t soft2 = hard;
     soft2.peer.disco_pub[1] ^= 1;
     check("store/reboot-soft-first-at-once",
-          tl_warm_store(&m, &soft2, 1700010060u, 2 * MIN_US, fake_write, &f) == 1 && f.writes == 4);
+          tl_warm_store(&m, &soft2, 1700010060u, 2 * MIN_US, false, fake_write, &f) == 1 && f.writes == 4);
     tl_warm_rec_t soft3 = soft2;
     soft3.peer.ep[3].port = 2;
     check("store/reboot-soft-second-held",
-          tl_warm_store(&m, &soft3, 1700010120u, 3 * MIN_US, fake_write, &f) == 0 && f.writes == 4);
+          tl_warm_store(&m, &soft3, 1700010120u, 3 * MIN_US, false, fake_write, &f) == 0 && f.writes == 4);
 
     /* A layout this firmware cannot read counts as nothing stored. */
     f.b[0] = 2;
     boot(&m, &f);
     check("store/unknown-layout-replaced", !m.valid &&
-          tl_warm_store(&m, &soft3, 1700010180u, MIN_US, fake_write, &f) == 1 && f.writes == 5 &&
+          tl_warm_store(&m, &soft3, 1700010180u, MIN_US, false, fake_write, &f) == 1 && f.writes == 5 &&
           f.b[0] == TL_WARM_REC_V1);
 
     /* A failing NVS: one attempt per change, not one per housekeeping. */
@@ -634,15 +646,15 @@ static void test_store(void)
     tl_warm_rec_t h2 = soft3;
     h2.peer.addr[0].ip[3] = 21;
     const int w0 = f.writes;
-    const int rc1 = tl_warm_store(&m, &h2, 0, 2 * MIN_US, fake_write, &f);
-    const int rc2 = tl_warm_store(&m, &h2, 0, 3 * MIN_US, fake_write, &f);
+    const int rc1 = tl_warm_store(&m, &h2, 0, 2 * MIN_US, false, fake_write, &f);
+    const int rc2 = tl_warm_store(&m, &h2, 0, 3 * MIN_US, false, fake_write, &f);
     check("store/write-failure-no-retry-storm", rc1 == -1 && rc2 == 0 && f.writes == w0 + 1);
     f.fail = 0;
 
     tl_warm_rec_t bad = h2;
     bad.peer.n_ep = 0;
     const int w1 = f.writes;
-    check("store/unstorable-refused", tl_warm_store(&m, &bad, 0, 4 * MIN_US, fake_write, &f) == -1 &&
+    check("store/unstorable-refused", tl_warm_store(&m, &bad, 0, 4 * MIN_US, false, fake_write, &f) == -1 &&
                                       f.writes == w1);
 
     /* A day of endpoints churning every minute: the boot's first write,
@@ -654,11 +666,459 @@ static void test_store(void)
     for (int min = 1; min <= 24 * 60; min++) {
         c.peer.ep[min % 4].port = (uint16_t)(1000 + min);
         if (tl_warm_store(&m, &c, 1700000000u + 60u * (uint32_t)min, (int64_t)min * MIN_US,
-                          fake_write, &f) == 1) {
+                          false, fake_write, &f) == 1) {
             writes_day++;
         }
     }
     check("store/churn-day-24-writes", writes_day == 24 && f.writes == 24);
+}
+
+/* ---- Refresh and age ---------------------------------------------------- */
+
+#define DAY 86400u
+
+static void test_refresh_age(void)
+{
+    check("refresh/needs-fresh", !tl_warm_refresh_due(1700000000u, 1700000000u + 2 * DAY, false));
+    check("refresh/needs-clock", !tl_warm_refresh_due(1700000000u, 0, true));
+    check("refresh/unknown-written", tl_warm_refresh_due(0, 1700000000u, true));
+    check("refresh/daily", !tl_warm_refresh_due(1700000000u, 1700000000u + DAY - 1, true) &&
+                           tl_warm_refresh_due(1700000000u, 1700000000u + DAY, true));
+    check("refresh/clock-behind", !tl_warm_refresh_due(1700000000u, 1600000000u, true));
+
+    fake_nvs_t f;
+    memset(&f, 0, sizeof(f));
+    tl_warm_nvs_t m;
+    boot(&m, &f);
+    const tl_warm_rec_t r = mk_rec();
+    tl_warm_store(&m, &r, 1700000000u, MIN_US, false, fake_write, &f);
+    const int w = f.writes;
+    check("refresh/not-within-a-day",
+          tl_warm_store(&m, &r, 1700000000u + DAY - 60, 2 * MIN_US, true, fake_write, &f) == 0 &&
+          f.writes == w);
+    check("refresh/not-when-stale-netmap",
+          tl_warm_store(&m, &r, 1700000000u + 2 * DAY, 3 * MIN_US, false, fake_write, &f) == 0 &&
+          f.writes == w);
+    tl_warm_rec_t back;
+    check("refresh/a-day-later-fresh",
+          tl_warm_store(&m, &r, 1700000000u + 2 * DAY, 4 * MIN_US, true, fake_write, &f) == 1 &&
+          f.writes == w + 1 && tl_warm_decode(f.b, f.n, &back) &&
+          back.written == 1700000000u + 2 * DAY && tl_warm_diff(&back, &r) == 0);
+    /* Up for 60 days, control heard: one write a day keeps it young. */
+    int writes = 0;
+    for (uint32_t h = 1; h <= 60 * 24; h++) {
+        if (tl_warm_store(&m, &r, 1700000000u + 2 * DAY + 3600u * h, (int64_t)(5 + h) * MIN_US,
+                          true, fake_write, &f) == 1) {
+            writes++;
+        }
+    }
+    check("refresh/60-days-60-writes", writes == 60 &&
+          !tl_warm_too_old(1700000000 + 62 * (int64_t)DAY + 3600, m.rec.written));
+
+    check("age/too-old-unknown", !tl_warm_too_old(1700000000, 0));
+    check("age/too-old-clock-behind", !tl_warm_too_old(1600000000, 1700000000u));
+    check("age/too-old-30d", !tl_warm_too_old(1700000000 + 30 * (int64_t)DAY, 1700000000u) &&
+                             tl_warm_too_old(1700000000 + 30 * (int64_t)DAY + 1, 1700000000u));
+}
+
+/* ---- The target pick, the address and register rules --------------------- */
+
+static void test_pick(void)
+{
+    static const uint8_t pub1[4] = { 203, 0, 113, 7 }, pub2[4] = { 198, 51, 100, 9 },
+                         p10[4] = { 10, 1, 2, 3 }, p172[4] = { 172, 20, 0, 1 },
+                         p172o[4] = { 172, 32, 0, 1 }, p192[4] = { 192, 168, 1, 2 },
+                         ll[4] = { 169, 254, 1, 1 }, lo[4] = { 127, 0, 0, 1 },
+                         z[4] = { 0, 1, 2, 3 }, mc[4] = { 224, 0, 0, 1 };
+    check("pick/public", tl_warm_ipv4_public(pub1) && tl_warm_ipv4_public(pub2) &&
+                         tl_warm_ipv4_public(p172o));
+    check("pick/not-public", !tl_warm_ipv4_public(p10) && !tl_warm_ipv4_public(p172) &&
+                             !tl_warm_ipv4_public(p192) && !tl_warm_ipv4_public(ll) &&
+                             !tl_warm_ipv4_public(lo) && !tl_warm_ipv4_public(z) &&
+                             !tl_warm_ipv4_public(mc));
+
+    static const char *const a[] = { "192.0.2.50/32" };
+    static const char *const lan[] = { "10.0.0.5:41641", "192.168.1.5:41641" };
+    static const char *const ours[] = { "203.0.113.7:41641", "10.0.0.6:41641" };
+    static const char *const other[] = { "garbage", "198.51.100.9:41641" };
+    static const char *const both[] = { "203.0.113.7:41641", "198.51.100.10:41641" };
+    const tl_peer_t t[4] = {
+        mk_peer(1, 0x01, 0x81, a, 1, lan, 2),     /* LAN only */
+        mk_peer(2, 0x02, 0x82, a, 1, ours, 2),    /* public = our STUN address */
+        mk_peer(3, 0x03, 0x83, a, 1, other, 2),   /* another public (after junk) */
+        mk_peer(4, 0x04, 0x84, a, 1, both, 2),
+    };
+    bool q = false;
+    check("pick/first-cross-nat", tl_warm_target_index(t, 4, true, pub1, &q) == 2 && q);
+    q = false;
+    check("pick/no-stun-optimistic", tl_warm_target_index(t, 4, false, pub1, &q) == 1 && q);
+    q = true;
+    check("pick/fallback-peers0", tl_warm_target_index(t, 2, true, pub1, &q) == 0 && !q);
+    q = true;
+    check("pick/fallback-single", tl_warm_target_index(t, 1, true, pub1, &q) == 0 && !q);
+    q = true;
+    check("pick/empty", tl_warm_target_index(t, 0, true, pub1, &q) == 0 && !q);
+    check("pick/ours-then-other", tl_warm_peer_reachable(&t[3], true, pub1) &&
+                                  !tl_warm_peer_reachable(&t[1], true, pub1) &&
+                                  !tl_warm_peer_reachable(&t[0], false, pub1));
+    q = false;
+    check("pick/second-of-three", tl_warm_target_index(&t[1], 3, true, pub1, &q) == 1 && q);
+    q = false;
+    check("pick/only-the-last-qualifies", tl_warm_target_index(t, 3, true, pub1, &q) == 2 && q);
+    const tl_peer_t first[2] = { t[2], t[0] };
+    q = false;
+    check("pick/peers0-qualifies", tl_warm_target_index(first, 2, true, pub1, &q) == 0 && q);
+
+    check("addr/moved", tl_warm_addr_moved(0x0102000au, 0x0202000au));
+    check("addr/same", !tl_warm_addr_moved(0x0102000au, 0x0102000au));
+    check("addr/none-keeps", !tl_warm_addr_moved(0x0102000au, 0));
+    check("addr/first-one", tl_warm_addr_moved(0, 0x0102000au));
+
+    check("reg/known-no-retry", tl_warm_reg_reused(true, false));
+    check("reg/retried-with-key", !tl_warm_reg_reused(true, true));
+    check("reg/unknown", !tl_warm_reg_reused(false, false) && !tl_warm_reg_reused(false, true));
+}
+
+/* ---- The RTC marks ------------------------------------------------------ */
+
+#define RST_POWERON 1
+#define RST_SW      3
+#define RST_PANIC   4
+#define RST_TWDT    6
+#define RST_BROWN   9
+
+static void test_rtc(void)
+{
+    tl_warm_rtc_t r;
+    bool erase = true;
+    memset(&r, 0xa7, sizeof(r));
+    check("rtc/garbage-clean", tl_warm_rtc_boot(&r, RST_SW, &erase) == TL_WARM_RTC_CLEAN &&
+                               !erase && r.magic == TL_WARM_RTC_MAGIC && r.attempt == 0 &&
+                               r.skip == 0 && r.crashes == 0);
+    r.attempt = 1;
+    tl_warm_rtc_seal(&r);
+    check("rtc/attempt-sw-not-a-crash",
+          tl_warm_rtc_boot(&r, RST_SW, &erase) == TL_WARM_RTC_CLEAN && !erase &&
+          r.attempt == 0 && r.crashes == 0);
+    r.attempt = 1;
+    tl_warm_rtc_seal(&r);
+    check("rtc/attempt-panic-crash", tl_warm_rtc_boot(&r, RST_PANIC, &erase) == TL_WARM_RTC_CRASHED &&
+                                     erase && r.crashes == 1 && r.attempt == 0);
+    check("rtc/after-crash-clean", tl_warm_rtc_boot(&r, RST_SW, &erase) == TL_WARM_RTC_CLEAN &&
+                                   !erase && r.crashes == 1);
+    r.attempt = 1;
+    tl_warm_rtc_seal(&r);
+    check("rtc/second-crash-off", tl_warm_rtc_boot(&r, RST_TWDT, &erase) == TL_WARM_RTC_OFF &&
+                                  erase && r.crashes == TL_WARM_RTC_MAX_CRASHES);
+    check("rtc/off-stays", tl_warm_rtc_boot(&r, RST_SW, &erase) == TL_WARM_RTC_OFF && !erase &&
+                           tl_warm_rtc_boot(&r, RST_PANIC, &erase) == TL_WARM_RTC_OFF && !erase);
+    check("rtc/power-on-re-enables", tl_warm_rtc_boot(&r, RST_POWERON, &erase) == TL_WARM_RTC_CLEAN &&
+                                     !erase && r.crashes == 0);
+    r.attempt = 1;
+    tl_warm_rtc_seal(&r);
+    check("rtc/power-on-clears-attempt",
+          tl_warm_rtc_boot(&r, RST_POWERON, &erase) == TL_WARM_RTC_CLEAN && !erase && r.attempt == 0);
+    r.attempt = 1;
+    tl_warm_rtc_seal(&r);
+    check("rtc/brownout-counts", tl_warm_rtc_boot(&r, RST_BROWN, &erase) == TL_WARM_RTC_CRASHED && erase);
+    memset(&r, 0, sizeof(r));
+    tl_warm_rtc_seal(&r);
+    r.attempt = 1;
+    tl_warm_rtc_restart(&r);
+    check("rtc/restart-mark", r.skip == 1 && r.attempt == 0 &&
+                              tl_warm_rtc_boot(&r, RST_SW, &erase) == TL_WARM_RTC_RESTARTED && !erase);
+    check("rtc/restart-consumed-once", tl_warm_rtc_boot(&r, RST_SW, &erase) == TL_WARM_RTC_CLEAN &&
+                                       r.skip == 0);
+    r.skip = 1;
+    r.attempt = 1;
+    tl_warm_rtc_seal(&r);
+    check("rtc/crash-beats-skip", tl_warm_rtc_boot(&r, RST_PANIC, &erase) == TL_WARM_RTC_CRASHED &&
+                                  erase && r.skip == 0);
+    r.attempt = 1;   /* not resealed: the check fails */
+    check("rtc/torn-reset", tl_warm_rtc_boot(&r, RST_PANIC, &erase) == TL_WARM_RTC_CLEAN && !erase &&
+                            r.crashes == 0);
+    r.crashes = 7;
+    tl_warm_rtc_seal(&r);
+    check("rtc/out-of-range-reset", tl_warm_rtc_boot(&r, RST_SW, &erase) == TL_WARM_RTC_CLEAN &&
+                                    r.crashes == 0);
+}
+
+/* ---- Does a boot warm-start? -------------------------------------------- */
+
+static tl_warm_go_in_t go_ok(void)
+{
+    return (tl_warm_go_in_t){ .rtc = TL_WARM_RTC_CLEAN, .have_rec = true, .keys_ok = true,
+                              .reg_reused = true, .heap_ok = true,
+                              .now_unix = 1700000000 + 3600, .written = 1700000000u };
+}
+
+static void test_go(void)
+{
+    tl_warm_go_in_t in = go_ok();
+    check("go/all-good", tl_warm_go(&in) == TL_WARM_GO);
+    in = go_ok(); in.have_rec = false;
+    check("go/no-record", tl_warm_go(&in) == TL_WARM_NO_RECORD);
+    in = go_ok(); in.rtc = TL_WARM_RTC_CRASHED; in.have_rec = false;
+    check("go/crash-first", tl_warm_go(&in) == TL_WARM_SKIP_CRASH);
+    in = go_ok(); in.rtc = TL_WARM_RTC_OFF;
+    check("go/off", tl_warm_go(&in) == TL_WARM_SKIP_OFF);
+    in = go_ok(); in.rtc = TL_WARM_RTC_RESTARTED;
+    check("go/after-restart", tl_warm_go(&in) == TL_WARM_SKIP_RESTART);
+    in = go_ok(); in.keys_ok = false;
+    check("go/other-keys", tl_warm_go(&in) == TL_WARM_OTHER_KEYS);
+    in = go_ok(); in.now_unix = 1700000000 + 31 * (int64_t)DAY;
+    check("go/stale", tl_warm_go(&in) == TL_WARM_STALE);
+    in = go_ok(); in.now_unix = 1600000000;   /* floor behind the write: can't tell */
+    check("go/age-unknown-goes", tl_warm_go(&in) == TL_WARM_GO);
+    in = go_ok(); in.reg_reused = false;
+    check("go/needed-auth", tl_warm_go(&in) == TL_WARM_NEEDED_AUTH);
+    in = go_ok(); in.heap_ok = false;
+    check("go/low-heap", tl_warm_go(&in) == TL_WARM_LOW_HEAP);
+    /* Only GO starts it: every single failing input stops it. */
+    int only = 1;
+    for (int k = 0; k < 6; k++) {
+        in = go_ok();
+        if (k == 0) in.have_rec = false;
+        if (k == 1) in.keys_ok = false;
+        if (k == 2) in.reg_reused = false;
+        if (k == 3) in.heap_ok = false;
+        if (k == 4) in.rtc = TL_WARM_RTC_RESTARTED;
+        if (k == 5) in.written = 1, in.now_unix = 1 + 31 * (int64_t)DAY;
+        only &= tl_warm_go(&in) != TL_WARM_GO;
+    }
+    check("go/each-input-gates", only);
+}
+
+/* ---- The state machine -------------------------------------------------- */
+
+typedef struct {
+    tl_cidr_t        self[TL_MAX_PEER_ADDRESSES];
+    tl_peer_t        peers[TL_MAX_PEERS];
+    size_t           n_self, n_peers;
+    tl_warm_tables_t t;
+    tl_warm_sm_t     sm;
+    tl_warm_rtc_t    rtc;
+    tl_warm_rec_t    rec;
+} rig_t;
+
+static void rig_start(rig_t *g, bool ok, uint32_t now_s)
+{
+    memset(g, 0, sizeof(*g));
+    g->t = (tl_warm_tables_t){ g->self, &g->n_self, g->peers, &g->n_peers };
+    tl_warm_rtc_seal(&g->rtc);
+    g->rec = mk_rec();
+    g->rec.written = 1700000000u;
+    tl_warm_sm_begin(&g->sm, &g->rtc, &g->rec, &g->t);
+    tl_warm_sm_started(&g->sm, &g->rtc, &g->t, ok, now_s, g->rec.written);
+}
+
+static tl_warm_act_t rig_netmap(rig_t *g, const tl_warm_rec_t *now, bool have_self,
+                                bool expired, bool moved, unsigned *why)
+{
+    const tl_warm_nm_t in = { .expired = expired, .have_self = have_self,
+                              .self0_moved = moved, .now = now };
+    return tl_warm_sm_netmap(&g->sm, &g->rtc, &g->rec, &in, why);
+}
+
+static void test_sm(void)
+{
+    rig_t g;
+    unsigned why = 0;
+    rig_start(&g, true, 100);
+    check("sm/started", g.sm.state == TL_WARM_ST_PENDING && g.sm.pending_s == 101 &&
+                        g.sm.seeded && g.n_self == 2 && g.n_peers == 1 && g.rtc.attempt == 1);
+    /* The first frame empties the seeded tables, once. */
+    check("sm/first-frame-resets", tl_warm_sm_frame(&g.sm, &g.t) && g.n_self == 0 &&
+                                   g.n_peers == 0 && !g.sm.seeded);
+    g.n_self = 2;
+    g.n_peers = 3;
+    check("sm/second-frame-keeps", tl_warm_sm_frame(&g.sm, &g.t) && g.n_self == 2 && g.n_peers == 3);
+    check("sm/wait-before-full-map", rig_netmap(&g, NULL, false, false, false, &why) ==
+                                     TL_WARM_ACT_WAIT && g.sm.state == TL_WARM_ST_PENDING &&
+                                     !g.sm.restart && g.sm.pending_s == 101);
+    const tl_warm_rec_t same = g.rec;
+    check("sm/confirm", rig_netmap(&g, &same, true, false, false, &why) == TL_WARM_ACT_CONFIRM &&
+                        why == 0 && g.sm.state == TL_WARM_ST_CONFIRMED && g.sm.pending_s == 0 &&
+                        g.rtc.attempt == 0 && !g.sm.restart);
+    /* Confirmed: the bound never fires, later frames take the cold path. */
+    check("sm/confirmed-no-bound", tl_warm_sm_bound(&g.sm, 101 + 100000, 600, true,
+                                                    1700000000 + 400 * (int64_t)DAY) == 0);
+    check("sm/confirmed-cold-path", !tl_warm_sm_frame(&g.sm, &g.t) &&
+                                    rig_netmap(&g, &same, true, false, false, &why) ==
+                                    TL_WARM_ACT_COLD);
+
+    rig_start(&g, true, 100);
+    tl_warm_sm_frame(&g.sm, &g.t);
+    tl_warm_rec_t d = g.rec;
+    d.peer.disco_pub[3] ^= 1;
+    d.peer.ep[0].port = 2;
+    d.peer.addr[0].ip[3] = 99;
+    d.peer.node_pub[0] ^= 1;
+    check("sm/in-place", rig_netmap(&g, &d, true, false, false, &why) == TL_WARM_ACT_CONFIRM &&
+                         why == (TL_WARM_D_DISCO | TL_WARM_D_EP | TL_WARM_D_ADDR | TL_WARM_D_KEY));
+
+    struct { const char *name; int kind; unsigned want; } rs[] = {
+        { "sm/restart-other-peer", 0, TL_WARM_D_PEER },
+        { "sm/restart-self0",      1, TL_WARM_D_SELF0 },
+        { "sm/restart-expired",    2, TL_WARM_WHY_EXPIRED },
+        { "sm/restart-moved",      3, TL_WARM_D_SELF0 },
+        { "sm/restart-empty",      4, TL_WARM_WHY_EMPTY },
+    };
+    for (size_t i = 0; i < sizeof(rs) / sizeof(rs[0]); i++) {
+        rig_start(&g, true, 100);
+        tl_warm_sm_frame(&g.sm, &g.t);
+        tl_warm_rec_t n = g.rec;
+        tl_warm_act_t act;
+        if (rs[i].kind == 0) { n.peer.id++; act = rig_netmap(&g, &n, true, false, false, &why); }
+        else if (rs[i].kind == 1) { n.self[0].ip[3]++; act = rig_netmap(&g, &n, true, false, false, &why); }
+        else if (rs[i].kind == 2) act = rig_netmap(&g, NULL, true, true, false, &why);
+        else if (rs[i].kind == 3) act = rig_netmap(&g, NULL, true, false, true, &why);
+        else act = rig_netmap(&g, NULL, true, false, false, &why);
+        check(rs[i].name, act == TL_WARM_ACT_RESTART && (why & rs[i].want) && g.sm.restart &&
+                          g.sm.pending_s == 0 && g.sm.state == TL_WARM_ST_PENDING &&
+                          g.rtc.attempt == 1);
+    }
+
+    /* The bound: 600 s after the start, once; then the netmap is late. */
+    rig_start(&g, true, 100);
+    tl_warm_sm_frame(&g.sm, &g.t);
+    check("sm/bound-not-yet", tl_warm_sm_bound(&g.sm, 699, 600, false, 0) == 0);
+    check("sm/bound-due", tl_warm_sm_bound(&g.sm, 700, 600, false, 0) == TL_WARM_BOUND_TIME &&
+                          g.sm.bound_fired && g.sm.pending_s == 0);
+    check("sm/bound-once", tl_warm_sm_bound(&g.sm, 800, 600, false, 0) == 0);
+    check("sm/netmap-after-bound-late",
+          rig_netmap(&g, &same, true, false, false, &why) == TL_WARM_ACT_LATE &&
+          g.sm.state == TL_WARM_ST_PENDING);
+    /* The age, once the clock can tell. */
+    rig_start(&g, true, 100);
+    check("sm/age-unsynced-waits", tl_warm_sm_bound(&g.sm, 200, 600, false,
+                                                    1700000000 + 31 * (int64_t)DAY) == 0);
+    check("sm/age-synced-ends", tl_warm_sm_bound(&g.sm, 200, 600, true,
+                                                 1700000000 + 31 * (int64_t)DAY) == TL_WARM_BOUND_AGE);
+    rig_start(&g, true, 100);
+    check("sm/age-young-stays", tl_warm_sm_bound(&g.sm, 200, 600, true,
+                                                 1700000000 + 29 * (int64_t)DAY) == 0);
+
+    /* A failed bring-up: tables as before a cold boot's netmap, no mark,
+     * the frames take the cold path. */
+    rig_start(&g, false, 100);
+    check("sm/failed-start", g.sm.state == TL_WARM_ST_OFF && !g.sm.seeded && g.n_self == 0 &&
+                             g.n_peers == 0 && g.rtc.attempt == 0);
+    g.n_peers = 2;
+    check("sm/failed-start-cold-path", !tl_warm_sm_frame(&g.sm, &g.t) && g.n_peers == 2 &&
+                                       tl_warm_sm_bound(&g.sm, 100000, 600, false, 0) == 0 &&
+                                       rig_netmap(&g, &same, true, false, false, &why) ==
+                                       TL_WARM_ACT_COLD);
+    tl_warm_sm_cold(&g.sm);
+    check("sm/cold-start-confirmed", g.sm.state == TL_WARM_ST_CONFIRMED);
+
+    /* While pending, no input takes the cold path or keeps the bound. */
+    int never_cold = 1;
+    for (int k = 0; k < 2000; k++) {
+        rig_start(&g, true, 100);
+        tl_warm_sm_frame(&g.sm, &g.t);
+        tl_warm_rec_t n = g.rec;
+        const uint32_t m = rnd();
+        if (m & 1) n.peer.id ^= rnd();
+        if (m & 2) n.peer.ep[0].port ^= (uint16_t)rnd();
+        if (m & 4) n.self[0].ip[3] ^= (uint8_t)rnd();
+        if (m & 8) n.peer.disco_pub[0] ^= 1;
+        const tl_warm_act_t act = rig_netmap(&g, (m & 16) ? NULL : &n, (m & 32) != 0,
+                                             (m & 64) != 0, (m & 128) != 0, &why);
+        never_cold &= act != TL_WARM_ACT_COLD;
+        if (act == TL_WARM_ACT_CONFIRM || act == TL_WARM_ACT_RESTART) {
+            never_cold &= g.sm.pending_s == 0 &&
+                          tl_warm_sm_bound(&g.sm, 1000000, 600, true, 0) == 0;
+        }
+        never_cold &= (act == TL_WARM_ACT_RESTART) == g.sm.restart;
+    }
+    check("sm/pending-never-cold-path", never_cold);
+}
+
+/* ---- Boots in a row: fake NVS + RTC ----------------------------------- */
+
+static void test_boots(void)
+{
+    fake_nvs_t f;
+    memset(&f, 0, sizeof(f));
+    tl_warm_rtc_t rtc;
+    memset(&rtc, 0x3c, sizeof(rtc));   /* power-on garbage */
+    tl_warm_nvs_t m;
+    bool erase = false;
+    unsigned why = 0;
+    int ok = 1;
+
+    /* Boot 1 (power-on): nothing stored → cold, the record written. */
+    tl_warm_rtc_verdict_t v = tl_warm_rtc_boot(&rtc, RST_POWERON, &erase);
+    boot(&m, &f);
+    tl_warm_go_in_t in = go_ok();
+    in.rtc = v;
+    in.have_rec = m.valid;
+    ok &= tl_warm_go(&in) == TL_WARM_NO_RECORD;
+    tl_warm_sm_t sm;
+    memset(&sm, 0, sizeof(sm));
+    tl_warm_sm_cold(&sm);
+    const tl_warm_rec_t r = mk_rec();
+    ok &= tl_warm_store(&m, &r, 1700000000u, MIN_US, true, fake_write, &f) == 1;
+    check("boots/1-cold-then-stored", ok);
+
+    /* Boot 2 (software reset): warm, the netmap confirms. */
+    v = tl_warm_rtc_boot(&rtc, RST_SW, &erase);
+    boot(&m, &f);
+    in = go_ok();
+    in.rtc = v;
+    in.have_rec = m.valid;
+    in.written = m.rec.written;
+    ok = tl_warm_go(&in) == TL_WARM_GO;
+    tl_cidr_t self[2];
+    tl_peer_t peers[TL_MAX_PEERS];
+    size_t ns = 0, np = 0;
+    tl_warm_tables_t t = { self, &ns, peers, &np };
+    tl_warm_sm_begin(&sm, &rtc, &m.rec, &t);
+    tl_warm_sm_started(&sm, &rtc, &t, true, 3, m.rec.written);
+    tl_warm_sm_frame(&sm, &t);
+    tl_warm_nm_t nm = { .have_self = true, .now = &r };
+    ok &= tl_warm_sm_netmap(&sm, &rtc, &m.rec, &nm, &why) == TL_WARM_ACT_CONFIRM && rtc.attempt == 0;
+    check("boots/2-warm-confirmed", ok);
+
+    /* Boot 3: the netmap picks another peer → restart (mark, erase). */
+    v = tl_warm_rtc_boot(&rtc, RST_SW, &erase);
+    boot(&m, &f);
+    tl_warm_sm_begin(&sm, &rtc, &m.rec, &t);
+    tl_warm_sm_started(&sm, &rtc, &t, true, 3, m.rec.written);
+    tl_warm_sm_frame(&sm, &t);
+    tl_warm_rec_t other = r;
+    other.peer.id = 777;
+    nm.now = &other;
+    ok = v == TL_WARM_RTC_CLEAN &&
+         tl_warm_sm_netmap(&sm, &rtc, &m.rec, &nm, &why) == TL_WARM_ACT_RESTART && sm.restart;
+    tl_warm_rtc_restart(&rtc);   /* warm_restart_now */
+    f.n = 0;                     /* …and its erase */
+    check("boots/3-diverged-restart", ok);
+
+    /* Boot 4: cold (marked and erased), and its record replaces it. */
+    v = tl_warm_rtc_boot(&rtc, RST_SW, &erase);
+    boot(&m, &f);
+    in = go_ok();
+    in.rtc = v;
+    in.have_rec = m.valid;
+    ok = v == TL_WARM_RTC_RESTARTED && tl_warm_go(&in) == TL_WARM_NO_RECORD &&
+         tl_warm_store(&m, &other, 1700000100u, MIN_US, true, fake_write, &f) == 1;
+    check("boots/4-cold-after-restart", ok);
+
+    /* Boot 5: warm, panics before its netmap. Boot 6: erased, cold. */
+    v = tl_warm_rtc_boot(&rtc, RST_SW, &erase);
+    boot(&m, &f);
+    tl_warm_sm_begin(&sm, &rtc, &m.rec, &t);
+    tl_warm_sm_started(&sm, &rtc, &t, true, 3, m.rec.written);
+    v = tl_warm_rtc_boot(&rtc, RST_PANIC, &erase);
+    if (erase) f.n = 0;
+    boot(&m, &f);
+    in = go_ok();
+    in.rtc = v;
+    in.have_rec = m.valid;
+    ok = v == TL_WARM_RTC_CRASHED && erase && !m.valid && tl_warm_go(&in) == TL_WARM_SKIP_CRASH;
+    check("boots/5-6-crash-guard", ok);
 }
 
 /* ---- Log helpers, bound ------------------------------------------------- */
@@ -694,6 +1154,12 @@ int main(void)
     test_cold_equivalence();
     test_diff();
     test_store();
+    test_refresh_age();
+    test_pick();
+    test_rtc();
+    test_go();
+    test_sm();
+    test_boots();
     test_misc();
     if (s_fails) {
         printf("test_warm: %d FAIL\n", s_fails);

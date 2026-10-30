@@ -346,9 +346,20 @@ bool wg_netif_get_peer_disco_k(uint8_t pub[WG_KEY_LEN], uint8_t k[WG_KEY_LEN],
  * own (roam on authenticated packets, pong roam). False before start. */
 bool wg_netif_get_peer_endpoint(uint32_t *v4_be, uint16_t *port);
 
-/* True while the session is up and a transport packet authenticated
- * within the RX-stale window (WG_RX_STALE_THRESHOLD_MS). */
-bool wg_netif_path_alive(void);
+/* The live endpoint is proven, i.e. worth keeping over what control
+ * advertises (wg_dataplane apply_peer_endpoint; round 1.3.9): for a peer
+ * with a DiscoKey, a pong from it confirmed the direct path within
+ * WG_PATH_TRUST_MS (wg_path_valid); for one without (no pings, direct
+ * only), the session is up and a transport packet authenticated within
+ * the RX-stale window, as before. */
+bool wg_netif_live_path_proven(void);
+
+/* Undo a wg_netif_start that wg_dataplane_start could not finish (the RX
+ * task or the lwIP netif was not created; round 1.3.9): back to the
+ * state after wg_netif_init — socket, wg_tx and every callback kept, the
+ * peer and its handshake gone — so the next wg_netif_start is a first
+ * one. A wg_rx already spawned stays and is reused. */
+void wg_netif_abort_start(void);
 
 #ifdef __cplusplus
 }

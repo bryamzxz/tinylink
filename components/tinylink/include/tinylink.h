@@ -250,6 +250,12 @@ esp_err_t tinylink_long_poll_start(void);
  * the netmap came first, or the option is off. */
 void tinylink_warm_start(void);
 
+/* True once the long-poll handled the first full netmap of the boot (a
+ * cold start, or a warm start's confirmation; round 1.3.9). app_wifi.c
+ * keeps the modem awake until then (the netmap's body is the boot's
+ * largest download). Any task. */
+bool tinylink_netmap_seen(void);
+
 /* True once the WG session has transport keys (a handshake response
  * was accepted). Non-blocking, callable from any task or an esp_timer
  * callback; app_wifi.c polls it to end the modem-awake boot window. */
