@@ -165,6 +165,34 @@ static void test_source_binding(void) {
                 !disco_prober_match_and_remove(txid, 0x01020304, 41641, 2000));
 }
 
+/* Round 1.3.6: the match also hands back the Ping's send time — the
+ * Pong's RTT, which the path selection compares between endpoints. */
+static void test_take_send_time(void) {
+    disco_prober_reset();
+    uint8_t txid[DISCO_TXID_LEN], other[DISCO_TXID_LEN];
+    make_txid(txid, 0x80);
+    make_txid(other, 0x90);
+    disco_prober_record(txid, 0x01020304, 41641, 1234567);
+    int64_t sent = -1;
+    fails += ok("take/spoofed-leaves-sent",
+                !disco_prober_take(txid, 0x05060708, 41641, 1300000, &sent) &&
+                sent == -1);
+    fails += ok("take/sent-us",
+                disco_prober_take(txid, 0x01020304, 41641, 1300000, &sent) &&
+                sent == 1234567);
+    fails += ok("take/once",
+                !disco_prober_take(txid, 0x01020304, 41641, 1300000, &sent));
+    disco_prober_record(other, 0x01020304, 41641, 0);
+    sent = -1;
+    fails += ok("take/expired-leaves-sent",
+                !disco_prober_take(other, 0x01020304, 41641,
+                                   (int64_t)DISCO_PROBER_TIMEOUT_MS * 1000 + 1, &sent) &&
+                sent == -1);
+    disco_prober_record(other, 0x01020304, 41641, 5000);
+    fails += ok("take/null-out",
+                disco_prober_take(other, 0x01020304, 41641, 6000, NULL));
+}
+
 static void test_null_safety(void) {
     disco_prober_reset();
     fails += ok("null/record-no-crash",
@@ -181,6 +209,7 @@ int main(void) {
     test_lru_eviction();
     test_unknown_txid();
     test_source_binding();
+    test_take_send_time();
     test_null_safety();
 
     if (fails == 0) {
