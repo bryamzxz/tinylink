@@ -216,12 +216,16 @@ Hardware section at the end of this entry.
 
 #### Hardware (deployed sensor, app partition only; `ota_0` + `otadata` read back to `~/tinylink-backups/` before each flash)
 
-Two images: `817c484` (ctl + boot branches) and `6dc9d83` (+ DNS);
+Two images: `9a54b88` (ctl + boot branches) and `b497bde` (+ DNS);
+(hashes after the pre-push history rewrite that took the peer's public
+address out of a `test_mapresp.c` fixture — the flashed images still
+report the old ones: 1.3.4 `g26b589d` = `2c22a8b`, 1.3.5 `g817c484` =
+`9a54b88`, `g6dc9d83` = `b497bde`, 1.3.6 `gf7d95e1` = `827c1b9`);
 each backup byte-identical to the image it replaced, otadata seq 1 /
 CRC OK. Times below are from got-ip (the AP's association after a
 serial reset took 3–9 s and is not ours).
 
-- **`817c484` smoke + 10 × 5 min:** register without Auth 10 / 10;
+- **`9a54b88` smoke + 10 × 5 min:** register without Auth 10 / 10;
   control conn on :80 in 440–590 ms (1.57 s behind a DNS retry), register
   0.66–1.94 s (1.3.4 series 2.62–11.49 s, median 4.7); with DNS
   answering at once WG up **2.04 s** (1.3.4 median 8.7 s). It also
@@ -237,7 +241,7 @@ serial reset took 3–9 s and is not ours).
   side): DERP `peer-gone`, unanswered handshakes, direct paths dying —
   the RX-drop counters showed `seen direct=0 derp=0` every time, nothing
   dropped on the sensor; it recovered by itself each time.
-- **`6dc9d83` (+ DNS), first boot (nothing stored):** everything by
+- **`b497bde` (+ DNS), first boot (nothing stored):** everything by
   name; `address cache: … stored` once at 64 s. Warm boots: STUN to the
   home DERP node (`stun probe: home DERP node at …:3478 (no DNS)`),
   control and DERP at the stored addresses. **10 × 2 min:** register
@@ -247,7 +251,7 @@ serial reset took 3–9 s and is not ours).
   boots 1–2); 19 / 20 connects at the stored address, one DERP attempt
   failed there during an association stall and went by name (+2.7 s).
   Heap 161 100–161 380 B free (158 968 on 1.3.4).
-- **Soak (`6dc9d83`, 370 min):** 0 resets / panics / WDT / brown-outs,
+- **Soak (`b497bde`, 370 min):** 0 resets / panics / WDT / brown-outs,
   0 E lines; **0 long-poll stream ends** (no boot-connection FIN this
   time); 198 rekeys (22 needed a REKEY_TIMEOUT retry), 2 RX-stale — both
   with the healthy peer, 30–47 s of WireGuard silence right after a
@@ -373,7 +377,7 @@ depends on record cuts).
 #### Hardware (deployed sensor, app partition only; the 1.3.3 `ota_0` + `otadata` read back to `~/tinylink-backups/` first)
 
 Backup byte-identical to the flashed 1.3.3 (`b58273f`), otadata seq 1 /
-CRC OK; flashed `26b589d`.
+CRC OK; flashed `2c22a8b`.
 
 - **Smoke** (180 s): `register … (known node, no auth)`; **heap_free
   158 968 B (94 884 on 1.3.3, +64 KB), largest block 110 592 B
