@@ -19,13 +19,14 @@ and `session up` ~100–200 ms later: WireGuard waited for the whole
 control path. What it takes from the netmap is small and was in the
 previous boot's: our tailnet address(es) and the one target peer —
 NodeID, NodeKey, DiscoKey, endpoints, tailnet addresses (our keys,
-DiscoKey included, are in NVS). Image 746 848 → **753 584 B (+6 736)**;
-static DRAM 58 684 → 59 020 B (+336, `.bss`: the NVS mirror and the
-staged record, 144 B each), IRAM ±0, RTC slow +4 B. Host suite 2 452 →
-**2 559 OK** (CI floor 2 559; counted serially — `make -j` interleaves
-output and loses a line now and then), ASan + UBSan clean, 0 warnings.
-Static worst cases unchanged (`main` 5 440 → 5 424, the rest equal;
-frame sums in docs/ARCHITECTURE.md). Not yet on the sensor.
+DiscoKey included, are in NVS). Image 746 848 → **755 904 B (+9 056**,
+of which +2 320 the review fixes); static DRAM 58 684 → 59 020 B (+336,
+`.bss`: the NVS mirror 160 B, the staged record 144 B), IRAM ±0, RTC
+slow +12 B (the crash guard). Host suite 2 452 → **2 643 OK** (CI floor
+2 643; counted serially — `make -j` without `-O` interleaves output and
+loses a line now and then), ASan + UBSan clean, 0 warnings. Static
+worst cases unchanged (`main` 5 440 → 5 424, the rest equal; frame sums
+in docs/ARCHITECTURE.md). Not yet on the sensor.
 
 - **The record** (`tl_warm.h`, NVS `tl_state` / `warm_rec`): versioned
   binary, 108–141 B — the write time, 8-byte tags of our NodeKey and of
@@ -47,23 +48,42 @@ frame sums in docs/ARCHITECTURE.md). Not yet on the sensor.
   addresses at the next housekeeping, endpoints or DiscoKey alone at most
   once an hour after the boot's first write — the next boot's netmap
   update takes those in place anyway, and an endpoint list churning
-  every minute costs 24 writes a day, not 1 440. Expected: one write at
-  the first boot, then a few a week (the 1.3.5 soak: 10 netmap updates
-  and one endpoint change of the session's peer in 2.7 h).
+  every minute costs 24 writes a day, not 1 440. The write time is the
+  last confirmation: an unchanged record is rewritten at most once a day
+  with a synced clock, and only while it is current — this boot's
+  netmap handled, control heard within 10 min. Expected: one write at
+  the first boot, then a few a week plus the daily refresh (the 1.3.5
+  soak: 10 netmap updates and one endpoint change of the session's peer
+  in 2.7 h).
 - **The warm start** (`tinylink_warm_start`, main task, right after
   `tinylink_long_poll_start` — the long-poll at IDLE+4 sends the push
   first and the main task runs while it waits): only after a register
   that sent no auth key (control answered for the node it knows with
   these keys; one that needed the key may be a new node), with a record
-  for these keys, and not right after a restart out of one. The same
+  for these keys that a netmap confirmed within 30 days (a record
+  written with the clock unsynced has no age and is taken), not right
+  after a restart out of one, not after a reset during one (below), and
+  with heap free ≥ 32 KiB and a largest block ≥ 16 KiB (both in its log
+  line, before → after). The same
   steps as the first netmap's bring-up: `relay_boot_join` (the first
   INIT still waits ≤ 1 s for the DERP login), `wg_dataplane_start` from
   `s_self_addrs` / `s_last_peers` seeded with the record (the path-stale
   prepunch works on them), `telemetry_start`, the prepunch to the cached
   peer. The long-poll's first netmap shuts the gate (a mutex): a warm
-  start under way finishes first, none begins after.
+  start under way finishes first, none begins after; the long-poll waits
+  for it at most 30 s, fed to the WDT, then restarts cold. A failed
+  `wg_dataplane_start` (the wg_rx task or the lwIP netif not created)
+  leaves wg_netif as after its init (`wg_netif_abort_start`: the socket,
+  wg_tx and every callback stay), and the netmap's start is the first.
+- **Crash guard** (RTC no-init, checksummed): a warm attempt is marked
+  before `relay_boot_join` and cleared when the netmap confirms it or its
+  start fails. A boot that finds the mark after any reset but a software
+  one (panic, task / interrupt WDT, brown-out) erases the record and
+  starts cold; after two such resets the warm start stays off until a
+  power cycle (power-on clears RTC memory, so it clears the guard).
 - **The first netmap converges to a cold start's state**
-  (`warm_reconcile`). It replaces the seeded tables (an omitted `Peers`
+  (`warm_netmap`, its verdict from `tl_warm_sm_netmap`). It replaces the
+  seeded tables (an omitted `Peers`
   is an empty table, as cold), logs `netmap (initial)` as before, and
   compares what a cold start would run against — the netmap's pick, our
   netmap address — with the record (`tl_warm_diff`):
@@ -91,6 +111,16 @@ frame sums in docs/ARCHITECTURE.md). Not yet on the sensor.
   - Left as it is: a target with no endpoint keeps the warm session (via
     DERP) where a cold start would refuse to start — what a cold session
     does when its peer loses its endpoints.
+- **What else a warm boot changes**: modem sleep waits for the session
+  *and* the first netmap (`tinylink_netmap_seen`; still capped by the
+  awake cap) — on a warm boot the session is up mid-download and the
+  3-beacon listen interval stretched the netmap body out, and with it
+  the trust window. The boot STUN re-probe waits for the first netmap
+  too: wg_rx runs early on a warm boot, and the re-probe's endpoint push
+  recycled the first map stream mid-body. A netmap's endpoint list now
+  replaces the live endpoint unless that one is still listed or proven
+  by a pong (`wg_netif_live_path_proven`): a session alive via DERP
+  alone no longer keeps a dead cached endpoint.
 - **Trade-off** (Kconfig help, docs/SECURITY-MODEL.md "Warm start"):
   until the netmap the device trusts the previous boot's binding — this
   NodeKey is the peer at that address — from an authenticated netmap,
@@ -99,12 +129,26 @@ frame sums in docs/ARCHITECTURE.md). Not yet on the sensor.
   telemetry until the netmap: normally seconds, at most
   `CONFIG_TINYLINK_WARM_START_MAX_S` (default 600 s, three times the
   longest netmap gap seen, 181 s in 1.3.7; checked by the 60-s
-  housekeeping). No reachable control plane, no register, no warm start.
+  housekeeping, so up to a minute more). The cached DiscoKey is trusted
+  the same way: its holder gets DISCO pings answered, its CallMeMaybe
+  endpoints punched and can move the endpoint with a pong (frames stay
+  encrypted to the session). No reachable control plane, no register,
+  no warm start.
   Upstream tailscaled keeps its last netmap through a control outage
   within a run, as tinylink after its first netmap. No packet filter is
   skipped (none is enforced). `CONFIG_TINYLINK_WARM_START` default y, to
   be confirmed with the owner.
-- **Test (`test_warm`, +107):** the text forms (accepted and refused),
+- **Test (`test_warm`, +191):** the decisions live in `tl_warm.h` as a
+  pure state machine `tinylink.c` drives one call per event — the go
+  verdict (`tl_warm_go`), seeding and the first frame's table reset,
+  the netmap verdict, the bound and age, the RTC guard, the target pick
+  `wg_dataplane.c` runs, the peer-address and register rules — tested
+  over boot sequences (crash → erase → cold, two crashes → off until a
+  power-on, restart mark → one cold boot); 31 mutants of those rules
+  (the reset of the seeded flag dropped, the warm dispatch moved, a
+  verdict that leaves the bound armed, the register rule inverted, the
+  skip cleared after the checks, off-by-ones in the pick, the address
+  rule's condition) all fail it. Also the text forms (accepted and refused),
   the netmap → record → `wg_dataplane_start` inputs round trip for every
   target of a three-peer table, all 48 count shapes encoded and decoded,
   every truncation, each refused count / flag / address / port, 20 000
@@ -113,21 +157,28 @@ frame sums in docs/ARCHITECTURE.md). Not yet on the sensor.
   set, the write policy over a fake NVS across reboots (first write,
   unchanged, soft held an hour, hard at once, an unreadable layout
   replaced, a failing NVS tried once per change, a day of minute-by-
-  minute endpoint churn: 24 writes), the age text, the bound.
+  minute endpoint churn: 24 writes; the daily refresh only while
+  current), the age text, the bound.
 - On the sensor, first boot after the flash: `warm start: no cached
   netmap — WireGuard waits for the netmap`, the usual cold boot, then
   ~60 s later `warm start: record stored for the next boot (peer
   100.x.y.z/32)`. Every boot after it: `node registered`, `warm start:
   WG up from the cached netmap (peer 100.x.y.z/32, cached ≥ N min ago,
-  clock not synced)` (exact age once SNTP synced before the line) a few
-  ms after the `WG bringup` line, `session up` 0.1–0.3 s later — around
+  clock not synced; heap free A→B, largest C→D)` (exact age once SNTP
+  synced before the line) a few ms after the `WG bringup` line, `session
+  up` 0.1–0.3 s later — around
   the endpoint push's answer, ~2.4–2.6 s after reset with the DERP login
   done (expected 1.2–5.4 s earlier than 1.3.8) — telemetry `tx seq=0`
   right after, then `netmap (initial)` and `netmap confirms the warm
   start (peer …)` or `netmap differs: peer DiscoKey — updated (peer …)`
   (a peer tailscaled restart). A W `netmap differs: … — restarting into
   a cold start` should be rare, followed by one cold boot (`warm start:
-  no cached netmap`). No second `WG bringup` on a warm boot.
+  no cached netmap`). No second `WG bringup` on a warm boot. `modem
+  sleep (MAX_MODEM) on after N ms awake` comes after `netmap confirms`
+  on a warm boot (`— no netmap yet` if the cap hit first), the boot STUN
+  re-probe after the netmap. After a panic / WDT reset during a warm
+  start: W `warm start: the last one ended in a reset (reason N) before
+  its netmap — record erased`, then a cold boot.
 
 #### The first telemetry sample of a boot
 

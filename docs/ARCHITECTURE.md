@@ -890,17 +890,22 @@ its static worst case is 4 864 B against 7 KiB (see
 high-water mark.
 
 The warm start (round 1.3.9, `tl_warm.h`) moves no task's deepest
-path (`tools/stack_worst.py`, static): on `main` it is 4 560 B
-(`main_task` 208 → `app_main` 64 → `tinylink_warm_start` 128 →
-`wg_dataplane_start` → netif / lwIP → Wi-Fi TX), under the register
-path's 5 424 B; on `tinylink_lp` the first netmap's `warm_reconcile`
-(320 B) sits beside `wg_dataplane_start` under `long_poll_handler`,
-and the erase + restart run at the task's top level (`warm_restart_now`
-→ `esp_restart` 2 720 B), not under the stream callback — the task
-stays at 5 232 B (stream variant 4 656 → 4 640). The record's NVS write
-in the `tinylink_tlm` housekeeping is 3 440 B (`telemetry_task` 96 →
-`tinylink_warm_persist_poll` 32 → `warm_persist` 496 → `nvs_set_blob`),
-its bound's restart 3 248 B, both under the task's 3 728 B.
+path (`tools/stack_worst.py`, static, after the review fixes): on
+`main` it is 4 400 B (`main_task` 48 → `app_main` 64 →
+`tinylink_warm_start` 128, the go / heap gate inlined →
+`wg_dataplane_start` 352 → netif / lwIP → Wi-Fi TX), under the register
+path's 5 424 B; `warm_load` (RTC guard + NVS read, in `tinylink_init`)
+stays under `tinylink_init`'s TLS key fetch (4 336 B). On `tinylink_lp`
+the first netmap's `warm_netmap` (320 B) sits beside
+`wg_dataplane_start` under `long_poll_handler` (whose own subtree is
+3 952 B chain either way), and the restarts run either at the task's
+top level (`long_poll_task` → `warm_restart_now` → `esp_restart`,
+3 120 B) or, for the 30-s gate cap, from the handler (3 184 B) — the
+task stays at 5 232 B (stream variant 4 656 → 4 640). The record's NVS
+write in the `tinylink_tlm` housekeeping is 3 440 B (`telemetry_task`
+96 → `tinylink_warm_persist_poll` 32 → `warm_persist` 496 →
+`nvs_set_blob`), its bound's restart 3 232 B and the deferred STUN
+re-probe 3 632 B, all under the task's 3 728 B.
 
 There is no dedicated endpoint-push task any more (2026-09): the push
 runs on `tinylink_lp` — see item 9 below.
