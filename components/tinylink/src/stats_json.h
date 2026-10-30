@@ -15,9 +15,10 @@
 
 #include "tinylink.h"
 
-/* Reply buffer (BSS). Worst case 862 B (test_stats prints it): 1.3.1's
+/* Reply buffer (BSS). Worst case 893 B (test_stats prints it): 1.3.1's
  * line peaked at 721 B in a 768-B buffer; the boot counters (+113 B)
- * and heap_min (+22 B) do not fit that, hence 896 (+128 B BSS).
+ * and heap_min (+22 B) do not fit that, hence 896 (+128 B BSS); 1.3.6's
+ * wg path + lapses (+31 B) take all but 3 B — the next key needs more.
  * ~600 B on the sensor. */
 #define TL_STATS_JSON_CAP 896
 
@@ -34,7 +35,8 @@ static inline int tl_stats_json(char *out, size_t cap,
         "\"derp\":{\"connected\":%s,\"host\":\"%s\"},"
         "\"endpoint\":\"%u.%u.%u.%u:%u\","
         "\"wg\":{\"state\":%d,\"rekeys\":%u,\"cold_handshakes\":%u,\"rx_stale\":%u,"
-        "\"roams\":%u,\"disco_adverts\":%u,\"tx_drops\":%u,\"relayed_stale\":%u,\"relay_errors\":%u,\"last_rx_age_s\":%u},"
+        "\"roams\":%u,\"disco_adverts\":%u,\"tx_drops\":%u,\"relayed_stale\":%u,\"relay_errors\":%u,\"last_rx_age_s\":%u,"
+        "\"path\":%u,\"lapses\":%u},"
         "\"telemetry_seq\":%u}\n",
         host, version,
         (unsigned)st->uptime_s, st->reset_reason,
@@ -52,5 +54,6 @@ static inline int tl_stats_json(char *out, size_t cap,
         (unsigned)st->wg_disco_adverts,
         (unsigned)st->wg_tx_drops, (unsigned)st->wg_relayed_stale,
         (unsigned)st->wg_relay_errors, (unsigned)st->wg_last_rx_age_s,
+        (unsigned)st->wg_path, (unsigned)st->wg_path_lapses,
         (unsigned)telemetry_seq);
 }

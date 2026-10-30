@@ -148,6 +148,8 @@ typedef struct {
     uint32_t wg_relayed_stale;
     uint32_t wg_relay_errors;
     uint32_t wg_last_rx_age_s;
+    uint8_t  wg_path;                /* 0 direct + DERP, 1 direct, 2 DERP only (1.3.6) */
+    uint32_t wg_path_lapses;         /* direct → direct + DERP since boot */
 } tinylink_stats_t;
 
 void tinylink_get_stats(tinylink_stats_t *out);

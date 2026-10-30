@@ -1946,6 +1946,8 @@ void tinylink_get_stats(tinylink_stats_t *out)
     out->wg_tx_drops        = (uint32_t)ws.tx_drops;
     out->wg_relayed_stale   = (uint32_t)ws.relayed_stale;
     out->wg_relay_errors    = (uint32_t)ws.relay_errors;
+    out->wg_path            = ws.path_mode;
+    out->wg_path_lapses     = ws.path_lapses;
     out->wg_last_rx_age_s   = ws.last_transport_recv_us > 0
         ? (uint32_t)((now - ws.last_transport_recv_us) / 1000000LL) : 0u;
 }

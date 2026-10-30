@@ -111,8 +111,9 @@ esp_err_t wg_netif_update_peer_keys(const uint8_t static_pub[WG_KEY_LEN],
  *                     (its copy queued at build time was declined).
  *   CALL_ME_MAYBE   — the WG peer sent a CallMeMaybe: it is punching
  *                     towards us, so send it direct (and via DERP while
- *                     no direct path is confirmed).
- * A solicited DISCO pong does the same direct re-send inside wg_netif.
+ *                     the direct path is not valid, wg_path.h).
+ * A solicited DISCO pong that changes the path does the same direct
+ * re-send inside wg_netif.
  * No-op when nothing is pending. Takes hs_lock and g.lock briefly; the
  * DERP copy goes through the TX worker, so it is safe to call from the
  * DERP task (it never holds a DERP lock into wg_netif). */
@@ -145,12 +146,15 @@ void wg_netif_set_stun_callback(wg_netif_stun_cb_t cb, void *user);
 
 /* Callback invoked from the RX task when the WG transport has been
  * silent (no successful decrypt) for WG_RX_STALE_THRESHOLD_MS AND we
- * have a registered probe handler. Tinylink's handler iterates the
- * latest known peer endpoints and sends DISCO pings to all of them;
- * if the peer responds from a different AddrPort, the existing roaming
- * in handle_disco_direct swaps g.peer.peer_endpoint to the live one
- * BEFORE the next rekey/cold-handshake INIT goes out — so the INIT
- * lands on a working address instead of hammering a stale NAT mapping.
+ * have a registered probe handler — and, since round 1.3.6, when the
+ * current endpoint failed a ping (DERP only) and at the DERP-only
+ * re-probes (10 s, doubling to 60 s, while data goes out; wg_path.h).
+ * Tinylink's handler iterates the latest known peer endpoints and sends
+ * DISCO pings to all of them; if the peer responds from a different
+ * AddrPort, the existing roaming in handle_disco_direct swaps
+ * g.peer.peer_endpoint to the live one BEFORE the next
+ * rekey/cold-handshake INIT goes out — so the INIT lands on a working
+ * address instead of hammering a stale NAT mapping.
  *
  * Mirrors the upstream tailscale model (wgengine/magicsock/endpoint.go:
  * setBestAddrLocked + addrForSendLocked): DISCO ping/pong, not WG
@@ -195,15 +199,16 @@ void wg_netif_stop(void);
 uint64_t wg_netif_get_tx_drops(void);
 
 /* Relay callback for the encrypted WG transport frame when the direct
- * UDP path looks broken. Invoked by the TX worker BEFORE sendto if
- * the RX-stale watchdog says no transport packet has decrypted in
- * WG_RX_STALE_THRESHOLD_MS, AND ALSO after sendto if it returns
- * errno != 0. Since round 1.3.2 (B7) also for handshake INITs while no
- * direct path is confirmed (`packet` is then a 148-B MessageInitiation),
- * and after sendto for every frame while a session that came up over
- * DERP has no confirmed direct path. The relay is responsible for
- * shipping the bytes to the peer via an alternate transport (e.g.
- * DERP); the WG bytes are already encrypted with the session keys (or
+ * UDP path is not confirmed. Invoked by the TX worker per the path
+ * selection (round 1.3.6, wg_path.h): INSTEAD of sendto while the direct
+ * path failed its ping or answered it with WireGuard silent (DERP only),
+ * AFTER it (a redundant copy) while the direct path is unconfirmed, and
+ * after a sendto that returns errno != 0. Since round 1.3.2 (B7) also
+ * for handshake INITs while the direct path is not valid (`packet` is
+ * then a 148-B MessageInitiation); since 1.3.6 also for the recent
+ * direct-only frames re-sent when a lapse of the direct path is
+ * confirmed. The relay is responsible for shipping the bytes to the
+ * peer via an alternate transport (e.g. DERP); the WG bytes are already encrypted with the session keys (or
  * are a public handshake message), so the relay just carries opaque
  * ciphertext.
  *
@@ -229,8 +234,8 @@ uint64_t wg_netif_get_tx_drops(void);
  * of a handshake INIT, or the DERP half of the dual send while the
  * direct path is unproven: the callee must not block at all and may
  * decline (ESP_ERR_TIMEOUT) when the relay cannot take it at once. A
- * relay the TX worker depends on (RX-stale path, sendto errno) passes
- * false and may wait for the relay's write lock.
+ * relay the TX worker depends on (DERP only, the re-sent frames, sendto
+ * errno) passes false and may wait for the relay's write lock.
  *
  * cb=NULL (the default) disables all relay paths; the TX worker only
  * does direct UDP sendto. */
@@ -248,9 +253,10 @@ void wg_netif_set_relay_callback(wg_netif_relay_fn cb, void *user);
  * DERP-completed handshake; a failed dual-send relay does count in
  * relay_errors (it is a relay failure). Two-counter split:
  *
- *   _stale: relay used because path-stale watchdog said direct
- *           transport hadn't decrypted in WG_RX_STALE_THRESHOLD_MS.
- *           Preemptive route; direct sendto skipped on relay success.
+ *   _stale: relay used because the direct path failed its ping, or
+ *           answered it with WireGuard silent (DERP only, round 1.3.6;
+ *           until 1.3.5: no decrypt in WG_RX_STALE_THRESHOLD_MS).
+ *           Direct sendto skipped on success.
  *   _errno: relay used because sendto returned errno != 0. Reactive
  *           route; direct sendto was attempted first.
  *
@@ -287,6 +293,14 @@ typedef struct {
     uint64_t relay_errors;
     int64_t  last_transport_recv_us;
     int64_t  last_handshake_completed_us;
+    /* Path selection (round 1.3.6, wg_path.h). */
+    uint8_t  path_mode;              /* wg_path_mode_t: 0 dual, 1 direct, 2 DERP only */
+    uint32_t path_lapses;            /* direct → dual */
+    uint32_t path_deaths;            /* dual → DERP only */
+    uint32_t path_confirms;          /* → direct (pong) */
+    uint32_t path_silences;          /* pong answered, WG silent: → DERP only */
+    uint32_t silent_rekeys;          /* ...and the rekeys they started */
+    uint32_t rescued;                /* direct-only frames re-sent via DERP */
 } wg_netif_stats_t;
 
 void wg_netif_get_stats(wg_netif_stats_t *out);

@@ -132,6 +132,8 @@ static void test_stats_json(void)
     st.wg_rekeys = st.wg_cold_handshakes = st.wg_rx_stale_events = UINT32_MAX;
     st.wg_roams = st.wg_disco_adverts = st.wg_tx_drops = UINT32_MAX;
     st.wg_relayed_stale = st.wg_relay_errors = st.wg_last_rx_age_s = UINT32_MAX;
+    st.wg_path = UINT8_MAX;
+    st.wg_path_lapses = UINT32_MAX;
 
     /* Version at its widest plausible form, "255.255.255". */
     int len = tl_stats_json(out, sizeof(out), &st, host, "255.255.255", UINT32_MAX);
@@ -153,6 +155,9 @@ static void test_stats_json(void)
                 key_present(out, tok, n, "brownout") &&
                 key_present(out, tok, n, "task_wdt") &&
                 key_present(out, tok, n, "int_wdt"));
+    fails += ok("stats/path-keys",
+                n > 0 && key_present(out, tok, n, "path") &&
+                key_present(out, tok, n, "lapses"));
 
     /* A typical sensor reply for comparison. */
     memset(&st, 0, sizeof(st));

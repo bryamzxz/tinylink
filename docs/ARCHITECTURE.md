@@ -191,13 +191,43 @@ and on a solicited pong (direct). The re-sends are the same 148 bytes,
 not new attempts — the responder takes the first copy and drops the rest
 as a TAI64N replay — so new INITs stay one per `REKEY_TIMEOUT`
 (wireguard-go / kernel rule; magicsock queues the INIT on DERP and sends
-to both paths while `bestAddr` is untrusted). A session that came up on
-a DERP-relayed response sends every frame on both paths until something
-authenticates on the UDP socket ("direct path confirmed"). Wake cadence
+to both paths while `bestAddr` is untrusted). Until 1.3.5 a session
+that came up on a DERP-relayed response sent every frame on both paths
+until something authenticated on the UDP socket ("direct path
+confirmed"); since 1.3.6 the path selection below decides. Wake cadence
 (B21): `wg_rx` sleeps until its next timer deadline, at most
 `REKEY_TIMEOUT` (5 s) when idle; `wg_tx` blocks until a frame arrives
 (10-s idle wait, woken by a sentinel on stop); both feed the task WDT at
 most once per second — 3 → ~0.3 light-sleep exits/s for an idle tunnel.
+
+Round 1.3.6 — path selection (`wg_path.h`, pure, `test_wg_path.c`).
+Every frame goes direct only (DIRECT), direct + DERP (DUAL) or DERP
+only (RELAY). DIRECT is entered only on a pong to our own DISCO ping
+(txid + source bound by the prober: a round trip on that address pair) —
+a datagram *from* the peer proves only peer→us, and on the sensor a
+one-way path held the old "confirmed" state for an hour. DIRECT is kept
+by the peer's passive keepalives, which answer data it received (we
+sent it direct only): the first data frame after the last proof must be
+answered within KEEPALIVE_TIMEOUT + 2 s, else the path lapses to DUAL
+with one ping; the peer's handshake response and its first data after a
+handshake (its TSMP disco advert) cancel its pending keepalive and
+restart the window once each. No pong in 5 s → RELAY: every endpoint is
+probed (10 s, doubling to 60 s, while data flows). A pong from the
+current endpoint with nothing authenticated from the peer since the
+unanswered frame means DISCO works and WireGuard does not (1.3.5 soak:
+30 s of silence, fixed by the RX-stale rekey in 60 ms): RELAY too, and a
+make-before-break rekey at once — the first of a streak only; a fresh
+session silent as well backs the direct re-tests off to one a minute.
+When a lapse is confirmed — that ping unanswered, answered with
+WireGuard silent, or the endpoint moved elsewhere first — the
+direct-only frames of the last 40 s are re-sent via DERP (`wg_tx`'s
+rescue ring; the peer's replay window drops those it has). Steady state
+costs no packet (upstream heartbeats a ping every 3 s). A pong from another endpoint
+moves a valid current one only if clearly better (upstream `betterAddr`
+points, +20 private, > 15 points and > 25 ms, compared within one ping
+round); an authenticated packet from another source roams only while
+the current one is not valid. A pong replaces the INIT in flight only
+when it changed the path and the INIT is ≥ 2.5 s old.
 
 ## `/stats` (M16, 2026-09)
 
