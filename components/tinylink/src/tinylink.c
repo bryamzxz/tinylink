@@ -1420,14 +1420,13 @@ esp_err_t tinylink_relay_via_derp(const uint8_t *dst_node_pub,
      * when the supervisor isn't connected; we short-circuit ahead of
      * it here so the wg_netif TX worker can read the state in a
      * single field-load and skip the function-call cost on the hot
-     * path when DERP isn't usable. The .connected flag is set/cleared
-     * by the supervisor task under its own mutex; reads outside that
-     * mutex are racy in the strict sense but the racy window is
-     * harmless — at worst we attempt one extra send (which fails fast
-     * inside derp_client_send_packet's own state guard) or skip one
-     * send that was about to be accepted (which the next packet
-     * picks up). */
-    if (!s_derp_sup.connected) {
+     * path when DERP isn't usable. The flag is set by the supervisor at
+     * login and cleared by a close or a failed write (an atomic load
+     * here, derp_wlock.h); the window is harmless — at worst we attempt
+     * one extra send (which fails fast inside derp_client_send_packet's
+     * own state guard) or skip one send that was about to be accepted
+     * (which the next packet picks up). */
+    if (!derp_client_is_connected(&s_derp_sup)) {
         return ESP_ERR_INVALID_STATE;
     }
     return best_effort
@@ -1446,7 +1445,7 @@ esp_err_t tinylink_relay_via_derp(const uint8_t *dst_node_pub,
 static bool relay_connected(void *user)
 {
     (void)user;
-    return s_derp_sup.connected;
+    return derp_client_is_connected(&s_derp_sup);
 }
 #endif
 
@@ -2159,7 +2158,7 @@ void tinylink_get_stats(tinylink_stats_t *out)
     out->control_reconnects = s_stat_lp_reconnects;
     out->endpoint_pushes    = s_stat_ep_pushes;
 #if CONFIG_TINYLINK_DERP_SUPERVISED
-    out->derp_connected = s_derp_sup.connected;
+    out->derp_connected = derp_client_is_connected(&s_derp_sup);
     tl_derp_addr_t node;
     home_derp_get(&node, NULL);
     _Static_assert(sizeof(out->derp_host) == sizeof(node.host), "derp_host size");

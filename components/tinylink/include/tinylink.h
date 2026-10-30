@@ -299,7 +299,7 @@ esp_err_t tinylink_derp_supervised_start(void);
  * Wired into wg_netif via wg_netif_set_relay_callback at startup. The
  * signature matches wg_netif_relay_fn so it can be registered
  * directly. Safe to call from any task; serialized by the DERP client's
- * write_lock mutex internally. */
+ * write lock internally (derp_wlock.h). */
 esp_err_t tinylink_relay_via_derp(const uint8_t *dst_node_pub,
                                   const uint8_t *packet,
                                   size_t len,
