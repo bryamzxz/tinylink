@@ -224,6 +224,21 @@ before). Not yet on the sensor.
   `ab-tcp-sack` shortens them. busy in the hundreds of ms would be our
   own parse, neither. A bigger window shows as in falling to ~2 RTTs
   (wnd8) / ~1 RTT (wnd12) on the stall-free boots.
+- **On the sensor** (36 boots, 3 rounds × 4 images × 3 boots, images
+  interleaved, `ab139tcp_*`): every slow body was transport — first DATA
+  +1–6 ms in all 36, busy 14–15 ms; the slow ones had one stall of
+  2.4–3.4 s, none a late first byte (not the server). Body median / mean
+  (ms) and stalls: default 830 / 1 180, 1 of 9 (3 401 ms at 12 KB); sack
+  950 / 909, 0 of 9; wnd8 440 / 1 020, 2 of 9 (2 741, 2 914 at 20 KB);
+  wnd12 480 / 933, 2 of 9 (2 655, 2 377 at 24 KB; the second with a DERP
+  TCP connect timing out at the same moment). The window halves the
+  median, but its stalls sit at the body's tail, three of four on the
+  first boot after a flash (a reboot seconds after the last) and were
+  followed by `prepunch sendto: errno=12` — Wi-Fi TX buffers full —
+  which the default window never showed there (0 of 3). Adopted: SACK
+  (`sdkconfig.defaults`); the window stays 4 × MSS — with the warm start
+  the netmap is off the WireGuard path, so its median matters less than
+  its tail.
 
 ### Optimization round 1.3.8 — TLS handshake, WireGuard silence, stalled polls, PSK (in progress, branch `feat/opt-1.3.8`)
 

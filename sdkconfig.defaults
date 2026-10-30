@@ -436,7 +436,16 @@ CONFIG_LWIP_DHCP_DOES_NOT_CHECK_OFFERED_IP=y
 # Makes idf-patches/0001–0002 load-bearing: on a stock v5.5.6 the WG
 # netif's netif_set_addr reaches dhcp_ip_addr_store with no DHCP data.
 CONFIG_LWIP_DHCP_RESTORE_LAST_IP=y
-CONFIG_LWIP_TCP_SACK_OUT=n
+# SACK on our ACKs (round 1.3.9): a segment lost mid-flight is resent
+# after one RTT instead of the server's RTO. Interleaved A/B on the
+# sensor, 9 boots each (tools/power/sdkconfig.ab-tcp-*, `map body:`):
+# the 26 KB netmap body took 830 ms median / 1 180 mean with one 3.4-s
+# stall at the default, 950 / 909 and no stall with SACK. A 2–3× window
+# halved the median (440 / 330 ms) but stalled 2 of 9 boots for 2.4–2.9 s
+# at the body's tail, three of the four right after a quick reboot and
+# followed by Wi-Fi TX ENOMEM — kept at 4 × MSS. +1 072 B, 32 B of heap
+# per TCP connection.
+CONFIG_LWIP_TCP_SACK_OUT=y
 CONFIG_LWIP_TCP_MSS=1440
 # Pin lwIP tcpip_thread to CPU0 (same core as WiFi MAC) for cache
 # locality with the WiFi driver's RX path. IDF default is NO_AFFINITY,
