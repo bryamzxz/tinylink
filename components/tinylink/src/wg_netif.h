@@ -302,6 +302,7 @@ typedef struct {
     uint32_t path_silences;          /* ...nor WireGuard in a 2nd window: DERP only */
     uint32_t path_undelivered;       /* ...WireGuard answered via DERP only: DERP only */
     uint32_t silent_rekeys;          /* rekeys the silences started */
+    uint32_t doubt_rekeys;           /* rekeys the doubts' tests started (1.3.8) */
     uint32_t rescued;                /* direct-only frames re-sent via DERP */
     uint32_t late_responses;         /* answers to replaced INITs (dropped) */
 } wg_netif_stats_t;

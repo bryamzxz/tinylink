@@ -512,7 +512,8 @@ static struct {
     uint32_t                 replaced_index;
     int64_t                  replaced_us;
     uint32_t                 stat_late_responses;
-    uint32_t                 stat_silent_rekeys;   /* rekeys started by a WG-silent pong */
+    uint32_t                 stat_silent_rekeys;   /* rekeys started by a silence */
+    uint32_t                 stat_doubt_rekeys;    /* ...by a doubt's test (1.3.8) */
     /* Wi-Fi came back (IP_EVENT_STA_GOT_IP): rx_task re-sends a pending
      * INIT at its next wake. Set by the event task. */
     volatile bool            link_up_pending;
@@ -642,6 +643,7 @@ typedef struct {
     uint32_t           rtt_ms;
     uint32_t           retest_s;   /* RELAY after a failed test: next re-test in */
     bool               rekey;      /* SILENT: the first of a streak, rekeying */
+    bool               test;       /* DOUBT: tested with a handshake (1.3.8) */
     struct sockaddr_in ep;
 } path_note_t;
 
@@ -661,6 +663,7 @@ static void path_note_take(path_note_t *n, wg_path_mode_t from, wg_path_why_t fr
     n->rtt_ms   = g.path.rtt_us / 1000u;
     n->retest_s = g.path.reprobe_ms / 1000u;
     n->rekey    = g.path.silent_streak == 1;
+    n->test     = g.path.test_at_us != 0;
     switch (n->to) {
     case WG_PATH_DUAL:
         n->count = n->why == WG_PATH_WHY_DOUBT ? g.path.doubts_total : g.path.lapses;
@@ -691,10 +694,15 @@ static __attribute__((noinline)) void path_note_log(const path_note_t *n)
     switch (n->to) {
     case WG_PATH_DUAL:
         if (n->why == WG_PATH_WHY_DOUBT) {
+            /* test: a handshake follows at once (or the pending one's
+             * answer settles it); else a silence since the last transport
+             * packet from the peer already tried one. */
             ESP_LOGI(TAG, "direct path to %s:%u answers DISCO (rtt %u ms), but no "
                           "WireGuard packet from the peer for %u.%u s — via DERP "
-                          "too until one comes (doubt %u)",
-                     ip, port, (unsigned)n->rtt_ms, s10, d10, (unsigned)n->count);
+                          "too until one comes%s (doubt %u)",
+                     ip, port, (unsigned)n->rtt_ms, s10, d10,
+                     n->test ? ", testing the session with a handshake" : "",
+                     (unsigned)n->count);
             break;
         }
         /* Otherwise only a lapse lands here: a roam logs its own line. */
@@ -997,16 +1005,18 @@ static void init_refresh_or_resend(bool direct, bool relay, bool force_relay,
  * outbound app traffic continues to encrypt with the OLD keys (which
  * the responder still accepts up to its REJECT_AFTER_TIME = 180 s).
  * Sets rekey_in_flight whatever the outcome, so the rekey-retry timer
- * (REKEY_TIMEOUT) owns the next try. */
-static void start_rekey(void)
+ * (REKEY_TIMEOUT) owns the next try. `why` (may be NULL) ends the log
+ * line: what the path selection asked it for. */
+static void start_rekey(const char *why)
 {
     const int rc = build_and_send_init();
     g.rekey_attempt++;
     g.rekey_in_flight = true;
     if (rc == 0) {
-        ESP_LOGI(TAG, "rekey init sent (attempt %d, idx=0x%08x, age=%lds)",
+        ESP_LOGI(TAG, "rekey init sent (attempt %d, idx=0x%08x, age=%lds%s%s)",
                  g.rekey_attempt, (unsigned)g.local_index,
-                 (long)((now_us() - g.last_handshake_completed_us) / 1000000LL));
+                 (long)((now_us() - g.last_handshake_completed_us) / 1000000LL),
+                 why != NULL ? ", " : "", why != NULL ? why : "");
     }
 }
 
@@ -1723,16 +1733,25 @@ static __attribute__((noinline)) void rx_path_tick(int64_t now)
         g.path_stale_cb(g.path_stale_cb_user);
     }
     queue_rescue(act);
-    if (act & WG_PATH_ACT_REKEY) {
-        /* SILENT: two windows without a WireGuard packet by either path
-         * while DISCO answers — the session is the suspect. Usually the
-         * RX-stale rekey (30 s after the last decrypt) is in flight by
-         * then and does it; make-before-break either way. */
+    if (act & (WG_PATH_ACT_REKEY | WG_PATH_ACT_TEST)) {
+        /* DOUBT (1.3.8): DISCO answers, WireGuard has been silent for a
+         * window — test the session at once; the response ends the doubt
+         * and replaces a broken session (wg_path.h). SILENT: a second
+         * window, still nothing — usually the doubt's test or the RX-stale
+         * rekey is in flight by then and does it. Make-before-break either
+         * way, and never a second INIT while one is pending (a responder
+         * that gets two keeps only the second session: see
+         * WG_INIT_FRESH_AFTER_MS), nor a new one within REKEY_TIMEOUT of
+         * the last (whitepaper §6.1). */
         xSemaphoreTake(g.hs_lock, portMAX_DELAY);
-        if (g.state == WG_NETIF_UP && !g.rekey_in_flight) {
+        if (g.state == WG_NETIF_UP && !g.rekey_in_flight &&
+            wg_timer_due(now, g.last_handshake_us, WG_REKEY_TIMEOUT_MS * 1000LL)) {
             g.rekey_attempt = 0;
-            g.stat_silent_rekeys++;
-            start_rekey();
+            if (act & WG_PATH_ACT_TEST) g.stat_doubt_rekeys++;
+            else g.stat_silent_rekeys++;
+            start_rekey(act & WG_PATH_ACT_TEST ? "doubt test" : "silent");
+        } else if (act & WG_PATH_ACT_TEST) {
+            ESP_LOGD(TAG, "doubt: a handshake is in flight — its answer settles it");
         }
         xSemaphoreGive(g.hs_lock);
     }
@@ -1917,7 +1936,7 @@ retry_timer:;
             ESP_LOGI(TAG, "session age >%ds — triggering proactive rekey",
                      WG_REKEY_AFTER_MS / 1000);
             g.rekey_attempt = 0;
-            start_rekey();
+            start_rekey(NULL);
         }
 
         /* Active DISCO probe of alternate peer endpoints. Fires when
@@ -2004,7 +2023,7 @@ retry_timer:;
              * from it backdates the clock again (send_to_peer) so the
              * path probe still fires at the next wake. */
             g.last_transport_recv_us = now;
-            start_rekey();
+            start_rekey(NULL);
         }
 
         /* Rekey retry timer. Mirrors the cold-path retry but does NOT
@@ -2027,7 +2046,7 @@ retry_timer:;
                 kick_off_handshake();
             } else {
                 ESP_LOGW(TAG, "rekey retry %d", g.rekey_attempt + 1);
-                start_rekey();
+                start_rekey(NULL);
             }
         }
         xSemaphoreGive(g.hs_lock);
@@ -2579,9 +2598,9 @@ void wg_netif_handshake_kick(wg_netif_kick_t why)
 
 /* `rescue`: a copy may be kept for a re-send via DERP (wg_rescue.h).
  * The TSMP advert (send_disco_advert) is not: it is not application data
- * (control gives the peer our DiscoKey too), and in the simulated worst
- * episode with our direct WireGuard dropped its slot pushed out a lost
- * sample. */
+ * (control gives the peer our DiscoKey too), and since 1.3.8 a doubt's
+ * test adds handshakes — in the simulated worst episode with our direct
+ * WireGuard dropped its slot pushed out a lost sample. */
 static esp_err_t send_plaintext(const uint8_t *pkt, size_t len, bool rescue)
 {
     if (!g.initialized || g.state != WG_NETIF_UP) {
@@ -2799,6 +2818,7 @@ void wg_netif_get_stats(wg_netif_stats_t *out)
     out->path_silences         = g.path.silences;
     out->path_undelivered      = g.path.undelivered;
     out->silent_rekeys         = g.stat_silent_rekeys;
+    out->doubt_rekeys          = g.stat_doubt_rekeys;
     xSemaphoreGive(g.lock);
 }
 
