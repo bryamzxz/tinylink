@@ -86,10 +86,11 @@ menu "tinylink core"
         bool "TLS: offer the ECDHE-RSA suites first (RSA certificate chain)"
         default y
         help
-            Round 1.3.8. The Tailscale servers (DERP, controlplane on
-            :443, the first-boot /key fetch) serve an ECDSA chain to a
-            ClientHello that lists an ECDHE-ECDSA suite and an RSA chain
-            to one that does not: leaf RSA-2048 <- YR2 <- Root YR <- ISRG
+            Round 1.3.8, for the DERP and control (:443) connects; the
+            first-boot /key fetch, whose TLS alone vouches for the
+            control key it pins, keeps the full offer. The Tailscale
+            servers serve an ECDSA chain to a ClientHello that lists an
+            ECDHE-ECDSA suite and an RSA chain to one that does not: leaf RSA-2048 <- YR2 <- Root YR <- ISRG
             Root X1 instead of leaf P-256 <- YE2 <- Root YE <- ISRG Root
             X2 <- X1. Verifying the RSA chain and its ServerKeyExchange is
             four RSA public-key operations (exponent 65537, on the RSA
