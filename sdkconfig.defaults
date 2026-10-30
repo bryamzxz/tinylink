@@ -413,6 +413,22 @@ CONFIG_LWIP_TCPIP_CORE_LOCKING=y
 # turns it off (round 1.3.1, −0.5…1.0 s per DHCP bind). The AP's DHCP
 # server is the only allocator on the sensor's LAN.
 CONFIG_LWIP_DHCP_DOES_NOT_CHECK_OFFERED_IP=y
+# DHCP INIT-REBOOT (round 1.3.7): the last bound address is kept in NVS
+# (namespace dhcp_state) and re-requested when the client starts — one
+# REQUEST / ACK instead of DISCOVER / OFFER / REQUEST / ACK, at every boot
+# and every re-association (esp_netif_down stops the client on each
+# disconnect, so without this a reconnect also starts from DISCOVER).
+# connected → got ip was 110–420 ms (median 130) over 68 boots of
+# 1.3.1–1.3.6; one exchange less is worth ~60 ms. Flash is written only
+# when the address changes: esp_netif stores it at each bind whose address
+# differs from the netif's last one (every boot) and nvs_set_u32 skips an
+# equal value (nvs_storage.cpp writeItem → cmpItem); nvs_commit is a no-op.
+# A NAK falls back to DISCOVER at once; a server with no record of us must
+# stay silent (RFC 2131 §4.3.2) — a router that lost its lease table —
+# which costs the two REBOOTING tries (1 s + 2 s, dhcp.c) before DISCOVER.
+# Makes idf-patches/0001–0002 load-bearing: on a stock v5.5.6 the WG
+# netif's netif_set_addr reaches dhcp_ip_addr_store with no DHCP data.
+CONFIG_LWIP_DHCP_RESTORE_LAST_IP=y
 CONFIG_LWIP_TCP_SACK_OUT=n
 CONFIG_LWIP_TCP_MSS=1440
 # Pin lwIP tcpip_thread to CPU0 (same core as WiFi MAC) for cache
