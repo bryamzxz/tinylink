@@ -687,7 +687,7 @@ static void put_peer(sb_t *b, int i, int shape)
               250 - i, 54 + i, 0x1000 + i, 250 - i, 54 + i, 0x1000 + i,
               shape == 3 ? ",\"192.168.10.0/24\",\"10.20.0.0/16\"" : "");
     if (shape != 4) {
-        sb_printf(b, "\"Endpoints\":[\"191.89.%d.157:%d\",\"[2800:e2:5c80::%x]:41641\",\"192.168.1.%d:41641\"],",
+        sb_printf(b, "\"Endpoints\":[\"203.0.113.%d:%d\",\"[2001:db8:5c80::%x]:41641\",\"192.168.1.%d:41641\"],",
                   196 + i, 56828 + i, i + 1, 20 + i);
     }
     sb_printf(b, "\"HomeDERP\":%d,", (i % 3) ? 16 : 1);
@@ -817,7 +817,7 @@ static void build_fixtures(void)
         "{\"PeersChangedPatch\":[{\"NodeID\":7004248,\"LastSeen\":\"2026-10-29T03:40:12Z\",\"Online\":false}]}");
     fix_add_str("delta/endpoints",
         "{\"PeersChangedPatch\":[{\"NodeID\":7004242,\"DERPRegion\":16,"
-        "\"Endpoints\":[\"203.0.113.157:56830\",\"[2800:e2:5c80::1]:41641\"]}],"
+        "\"Endpoints\":[\"203.0.113.157:56830\",\"[2001:db8:5c80::1]:41641\"]}],"
         "\"ControlTime\":\"2026-10-29T03:41:00Z\"}");
     fix_add_str("delta/removed", "{\"PeersRemoved\":[7004249,8004250],\"KeepAlive\":false}");
     b.n = 0; sb_printf(&b, "{\"DERPMap\":"); put_derpmap(&b, 1); sb_printf(&b, "}");

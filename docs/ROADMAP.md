@@ -41,7 +41,7 @@ Servidor1 WG peer with public IP):
 
 ```
 $ tailscale ping sensor-cali        # from Servidor1
-pong from sensor-cali (100.67.60.92) via 190.109.12.37:50582 in 403ms
+pong from sensor-cali (100.67.60.92) via 198.51.100.37:50582 in 403ms
 $ ping -c 10 100.67.60.92            # from Servidor1
 10 packets transmitted, 10 received, 0% packet loss, time 9008ms
 rtt min/avg/max/mdev = 48.916/93.805/141.008/28.296 ms

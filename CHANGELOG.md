@@ -2568,7 +2568,7 @@ Measured impact (PR-D0 + PR-D1, esp32, IDF v5.5.4):
   total app .bin    +0.39 KiB  (1015145 → 1015533)
   bootloader.bin     0
 
-Smoke validated on hardware (30 min, INTELCOM-CARDONA WPA2+PMF):
+Smoke validated on hardware (30 min, the production WPA2+PMF AP):
   - 0 panics / asserts / WDT / xTaskCreate fails (3 prior soaks had
     the supervisor xTaskCreate fail; this one didn't)
   - derp supervisor task spawned t=5.9 s + login OK t=16.9 s on
@@ -2624,7 +2624,7 @@ telemetry @ 5 s, PR #75 `KeepAlive:true` confirmed on-wire). The
 round targets sdkconfig only — no `.c`/`.h` changes, no API surface
 change. Each PR was validated independently by a 60-120 s smoke
 (boot + register + initial netmap + ≥5 telemetry @ 5 s + 0 panic /
-assert / WDT) on the same INTELCOM-CARDONA WPA2+PMF AP, then
+assert / WDT) on the same production WPA2+PMF AP, then
 pushed.
 
 | PR (branch) | Δ flash app | Δ DRAM | Δ IRAM | Other |
@@ -3214,7 +3214,7 @@ each flash.
   `tools/test/test_disco_replay.c` covers first-arrival, immediate
   replay, distinct-non-collide, ring-buffer eviction, and reset
   semantics. On-device verified with 30 s of normal traffic
-  (peer 191.89.194.5:3176 + 192.168.1.38:41641 LAN endpoint,
+  (peer 203.0.113.5:3176 + 192.168.1.38:41641 LAN endpoint,
   ~2-3 PING→Pong/s, all unique txids → all unique nonces → zero false
   positives).
 - **`parse_keyed_hex` partial-write hardening (mapreq.c).** On a
@@ -3399,7 +3399,7 @@ each flash.
   catching both binding requests and responses (the prior shape only
   caught requests; a STUN response with byte 0 = 0x01 collided with
   WG `MSG_RESPONSE` and got DISCARDed). Verified on hardware: 7-min
-  capture shows `stun re-probe ok via wg socket: 190.109.12.37:53174`
+  capture shows `stun re-probe ok via wg socket: 198.51.100.37:53174`
   (the WG socket's actual port), 3 clean rekey cycles, 80 telemetry
   packets uninterrupted, 0 crashes. Removes the *"followup PR
   re-probes via wg socket"* TODO from `tinylink.c`.
