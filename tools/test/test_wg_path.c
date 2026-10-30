@@ -24,6 +24,7 @@
 #include <string.h>
 
 #include "wg_path.h"
+#include "wg_rescue.h"
 
 static int fails = 0;
 
@@ -907,6 +908,61 @@ static void test_late_ticks(void)
                               doubt > 0);
 }
 
+/* The rescue ring (wg_rescue.h). Review of 1.3.6, finding 5: wg_tx
+ * emptied it even when the relay refused (DERP not connected), so the
+ * only copies of the frames the dead path ate were lost exactly when DERP
+ * was down too. */
+typedef struct { int accept; int calls; uint8_t order[16]; } rescue_sink_t;
+
+static bool rescue_sink(const uint8_t *buf, size_t len, void *user)
+{
+    rescue_sink_t *k = (rescue_sink_t *)user;
+    if (k->accept == 0) return false;
+    if (k->accept > 0) k->accept--;
+    if (k->calls < 16) k->order[k->calls] = len > 0 ? buf[0] : 0;
+    k->calls++;
+    return true;
+}
+
+static void test_rescue_ring(void)
+{
+    static wg_rescue_ring_t r;
+    memset(&r, 0, sizeof(r));
+    const int64_t age = MS(WG_PATH_RESCUE_MS);
+    uint8_t f[WG_RESCUE_MAX + 1];
+    for (int i = 0; i < 3; i++) {
+        memset(f, 0xA0 + i, sizeof(f));
+        wg_rescue_keep(&r, f, 112, T0 + S(5 * i));
+    }
+    rescue_sink_t k = { 0 };
+    unsigned kept = 99;
+    ok("rescue/refused-kept", wg_rescue_flush(&r, T0 + S(12), age, rescue_sink, &k, &kept) == 0 &&
+                              kept == 3 && k.calls == 0);
+    k = (rescue_sink_t){ .accept = 1 };
+    ok("rescue/partial", wg_rescue_flush(&r, T0 + S(13), age, rescue_sink, &k, &kept) == 1 &&
+                         kept == 2 && k.order[0] == 0xA0);
+    k = (rescue_sink_t){ .accept = -1 };
+    ok("rescue/relay-back", wg_rescue_flush(&r, T0 + S(20), age, rescue_sink, &k, &kept) == 2 &&
+                            kept == 0 && k.order[0] == 0xA1 && k.order[1] == 0xA2);
+    ok("rescue/once", wg_rescue_flush(&r, T0 + S(21), age, rescue_sink, &k, &kept) == 0 &&
+                      k.calls == 2);
+    /* Past the age bound: dropped, not sent late. */
+    wg_rescue_keep(&r, f, 112, T0 + S(30));
+    k = (rescue_sink_t){ .accept = -1 };
+    ok("rescue/age-bound", wg_rescue_flush(&r, T0 + S(30) + age + 1, age, rescue_sink, &k,
+                                           &kept) == 0 && kept == 0 && k.calls == 0);
+    /* Full: the oldest goes; too big: not kept. */
+    for (int i = 0; i < WG_RESCUE_SLOTS + 1; i++) {
+        memset(f, i, sizeof(f));
+        wg_rescue_keep(&r, f, 112, T0 + S(100 + i));
+    }
+    wg_rescue_keep(&r, f, WG_RESCUE_MAX + 1, T0 + S(110));
+    k = (rescue_sink_t){ .accept = -1 };
+    ok("rescue/ring-oldest-out",
+       wg_rescue_flush(&r, T0 + S(111), age, rescue_sink, &k, &kept) == WG_RESCUE_SLOTS &&
+       k.order[0] == 1 && k.order[WG_RESCUE_SLOTS - 1] == WG_RESCUE_SLOTS);
+}
+
 static void test_unmanaged(void)
 {
     wg_path_t p;
@@ -1612,6 +1668,7 @@ int main(void)
     test_doubt();
     test_review();
     test_late_ticks();
+    test_rescue_ring();
     test_unmanaged();
     test_deadline_agrees();
     test_init_fresh();

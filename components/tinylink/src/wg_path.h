@@ -193,7 +193,8 @@ typedef enum {
 /* When a lapse is confirmed — its ping got no pong (DUAL → RELAY), the
  * doubt after its pong ended SILENT or UNDELIVERED, or the endpoint
  * moved elsewhere before the current one answered — the data frames sent
- * direct-only within this long are re-sent via DERP (WG_PATH_ACT_RESCUE). Passive
+ * direct-only within this long are re-sent via DERP (WG_PATH_ACT_RESCUE),
+ * and frames whose DERP copy was refused count as direct-only. Passive
  * evidence is late by construction: a keepalive answers the frame the
  * peer got KEEPALIVE_TIMEOUT before sending it, so one sent just before
  * the path died still arrives ~10 s after, restarts the window, and the
@@ -389,7 +390,21 @@ static inline uint32_t wg_path_check_answer_(wg_path_t *p, int64_t now)
 }
 
 /* A transport frame is about to go out (wg_tx). `data`: it carries a
- * payload (keepalives are never answered). *mode is how to send it. */
+ * payload (keepalives are never answered). *mode is how to send it.
+ *
+ * After a pause — no frame for a window, no proof for a window — the
+ * first frame goes DUAL with a ping. With a telemetry period above
+ * ~WG_PATH_ANSWER_MS (Kconfig allows up to 600 s; the default is 5 s)
+ * that is every sample: one DERP copy and one ping / pong each (the ping
+ * is sealed with the cached key, no X25519). Kept on purpose: the proof
+ * is a keepalive ~10 s old by construction, and after minutes nothing
+ * says the path still works — magicsock does the same (any send after
+ * trustBestAddrUntil, 6.5 s past the last pong, goes to both and pings).
+ * Scaling the trust with the period would save those two packets per
+ * sample but deliver a sample sent into a path that died during the
+ * pause only once a lapse is confirmed (≥ 17 s late) — and never when
+ * the doubt needs a second window the next sample opens minutes later,
+ * past WG_PATH_RESCUE_MS. */
 static inline uint32_t wg_path_on_send(wg_path_t *p, int64_t now, bool data,
                                        wg_path_mode_t *mode)
 {

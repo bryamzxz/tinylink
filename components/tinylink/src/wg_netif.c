@@ -33,6 +33,7 @@
 #include "wg_demux.h"
 #include "wg_handshake.h"
 #include "wg_path.h"
+#include "wg_rescue.h"
 #include "wg_timers.h"
 #include "wg_transport.h"
 
@@ -320,21 +321,6 @@ typedef struct {
     bool                data;         /* carries a payload (not a keepalive) */
 } wg_tx_item_t;
 
-/* Rescue ring (round 1.3.6, WG_PATH_RESCUE_MS): copies of the last data
- * frames sent direct-only, re-sent via DERP when a lapse of the direct
- * path is confirmed. Telemetry-sized frames only — the 160-B JSON buffer
- * is at most 224 B on the wire, a typical sample 112 B; a bigger frame (a
- * /stats reply) belongs to an exchange whose requester retries. 8 slots
- * cover 40 s at the 5-s period. Owned by wg_tx alone: tx_send_item writes
- * it, the WG_TX_SLOT_RESCUE sentinel reads it. Heap, like the TX slots. */
-#define WG_RESCUE_SLOTS 8
-#define WG_RESCUE_MAX   224
-typedef struct {
-    int64_t  at_us;                   /* sent at; 0 = empty */
-    uint16_t len;
-    uint8_t  buf[WG_RESCUE_MAX];
-} wg_rescue_t;
-
 typedef enum {
     WG_NETIF_IDLE = 0,
     WG_NETIF_HANDSHAKE_PENDING,
@@ -512,9 +498,14 @@ static struct {
      * queues one (queue_rescue), cleared by wg_tx when it ran (keeps
      * tx_ready_q's spare entries for at most one rescue + the stop
      * sentinel). */
-    wg_rescue_t             *rescue;
-    uint8_t                  rescue_head;
+    /* Rescue ring (wg_rescue.h; heap, like the TX slots). Owned by
+     * wg_tx alone: tx_send_item writes it, the WG_TX_SLOT_RESCUE
+     * sentinel reads it. */
+    wg_rescue_ring_t        *rescue;
     volatile bool            rescue_queued;
+    /* A re-send found the relay down and kept the frames: the next DERP
+     * login queues it again (wg_tx sets, the DERP task reads). */
+    volatile bool            rescue_owed;
     uint32_t                 stat_rescued;
     /* The INIT the last new one replaced, and when (hs_lock): an answer
      * to it arriving afterwards is logged once, then dropped. */
@@ -2094,44 +2085,45 @@ retry_timer:;
 /* Keep a copy of a data frame that went direct only (WG_PATH_RESCUE_MS). */
 static void rescue_keep(const wg_tx_item_t *it, int64_t now)
 {
-    if (g.rescue == NULL || it->len > WG_RESCUE_MAX) return;
-    wg_rescue_t *r = &g.rescue[g.rescue_head];
-    memcpy(r->buf, it->buf, it->len);
-    r->len   = (uint16_t)it->len;
-    r->at_us = now;
-    g.rescue_head = (uint8_t)((g.rescue_head + 1) % WG_RESCUE_SLOTS);
+    if (g.rescue != NULL) wg_rescue_keep(g.rescue, it->buf, it->len, now);
+}
+
+/* wg_rescue_flush's sender: the relay, not best effort. */
+static bool rescue_relay(const uint8_t *buf, size_t len, void *user)
+{
+    const uint8_t *dst_pub = (const uint8_t *)user;
+    return g.relay_cb(dst_pub, buf, len, false, g.relay_cb_user) == ESP_OK;
 }
 
 /* A lapse of the direct path was confirmed (the WG_TX_SLOT_RESCUE
  * sentinel, queue_rescue): re-send via DERP, oldest first, the
  * direct-only frames of the last WG_PATH_RESCUE_MS. The peer's replay
  * window drops those it already has; the others are the telemetry the
- * dead path ate. Not best effort: these are the only copies. The ring is
- * emptied either way. */
+ * dead path ate. Not best effort: these are the only copies. A relay that
+ * refuses (DERP not connected) keeps the rest in the ring — the next
+ * DERP login queues the re-send again (rescue_owed), up to their age
+ * bound; until 1.3.6's review the ring was emptied either way. */
 static __attribute__((noinline)) void tx_rescue(int64_t now)
 {
     g.rescue_queued = false;
     if (g.rescue == NULL || g.relay_cb == NULL) return;
     uint8_t dst_pub[WG_KEY_LEN];
     peer_static_snapshot(dst_pub);
-    unsigned sent = 0;
-    for (unsigned i = 0; i < WG_RESCUE_SLOTS; i++) {
-        wg_rescue_t *r = &g.rescue[(g.rescue_head + i) % WG_RESCUE_SLOTS];
-        if (r->at_us == 0) continue;
-        if (!wg_timer_due(now, r->at_us, (int64_t)WG_PATH_RESCUE_MS * 1000LL)) {
-            if (g.relay_cb(dst_pub, r->buf, r->len, false, g.relay_cb_user) == ESP_OK) {
-                sent++;
-            } else {
-                g.relay_errors++;
-            }
-        }
-        r->at_us = 0;
-    }
+    unsigned kept = 0;
+    const unsigned sent = wg_rescue_flush(g.rescue, now,
+                                          (int64_t)WG_PATH_RESCUE_MS * 1000LL,
+                                          rescue_relay, dst_pub, &kept);
+    g.rescue_owed = kept > 0;
     if (sent > 0) {
         g.stat_rescued += sent;
         ESP_LOGI(TAG, "re-sent via DERP the %u direct-only frames of the last "
                       "%d s (rescued: %u)", sent, WG_PATH_RESCUE_MS / 1000,
                  (unsigned)g.stat_rescued);
+    }
+    if (kept > 0) {
+        g.relay_errors++;
+        ESP_LOGW(TAG, "DERP relay refused the re-send — %u frames kept for its "
+                      "return", kept);
     }
 }
 
@@ -2188,15 +2180,18 @@ static void tx_send_item(const wg_tx_item_t *it, int64_t now)
         if (n < 0) ESP_LOGW(TAG, "tx sendto: errno=%d", errno);
         peer_static_snapshot(dst_pub);
         /* Best effort: a stalled DERP conn must not hold up the
-         * direct path, which this item already used above. */
+         * direct path, which this item already used above. Refused, the
+         * frame went direct only after all: kept for a re-send. */
         if (g.relay_cb(dst_pub, it->buf, it->len, true,
                        g.relay_cb_user) != ESP_OK) {
             g.relay_errors++;
+            if (n >= 0 && it->data) rescue_keep(it, now);
         }
         return;
     }
     if (n >= 0) {
-        if (mode == WG_PATH_DIRECT && it->data && g.relay_cb != NULL) {
+        /* Direct only: DIRECT, or DERP only with the relay refusing. */
+        if (it->data && g.relay_cb != NULL && (mode == WG_PATH_DIRECT || relay_tried)) {
             rescue_keep(it, now);
         }
         return;
@@ -2257,7 +2252,7 @@ static void tx_task_fn(void *arg)
 static esp_err_t tx_ring_create(void)
 {
     g.tx_slots   = calloc(WG_TX_SLOTS, sizeof(wg_tx_item_t));
-    g.rescue     = calloc(WG_RESCUE_SLOTS, sizeof(wg_rescue_t));
+    g.rescue     = calloc(1, sizeof(wg_rescue_ring_t));
     g.tx_free_q  = xQueueCreate(WG_TX_SLOTS, sizeof(uint8_t));
     /* + the stop and the rescue sentinel */
     g.tx_ready_q = xQueueCreate(WG_TX_SLOTS + 2, sizeof(uint8_t));
@@ -2281,7 +2276,7 @@ static void tx_ring_destroy(void)
         g.tx_slots = NULL;
     }
     if (g.rescue != NULL) {
-        tl_secure_zero(g.rescue, WG_RESCUE_SLOTS * sizeof(wg_rescue_t));
+        tl_secure_zero(g.rescue, sizeof(wg_rescue_ring_t));
         free(g.rescue);
         g.rescue = NULL;
     }
@@ -2546,6 +2541,9 @@ void wg_netif_handshake_kick(wg_netif_kick_t why)
          * is older than WG_INIT_FRESH_AFTER_MS, replace it: the peer may
          * have consumed it and answered into the relay that was down. */
         init_refresh_or_resend(false, true, true, "DERP relay up");
+        /* A re-send the relay refused while it was down goes now (the
+         * frames younger than WG_PATH_RESCUE_MS). */
+        if (g.rescue_owed) queue_rescue(WG_PATH_ACT_RESCUE);
         break;
     case WG_NETIF_KICK_CALL_ME_MAYBE:
         /* The peer is punching towards our endpoints right now: its NAT

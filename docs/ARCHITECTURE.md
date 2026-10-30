@@ -226,8 +226,9 @@ is UNDELIVERED: the peer gets what goes via DERP only — RELAY, no rekey.
 Both back the direct re-tests off to one a minute; pongs between
 re-tests do not end them. When a lapse is confirmed — that ping
 unanswered, SILENT, UNDELIVERED, or the endpoint moved elsewhere first —
-the direct-only frames of the last 40 s are re-sent via DERP (`wg_tx`'s
-rescue ring; the peer's replay window drops those it has). Steady
+the direct-only frames of the last 40 s (and those whose DERP copy was
+refused) are re-sent via DERP (`wg_tx`'s rescue ring, kept while the
+relay is down; the peer's replay window drops those it has). Steady
 state costs no packet (upstream heartbeats a ping every 3 s); 0.5 / 1 /
 2 % random loss costs ~8 / 22 / 59 one-ping lapses per 6 h and no
 rekey (test_wg_path). A pong from another endpoint
