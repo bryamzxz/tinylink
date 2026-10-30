@@ -1771,7 +1771,8 @@ static uint32_t s_stat_lp_reconnects;
 static uint32_t s_stat_ep_pushes;
 
 /* A push the server throttled (429 / 503), reset, or left unanswered
- * while the map stream it rides with runs (round 1.3.7 review). Until
+ * while the map stream it rides with runs (round 1.3.7 review; one a
+ * GOAWAY refused goes with the reconnect, at once). Until
  * 1.3.6 a failed push went again before the next stream, after the
  * server's Retry-After; riding with the stream it would wait for the
  * stream's end — hours on a healthy conn. So: one recycle of the stream
@@ -1811,7 +1812,12 @@ static void ep_push_done(int status, uint32_t wait_ms)
         return;
     }
     s_ep_push_pending = true;   /* owed — with the next stream at the latest */
-    const bool transient = status <= 0 || status == 429 || status == 503;
+    if (status == MAPREQ_PUSH_GOAWAY) {
+        /* Not processed and the conn is ending: with the reconnect. */
+        ESP_LOGI(TAG, "endpoint push: again with the reconnect");
+        return;
+    }
+    const bool transient = status == 0 || status == 429 || status == 503;
     const char *what = status > 0 ? "refused" : "reset or unanswered";
     const uint32_t ms = wait_ms > EP_PUSH_RETRY_MS ? wait_ms : EP_PUSH_RETRY_MS;
     if (transient && !s_ep_push_retried && s_ep_push_timer != NULL) {

@@ -295,6 +295,8 @@ static esp_err_t side_closed(ts2021_conn_t *conn, h2_side_t *side)
     side->res.status = ss->final ? ss->status : 0;
     side->res.stream_error = (int)ss->close_err;
     side->res.expired = side->expired;
+    side->res.goaway = !ss->final && conn->h2_goaway &&
+                       ss->close_err == H2_REFUSED_STREAM;
     side->cb(&side->res, side->ctx);
     return err;
 }
@@ -423,10 +425,14 @@ static esp_err_t h2_drive_request(ts2021_conn_t *conn,
                 side->repoll = false;
                 if (ts2021_request_deadline(conn, 0) != ESP_OK) return ESP_FAIL;
             }
-            if (side->detached && h->side.open &&
-                esp_timer_get_time() > side->deadline_us) {
-                /* Checked as records arrive — on a quiet stream at its
-                 * next KeepAlive. */
+            /* Unanswered past its deadline: cancelled — checked as records
+             * arrive, so on a quiet stream at its next KeepAlive. Not
+             * while received bytes wait unread (the stream callback can
+             * hold this loop past the deadline with the answer already
+             * in): those records first. Answered — its final :status in,
+             * the body still coming — is not late: it closes on its own. */
+            if (side->detached && h->side.open && !h->side.final &&
+                esp_timer_get_time() > side->deadline_us && !ts2021_rx_ready(conn)) {
                 ESP_LOGW(TAG, "side request: no answer within %u ms — "
                               "cancelled, the stream goes on", (unsigned)side->ms);
                 side->expired = true;

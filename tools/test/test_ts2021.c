@@ -182,6 +182,11 @@ ssize_t esp_tls_conn_write(esp_tls_t *tls, const void *data, size_t datalen)
     return (ssize_t)datalen;
 }
 int esp_tls_conn_destroy(esp_tls_t *tls) { (void)tls; tls_fd_close(); return 0; }
+ssize_t esp_tls_get_bytes_avail(esp_tls_t *tls)
+{
+    (void)tls;
+    return 0;
+}
 esp_err_t esp_tls_get_conn_sockfd(esp_tls_t *tls, int *sockfd)
 {
     (void)tls;
