@@ -23,13 +23,14 @@ credits both to the rekey). The rest were a lost frame or keepalive,
 settled by the peer's own WireGuard 1.3–8.0 s after the lapse. And with
 only our direct WireGuard toward the peer dropped, the first episode lost
 the frames older than the 40-s re-send window (1.3.6 "Known gap"). Image
-731 952 → **733 776 B (+1 824)**; static DRAM 58 116 → 58 212 B (+96), IRAM
+731 952 → **734 352 B (+2 400)**; static DRAM 58 116 → 58 228 B (+112), IRAM
 ±0, ~500 B more heap in use (rescue ring 8 → 10 slots). Host suite 2 092 →
-**2 139 OK** (CI floor 2 139), ASan + UBSan clean, 0 warnings. Static worst
+**2 147 OK** (CI floor 2 147), ASan + UBSan clean, 0 warnings. Static worst
 cases unchanged: `wg_rx` 5 728 / 8 192, `wg_tx` 3 440 / 5 120 (`start_rekey`
 and `tx_rescue` +16 B each, off the deepest chains). Not yet on the
-sensor. All numbers below are from the keypair-aware
-simulation (see the review).
+sensor. All numbers below are from the keypair-aware simulation, with
+our DERP send queue modelled (see the review); "host test" numbers are
+what `test_wg_path` prints, the others from sweeps of the same code.
 
 - **D1 — a doubt is tested at once with a handshake (`WG_PATH_ACT_TEST`).**
   The pong that puts the path in doubt owes a test; the RX task's timer
@@ -46,10 +47,10 @@ simulation (see the review).
   since a direct proof back to DIRECT, the second UNDELIVERED — the INIT
   went both ways, so it proves the session, not our direct path. A broken
   session is replaced by it. Simulated (100 random instants, the peer's
-  session dead until an INIT, DISCO alive): **the session is back 12.3–13.2
-  s after the first unanswered frame (1.3.7: 25.2–28.1 s), 16.5 s on
-  average / 17.9 s at most after the peer's last packet (1.3.7: 30.0 /
-  30.6 s)**, frames sealed with the dead keys 2.1 on average (1.3.7: 5.1).
+  session dead until an INIT, DISCO alive): **the session is back 12.3–13.0
+  s after the first unanswered frame (1.3.7: 25.2–27.9 s), 16.4 s on
+  average / 17.9 s at most after the peer's last packet (1.3.7: 29.9 /
+  30.6 s)**, frames sealed with the dead keys 2.1 on average (1.3.7: 5.0).
   Cost, healthy path with random WireGuard loss, 6 h, 20 runs each against
   the same rules without the test: **+6 / +12.5 / +27 / +42 handshakes on
   195** at 0.5 / 1 / 2 / 3 % (~14 / 26 / 55 / 86 doubts; a doubt's
@@ -57,49 +58,58 @@ simulation (see the review).
   CPU, the INIT, the response and the two adverts); 2 % is a doubt every
   ~6.5 min, the soak's rate was one per 8.4 min. A doubt now ends within
   a round trip, so fewer frames go both ways during one: DERP copies 21 /
-  44 / 91 / 149 → 1.6 / 3.1 / 17 / 45, frames re-sent 0.8 / 6 / 26 / 56 →
-  15 / 30 / 82 / 137 (mostly ahead of a DERP-only test, below; the peer's
+  44 / 91 / 148 → 1.6 / 3.0 / 17 / 46, frames re-sent 0.8 / 6 / 26 / 58 →
+  15 / 30 / 82 / 138 (mostly ahead of a DERP-only test, below; the peer's
   replay window drops those it has; data frames via DERP in all still
-  fewer), frames lost to the random loss 21.7 / 41.3 / 80.5 / 116.7 →
-  21.4 / 41.2 / 78.5 / 113.7, and the RX-stale rekeys the loss caused
-  (0.25 / 0.70 / 1.80 / 3.80, each after 30 s of silence) are gone.
-  UNDELIVERED under random loss 0.05 / 0.60 / 2.65 / 5.80 → 0.3 / 0.6 /
-  3.55 / 8.55 (a second doubt before a direct proof is now settled in a
+  fewer), frames lost to the random loss 21.7 / 41.4 / 80.5 / 115.6 →
+  21.4 / 41.0 / 78.4 / 113.3, and the RX-stale rekeys the loss caused
+  (0.25 / 0.70 / 1.80 / 3.85, each after 30 s of silence) are gone.
+  UNDELIVERED under random loss 0.05 / 0.60 / 2.65 / 6.05 → 0.3 / 0.6 /
+  3.5 / 8.75 (a second doubt before a direct proof is now settled in a
   round trip; each costs 10–20 s of DERP only and a re-send). With our
-  direct WireGuard dropped for an hour: 0 lost, 47 tests (1 behind a
-  re-send), 79 handshakes (1.3.7: 68, 14 of them RX-stale), 0 forced
-  rekeys, re-tests still backed off to one a minute.
+  direct WireGuard dropped for an hour (host test): 0 lost, 47 tests (1
+  behind a re-send), 79 handshakes (1.3.7: 69, 18 of them RX-stale), 0
+  forced rekeys, re-tests still backed off to one a minute.
 - **No INIT costs a frame still to re-send (`wg_path_init_route`,
   `wg_rescue_init_risk`).** wireguard-go as responder
   (`BeginSymmetricSession`) parks the new keypair as `next` and deletes
   `previous`; a re-sent frame sealed under a deleted keypair is dropped.
   Each ring slot records the keypair it was sealed under, and the ring
-  the keypairs it re-sent in the last 5 s (`WG_RESCUE_TRANSIT_MS`: maybe
-  still on the DERP stream). While a pending or just re-sent frame is
-  under the keypair an INIT would delete (our previous once a packet of
-  the peer under the current one confirms it, else the current one too),
-  every INIT of a live session, new or re-sent, whatever started it —
-  the doubt's test, SILENT, the proactive and RX-stale rekeys, the 5-s
-  retry, a fresh INIT at a path event, the re-sends at a DERP login, a
-  CallMeMaybe, link-up or a pong — goes via DERP only, behind a re-send
-  of the pending frames on the same TCP stream (`build_and_send_init` and
-  `init_resend` both ask; `… via DERP behind a re-send` in their log
-  lines). With DERP down the re-send is kept owed and the INIT's copy
-  dropped; the login kick now re-sends first, then refreshes the INIT. A
-  cold handshake goes as before (no session carries data). 2.3 / 4.5 /
-  11 / 18 of the 13 / 26 / 54 / 85 tests above went behind a re-send.
-  Known gap, 2 000 random block instants: the test sent as it comes loses
-  6 157 frames (3.1 per episode, 1.3.7: 2.3); the hold, **0**. With our
-  DERP also down 3 / 8 / 20 s within the episode, holding only the test
-  (81134de) lost 194 / 642 / 1 597; every INIT held, **0 / 2 / 60** —
-  those 62 pushed out of the full ring by the outage, none to a deleted
-  keypair. Withholding the test instead leaves a third of the WG-silent
-  breaks to the RX-stale rekey (33 of 100 in the host test; 1 000
-  instants: 111 breaks over 14 s after the first unanswered frame, up to
-  28.3 s); held, recovery is unchanged (12.6 s mean, 13.1 s max, none
-  over 14 s). `wg_path_rekey_gate` keeps the timing rules (no session,
-  one INIT in flight, REKEY_TIMEOUT since the last); both pure functions
-  are what `wg_netif.c` and the simulation call.
+  the keypairs it re-sent in the last 5 s (`WG_RESCUE_TRANSIT_MS`, from
+  when the re-send's last frame left: maybe still on the DERP stream).
+  While a pending or just re-sent frame is under the keypair an INIT
+  would delete (our previous once a packet of the peer under the current
+  one confirms it, else the current one too), every INIT of a live
+  session, new or re-sent, whatever started it — the doubt's test,
+  SILENT, the proactive and RX-stale rekeys, the 5-s retry, a fresh INIT
+  at a path event, the re-sends at a DERP login, a CallMeMaybe, link-up
+  or a pong — goes via DERP only, behind a re-send of the pending frames
+  on the same TCP stream, with the waiting write the re-send uses
+  (`build_and_send_init` and `init_resend` both ask; `… via DERP behind a
+  re-send` in their log lines). The login kick re-sends first, and its
+  INIT copy, fresh or not, waits too. Only while DERP is connected (a new
+  `wg_netif_set_relay_state_callback`, the supervisor's flag): with it
+  down the INIT goes as in 1.3.7. And for one attempt (`WG_PATH_INIT_HOLD_MS`
+  = REKEY_TIMEOUT from the first INIT held, DERP up all along): the retry
+  of an unanswered held INIT goes both ways. A cold handshake goes as
+  before (no session carries data). 2.3 / 4.5 / 11 / 18 of the 13 / 26 /
+  54 / 85 tests above went behind a re-send. Known gap, 2 000 random
+  block instants: the test sent as it comes loses 6 157 frames (3.1 per
+  episode, 1.3.7: 2.3); held, **0**. With our DERP also down 3 / 8 / 20 s
+  within the episode (host test, 500 instants, each seeded on its own):
+  holding only the test (81134de) loses 59 / 166 / 403; now **1 / 3 / 22**,
+  every one pushed out of the full ring by the outage, none to a deleted
+  keypair (2 000 instants: 194 / 636 / 1 575 → 0 / 2 / 60). DERP down for
+  good and the peer's keys lost 1 ms after a proactive rekey's response
+  (before it confirmed ours): back 12.6 s mean, 13.0 s max, as without any
+  hold (fee2336, holding regardless: 72 s, the rekey given up). Withholding
+  the test instead leaves a third of the WG-silent breaks to the RX-stale
+  rekey (34 of 100 in the host test; 1 000 instants: 111 breaks over 14 s
+  after the first unanswered frame, up to 28.0 s); held, recovery is
+  unchanged (12.6 s mean, 13.1 s max, none over 14 s). `wg_path_rekey_gate`
+  keeps the timing rules (no session, one INIT in flight, REKEY_TIMEOUT
+  since the last); both pure functions are what `wg_netif.c` and the
+  simulation call.
 - **Rejected: an in-tunnel probe.** An empty keepalive is never answered
   (wireguard-go arms its passive keepalive only for packets with a
   payload). A TSMP ping is answered by tailscaled without a new session,
@@ -130,7 +140,7 @@ simulation (see the review).
   (direct → doubt → direct → lapse → doubt → UNDELIVERED, up to 9
   direct-only samples): **1.3.7's rules lose 2.3 on average (4 596
   frames in 2 000 random block instants); now 0** (host test: 500
-  instants, 0 lost; the test sent as it comes: 1 586).
+  instants, 0 lost; the test sent as it comes: 1 582).
   `re-sent via DERP the N direct-only frames sent since the last one
   proven delivered, X s ago (rescued: M)`.
 - **The simulation now models wg_netif's handshakes**: one INIT in
@@ -150,15 +160,17 @@ simulation (see the review).
   to delivery under a keypair the peer holds, an end-of-run drain). Since
   the second pass, also our DERP connection down (the relay refusing,
   what the peer relays to us lost) and its login kick, and the INIT
-  re-sends a pong makes. Every scenario prints the 1.3.7 behaviour beside it
-  (the test action ignored).
+  re-sends a pong makes; since the third, lwIP's send queue toward DERP
+  (a best-effort write refused while 8 segments are unacknowledged). Every
+  scenario prints the 1.3.7 behaviour beside it (the test action
+  ignored).
 - **Finding (pre-existing, not fixed): WireGuard dropped on the direct
   path both ways with DISCO passing**, the peer keeping its direct path:
   the peer gets what goes via DERP and answers on the blocked path, so no
   handshake completes; the first rekey (1.3.8 the doubt's test, 1.3.7
   the silence's or RX-stale's) gives up after 12 attempts and the cold
   handshake refuses data — the tunnel is down while the block lasts
-  (704 of ~720 frames in the simulated hour, 1.3.7: 703). The old simulation sent INITs
+  (706 of ~720 frames in the simulated hour, 1.3.7: 701). The old simulation sent INITs
   without retries and showed no loss. Only the peer's path choice can fix
   it; the old keys would carry our frames via DERP at most until
   REJECT_AFTER_TIME anyway.
@@ -196,7 +208,19 @@ simulation (see the review).
   (`wg_path_init_route`, tests `route/*`, `transit/*`,
   `sim/derp-down-*`). It also noted that "no relay, no test" cannot
   happen on the device (the relay callback is always registered; the
-  ring keeps frames only with one): that branch is gone.
+  ring keeps frames only with one): that branch is gone. A third pass
+  modelled lwIP's send queue: a held INIT's only copy went as a
+  best-effort write and was refused behind a re-send of 8 frames (9 of 32
+  held WG-silent tests, recovery up to 17.8 s; the login kick's fresh INIT
+  the same, until the rekey gave up), and with DERP down for good the
+  hold starved the handshake until the cold fallback (~72 s) — held
+  copies now take the waiting write, the hold needs DERP connected and
+  lasts one attempt, the transit window starts when the re-send's last
+  frame left (tests `route/relay-down-any`, `route/hold-*`,
+  `transit/from-last-write`, `sim/derp-down-no-starving`). fee2336's
+  message quoted a 2 000-instant sweep as the host test's numbers; the
+  test now seeds each trial on its own and checks what is lost, not how
+  much.
 
 #### Control plane (`feat/r138-ctl`)
 

@@ -234,8 +234,10 @@ every INIT it consumes, so while the rescue ring holds frames sealed
 under that keypair, or re-sent them less than 5 s ago, every INIT — the
 test, a retry, the proactive or RX-stale rekey, the re-sends at a DERP
 login, a CallMeMaybe or a pong — goes via DERP only, behind their re-send
-(`wg_path_init_route`); with DERP down both wait, and the login re-sends
-first. A second window, opened by a frame sent
+and with the same waiting write (`wg_path_init_route`); the login
+re-sends first. Only while DERP is connected (down, the INIT goes as in
+1.3.7) and for one attempt: the REKEY_TIMEOUT retry goes both ways. A
+second window, opened by a frame sent
 both ways, without one is SILENT (DISCO works, WireGuard does not):
 RELAY and a make-before-break rekey, the first of a streak only — in
 practice the doubt's test is in flight by then. A second doubt ended before a keepalive

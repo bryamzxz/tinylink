@@ -1439,6 +1439,17 @@ esp_err_t tinylink_relay_via_derp(const uint8_t *dst_node_pub,
 #endif
 }
 
+#if CONFIG_TINYLINK_DERP_SUPERVISED
+/* wg_netif's relay state (wg_netif_set_relay_state_callback): an INIT is
+ * held behind a re-send only while the supervisor is connected. The same
+ * racy-but-harmless read of the flag as above. */
+static bool relay_connected(void *user)
+{
+    (void)user;
+    return s_derp_sup.connected;
+}
+#endif
+
 esp_err_t tinylink_derp_supervised_start(void)
 {
 #if CONFIG_TINYLINK_DERP_SUPERVISED
@@ -2204,6 +2215,7 @@ esp_err_t tinylink_wg_socket_init(void)
      * sendto errno indicates direct UDP is broken. */
 #if CONFIG_TINYLINK_DERP_SUPERVISED
     wg_netif_set_relay_callback(tinylink_relay_via_derp, NULL);
+    wg_netif_set_relay_state_callback(relay_connected, NULL);
 #endif
 
     return ESP_OK;

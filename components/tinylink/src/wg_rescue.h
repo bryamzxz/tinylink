@@ -36,8 +36,9 @@ extern "C" {
  * DERP stream is TCP, and a segment the Wi-Fi lost waits for its
  * retransmission (lwIP: 1 s and more); a direct INIT sent meanwhile
  * could reach the peer first (review of 1.3.8, second pass). One
- * REKEY_TIMEOUT. A guard: no simulated scenario changes with it at 0
- * (an INIT seldom follows a re-send within a DERP transit). */
+ * REKEY_TIMEOUT, from when the re-send's last frame left
+ * (wg_rescue_sent_by). A guard: no simulated scenario changes with it at
+ * 0 (an INIT seldom follows a re-send within a DERP transit). */
 #define WG_RESCUE_TRANSIT_MS 5000
 
 typedef struct {
@@ -121,6 +122,16 @@ static inline unsigned wg_rescue_flush(wg_rescue_ring_t *r, int64_t now, int64_t
     }
     if (kept != NULL) *kept = left;
     return sent;
+}
+
+/* The frames a flush at `flushed_at` handed to the relay left by `left_at`
+ * (a waiting write blocks while lwIP's send queue is full): their transit
+ * window starts then — review of 1.3.8, third pass. */
+static inline void wg_rescue_sent_by(wg_rescue_ring_t *r, int64_t flushed_at, int64_t left_at)
+{
+    for (unsigned i = 0; i < 2; i++) {
+        if (r->sent_gen[i] != 0 && r->sent_us[i] == flushed_at) r->sent_us[i] = left_at;
+    }
 }
 
 /* What the ring holds, per keypair, for a task that does not own it

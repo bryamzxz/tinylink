@@ -110,16 +110,17 @@
 // ways, so it proves the session, not our direct path), and a broken
 // session is replaced by the response. Recovery from
 // that failure (test_wg_path, 100 random instants, the peer's keypair
-// slots modelled): the session is back 12.3–13.0 s after the first
-// unanswered frame, 16.6 s on average (max 17.9) after the peer's last
-// packet — 1.3.7: 25.1–28.0 s and 29.8 s (the RX-stale rekey). The
+// slots and our DERP send queue modelled): the session is back 12.3–13.0
+// s after the first unanswered frame, 16.4 s on average (max 17.9) after
+// the peer's last packet — 1.3.7: 25.2–27.9 s and 29.9 s (the RX-stale
+// rekey). The
 // price: a handshake per doubt, +6 / +12.5 / +27 handshakes per 6 h on
 // 195 at 0.5 / 1 / 2 % loss (20 runs each, against the same rules without
 // the test; a doubt's handshake also moves the next proactive one 110 s
 // on). A doubt now ends within a round trip, so fewer frames go both ways
-// during one (DERP copies 21 / 44 / 90 → 1.6 / 3.1 / 17 per 6 h, frames
-// lost to the random loss 21.7 / 41.6 / 80.3 → 21.4 / 41.2 / 78.5), and
-// the RX-stale rekeys the loss caused (0.25 / 0.65 / 1.85 per 6 h, each
+// during one (DERP copies 21 / 44 / 91 → 1.6 / 3.0 / 17 per 6 h, frames
+// lost to the random loss 21.7 / 41.4 / 80.5 → 21.4 / 41.0 / 78.4), and
+// the RX-stale rekeys the loss caused (0.25 / 0.70 / 1.80 per 6 h, each
 // after 30 s of silence) are gone. An INIT that would make the peer delete
 // the keypair of frames still to re-send goes via DERP behind their
 // re-send (wg_path_init_route): 2.3 / 4.5 / 11 of the 13 / 26 / 54 tests.
@@ -305,6 +306,9 @@ typedef struct {
     int64_t last_data_us;       /* last data frame sent; 0 none */
     int64_t last_relay_data_us; /* last data frame that also went via DERP */
     int64_t hs_us;              /* last completed handshake; 0 none */
+    int64_t init_hold_us;       /* the first INIT held behind a re-send since
+                                   then, DERP up all along (wg_path_init_route);
+                                   0 none */
     int64_t peer_wg_us;         /* last authenticated WG packet from the peer */
     int64_t peer_tr_us;         /* ...transport (keepalive / data): under our current
                                    keypair, the only one wg_netif receives on */
@@ -754,36 +758,51 @@ static inline wg_rekey_gate_t wg_path_rekey_gate(bool up, bool in_flight, int64_
  * re-send, or one just re-sent, the INIT goes via DERP only, behind the
  * re-send on the same stream — the peer looks a transport packet's
  * keypair up as it arrives, before its handshake queue gets the INIT —
- * and wg_netif queues the re-send first. With DERP down both wait: the
- * re-send is kept owed, the INIT copy dropped, and the login sends them
- * in that order. Review of 1.3.8: the doubt's test sent as it comes lost
- * 3.1 frames per episode with only our direct WireGuard dropped (2 000
- * random instants); with only the test held (81134de), our DERP down 3 /
- * 8 / 20 s within the episode lost 194 / 642 / 1 597 (the login kick's
- * fresh INIT or its DERP copy ahead of the re-send, the 5-s retry, a
- * pong's re-send went direct); now 0 / 2 / 60, those 62 pushed out of the
- * full ring by the outage, none to a deleted keypair. Withholding the test instead left a third of the
- * simulated WG-silent failures to the RX-stale rekey (a proactive rekey
- * leaves frames of the previous keypair pending for ~20 s): back up to
- * 27.8 s after the first unanswered frame, against 13.0 s. A cold
- * handshake (`rekey` false: none yet, or the rekey gave up after 60 s)
- * goes as before: no session carries data, the tunnel is down. The ring
- * keeps frames only with a relay registered (on the device always, with
- * the DERP supervisor built in), so a held INIT always has a way. */
+ * and wg_netif queues the re-send first and sends that copy with the
+ * waiting write the re-send uses (a best-effort write is refused once
+ * lwIP holds 8 unacknowledged segments: TCP_SNDQUEUELOWAT, TCP_NODELAY).
+ * Only while DERP is connected (`relay_up`): with it down the held copy
+ * could not go, and the INIT goes as in 1.3.7 (the frames at risk are
+ * lost as then). And for one attempt at most (WG_PATH_INIT_HOLD_MS from
+ * the first INIT held, DERP up all along): the REKEY_TIMEOUT retry of an
+ * unanswered held INIT goes both ways — with the peer's keys lost and the
+ * ring never drained (every new frame under a keypair not yet confirmed)
+ * the hold would otherwise last until the cold fallback, 60 s. A
+ * handshake, the risk's end or DERP dropping ends the hold. Review of
+ * 1.3.8: the doubt's test sent as it comes lost 3.1 frames per episode
+ * with only our direct WireGuard dropped (2 000 random instants); 81134de
+ * held only the test, and our DERP down 3 / 8 / 20 s within the episode
+ * lost 59 / 166 / 403 in 500 to a deleted keypair (the login kick's INIT,
+ * the 5-s retry, a pong's re-send went direct first; now 1 / 3 / 22, all
+ * pushed out of the full ring by the outage); fee2336 held every INIT but
+ * dropped the held copy behind a re-send of 8+ frames (best-effort write)
+ * and, DERP down for good with the peer's keys lost before it confirmed
+ * ours, held until the cold fallback: 72 s, now 12.6 s. Withholding the
+ * test instead left a third of the simulated WG-silent failures to the
+ * RX-stale rekey (a proactive rekey leaves frames of the previous keypair
+ * pending for ~20 s). A cold handshake (`rekey` false: none yet, or the
+ * rekey gave up after 60 s) goes as before: no session carries data. */
 typedef enum {
     WG_INIT_ANY_PATH = 0,
     WG_INIT_DERP_BEHIND_RESEND,
 } wg_init_route_t;
 
-static inline wg_init_route_t wg_path_init_route(const wg_path_t *p, const wg_rescue_sum_t *ring,
-                                                 bool rekey, int64_t now, uint32_t cur_gen)
+#define WG_PATH_INIT_HOLD_MS WG_PATH_REKEY_TIMEOUT_MS
+
+static inline wg_init_route_t wg_path_init_route(wg_path_t *p, const wg_rescue_sum_t *ring,
+                                                 bool rekey, bool relay_up, int64_t now,
+                                                 uint32_t cur_gen)
 {
-    if (rekey && wg_rescue_init_risk(ring, now, wg_path_rescue_from(p),
-                                     (int64_t)WG_PATH_RESCUE_MAX_MS * 1000LL, cur_gen,
-                                     wg_path_keys_confirmed(p))) {
-        return WG_INIT_DERP_BEHIND_RESEND;
+    if (!rekey || !relay_up ||
+        !wg_rescue_init_risk(ring, now, wg_path_rescue_from(p),
+                             (int64_t)WG_PATH_RESCUE_MAX_MS * 1000LL, cur_gen,
+                             wg_path_keys_confirmed(p))) {
+        p->init_hold_us = 0;
+        return WG_INIT_ANY_PATH;
     }
-    return WG_INIT_ANY_PATH;
+    if (p->init_hold_us == 0) p->init_hold_us = now;
+    return wg_timer_due(now, p->init_hold_us, (int64_t)WG_PATH_INIT_HOLD_MS * 1000LL)
+               ? WG_INIT_ANY_PATH : WG_INIT_DERP_BEHIND_RESEND;
 }
 
 /* A transport packet with a payload from the peer, either path. Proves
@@ -811,6 +830,7 @@ static inline uint32_t wg_path_on_handshake(wg_path_t *p, int64_t now)
     p->hs_us      = now;
     p->peer_wg_us = now;
     p->grace_used = false;
+    p->init_hold_us = 0;              /* a new session: a new hold may start */
     if (WG_PATH_IN_DOUBT(p)) return wg_path_resolve_(p, now);
     if (p->mode == WG_PATH_DIRECT) p->await_us = 0;
     return 0;

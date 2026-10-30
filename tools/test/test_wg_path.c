@@ -1217,16 +1217,43 @@ static void test_init_route(void)
     wg_rescue_keep(&r, f, 112, T0 + S(15), 6);
     wg_rescue_keep(&r, f, 112, T0 + S(35), 7);
     wg_rescue_summarize(&r, &sum);
-    ok("route/risk-derp", wg_path_init_route(&p, &sum, true, T0 + S(36), 7) ==
+    ok("route/risk-derp", wg_path_init_route(&p, &sum, true, true, T0 + S(36), 7) ==
                           WG_INIT_DERP_BEHIND_RESEND);
-    ok("route/cold-any", wg_path_init_route(&p, &sum, false, T0 + S(36), 7) == WG_INIT_ANY_PATH);
+    ok("route/cold-any", wg_path_init_route(&p, &sum, false, true, T0 + S(36), 7) == WG_INIT_ANY_PATH);
     p.delivered_us = T0 + S(16);                /* keypair 6's frame proven */
-    ok("route/proven-any", wg_path_init_route(&p, &sum, true, T0 + S(36), 7) ==
+    ok("route/proven-any", wg_path_init_route(&p, &sum, true, true, T0 + S(36), 7) ==
                            WG_INIT_ANY_PATH);
     p.peer_tr_us = T0 + S(29);                  /* not confirmed: 7 may be `next` */
-    ok("route/unconfirmed-derp", wg_path_init_route(&p, &sum, true, T0 + S(36), 7) ==
+    ok("route/unconfirmed-derp", wg_path_init_route(&p, &sum, true, true, T0 + S(36), 7) ==
                                  WG_INIT_DERP_BEHIND_RESEND);
     p.peer_tr_us = T0 + S(31);
+    /* DERP down: the held copy could not go — as in 1.3.7. */
+    p.delivered_us = T0 + S(12);                /* keypair 6's frame pending again */
+    p.init_hold_us = 0;
+    ok("route/relay-down-any", wg_path_init_route(&p, &sum, true, false, T0 + S(36), 7) ==
+                               WG_INIT_ANY_PATH && p.init_hold_us == 0);
+    /* One attempt held at most: the REKEY_TIMEOUT retry goes both ways;
+     * a handshake, or DERP dropping, lets a new hold start. */
+    const int64_t h = T0 + S(36);
+    ok("route/hold-starts", wg_path_init_route(&p, &sum, true, true, h, 7) ==
+                            WG_INIT_DERP_BEHIND_RESEND && p.init_hold_us == h);
+    ok("route/hold-one-attempt",
+       wg_path_init_route(&p, &sum, true, true, h + MS(WG_PATH_INIT_HOLD_MS), 7) ==
+       WG_INIT_DERP_BEHIND_RESEND &&
+       wg_path_init_route(&p, &sum, true, true, h + MS(WG_PATH_INIT_HOLD_MS) + 1, 7) ==
+       WG_INIT_ANY_PATH);
+    ok("route/hold-past-retry", wg_path_init_route(&p, &sum, true, true, h + S(20), 7) ==
+                                WG_INIT_ANY_PATH);
+    (void)wg_path_init_route(&p, &sum, true, false, h + S(21), 7);   /* DERP drops */
+    ok("route/hold-after-relay-down", wg_path_init_route(&p, &sum, true, true, h + S(22), 7) ==
+                                      WG_INIT_DERP_BEHIND_RESEND);
+    (void)wg_path_init_route(&p, &sum, true, true, h + S(40), 7);    /* expired again */
+    (void)wg_path_on_handshake(&p, h + S(41));
+    p.hs_us = T0 + S(30);                       /* keep keypair 7's confirmation */
+    ok("route/hold-after-handshake", p.init_hold_us == 0 &&
+                                     wg_path_init_route(&p, &sum, true, true, h + S(42), 7) ==
+                                     WG_INIT_DERP_BEHIND_RESEND);
+    p.init_hold_us = 0;
 
     /* Re-sent and gone from the ring, but maybe still on the DERP stream:
      * at risk for WG_RESCUE_TRANSIT_MS. */
@@ -1239,16 +1266,26 @@ static void test_init_route(void)
                            r.sent_us[1] == at);
     wg_rescue_summarize(&r, &sum);
     ok("transit/ring-empty", sum.gen[0] == 0 && sum.gen[1] == 0 && sum.sent_gen[1] == 6);
-    ok("transit/held", wg_path_init_route(&p, &sum, true, at + MS(WG_RESCUE_TRANSIT_MS), 7) ==
+    ok("transit/held", wg_path_init_route(&p, &sum, true, true, at + MS(WG_RESCUE_TRANSIT_MS), 7) ==
                        WG_INIT_DERP_BEHIND_RESEND);
-    ok("transit/over", wg_path_init_route(&p, &sum, true, at + MS(WG_RESCUE_TRANSIT_MS) + 1, 7) ==
+    ok("transit/over", wg_path_init_route(&p, &sum, true, true, at + MS(WG_RESCUE_TRANSIT_MS) + 1, 7) ==
                        WG_INIT_ANY_PATH);
+    /* A re-send whose waiting writes took 2 s: the window from then. */
+    wg_rescue_sent_by(&r, at, at + S(2));
+    wg_rescue_summarize(&r, &sum);
+    p.init_hold_us = 0;
+    ok("transit/from-last-write",
+       wg_path_init_route(&p, &sum, true, true, at + S(2) + MS(WG_RESCUE_TRANSIT_MS), 7) ==
+       WG_INIT_DERP_BEHIND_RESEND &&
+       wg_path_init_route(&p, &sum, true, true, at + S(2) + MS(WG_RESCUE_TRANSIT_MS) + 1, 7) ==
+       WG_INIT_ANY_PATH);
+    p.init_hold_us = 0;
     /* Only keypair 7 (ours, confirmed) re-sent: an INIT deletes 6. */
     memset(&r, 0, sizeof(r));
     wg_rescue_keep(&r, f, 112, T0 + S(35), 7);
     (void)wg_rescue_flush(&r, at, p.delivered_us, age, rescue_sink, &k, &kept);
     wg_rescue_summarize(&r, &sum);
-    ok("transit/current-safe", wg_path_init_route(&p, &sum, true, at + S(1), 7) ==
+    ok("transit/current-safe", wg_path_init_route(&p, &sum, true, true, at + S(1), 7) ==
                                WG_INIT_ANY_PATH &&
                                wg_rescue_init_risk(&sum, at + S(1), 0, age, 8, true));
     /* A refused re-send records nothing: the frames stay, owed. */
@@ -1258,7 +1295,7 @@ static void test_init_route(void)
     (void)wg_rescue_flush(&r, at, p.delivered_us, age, rescue_sink, &k, &kept);
     wg_rescue_summarize(&r, &sum);
     ok("transit/refused-owed", r.sent_gen[0] == 0 && kept == 1 && sum.owed_us[0] == T0 + S(15) &&
-                               wg_path_init_route(&p, &sum, true, at + S(60), 7) ==
+                               wg_path_init_route(&p, &sum, true, true, at + S(60), 7) ==
                                WG_INIT_DERP_BEHIND_RESEND);
 }
 
@@ -1382,6 +1419,9 @@ typedef struct {
     bool    hold_tests_only;            /* only a doubt's test held, the login kick's
                                            INIT before its re-send (81134de, before
                                            the second review) */
+    bool    hold_fee2336;               /* every INIT held, DERP up or not, with no
+                                           time bound, the held copy best effort
+                                           (fee2336, before the third review) */
     bool    no_relay_first;             /* withhold such a test instead of re-sending
                                            first (the alternative measured) */
     int64_t end;
@@ -1403,6 +1443,8 @@ typedef struct {
     uint32_t init_resends;              /* re-sent INITs (login kick, pong) */
     uint32_t ring_full;                 /* lost frames still pending pushed out of
                                            the full ring */
+    uint32_t copy_refused;              /* INIT DERP copies a full send queue refused */
+    int64_t  hs_probe_from, hs_probe_at; /* first handshake done at or after from */
     uint32_t inits, hs_done;            /* INITs sent (retries too); handshakes done */
     uint32_t exhausted, lost_cold;      /* rekeys given up (cold), frames refused then */
     uint32_t deadkey;                   /* re-sent frames the peer dropped: their
@@ -1549,6 +1591,27 @@ static bool derp_ok(int64_t t)
 {
     return !(t >= s_sim->derp_down_at && t < s_sim->derp_up_at);
 }
+
+/* ...and lwIP's send queue toward the DERP server (review of 1.3.8, third
+ * pass): with TCP_NODELAY one TLS record is one segment, and select()
+ * says not writable while 8 are unacknowledged (TCP_SNDQUEUELOWAT, this
+ * build's TCP_SND_BUF 5 760 / MSS 1 440) — a best-effort write
+ * (derp_client_try_send_packet) is refused then; a waiting one goes. An
+ * ACK 100 ms after the write (fixed: the PRNG sequence stays). */
+#define DQ_N 64
+static int64_t  s_dq[DQ_N];
+static unsigned s_dqn;
+static bool derp_write(int64_t t, bool best_effort)
+{
+    if (!derp_ok(t)) return false;
+    if (best_effort) {
+        unsigned n = 0;
+        for (unsigned i = 0; i < DQ_N; i++) n += s_dq[i] > t;
+        if (n >= 8) return false;
+    }
+    s_dq[s_dqn++ % DQ_N] = t + MS(100);
+    return true;
+}
 static int64_t s_derp_last;
 static int64_t derp_at(int64_t t)
 {
@@ -1610,7 +1673,7 @@ static bool sim_rescue_send(const uint8_t *buf, size_t len, void *user)
     rsink_t *k = (rsink_t *)user;
     uint32_t id;
     (void)len;
-    if (!derp_ok(k->t)) return false;
+    if (!derp_write(k->t, false)) return false;
     memcpy(&id, buf, sizeof(id));
     k->s->rescue_copies++;
     send_frame(derp_at(k->t), id, true);
@@ -1625,13 +1688,17 @@ static void sim_rescue(sim_t *s, const wg_path_t *p, int64_t t)
 }
 
 /* wg_netif's init_derp_only, on the same ring: via DERP only, behind a
- * re-send? (`test`: a doubt's test — all that 81134de held.) */
-static bool sim_hold(const sim_t *s, const wg_path_t *p, int64_t t, bool test)
+ * re-send? (`test`: a doubt's test — all that 81134de held. It and
+ * fee2336 held with DERP down too, and with no time bound.) */
+static bool sim_old_hold(const sim_t *s) { return s->hold_tests_only || s->hold_fee2336; }
+static bool sim_hold(const sim_t *s, wg_path_t *p, int64_t t, bool test)
 {
     if (s->no_hold || (s->hold_tests_only && !test)) return false;
     wg_rescue_sum_t sum;
     wg_rescue_summarize(&s_ring, &sum);
-    return wg_path_init_route(p, &sum, !s_hs.cold, t, s_gen) == WG_INIT_DERP_BEHIND_RESEND;
+    if (sim_old_hold(s)) p->init_hold_us = 0;
+    return wg_path_init_route(p, &sum, !s_hs.cold, sim_old_hold(s) || derp_ok(t), t, s_gen) ==
+           WG_INIT_DERP_BEHIND_RESEND;
 }
 
 /* Does an INIT copy sent direct now arrive? */
@@ -1644,9 +1711,10 @@ static bool init_direct_ok(const sim_t *s, int64_t t)
 
 /* A new INIT (a new attempt, build_and_send_init): direct, plus DERP
  * unless the path is valid — or, held (sim_hold), the re-send first and
- * DERP only behind it; a relay that is down drops its copy. The peer
+ * DERP only behind it; a relay that is down drops its copy. The DERP copy
+ * takes the waiting write when held or `wait` (the login's). The peer
  * answers the first copy that arrives. */
-static void sim_init(sim_t *s, wg_path_t *p, int64_t t, bool test)
+static void sim_init_(sim_t *s, wg_path_t *p, int64_t t, bool test, bool wait)
 {
     s_hs.in_flight = true;
     s_hs.init_at = t;
@@ -1665,11 +1733,20 @@ static void sim_init(sim_t *s, wg_path_t *p, int64_t t, bool test)
     s_hs.relay_at = relay ? t : 0;
     const bool direct = !held && init_direct_ok(s, t);
     int64_t at = direct ? t + one_way() : INT64_MAX;
-    if (relay && derp_ok(t)) {
-        const int64_t d = derp_at(t);
-        if (d < at) at = d;
+    if (relay) {
+        if (derp_write(t, !(held || wait) || sim_old_hold(s))) {
+            const int64_t d = derp_at(t);
+            if (d < at) at = d;
+        } else if (derp_ok(t)) {
+            s->copy_refused++;
+        }
     }
     if (at != INT64_MAX) push(at, EV_PEER_GOT_INIT, (int)s_hs.id);
+}
+
+static void sim_init(sim_t *s, wg_path_t *p, int64_t t, bool test)
+{
+    sim_init_(s, p, t, test, false);
 }
 
 /* The same INIT again (init_resend): direct when the endpoint moved or
@@ -1696,7 +1773,11 @@ static void sim_resend(sim_t *s, wg_path_t *p, int64_t t, bool direct, bool rela
             s->held_inits++;
             sim_rescue(s, p, t);
         }
-        if (derp_ok(t)) push(derp_at(t), EV_PEER_GOT_INIT, (int)s_hs.id);
+        if (derp_write(t, !(held || force) || sim_old_hold(s))) {
+            push(derp_at(t), EV_PEER_GOT_INIT, (int)s_hs.id);
+        } else if (derp_ok(t)) {
+            s->copy_refused++;
+        }
     }
 }
 
@@ -1705,7 +1786,7 @@ static void sim_resend(sim_t *s, wg_path_t *p, int64_t t, bool direct, bool rela
 static void sim_refresh(sim_t *s, wg_path_t *p, int64_t t, bool direct, bool relay, bool force)
 {
     if (!s_hs.in_flight) return;
-    if (wg_init_fresh_due(t, s_hs.init_at)) sim_init(s, p, t, false);
+    if (wg_init_fresh_due(t, s_hs.init_at)) sim_init_(s, p, t, false, force);
     else sim_resend(s, p, t, direct, relay, force);
 }
 
@@ -1734,6 +1815,8 @@ static void run_sim(sim_t *s)
     s->silent_at = s->silent_after_rx = s->direct_after_silent = 0;
     s->forced_rekeys = s->stale_rekeys = s->tests = s->test_skips = s->inits = s->hs_done = 0;
     s->tests_after_rescue = s->held_inits = s->init_resends = s->ring_full = 0;
+    s->copy_refused = 0;
+    s->hs_probe_at = 0;
     s->exhausted = s->lost_cold = s->deadkey = s->rx_oldkey = 0;
     s->rekey_after_rx = s->fixed_at = s->fixed_after_rx = s->unanswered_at = 0;
     int64_t last_rx = t;                        /* the peer's last WG packet we took */
@@ -1750,6 +1833,8 @@ static void run_sim(sim_t *s)
     s_peer_init = 0;
     s_derp_last = 0;
     s_sim = s;
+    memset(s_dq, 0, sizeof(s_dq));
+    s_dqn = 0;
     push(t + S(1), EV_TELEMETRY, 0);
     if (s->derp_down_at < s->end && s->derp_up_at > s->derp_down_at) {
         push(s->derp_up_at, EV_DERP_UP, 0);
@@ -1830,7 +1915,7 @@ static void run_sim(sim_t *s)
                 bool direct = m != WG_PATH_RELAY;
                 bool derp   = m != WG_PATH_DIRECT;
                 bool keep   = m == WG_PATH_DIRECT;
-                if (derp && !derp_ok(t)) {      /* tx_send_item: refused, direct, kept */
+                if (derp && !derp_write(t, m == WG_PATH_DUAL)) {   /* refused: direct, kept */
                     derp = false;
                     direct = keep = true;
                 }
@@ -1862,6 +1947,7 @@ static void run_sim(sim_t *s)
                 s_hs.attempts = 0;
                 s_hs.done_at = t;
                 s->hs_done++;
+                if (t >= s->hs_probe_from && s->hs_probe_at == 0) s->hs_probe_at = t;
                 s_gen++;
                 s_kp[s_gen % GEN_N] = (uint32_t)(e.arg >> 2) + 1u;
                 if (t >= break_at && s->fixed_at == 0) {
@@ -1876,7 +1962,7 @@ static void run_sim(sim_t *s)
                 wg_path_mode_t m;
                 act |= wg_path_on_send(&p, t + 1, true, &m);
                 const uint32_t id = fr_new(t + 1, false);
-                const bool derp = m != WG_PATH_DIRECT && derp_ok(t + 1);
+                const bool derp = m != WG_PATH_DIRECT && derp_write(t + 1, m == WG_PATH_DUAL);
                 bool via_direct = (m != WG_PATH_RELAY || !derp) && up_ok(s, t, s_cur) &&
                                   t < s->wg_block_at && t < s->wg_upblock_at;
                 if (via_direct && s->loss_pm && rnd(1000) < s->loss_pm) via_direct = false;
@@ -2359,13 +2445,18 @@ static void test_sim(void)
      * direct (or its DERP copy ahead of the re-send), the 5-s retry and a
      * pong's re-send went direct while frames were still owed — the peer
      * deleted their keypair, then dropped them. Every INIT asks
-     * wg_path_init_route now, and the login re-sends first. */
+     * wg_path_init_route now, the login re-sends first, and a held copy
+     * takes the waiting write (third pass: the best-effort one is refused
+     * behind a re-send of 8 frames). Each trial seeded on its own: what is
+     * lost then is the ring's size (the outage on top of up to 9 unproven
+     * frames), never a deleted keypair. */
     const int64_t downs[] = { S(3), S(8), S(20) };
     uint32_t dlost[3] = { 0 }, odlost[3] = { 0 }, deps[3] = { 0 }, odeps[3] = { 0 };
-    uint32_t dheld[3] = { 0 }, ddead[3] = { 0 }, oddead[3] = { 0 }, dopen[3] = { 0 };
-    uint32_t dfull[3] = { 0 };
+    uint32_t dheld[3] = { 0 }, ddead[3] = { 0 }, oddead[3] = { 0 }, dfull[3] = { 0 };
+    uint32_t drefused[3] = { 0 };
     for (int d = 0; d < 3; d++) {
         for (int trial = 0; trial < 500; trial++) {
+            const uint64_t seed = 0x2545F4914F6CDD1DULL ^ (uint64_t)(trial + 1) * 0x9E3779B97F4A7C15ULL;
             s = sim_base();
             s.wg_upblock_at = T0 + S(600) + MS((trial * 7919) % 110000) + trial;
             s.end = s.wg_upblock_at + S(240);
@@ -2373,7 +2464,9 @@ static void test_sim(void)
             s.derp_up_at = s.derp_down_at + downs[d];
             o = s;
             o.hold_tests_only = true;
+            s_rng = seed;
             run_sim(&s);
+            s_rng = seed;
             run_sim(&o);
             const uint32_t l = s.lost_after_break - s.lost_open;
             const uint32_t ol = o.lost_after_break - o.lost_open;
@@ -2381,29 +2474,71 @@ static void test_sim(void)
             odlost[d] += ol;
             deps[d] += l != 0;
             odeps[d] += ol != 0;
-            dopen[d] += s.lost_open;
             dheld[d] += s.held_inits;
-            dfull[d] += s.ring_full;
             ddead[d] += s.deadkey;
             oddead[d] += o.deadkey;
+            dfull[d] += s.ring_full;
+            drefused[d] += s.copy_refused;
         }
     }
     printf("  known gap + our DERP down 3 / 8 / 20 s within the episode, 500 instants each: "
-           "%u / %u / %u lost (episodes %u / %u / %u; pushed out of the full ring %u / %u / %u; "
-           "%u / %u / %u still to re-send), re-sent frames the peer dropped for a deleted "
-           "keypair %u / %u / %u, INITs via DERP behind a re-send %u / %u / %u (81134de, only "
-           "the test held: %u / %u / %u lost in %u / %u / %u episodes, %u / %u / %u dropped)\n",
+           "%u / %u / %u lost (episodes %u / %u / %u; pushed out of the full ring %u / %u / %u), "
+           "re-sent frames the peer dropped for a deleted keypair %u / %u / %u, INITs via DERP "
+           "behind a re-send %u / %u / %u, unheld INIT copies a full send queue refused "
+           "%u / %u / %u (81134de, only the test held: %u / %u / %u lost in %u / %u / %u "
+           "episodes, %u / %u / %u dropped)\n",
            dlost[0], dlost[1], dlost[2], deps[0], deps[1], deps[2], dfull[0], dfull[1], dfull[2],
-           dopen[0], dopen[1], dopen[2], ddead[0], ddead[1], ddead[2], dheld[0], dheld[1],
-           dheld[2], odlost[0], odlost[1], odlost[2], odeps[0], odeps[1], odeps[2], oddead[0],
-           oddead[1], oddead[2]);
-    /* 20 s down on top of up to 9 unproven frames outgrows 10 slots: what
-     * is lost then is the ring's size, never a deleted keypair. */
+           ddead[0], ddead[1], ddead[2], dheld[0], dheld[1], dheld[2], drefused[0], drefused[1],
+           drefused[2], odlost[0], odlost[1], odlost[2], odeps[0], odeps[1], odeps[2],
+           oddead[0], oddead[1], oddead[2]);
     ok("sim/derp-down-no-keypair-loss", ddead[0] + ddead[1] + ddead[2] == 0 &&
-                                        dlost[0] == 0 && dlost[1] == 0 &&
-                                        dlost[2] == dfull[2] && dlost[2] <= 20);
-    ok("sim/derp-down-81134de-lost", odlost[0] > 0 && odlost[1] > odlost[0] &&
-                                     odlost[2] > odlost[1]);
+                                        dlost[0] == dfull[0] && dlost[1] == dfull[1] &&
+                                        dlost[2] == dfull[2]);
+    ok("sim/derp-down-81134de-lost", oddead[0] > 0 && oddead[1] > oddead[0] &&
+                                     oddead[2] > oddead[1] && odlost[2] > 10 * (dlost[2] + 1));
+
+    /* Third pass: DERP down for good, and the peer loses its keys 1 ms
+     * after a proactive rekey's response — before it confirmed the new
+     * keypair, so every new frame (kept: DERP refuses) is at risk and the
+     * ring never drains. fee2336 held every INIT, DERP down or not, until
+     * the cold fallback (~70 s); the hold is off while DERP is down now, so
+     * the doubt's test goes both ways as in 1.3.7 (no hold: ~12.6 s). */
+    int64_t vworst[3] = { 0 }, vsum[3] = { 0 };
+    uint32_t vn[3] = { 0 }, vexh[3] = { 0 };
+    for (int trial = 0; trial < 50; trial++) {
+        const uint64_t seed = 0x2545F4914F6CDD1DULL ^ (uint64_t)(trial + 1) * 0x9E3779B97F4A7C15ULL;
+        sim_t q = sim_base();
+        q.derp_down_at = T0 + S(500);
+        q.end = T0 + S(800);
+        q.derp_up_at = INT64_MAX;
+        q.hs_probe_from = T0 + S(600);
+        s_rng = seed;
+        run_sim(&q);
+        if (q.hs_probe_at == 0) continue;
+        for (int v = 0; v < 3; v++) {
+            sim_t r = sim_base();
+            r.derp_down_at = T0 + S(500);
+            r.end = T0 + S(1200);
+            r.derp_up_at = INT64_MAX;
+            r.wg_dead_at = q.hs_probe_at + MS(1);
+            r.hold_fee2336 = v == 1;
+            r.no_hold = v == 2;
+            s_rng = seed;
+            run_sim(&r);
+            const int64_t back = r.fixed_at != 0 ? r.fixed_at - r.wg_dead_at : r.end - r.wg_dead_at;
+            vsum[v] += back;
+            if (back > vworst[v]) vworst[v] = back;
+            vn[v]++;
+            vexh[v] += r.exhausted;
+        }
+    }
+    printf("  DERP down for good, the peer's keys lost 1 ms after a proactive rekey's response "
+           "(%u runs): session back mean %.1f s, max %.1f s after (fee2336: %.1f / %.1f s, %u "
+           "rekeys given up; no hold: %.1f / %.1f s)\n", vn[0], vsum[0] / 1e6 / vn[0],
+           vworst[0] / 1e6, vsum[1] / 1e6 / vn[1], vworst[1] / 1e6, vexh[1],
+           vsum[2] / 1e6 / vn[2], vworst[2] / 1e6);
+    ok("sim/derp-down-no-starving", vn[0] >= 40 && vexh[0] == 0 && vworst[0] <= vworst[2] + S(1) &&
+                                    vworst[1] > S(30));
 
     /* Review of 1.3.6 (sim_loss.c): random loss of WireGuard datagrams on
      * a healthy path, 6 h each. Declaring WG silent on the first window
