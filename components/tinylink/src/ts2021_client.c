@@ -280,14 +280,27 @@ static uint32_t poll_ms(const ts2021_conn_t *c)
            c->req_idle != 0 ? TS2021_REQ_POLL_MS : TLS_TIMEOUT_MS;
 }
 
-/* A one-shot request ran out of time: one W line per request. */
+/* A one-shot request ran out of time: one W line per request, and a
+ * transport failure. The map stream's first-response deadline (round
+ * 1.3.8, C1): one W line, a recycle — the transport carried the Noise
+ * handshake and the server's HTTP/2 preface, the answer is what is
+ * missing (h2_post_json_stream escalates a repeated one). */
 static void note_req_expired(ts2021_conn_t *c)
 {
+    if (c->resp_wait) {
+        if (!c->resp_expired) {
+            ESP_LOGW(TAG, "control stream: no response within %u ms — recycling the conn",
+                     (unsigned)c->req_ms);
+        }
+        c->resp_expired = true;
+        return;
+    }
     if (!c->req_expired) {
         ESP_LOGW(TAG, "control request: no answer within %u ms — dropping the conn",
                  (unsigned)c->req_ms);
     }
     c->req_expired = true;
+    c->io_failed = true;
 }
 
 /* Which short handshake budget ran out (hs_idle): :80's, or the one at
@@ -316,11 +329,13 @@ static esp_err_t tls_read_full(ts2021_conn_t *c, uint8_t *buf, size_t need)
             ESP_LOGI(TAG, "control stream read aborted on request (recycle)");
             return ESP_FAIL;
         }
-        c->io_failed = true;
         if (rc == TS2021_ERR_REQ_DEADLINE ||
             (rc == TLS_IO_ERR_IDLE_TIMEOUT && c->req_idle != 0)) {
             note_req_expired(c);
-        } else if (rc == TS2021_ERR_HS_DEADLINE ||
+            return ESP_FAIL;
+        }
+        c->io_failed = true;
+        if (rc == TS2021_ERR_HS_DEADLINE ||
             (rc == TLS_IO_ERR_IDLE_TIMEOUT && c->hs_idle != 0)) {
             ESP_LOGW(TAG, "%s: no answer within %d ms", hs_what(c),
                      TS2021_PLAIN_TIMEOUT_MS);
@@ -339,11 +354,11 @@ static esp_err_t tls_write_full(ts2021_conn_t *c, const uint8_t *buf, size_t len
 {
     int rc = tls_io_write_full(ts2021_conn_write, c, buf, len, idle_budget(c));
     if (rc != 0) {
-        c->io_failed = true;
         if (rc == TS2021_ERR_REQ_DEADLINE ||
             (rc == TLS_IO_ERR_IDLE_TIMEOUT && c->req_idle != 0)) {
             note_req_expired(c);
         } else {
+            c->io_failed = true;
             ESP_LOGE(TAG, "tls_write_full failed: %d", rc);
         }
         return ESP_FAIL;
@@ -1033,7 +1048,9 @@ bool ts2021_rx_ready(ts2021_conn_t *c)
     return fd >= 0 && recv(fd, &b, 1, MSG_PEEK | MSG_DONTWAIT) == 1;
 }
 
-esp_err_t ts2021_request_deadline(ts2021_conn_t *c, uint32_t ms)
+/* Arm (ms > 0: until `until_us`, logged as `ms`) or disarm a deadline. */
+static esp_err_t arm_deadline(ts2021_conn_t *c, uint32_t ms, int64_t now_us, int64_t until_us,
+                              bool resp)
 {
     if (c == NULL || !c->connected) return ESP_ERR_INVALID_STATE;
     int fd = c->plain ? c->sock : -1;
@@ -1046,14 +1063,36 @@ esp_err_t ts2021_request_deadline(ts2021_conn_t *c, uint32_t ms)
     if (ms == 0) {
         c->req_idle = 0;
         c->req_deadline_us = 0;
+        c->resp_wait = false;
         return ESP_OK;
     }
-    const uint32_t polls = (ms + TS2021_REQ_POLL_MS - 1) / TS2021_REQ_POLL_MS;
-    c->req_idle = (uint8_t)(polls > 0 && polls < 255 ? polls : 255);
+    /* Silent polls left until then (≥ 1): the idle budget the deadline
+     * also bites through when no clock moves under the reads. */
+    const int64_t left_ms = (until_us - now_us) / 1000;
+    const uint32_t polls = left_ms <= 0 ? 1u
+        : (uint32_t)((left_ms + TS2021_REQ_POLL_MS - 1) / TS2021_REQ_POLL_MS);
+    c->req_idle = (uint16_t)(polls < UINT16_MAX ? polls : UINT16_MAX);
     c->req_ms = ms;
-    c->req_expired = false;
-    c->req_deadline_us = esp_timer_get_time() + (int64_t)ms * 1000;
+    c->resp_wait = resp;
+    if (resp) {
+        c->resp_expired = false;
+    } else {
+        c->req_expired = false;
+    }
+    c->req_deadline_us = until_us;
     return ESP_OK;
+}
+
+esp_err_t ts2021_request_deadline(ts2021_conn_t *c, uint32_t ms)
+{
+    const int64_t now = esp_timer_get_time();
+    return arm_deadline(c, ms, now, now + (int64_t)ms * 1000, false);
+}
+
+esp_err_t ts2021_response_deadline(ts2021_conn_t *c, uint32_t ms, int64_t since_us)
+{
+    if (ms == 0) return ESP_ERR_INVALID_ARG;
+    return arm_deadline(c, ms, esp_timer_get_time(), since_us + (int64_t)ms * 1000, true);
 }
 
 /* Seal rec[4..4 + len) in place (the tag lands right behind it) and

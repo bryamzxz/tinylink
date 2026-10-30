@@ -122,6 +122,113 @@ sensor.
   about the doubts (minus the proactive ones they move); free heap ~480 B
   lower. `wg_netif_get_stats` gains `doubt_rekeys`.
 
+#### Control plane (`feat/r138-ctl`)
+
+What a stalled map poll cost on the 1.3.7 sensor: after tailscale.com
+ended a map stream cleanly, the reconnect's streaming MapRequest got no
+answer at all and sat out the stream's 4 × 30-s budget (`control stream
+silent past 120 s — declaring dead`, twice), the conn after it its
+netmap 26 / 55 s after the request — 152 / 181 s without a netmap.
+Image 731 952 → **732 960 B (+1 008)**; static DRAM 58 116 → 58 212 B
+(+96), IRAM ±0. Host suite 2 092 → **2 117 OK** (CI floor 2 117),
+ASan + UBSan clean, 0 warnings. `tools/stack_worst.py`: `tinylink_lp`
+5 168 → 5 184 / 7 168, `main` 5 424 → 5 440 / 8 192 (the seventh
+request header in `h2_drive_request`'s frame), the rest unchanged. Not
+yet on the sensor.
+
+- **C1 — the map stream's first-response deadline.** Every first
+  response in the 1.3.0–1.3.7 captures (`~/tinylink-backups`, 111 conns
+  with a stream request; the first `stream peak` after it — headscale
+  sends the headers with that frame, its first Write, and tailscale.com
+  cannot send them later): the 104 that did not follow a clean server
+  end (91 boots, 13 reconnects — 9 after a FIN) came 0.86–11.43 s
+  after the request, median 1.19 s, 90 % within 5.06 s; all 5 after a
+  clean end (`/machine/map stream closed cleanly`) were slow — 59 s
+  (1.3.5), 104 / 108 s (1.2.0, M16 soak), twice nothing within 120 s
+  (1.3.7, then 26 / 55 s on the next conn): 61–181 s from the end to a
+  netmap. Upstream has no shorter deadline: its 120-s watchdog "also
+  covers the initial request (effectively the pre-body and initial-body
+  read timeouts)" (`direct.go`). Now the response headers must arrive
+  within **15 s** of the request (3.6 s over the slowest ordinary
+  answer; `TS2021_RESP_TIMEOUT_MS`): `ts2021_response_deadline` runs on
+  the one-shot deadline's 2-s polls, counted from the request, and
+  `h2_io_on_status` ends it before any DATA reaches the stream
+  callback; after the headers the stream budget only, unchanged. An
+  expiry recycles the conn — one W line, no E line: `resp_expired`, not
+  `io_failed`. The next stream gets twice as long, up to the stream
+  budget (15, 30, 60, 120 s: at the top a poll has the 120 s 1.3.7
+  gave every poll); after an answer, twice that
+  answer's time, at least 15 s — a server that answers in 20 s gets
+  40 s next time instead of a cut at every reconnect. With the push
+  riding along (B1, default off), a push that closes before the stream
+  answers hands the conn to the stream's deadline, counted from the
+  burst. If tailscale.com holds every poll until something on its side
+  is done, a recycle only resubmits (a gap of one :80 connect each
+  time); if the stalled poll was lost, it saves up to 105 s. Logs:
+  `ts2021: control stream: no response within 15000 ms — recycling the
+  conn` (W), `long-poll stream recycled (no response) — reconnecting`
+  (I); every stream `h2: map stream answered: HTTP 200 in N ms` (I) —
+  against the `stream peak` line it shows whether tailscale.com sends
+  its headers ahead of the netmap, which the frames above cannot.
+  `req_idle` 8 → 16 bits (a 3 600-s budget is 1 800 polls). Tests:
+  `test_ts2021` +11 (expiry, counted from the request, write side,
+  disarm, the :80 / address rules after one and two expiries),
+  `test_h2_interop` +11 against nghttp2 (silent server and the back-off
+  to the cap, reset by an answer and the reconnect, headers 1 µs before
+  / after the deadline, a body long after the headers, the B1
+  hand-over); a reconnect probe (clean end, two unanswered conns, an
+  answered one, each EarlyPayload split) 33 / 33.
+- **C2 — a recycle is not a :80 failure; a repeated one is.** The
+  1.3.5 rule (a :80 conn that fails within 120 s of its handshake sends
+  the next dial to :443 — tailscale#13597, upstream's "recent noise
+  dial") and the cached-address rule (a young conn there that fails →
+  the next dial resolves the name) both read `io_failed`. A first
+  expiry does not set it: the :80 transport carried the Noise
+  handshake, the EarlyPayload and the server's HTTP/2 preface; both
+  stalls followed a clean end on :80 conns that had worked for 230 /
+  646 s, and the :443 conn after them was as slow (26 / 55 s) — the
+  server, not the port; and :443 costs a full TLS handshake (2.4–3.0 s
+  against 0.37–0.77 s on :80 on the sensor, 3.7 KB more heap) on every
+  recycle. From the second expiry in a row `h2_post_json_stream` marks
+  the conn failed, so a stall that persists also tries :443 and a fresh
+  DNS answer — the hedge against a :80 middlebox that passes the
+  upgrade and then blackholes, which 1.3.7 had only through the 120-s
+  silence.
+- **C2 — redial at once after a healthy stream.** A stream up ≥ 10 s
+  reset the long-poll backoff to its 1-s base, so every reconnect still
+  waited 0.75–1.25 s: most of the 1.4 s from a stream's end to the next
+  Noise init on the sensor (647.86 → 649.26 s). Upstream resets its
+  backoff with every netmap and waits n² × 10 ms × [0.5, 1.5] — 5–15 ms
+  — before the next poll. Now 7–12 ms (`LP_REDIAL_MS`) after such a
+  stream — a server end, a FIN, a first-response recycle, a push
+  recycle; a failure of that redial waits from the base as before.
+- **C2 — `Ts-Lb` load-balancer hint.** Upstream adds `Ts-Lb:
+  nodekey:<hex>` (`tailcfg.LBHeader`) to register, map and every other
+  Noise request since 2024-03 (`ts2021.AddLBHeader`), so tailscale.com's
+  reverse proxy can route a request to the node's backend without
+  reading its body; tinylink never sent it. Not a security input
+  ("strictly denormalized redundant data as an optimization"); headscale
+  ignores it. Set from the node key at each control connect
+  (`h2_client_set_lb`), +80 B per HEADERS. Whether it changes how fast
+  tailscale.com answers a reconnect's poll cannot be measured from here;
+  it removes one difference from the official client on the path that
+  stalled. Tests: `test_h2_interop` +3.
+- **C2 — analysed, not changed.** *A fresh conn for the long-poll*
+  (the 1.3.3 experiment for the boot-connection FIN): it was to tell
+  "the conn that carried the register" from "the first map session
+  after a (re)connect". The 1.3.7 soak already does: its FIN at
+  1 166 s hit the :443 conn from 774 s — a reconnect's conn that never
+  carried a register, the first one served after the stall, 392 s into
+  its session. The variant would cost every boot one more connect
+  (+0.4–0.6 s to the netmap) to show that again; a FIN costs the
+  control stream ~2 s now (redial at once, :80, netmap ~1.2 s), the
+  data plane nothing. Not built. *The same conn for the next poll after
+  a clean end* (upstream's HTTP/2 pool would reuse it): one :80 connect
+  (0.4–0.8 s) against a 61–181-s wait on the server's side. *The :80
+  early-drop rule on a FIN* (1.3.5 series boot 10: FIN at 27 s → :443,
+  +1.8 s): kept — it is the #13597 hedge, and upstream's rule is wider
+  (any dial within 2 min of the last).
+
 ### Optimization round 1.3.7 (in progress, branch `feat/opt-1.3.7`)
 
 #### Wi-Fi association (`feat/r137-wifi`)

@@ -1467,9 +1467,11 @@ static esp_err_t run_stream_in(ts2021_conn_t *conn,
         /* A requested recycle (endpoint push, IP change) is no error: its
          * one line is ts2021's "control stream read aborted on request"
          * (round 1.3.5; it logged two E lines here and in h2 before) … */
-        if (conn->aborted || conn->req_expired) {
-            /* … nor is the push's deadline: ts2021 has its W line. */
-            ESP_LOGD(TAG, "map stream left: %s", conn->aborted ? "recycle" : "push deadline");
+        if (conn->aborted || conn->req_expired || conn->resp_expired) {
+            /* … nor is a deadline (the push's, or the stream's first
+             * response, round 1.3.8): ts2021 has its W line. */
+            ESP_LOGD(TAG, "map stream left: %s", conn->aborted ? "recycle"
+                     : conn->resp_expired ? "no response" : "push deadline");
         } else {
             ESP_LOGE(TAG, "h2_post_json_stream failed: 0x%x", err);
         }

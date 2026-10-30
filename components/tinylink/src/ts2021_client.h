@@ -83,6 +83,33 @@
 #ifndef TS2021_REQ_TIMEOUT_MAX_MS
 #define TS2021_REQ_TIMEOUT_MAX_MS 120000
 #endif
+
+/* The streaming MapRequest's first-response deadline (round 1.3.8, C1):
+ * its response headers within TS2021_RESP_TIMEOUT_MS of the request, or
+ * the conn is recycled (ts2021_response_deadline); after them the stream
+ * budget only, as upstream's watchdogTimeout. Until 1.3.7 a poll the
+ * server never answered sat out the whole 4 × 30-s budget: on the sensor
+ * twice after tailscale.com ended a map stream cleanly (1.3.7, 2026-10-30;
+ * the next connection's netmap then came 26 / 55 s after its request).
+ * Over the 104 first responses in the 1.3.0–1.3.7 logs that did not
+ * follow such a clean end (91 boots, 13 reconnects) the first frame —
+ * which carries the headers on headscale (its first Write) and bounds
+ * them from above on tailscale.com — came 0.86–11.43 s after the
+ * request (median 1.19 s, 90 % within 5.06 s); every poll after one was
+ * slow (5 of 5: 59, 104, 108 s, twice nothing within 120 s). 15 s clears
+ * the slowest ordinary answer by 3.6 s. After an expiry the next stream gets twice as long, up to
+ * TS2021_RESP_TIMEOUT_MAX_MS — the stream budget, so no poll is ever cut
+ * before the 1.3.7 one would have been at the end of the ladder — and
+ * after an answer twice that answer's time, at least
+ * TS2021_RESP_TIMEOUT_MS (h2_post_json_stream): a server that is slow
+ * rather than gone is waited out, and one that answered slowly is not
+ * cut at the next poll. */
+#ifndef TS2021_RESP_TIMEOUT_MS
+#define TS2021_RESP_TIMEOUT_MS  15000
+#endif
+#ifndef TS2021_RESP_TIMEOUT_MAX_MS
+#define TS2021_RESP_TIMEOUT_MAX_MS ((uint32_t)CONFIG_TINYLINK_STREAM_IDLE_TIMEOUT_S * 1000u)
+#endif
 #define TS2021_RECORD_PLAINTEXT_MAX (TS2021_MAX_MESSAGE - TS2021_HEADER_LEN - NOISE_TAGLEN)
 /* The records we send (round 1.3.4, D4): header + ciphertext ≤ 2 048 B,
  * CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN, so each one is one TLS record. */
@@ -140,11 +167,16 @@ typedef struct {
      * deadline. How the last failed transfer ended, for the layers above
      * (their log levels): `aborted` — ts2021_abort_reads asked for it (a
      * requested recycle, not a failure); `req_expired` — a one-shot
-     * request ran out of its deadline (logged once, here). */
-    uint8_t           req_idle;
+     * request ran out of its deadline (logged once, here). The same
+     * mechanism carries the map stream's first-response deadline (round
+     * 1.3.8, C1, ts2021_response_deadline): `resp_wait` — the deadline
+     * armed is that one; `resp_expired` — it ran out (one W line, here). */
+    uint16_t          req_idle;
     uint32_t          req_ms;
     bool              aborted;
     bool              req_expired;
+    bool              resp_wait;
+    bool              resp_expired;
     int64_t           req_deadline_us;
 
     /* (Round 1.3.4, D5: the 4 077-B `rx_residual` copy is gone. The
@@ -258,8 +290,21 @@ void ts2021_precompute(const uint8_t machine_priv[NOISE_DHLEN],
  * endpoint push riding with it is answered (h2_post_json_stream_side,
  * round 1.3.7), so its first frame (a netmap can take ~11 s server-side)
  * and its KeepAlives otherwise keep the stream budget. ESP_FAIL (io_failed) when the socket timeouts
- * cannot be set: a conn left at the wrong poll period must not be used. */
+ * cannot be set: a conn left at the wrong poll period must not be used.
+ * Disarming (0) also ends a ts2021_response_deadline. */
 esp_err_t ts2021_request_deadline(ts2021_conn_t *c, uint32_t ms);
+
+/* The map stream's first-response deadline (round 1.3.8, C1): armed as
+ * ts2021_request_deadline (short polls, every read and write failing
+ * once it has passed), but it runs out `ms` after `since_us` — when the
+ * request went — and an expiry is the recycle of a conn whose server did
+ * not answer, not a transport failure: one W line `control stream: no
+ * response within N ms — recycling the conn`, resp_expired set, io_failed
+ * not — so it neither sends the next dial to :443 nor re-resolves the
+ * name (ts2021_close; h2_post_json_stream sets io_failed itself from the
+ * second expiry in a row on). h2_post_json_stream arms it with the
+ * request and ends it at the response headers. */
+esp_err_t ts2021_response_deadline(ts2021_conn_t *c, uint32_t ms, int64_t since_us);
 
 /* Encrypt and write `data` as Noise transport records (msg type 4) of
  * ≤ TS2021_SMALL_PLAINTEXT_MAX bytes, sealed in a small stack record:

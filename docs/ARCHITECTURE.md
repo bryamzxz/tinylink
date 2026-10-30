@@ -468,7 +468,7 @@ anyone bisecting an unrelated regression to before the netstack switch.
    `s_ep_push_pending` and `ts2021_abort_reads()`: the long-poll's
    blocking record read returns `TS2021_ERR_READ_ABORTED` at its next
    30 s socket poll, the stream is dropped (logged as "recycled for
-   endpoint push", healthy-stream backoff ≈ 1 s), and right after the
+   endpoint push", redialed at once — round 1.3.8), and right after the
    reconnect `long_poll_task` sends the push with the read-only
    Stream=true request, as a second HTTP/2 stream in the same burst
    (1.3.7; a round trip before the stream until then): the same path
@@ -546,10 +546,19 @@ control channel:
    (~50-60 s) never trips it. Applies equally to the DERP supervisor's
    frame loop (`derp_run_loop`) — a half-open relay conn previously
    killed the CMM/relay fallback silently for the rest of the session.
+   Until its response headers the map stream is under a shorter,
+   first-response deadline instead (round 1.3.8,
+   `ts2021_response_deadline`): 15 s from the request in 2-s polls,
+   doubled after each expiry up to the idle budget, twice the last
+   answer's time after an answer; an expiry recycles the conn (one W
+   line), and only the second in a row counts as a transport failure
+   for the :80 early-drop and cached-address rules.
 2. **Reconnect with fresh handshake + capped backoff** (pre-existing
    RC-2 shape, unchanged): on any stream end the conn is dropped
    entirely and re-established from scratch — `tl_backoff_ms`
-   exponential, 30 s cap, jitter, reset after ≥10 s of healthy stream.
+   exponential, 30 s cap, jitter, reset after ≥10 s of healthy stream,
+   and then the redial goes at once (7–12 ms, round 1.3.8), the backoff
+   from its base only if that fails.
    Upstream never resumes a dead Noise session either.
 3. **In-place re-register on persistent 4xx** (M13): the reconnect
    loop can spin forever if the server *actively rejects* the node

@@ -42,10 +42,15 @@ esp_err_t h2_post_json(ts2021_conn_t *conn,
                        size_t *response_len);
 
 /* Streaming variant: every DATA frame chunk is delivered to `cb` as it
- * arrives. The function blocks until the stream closes (server EOF, our
- * watchdog timeout in a future revision, or `cb` returns a negative
- * value). The status is set once headers have been received, before the
- * first chunk is delivered.
+ * arrives. The function blocks until the stream closes (server EOF, the
+ * conn's idle budget, or `cb` returns a negative value). The status is
+ * set once headers have been received, before the first chunk is
+ * delivered. Until then the conn is under the first-response deadline
+ * (round 1.3.8, C1, TS2021_RESP_TIMEOUT_MS: ts2021_response_deadline) —
+ * no response headers in time and ESP_FAIL comes back with
+ * conn->resp_expired set, the conn to be recycled; the next stream gets
+ * twice as long, up to the stream budget, and one after an answer twice
+ * that answer's time (one I line `map stream answered: HTTP N in M ms`).
  *
  * Used by the M2 long-poll MapRequest loop: the body is a single
  * MapRequest with `Stream:true`, and the response is a sequence of
@@ -75,7 +80,9 @@ esp_err_t h2_post_json_stream(ts2021_conn_t *conn,
  *
  * Deadlines: until the stream's final response the conn is under the
  * one-shot request deadline (h2_post_json) — a conn that answers neither
- * is cut. Once the stream has answered, the conn is under the stream
+ * is cut — or, once the side request has closed, under the stream's
+ * first-response deadline from the burst (round 1.3.8, C1, as in
+ * h2_post_json_stream). Once the stream has answered, the conn is under the stream
  * budget only; a side request still unanswered at its deadline is then
  * cancelled (RST_STREAM CANCEL, `expired`; checked as records arrive,
  * once those already received are read) and the stream goes on — one
@@ -112,6 +119,16 @@ esp_err_t h2_post_json_stream_side(ts2021_conn_t *conn,
 /* Host tests: forget a one-stream server (h2_post_json_stream_side). */
 void h2_client_forget_limits(void);
 #endif
+
+/* The load-balancer hint every request carries from now on (round 1.3.8,
+ * C2): `ts-lb: nodekey:<hex>`, upstream's tailcfg.LBHeader — the
+ * official client adds it to register, map and every other Noise request
+ * (ts2021.AddLBHeader, since 2024-03), so that the control plane's
+ * reverse proxy can route a request to the node's backend without
+ * reading its body. "Not a security or authentication header; strictly
+ * denormalized redundant data as an optimization" (tailcfg.go); headscale
+ * ignores it. NULL: no hint. */
+void h2_client_set_lb(const uint8_t node_pub[32]);
 
 /* Start the persistent HTTP/2 session bound to `conn` (state embedded in
  * the conn, no heap). Called once at the end of ts2021_connect. Sends

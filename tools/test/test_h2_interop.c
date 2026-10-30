@@ -486,6 +486,9 @@ static int s_reads_short, s_reads_stream, s_reads_other;
 /* A server that went silent: every read is a socket timeout. */
 static bool s_silent;
 static int  s_silent_polls;
+/* A server that holds the conn open with nothing to send (round 1.3.8):
+ * a read with nothing left is a socket timeout instead of EOF. */
+static bool s_hold_open;
 static long sock_poll_ms(void)
 {
     struct timeval tv = { 0 };
@@ -523,8 +526,14 @@ esp_err_t esp_tls_plain_tcp_connect(const char *h, int hl, int p, const esp_tls_
     return ESP_FAIL;
 }
 /* A scripted clock: 0 unless a scenario moves it (the side request's
- * own deadline, round 1.3.7 review). */
+ * own deadline, round 1.3.7 review). Round 1.3.8: s_answer_at_us >= 0 —
+ * the clock is set to it when the server's first bytes after it is set
+ * reach the client (when the response leaves the server, as seen by the
+ * reads); s_late_after_answer — every read after the response headers
+ * moves it 10 stream budgets on (the body arrives long after them). */
 static int64_t s_now_us;
+static int64_t s_answer_at_us = -1;
+static bool    s_late_after_answer;
 int64_t esp_timer_get_time(void) { return s_now_us; }
 
 /* Seal the server's plaintext into records of random sizes (empty ones
@@ -560,10 +569,20 @@ ssize_t esp_tls_conn_read(esp_tls_t *t, void *data, size_t len)
         s_silent_polls++;
         return MBEDTLS_ERR_SSL_WANT_READ;     /* SO_RCVTIMEO fired */
     }
+    if (s_late_after_answer && s_conn.h2_status >= 200)
+        s_now_us += 10 * (int64_t)TS2021_RESP_TIMEOUT_MAX_MS * 1000;
     if (t->s2c_off == t->s2c_len) {
         t->s2c_off = t->s2c_len = 0;
         size_t n = srv_output();
+        if (n == 0 && s_hold_open) {
+            s_silent_polls++;
+            return MBEDTLS_ERR_SSL_WANT_READ;  /* nothing yet, the conn open */
+        }
         if (n == 0) return 0;                 /* EOF: nothing more will come */
+        if (s_answer_at_us >= 0) {
+            s_now_us = s_answer_at_us;
+            s_answer_at_us = -1;
+        }
         seal_records(s_s2c, n);
     }
     size_t n = t->s2c_len - t->s2c_off;
@@ -948,9 +967,12 @@ static void sc_sequence(void)
 #ifndef H2_REF
     check("deadline_oneshot_short_polls_then_disarmed",
           oneshot_short > 0 && oneshot_other == 0 && disarmed);
-    check("deadline_stream_on_stream_polls",
-          s_reads_stream > 0 && s_reads_short == 0 && s_reads_other == 0 &&
-          s_conn.req_deadline_us == 0);
+    /* round 1.3.8, C1: the stream's reads to its response headers under
+     * its first-response deadline's short polls, the rest on the
+     * stream's 30-s polls */
+    check("deadline_stream_short_polls_to_its_answer",
+          s_reads_stream > 0 && s_reads_short > 0 && s_reads_other == 0 &&
+          s_conn.req_deadline_us == 0 && s_conn.req_idle == 0 && !s_conn.resp_wait);
 #endif
     check("sequence_register_push_stream",
           r1.err == ESP_OK && r1.status == 200 && r2.err == ESP_OK && r2.status == 200 &&
@@ -1367,6 +1389,224 @@ static void sc_side_late_push(void)
     /* No answer to either: the conn is cut at the deadline, as before
      * (silent_pair in sc_side). */
 }
+
+/* Round 1.3.8, C1: the map stream's first-response deadline. No response
+ * headers within it → the stream fails as a recycle (resp_expired, no
+ * transport failure), and the next stream gets twice as long, up to the
+ * stream budget; an answer resets it to twice that answer's time (at
+ * least the base) and ends the streak; from the second expiry in a row
+ * the conn counts as failed (the :443 / address rules, test_ts2021). */
+static bool     s_last_io_failed;
+static uint32_t s_last_req_ms;
+
+static int silent_stream(void)
+{
+    srv_new(0);
+    conn_up(true);
+    s_silent = true;
+    s_silent_polls = 0;
+    res_t r = stream(kRegBody, sizeof(kRegBody) - 1);
+    s_silent = false;
+    const bool recycled = r.err == ESP_FAIL && r.status == 0 && r.len == 0 &&
+                          s_conn.resp_expired && !s_conn.req_expired && !s_conn.aborted &&
+                          !s_conn.resp_wait && disarmed();
+    s_last_io_failed = s_conn.io_failed;
+    s_last_req_ms = s_conn.req_ms;
+    const int polls = s_silent_polls;
+    conn_down();
+    return recycled ? polls : -1;
+}
+
+/* A stream answered at once: the deadline back at its base. */
+static res_t answered_stream(void)
+{
+    s_now_us = 0;
+    srv_new(0);
+    conn_up(true);
+    S.sc = SC_STREAM;
+    fill_mapresponses(1, 200);
+    res_t r = stream(kRegBody, sizeof(kRegBody) - 1);
+    conn_down();
+    return r;
+}
+
+static void sc_resp_deadline(void)
+{
+    const int base = (TS2021_RESP_TIMEOUT_MS + TS2021_REQ_POLL_MS - 1) / TS2021_REQ_POLL_MS;
+    const int cap = (TS2021_RESP_TIMEOUT_MAX_MS + TS2021_REQ_POLL_MS - 1) / TS2021_REQ_POLL_MS;
+    (void)answered_stream();
+
+    /* A server that never answers: recycled at the deadline, doubling. */
+    const int p1 = silent_stream();
+    const bool io1 = s_last_io_failed;
+    const int p2 = silent_stream();
+    const bool io2 = s_last_io_failed;
+    const int p3 = silent_stream();
+    const int p4 = silent_stream();
+    const bool io4 = s_last_io_failed;
+    check("resp_silent_server_recycled_at_its_deadline", p1 == base && !io1);
+    check("resp_backoff_doubles_to_the_stream_budget",
+          p2 == 2 * base && p3 == cap && p4 == cap && cap == 4 * base && cap < 65535);
+    check("resp_second_expiry_in_a_row_is_a_failure", io2 && io4);
+
+    /* The reconnect after an expiry is answered; the answer resets both
+     * the deadline and the streak. */
+    res_t r = answered_stream();
+    const bool whole = r.err == ESP_OK && r.status == 200 && r.len == S.resp_len &&
+                       memcmp(s_sbuf, S.resp, S.resp_len) == 0;
+    const int pa = silent_stream();
+    check("resp_reconnect_answered_resets_deadline_and_streak",
+          whole && pa == base && !s_last_io_failed && s_last_req_ms == TS2021_RESP_TIMEOUT_MS);
+    (void)answered_stream();
+
+    /* Headers 1 µs before the deadline: answered, the stream goes on —
+     * and the next stream gets twice the time this answer took. */
+    s_now_us = 0;
+    srv_new(0);
+    conn_up(true);
+    S.sc = SC_STREAM;
+    fill_mapresponses(2, 9000);
+    S.chunk = 5000;
+    s_answer_at_us = (int64_t)TS2021_RESP_TIMEOUT_MS * 1000 - 1;
+    r = stream(kRegBody, sizeof(kRegBody) - 1);
+    check("resp_headers_just_before_the_deadline",
+          r.err == ESP_OK && r.status == 200 && r.len == S.resp_len &&
+          memcmp(s_sbuf, S.resp, S.resp_len) == 0 && !s_conn.resp_expired &&
+          !s_conn.io_failed && disarmed() && S.bad == 0);
+    conn_down();
+    const int pn = silent_stream();
+    check("resp_next_deadline_twice_the_answer_time",
+          s_last_req_ms == 2 * TS2021_RESP_TIMEOUT_MS - 1 &&
+          pn == (int)((2 * TS2021_RESP_TIMEOUT_MS - 1 + TS2021_REQ_POLL_MS - 1) / TS2021_REQ_POLL_MS));
+    (void)answered_stream();
+
+    /* Headers 1 µs after it: never parsed, the conn recycled. */
+    s_now_us = 0;
+    srv_new(0);
+    conn_up(true);
+    S.sc = SC_STREAM;
+    fill_mapresponses(1, 3000);
+    s_answer_at_us = (int64_t)TS2021_RESP_TIMEOUT_MS * 1000 + 1;
+    r = stream(kRegBody, sizeof(kRegBody) - 1);
+    s_answer_at_us = -1;
+    check("resp_headers_just_after_the_deadline",
+          r.err == ESP_FAIL && r.status == 0 && r.len == 0 && s_conn.resp_expired &&
+          !s_conn.io_failed && disarmed());
+    conn_down();
+    (void)answered_stream();
+
+    /* After the headers the deadline is over: a body that arrives long
+     * after them (each read 10 stream budgets on) flows, on the stream's
+     * polls. */
+    s_now_us = 0;
+    srv_new(0);
+    conn_up(true);
+    S.sc = SC_STREAM;
+    fill_mapresponses(3, 9000);
+    S.chunk = 3000;
+    s_late_after_answer = true;
+    s_reads_short = s_reads_stream = s_reads_other = 0;
+    r = stream(kRegBody, sizeof(kRegBody) - 1);
+    s_late_after_answer = false;
+    check("resp_body_long_after_headers_flows",
+          r.err == ESP_OK && r.status == 200 && r.len == S.resp_len &&
+          memcmp(s_sbuf, S.resp, S.resp_len) == 0 && !s_conn.resp_expired &&
+          !s_conn.req_expired && !s_conn.io_failed && disarmed() && S.bad == 0);
+    check("resp_stream_polls_after_headers", s_reads_stream > 0 && s_reads_other == 0);
+    conn_down();
+    (void)answered_stream();
+
+    /* With the push riding along (B1): the push answered at once, the
+     * stream never — the conn goes from the push's deadline to the
+     * stream's own, counted from the burst, and is recycled there. */
+    s_now_us = 0;
+    srv_new(0);
+    conn_up(true);
+    S.sc = SC_DEFER;
+    S.keep_deferred = true;
+    S.sc_req[0] = SC_HEADERS_ONLY;
+    s_hold_open = true;
+    s_silent_polls = 0;
+    r = stream_side();
+    s_hold_open = false;
+    check("resp_side_answered_stream_silent_recycled",
+          r.err == ESP_FAIL && r.status == 0 && s_side_calls == 1 && s_side_status == 200 &&
+          s_conn.resp_expired && !s_conn.req_expired && !s_conn.io_failed && disarmed() &&
+          s_silent_polls == base && S.nreq == 2);
+    conn_down();
+    (void)answered_stream();
+    /* … and its push deadline untouched by that: the next one-shot gets
+     * the base */
+    check("resp_side_push_deadline_not_doubled", silent_post() ==
+          (TS2021_REQ_TIMEOUT_MS + TS2021_REQ_POLL_MS - 1) / TS2021_REQ_POLL_MS);
+    srv_new(0);   /* leave it reset */
+    conn_up(true);
+    S.sc = SC_HEADERS_ONLY;
+    (void)post("/machine/map", kRegBody, 10, 256);
+    conn_down();
+    s_now_us = 0;
+}
+
+/* Round 1.3.8, C2: the Ts-Lb load-balancer hint (upstream's
+ * tailcfg.LBHeader) on every request once set — register, push, the
+ * map stream and the side stream — and none once cleared. */
+static void sc_lb_hint(void)
+{
+    uint8_t pub[32];
+    for (int i = 0; i < 32; i++) pub[i] = (uint8_t)(0xa0 + i);
+    const char *want_lb =
+        "ts-lb: nodekey:a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf\n";
+    h2_client_set_lb(pub);
+
+    srv_new(0);
+    conn_up(true);
+    S.sc = SC_OK;
+    memcpy(S.resp, kOkBody, sizeof(kOkBody) - 1);
+    S.resp_len = sizeof(kOkBody) - 1;
+    res_t r1 = post("/machine/register", kRegBody, sizeof(kRegBody) - 1, 4095);
+    S.sc = SC_HEADERS_ONLY;
+    res_t r2 = post("/machine/map", kRegBody, sizeof(kRegBody) - 1, 256);
+    S.sc = SC_STREAM;
+    fill_mapresponses(1, 3000);
+    res_t r3 = stream(kRegBody, sizeof(kRegBody) - 1);
+    char want[512];
+    snprintf(want, sizeof(want), ":method: POST\n:scheme: https\n:path: /machine/register\n"
+             ":authority: " AUTH "\ncontent-type: application/json\ncontent-length: %zu\n%s",
+             sizeof(kRegBody) - 1, want_lb);
+    const size_t lb_len = strlen(want_lb);
+    const size_t h1 = strlen(S.hdrs[1]), h2 = strlen(S.hdrs[2]);
+    check("lb_hint_on_register_push_stream",
+          r1.err == ESP_OK && r1.status == 200 && r2.err == ESP_OK && r2.status == 200 &&
+          r3.err == ESP_OK && r3.status == 200 && r3.len == S.resp_len && S.nreq == 3 &&
+          strcmp(S.hdrs[0], want) == 0 &&
+          h1 > lb_len && strcmp(S.hdrs[1] + h1 - lb_len, want_lb) == 0 &&
+          h2 > lb_len && strcmp(S.hdrs[2] + h2 - lb_len, want_lb) == 0 && S.bad == 0);
+    conn_down();
+
+    /* the pair (B1): both streams carry it */
+    srv_new(0);
+    conn_up(true);
+    S.sc = SC_STREAM;
+    S.sc_req[0] = SC_HEADERS_ONLY;
+    fill_mapresponses(1, 3000);
+    res_t r4 = stream_side();
+    const size_t s0 = strlen(S.hdrs[0]), s1 = strlen(S.hdrs[1]);
+    check("lb_hint_on_the_side_pair",
+          r4.err == ESP_OK && r4.status == 200 && s_side_status == 200 && S.nreq == 2 &&
+          s0 > lb_len && strcmp(S.hdrs[0] + s0 - lb_len, want_lb) == 0 &&
+          s1 > lb_len && strcmp(S.hdrs[1] + s1 - lb_len, want_lb) == 0 && S.bad == 0);
+    conn_down();
+
+    /* cleared: the six fields of before */
+    h2_client_set_lb(NULL);
+    srv_new(0);
+    conn_up(true);
+    S.sc = SC_HEADERS_ONLY;
+    (void)post("/machine/map", kRegBody, sizeof(kRegBody) - 1, 256);
+    check("lb_hint_cleared", S.nreq == 1 && strstr(S.hdrs[0], "ts-lb") == NULL &&
+          strstr(S.hdrs[0], "content-length: ") != NULL);
+    conn_down();
+}
 #endif
 
 static void sc_small_server_window(void)
@@ -1519,6 +1759,8 @@ int main(void)
     sc_side();
     sc_side_one_stream();
     sc_side_late_push();
+    sc_resp_deadline();
+    sc_lb_hint();
 #endif
     if (s_fails == 0) printf("\nALL OK\n");
     return s_fails ? 1 : 0;
