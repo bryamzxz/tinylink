@@ -175,6 +175,22 @@ serial reset took 3–9 s and is not ours).
   boots 1–2); 19 / 20 connects at the stored address, one DERP attempt
   failed there during an association stall and went by name (+2.7 s).
   Heap 161 100–161 380 B free (158 968 on 1.3.4).
+- **Soak (`6dc9d83`, 370 min):** 0 resets / panics / WDT / brown-outs,
+  0 E lines; **0 long-poll stream ends** (no boot-connection FIN this
+  time); 198 rekeys (22 needed a REKEY_TIMEOUT retry), 2 RX-stale — both
+  with the healthy peer, 30–47 s of WireGuard silence right after a
+  rekey / double roam between the peer's two endpoints (`seen direct=0
+  derp=0`, nothing dropped), fixed by the rekey in 60 ms (→ round
+  1.3.6); 149 roams (the two endpoints, every pong round); DERP logged in
+  twice (the server closed the stream at 3 h 34; reconnect at the stored
+  address, full handshake 2.0 s — the server likely restarted, so the
+  ticket was not honoured; resumption is still unobserved on the
+  sensor), 0 DERP errors; 73 STUN re-probes, 4 368 telemetry packets; no
+  NVS write (the stored addresses did not change). **heap_free min /
+  last 160 548 / 160 564 B, largest block 110 592 B throughout** (93 604
+  / 77 824 on 1.3.3). Stack lows (B free): `tinylink_lp` 4 368 of 7 168,
+  `tinylink_derp` 4 532 of 8 192, `wg_rx` 4 116 of 8 192, `wg_tx` 2 904
+  of 5 120, `tinylink_tlm` 2 636 of 4 608, `esp_timer` 3 032 of 4 608.
 
 ### Optimization round D 1.3.4 (in progress, branch `feat/opt-1.3.4`)
 
