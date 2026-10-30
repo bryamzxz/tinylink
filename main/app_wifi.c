@@ -107,7 +107,7 @@ static void ps_timer_cb(void *arg)
  * (tools/stack_worst.py: 3 248 → 3 328 of 4 608 B — esp_wifi_set_config's
  * ioctl chain is as deep as esp_wifi_connect's); not inlined, so a plain
  * reconnect does not carry it. */
-static __attribute__((noinline)) void apply_channel(uint8_t channel)
+static __attribute__((noinline)) bool apply_channel(uint8_t channel)
 {
     wifi_config_t cfg;
     esp_err_t err = esp_wifi_get_config(WIFI_IF_STA, &cfg);
@@ -118,8 +118,10 @@ static __attribute__((noinline)) void apply_channel(uint8_t channel)
     if (err == ESP_OK) {
         s_cfg_channel = channel;
     } else {
-        ESP_LOGW(TAG, "esp_wifi_set_config (channel %u) failed: 0x%x", (unsigned)channel, err);
+        ESP_LOGW(TAG, "esp_wifi_set_config (channel %u) failed: 0x%x — retried at the next "
+                      "attempt", (unsigned)channel, err);
     }
+    return err == ESP_OK;
 }
 
 static void reconnect_timer_cb(void *arg)
@@ -127,9 +129,16 @@ static void reconnect_timer_cb(void *arg)
     (void)arg;
     portENTER_CRITICAL(&s_conn_mux);
     const tl_wifi_next_t n = s_next;
-    s_next.reapply = false;
     portEXIT_CRITICAL(&s_conn_mux);
-    if (tl_wifi_needs_config(&n, s_cfg_channel)) apply_channel(n.channel);
+    if (tl_wifi_needs_config(&n, s_cfg_channel)) {
+        /* A failed re-apply keeps `reapply` pending: no attempt can lose
+         * the blacklist clear (no disconnect can queue a newer one before
+         * the esp_wifi_connect below). */
+        const bool ok = apply_channel(n.channel);
+        portENTER_CRITICAL(&s_conn_mux);
+        tl_wifi_config_done(&s_next, ok);
+        portEXIT_CRITICAL(&s_conn_mux);
+    }
     esp_err_t cerr = esp_wifi_connect();
     if (cerr != ESP_OK) {
         ESP_LOGW(TAG, "esp_wifi_connect (reconnect) failed: 0x%x", cerr);
@@ -154,7 +163,7 @@ static int hint_nvs_write(const uint8_t *b, size_t n, void *ctx)
 
 /* tinylink_set_persist_hook: the 60-s housekeeping on the telemetry task
  * writes the record when it differs from NVS — after a connect to a new
- * channel / BSSID, never on the boot path. */
+ * channel, never on the boot path. */
 static void hint_persist(void)
 {
     portENTER_CRITICAL(&s_conn_mux);
@@ -212,7 +221,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
         const wifi_event_sta_connected_t *c = (const wifi_event_sta_connected_t *)data;
         if (c == NULL) return;
         portENTER_CRITICAL(&s_conn_mux);
-        const bool changed = tl_wifi_on_connected(&s_conn, c->channel, c->bssid, s_ssid_hash);
+        const bool changed = tl_wifi_on_connected(&s_conn, c->channel, s_ssid_hash);
         const tl_wifi_ap_t ap = s_conn.ap;
         portEXIT_CRITICAL(&s_conn_mux);
 #if CONFIG_TINYLINK_WIFI_DIAG
@@ -227,15 +236,14 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
         const wifi_event_sta_disconnected_t *d = (const wifi_event_sta_disconnected_t *)data;
         const unsigned reason = d ? (unsigned)d->reason : 0u;
         portENTER_CRITICAL(&s_conn_mux);
-        const tl_wifi_next_t n = tl_wifi_on_disconnected(&s_conn, (uint16_t)reason,
-                                                         d ? d->bssid : NULL);
+        const tl_wifi_next_t n = tl_wifi_on_disconnected(&s_conn, (uint16_t)reason);
         s_next.reapply = s_next.reapply || n.reapply;      /* until an attempt applies it */
         s_next.channel = n.channel;
         portEXIT_CRITICAL(&s_conn_mux);
         uint32_t delay_ms = 0;
         if (n.now) {
             ESP_LOGW(TAG, "disconnected (reason %u), retry now — 4-way timeout after "
-                          "association: config re-applied, channel %u first",
+                          "association: config re-applied, channel %u first (0 = 1..N)",
                      reason, (unsigned)n.channel);
         } else {
             delay_ms = tl_backoff_ms((uint32_t)s_retry_count, WIFI_RECONNECT_BASE_MS,
