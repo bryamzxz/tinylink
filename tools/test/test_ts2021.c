@@ -1913,26 +1913,92 @@ static void test_e2e_resp_deadline(void)
     check("e2e_answered_clean_end", rc == ESP_OK && s_conn.plain && wrote && err == ESP_OK &&
                                     st == 200 && s_conn.h2_stream_error == 0);
     ts2021_close(&s_conn);
-    for (int i = 0; i < 2; i++) {
+    /* one patient poll, then the ladder: the second unanswered poll
+     * after it escalates (second review: a server that never answers) */
+    static const struct { uint32_t ms; bool failed; const char *next; const char *name; } k[] = {
+        { TS2021_RESP_TIMEOUT_MAX_MS, false, "N80",  "e2e_after_clean_end_patient_poll" },
+        { TS2021_RESP_TIMEOUT_MS,     false, "N80",  "e2e_after_it_the_ladder_first" },
+        { 2 * TS2021_RESP_TIMEOUT_MS, true,  "N443", "e2e_after_it_the_ladder_second_to_443" },
+    };
+    for (size_t i = 0; i < sizeof(k) / sizeof(k[0]); i++) {
         script(ESP_OK, RP_OK, false, 1, RP_OK);
         rc = dial(true);
+        const bool on80 = rc == ESP_OK && s_conn.plain;
         /* the clock past any deadline at once: which one was armed is
          * req_ms; nothing buffered, so the first read expires it */
         s_clock_step = (int64_t)TS2021_RESP_TIMEOUT_MAX_MS * 1000 * 2;
         err = e2e_stream(&st);
         s_clock_step = 0;
-        const bool patient = err == ESP_FAIL && s_conn.resp_expired && !s_conn.io_failed &&
-                             s_conn.req_ms == TS2021_RESP_TIMEOUT_MAX_MS;
+        const bool as_want = err == ESP_FAIL && s_conn.resp_expired &&
+                             s_conn.io_failed == k[i].failed && s_conn.req_ms == k[i].ms;
         ts2021_close(&s_conn);
-        const bool tls_next = s_tls_next;
         script(ESP_OK, RP_OK, false, 1, RP_OK);
         rc = dial(true);
-        char nm[80];
-        snprintf(nm, sizeof(nm), "e2e_after_clean_end_patient_no_escalation_%d", i + 1);
-        check(nm, rc == ESP_OK && patient && !tls_next && s_conn.plain &&
-                  strcmp(s_dials, "N80") == 0);
+        check(k[i].name, on80 && as_want && rc == ESP_OK && strcmp(s_dials, k[i].next) == 0);
         ts2021_close(&s_conn);
     }
+}
+
+/* Second review (the reviewer's demo): after a clean end only the next
+ * poll is patient — a FIN or a requested recycle during it ends that
+ * too; the poll after either has the base deadline. */
+static bool e2e_expire_now(uint32_t want_ms)
+{
+    int st = 0;
+    s_clock_step = (int64_t)TS2021_RESP_TIMEOUT_MAX_MS * 1000 * 2;
+    const esp_err_t err = e2e_stream(&st);
+    s_clock_step = 0;
+    return err == ESP_FAIL && s_conn.resp_expired && s_conn.req_ms == want_ms;
+}
+
+static void e2e_clean_end(void)
+{
+    int st = 0;
+    script(ESP_OK, RP_OK, false, 1, RP_OK);
+    const esp_err_t rc = dial(true);
+    const bool w = e2e_answer_and_end();
+    const esp_err_t err = e2e_stream(&st);
+    if (rc != ESP_OK || !w || err != ESP_OK || st != 200) s_fails++;
+    ts2021_close(&s_conn);
+}
+
+static void test_e2e_patience_once(void)
+{
+    int st = 0;
+    /* a FIN during the patient poll: a young :80 conn's failure (next
+     * dial :443), and the poll after it is not patient */
+    boot_reset();
+    e2e_clean_end();
+    script(ESP_OK, RP_OK, false, 1, RP_OK);
+    esp_err_t rc = dial(true);
+    shutdown(s_srv_fd, SHUT_WR);
+    esp_err_t err = e2e_stream(&st);
+    const bool fin = rc == ESP_OK && err == ESP_FAIL && s_conn.io_failed && !s_conn.resp_expired &&
+                     s_conn.req_ms == TS2021_RESP_TIMEOUT_MAX_MS;
+    ts2021_close(&s_conn);
+    const bool to443 = s_tls_next;
+    boot_reset();
+    script(ESP_OK, RP_OK, false, 1, RP_OK);
+    rc = dial(true);
+    const bool base = rc == ESP_OK && e2e_expire_now(TS2021_RESP_TIMEOUT_MS);
+    ts2021_close(&s_conn);
+    check("e2e_fin_in_the_patient_poll_ends_the_patience", fin && to443 && base);
+
+    /* a requested recycle during it: likewise */
+    boot_reset();
+    e2e_clean_end();
+    script(ESP_OK, RP_OK, false, 1, RP_OK);
+    rc = dial(true);
+    ts2021_abort_reads();
+    err = e2e_stream(&st);
+    const bool aborted = rc == ESP_OK && err == ESP_FAIL && s_conn.aborted;
+    ts2021_close(&s_conn);
+    script(ESP_OK, RP_OK, false, 1, RP_OK);
+    rc = dial(true);
+    const bool base2 = rc == ESP_OK && e2e_expire_now(TS2021_RESP_TIMEOUT_MS);
+    ts2021_close(&s_conn);
+    /* (the clean end's answer had reset the ladder to its base) */
+    check("e2e_recycle_in_the_patient_poll_ends_the_patience", aborted && base2);
 }
 #endif
 
@@ -1943,6 +2009,7 @@ int main(void)
     curve25519_derive_pub(s_machine_pub, kMachinePriv);
     curve25519_derive_pub(s_control_pub, kControlPriv);
     test_e2e_resp_deadline();
+    test_e2e_patience_once();
     if (s_srv_fd >= 0) close(s_srv_fd);
     if (s_fails == 0) printf("\nALL OK\n");
     return s_fails ? 1 : 0;

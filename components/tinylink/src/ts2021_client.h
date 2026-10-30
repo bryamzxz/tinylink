@@ -103,11 +103,11 @@
  * after an answer twice that answer's time, at least
  * TS2021_RESP_TIMEOUT_MS (h2_post_json_stream): a server that is slow
  * rather than gone is waited out, and one that answered slowly is not
- * cut at the next poll. A poll after a clean server end (END_STREAM on
- * the last map stream, until a stream is answered) gets
- * TS2021_RESP_TIMEOUT_MAX_MS, and its expiries move none of that (round
- * 1.3.8 review: every such poll in the captures was slow on the
- * server's side). Received bytes are read before the deadline counts as
+ * cut at the next poll. The first poll after a clean server end
+ * (END_STREAM on the last map stream) gets TS2021_RESP_TIMEOUT_MAX_MS,
+ * and its expiry moves none of that (round 1.3.8 review: every such
+ * poll in the captures was slow on the server's side); the polls after
+ * it are under the rules above again. Received bytes are read before the deadline counts as
  * passed (ts2021_response_deadline). */
 #ifndef TS2021_RESP_TIMEOUT_MS
 #define TS2021_RESP_TIMEOUT_MS  15000
@@ -307,8 +307,8 @@ esp_err_t ts2021_request_deadline(ts2021_conn_t *c, uint32_t ms);
  * response within N ms — recycling the conn`, resp_expired set, io_failed
  * not — so it neither sends the next dial to :443 nor re-resolves the
  * name (ts2021_close; h2_post_json_stream sets io_failed itself from the
- * second expiry in a row on, unless the poll follows a clean server
- * end). The deadline is not past while received bytes wait unread
+ * second expiry in a row on, not for the first poll after a clean
+ * server end). The deadline is not past while received bytes wait unread
  * (ts2021_rx_ready): those are read first, the answer may be among them.
  * h2_post_json_stream arms it with the
  * request and ends it at the response headers. */

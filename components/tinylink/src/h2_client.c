@@ -69,25 +69,31 @@ static int64_t  s_resp_since_us;
 static bool     s_repoll;
 
 /* The last map stream was ended by the server (END_STREAM after its 200)
- * and no stream has been answered since (round 1.3.8 review). Every poll
- * that followed such an end in the 1.3.0–1.3.7 captures was slow on the
- * server's side — first frame after 59, 104, 108 s, twice nothing within
- * 120 s and the fresh conn after that 26 / 55 s — so the delay is the
- * server's and not obviously per request: cutting such a poll only
+ * and the poll after it has not gone out yet (round 1.3.8 review). Every
+ * poll that followed such an end in the 1.3.0–1.3.7 captures was slow on
+ * the server's side — first frame after 59, 104, 108 s, twice nothing
+ * within 120 s and the fresh conn after that 26 / 55 s — so the delay is
+ * the server's and not obviously per request: cutting such a poll only
  * resubmits it, and the 60-s alternative would have cut three of those
- * five answers (the 59-s one by 1 s). Until an answer, polls get
- * TS2021_RESP_TIMEOUT_MAX_MS — the stream budget, what 1.3.7 gave them —
- * and their expiries leave the ladder, the streak and the conn's
- * failure accounting alone (no :443 / re-resolve). After a boot, a FIN,
- * an error or a recycle, TS2021_RESP_TIMEOUT_MS and the ladder. */
+ * five answers (the 59-s one by 1 s). The first poll after it gets
+ * TS2021_RESP_TIMEOUT_MAX_MS — the stream budget, what 1.3.7 gave it —
+ * and its expiry leaves the ladder, the streak and the conn's failure
+ * accounting alone (no :443 / re-resolve); so does a one-shot request's
+ * expiry ahead of it on the same conn (the endpoint push), which then
+ * takes the patience with it. One poll or one expiry only: after it —
+ * whatever ended it, an expiry, a FIN, an error, a recycle —
+ * TS2021_RESP_TIMEOUT_MS and the ladder, so a server that never answers
+ * still meets the :443 / re-resolve escalation (second review). */
 static bool     s_after_clean;
 
 /* The first-response deadline for the streaming request going out now;
- * *patient: it follows a clean server end. */
+ * *patient: it is the first poll after a clean server end (and takes the
+ * patience). */
 static uint32_t resp_ms_now(bool *patient)
 {
     *patient = s_after_clean;
-    if (!s_after_clean) return s_resp_ms;
+    s_after_clean = false;
+    if (!*patient) return s_resp_ms;
     ESP_LOGI(TAG, "map stream after a clean server end: %u ms for its answer",
              (unsigned)TS2021_RESP_TIMEOUT_MAX_MS);
     return TS2021_RESP_TIMEOUT_MAX_MS;
@@ -584,6 +590,13 @@ esp_err_t h2_post_json(ts2021_conn_t *conn,
     if (err == ESP_OK) err = derr;   /* not usable for a stream at 2-s polls */
     if (conn->req_expired) {
         s_req_ms = ms < TS2021_REQ_TIMEOUT_MAX_MS / 2 ? 2 * ms : TS2021_REQ_TIMEOUT_MAX_MS;
+        if (s_after_clean) {
+            /* Ahead of the first poll after a clean server end (the
+             * endpoint push): the server's delay, as that poll's would
+             * be — no :443 / re-resolve; the patience goes with it. */
+            s_after_clean = false;
+            conn->io_failed = false;
+        }
     } else if (err == ESP_OK) {
         s_req_ms = TS2021_REQ_TIMEOUT_MS;
     }
@@ -719,6 +732,10 @@ esp_err_t h2_post_json_stream_side(ts2021_conn_t *conn,
         /* Left with the side request unanswered (or never sent). */
         if (conn->req_expired) {
             s_req_ms = ms < TS2021_REQ_TIMEOUT_MAX_MS / 2 ? 2 * ms : TS2021_REQ_TIMEOUT_MAX_MS;
+            /* Its deadline cut the first poll after a clean server end
+             * before an answer: the server's delay, no :443 /
+             * re-resolve (s_after_clean). */
+            if (patient) conn->io_failed = false;
         }
     }
     /* Either deadline off; a stream unanswered past its own counted as
