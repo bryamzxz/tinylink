@@ -29,6 +29,13 @@ static const char *TAG = "derp_client";
  * resumed 5/5 from the host (one address, TTL 600 s). */
 static tls_resume_slot_t s_resume;
 
+/* The login's NaCl box key for the last server key (round 1.3.7, B2;
+ * derp.h): one X25519 for the first login to a server key — ClientInfo
+ * and ServerInfo share it — and none for a reconnect to it (it was two
+ * per login). Same single-client rule as s_resume. */
+static derp_login_key_t  s_login_key;
+static bool              s_login_key_reused;   /* for the login line */
+
 /* Same budget as ts2021 — covers cert chain verify + ECDSA. */
 #define DERP_TLS_TIMEOUT_MS 30000
 
@@ -290,14 +297,21 @@ static esp_err_t login(derp_client_t *out, const char *server_host, uint32_t idl
     }
 
     /* Frame 2: client → server FrameClientInfo. */
+    bool computed = false;
+    if (derp_login_key(&s_login_key, client_pub, client_priv, out->server_pub,
+                       &computed) != 0) {
+        ESP_LOGE(TAG, "ServerKey is a low-order point");
+        return ESP_FAIL;
+    }
+    s_login_key_reused = !computed;
     uint8_t nonce[DERP_NONCE_LEN];
     esp_fill_random(nonce, sizeof(nonce));
 
     /* Header(5) + payload(32+24+16+32) = 5 + 104 = 109 B. */
     uint8_t ci_buf[5 + 32 + 24 + 16 + 64];
-    size_t ci_payload_len = derp_build_client_info(
+    size_t ci_payload_len = derp_build_client_info_k(
         ci_buf + DERP_FRAME_HDR_LEN, sizeof(ci_buf) - DERP_FRAME_HDR_LEN,
-        client_pub, client_priv, out->server_pub, nonce);
+        client_pub, s_login_key.k, nonce);
     if (ci_payload_len == 0) {
         ESP_LOGE(TAG, "client_info build failed");
         return ESP_FAIL;
@@ -317,8 +331,11 @@ static esp_err_t login(derp_client_t *out, const char *server_host, uint32_t idl
         ESP_LOGE(TAG, "expected ServerInfo, got 0x%02x", (unsigned)ftype);
         return ESP_FAIL;
     }
-    if (derp_parse_server_info(payload, plen, client_priv, out->server_pub,
-                               &out->server_version) != 0) {
+    if (derp_parse_server_info_k(payload, plen, s_login_key.k,
+                                 &out->server_version) != 0) {
+        /* A box under the server's own key that does not open: keep no
+         * key from this server. */
+        derp_login_key_forget(&s_login_key);
         ESP_LOGE(TAG, "ServerInfo decrypt/parse failed");
         return ESP_FAIL;
     }
@@ -362,7 +379,8 @@ static esp_err_t connect_on(derp_client_t *out, const char *server_host, uint16_
         return err;
     }
     out->connected = true;
-    ESP_LOGI(TAG, "DERP login OK: server version=%d", out->server_version);
+    ESP_LOGI(TAG, "DERP login OK: server version=%d (box key %s)",
+             out->server_version, s_login_key_reused ? "reused" : "new");
     return ESP_OK;
 }
 

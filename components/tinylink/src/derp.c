@@ -6,6 +6,7 @@
 #include <string.h>
 
 #include "crypto/nacl_box.h"
+#include "crypto/secure_zero.h"
 
 const uint8_t DERP_MAGIC[DERP_MAGIC_LEN] = {
     0x44, 0x45, 0x52, 0x50, 0xf0, 0x9f, 0x94, 0x91   /* "DERP🔑" */
@@ -73,14 +74,44 @@ int derp_parse_server_key(const uint8_t *payload, size_t plen,
     return 0;
 }
 
-size_t derp_build_client_info(uint8_t *out, size_t out_cap,
-                              const uint8_t client_pub[DERP_KEY_LEN],
-                              const uint8_t client_priv[DERP_KEY_LEN],
-                              const uint8_t server_pub[DERP_KEY_LEN],
-                              const uint8_t nonce[DERP_NONCE_LEN])
+void derp_login_key_forget(derp_login_key_t *c)
 {
-    if (out == NULL || client_pub == NULL || client_priv == NULL ||
-        server_pub == NULL || nonce == NULL) return 0;
+    if (c == NULL) return;
+    tl_secure_zero(c, sizeof(*c));
+}
+
+int derp_login_key(derp_login_key_t *c,
+                   const uint8_t client_pub[DERP_KEY_LEN],
+                   const uint8_t client_priv[DERP_KEY_LEN],
+                   const uint8_t server_pub[DERP_KEY_LEN],
+                   bool *computed)
+{
+    if (computed != NULL) *computed = false;
+    if (c == NULL || client_pub == NULL || client_priv == NULL || server_pub == NULL) {
+        return -1;
+    }
+    if (c->valid && memcmp(c->client_pub, client_pub, DERP_KEY_LEN) == 0 &&
+        memcmp(c->server_pub, server_pub, DERP_KEY_LEN) == 0) {
+        return 0;
+    }
+    derp_login_key_forget(c);
+    if (computed != NULL) *computed = true;
+    if (nacl_box_compute_shared(c->k, server_pub, client_priv) != 0) {
+        derp_login_key_forget(c);
+        return -1;
+    }
+    memcpy(c->client_pub, client_pub, DERP_KEY_LEN);
+    memcpy(c->server_pub, server_pub, DERP_KEY_LEN);
+    c->valid = true;
+    return 0;
+}
+
+size_t derp_build_client_info_k(uint8_t *out, size_t out_cap,
+                                const uint8_t client_pub[DERP_KEY_LEN],
+                                const uint8_t k[DERP_KEY_LEN],
+                                const uint8_t nonce[DERP_NONCE_LEN])
+{
+    if (out == NULL || client_pub == NULL || k == NULL || nonce == NULL) return 0;
     const size_t need = DERP_KEY_LEN + DERP_NONCE_LEN +
                         DERP_TAG_LEN + K_CLIENT_INFO_JSON_LEN;
     if (out_cap < need) return 0;
@@ -89,14 +120,30 @@ size_t derp_build_client_info(uint8_t *out, size_t out_cap,
     memcpy(p, client_pub, DERP_KEY_LEN); p += DERP_KEY_LEN;
     memcpy(p, nonce, DERP_NONCE_LEN);    p += DERP_NONCE_LEN;
 
-    /* nacl_box writes [tag(16) || ct(plen)] which is exactly the
+    /* The box writes [tag(16) || ct(plen)] which is exactly the
      * "boxed json" the wire format expects. */
-    if (nacl_box(p, (const uint8_t *)k_client_info_json,
-                 K_CLIENT_INFO_JSON_LEN, nonce, server_pub,
-                 client_priv) != 0) {
+    if (nacl_box_after_shared(p, (const uint8_t *)k_client_info_json,
+                              K_CLIENT_INFO_JSON_LEN, nonce, k) != 0) {
         return 0;
     }
     return need;
+}
+
+size_t derp_build_client_info(uint8_t *out, size_t out_cap,
+                              const uint8_t client_pub[DERP_KEY_LEN],
+                              const uint8_t client_priv[DERP_KEY_LEN],
+                              const uint8_t server_pub[DERP_KEY_LEN],
+                              const uint8_t nonce[DERP_NONCE_LEN])
+{
+    if (out == NULL || client_pub == NULL || client_priv == NULL ||
+        server_pub == NULL || nonce == NULL) return 0;
+    uint8_t k[DERP_KEY_LEN];
+    size_t n = 0;
+    if (nacl_box_compute_shared(k, server_pub, client_priv) == 0) {
+        n = derp_build_client_info_k(out, out_cap, client_pub, k, nonce);
+    }
+    tl_secure_zero(k, sizeof(k));
+    return n;
 }
 
 /* Tiny scanner: find the integer following a key in JSON. Returns
@@ -137,6 +184,20 @@ int derp_parse_server_info(const uint8_t *payload, size_t plen,
     if (payload == NULL || client_priv == NULL || server_pub == NULL) {
         return -1;
     }
+    uint8_t k[DERP_KEY_LEN];
+    int rc = -1;
+    if (nacl_box_compute_shared(k, server_pub, client_priv) == 0) {
+        rc = derp_parse_server_info_k(payload, plen, k, out_version);
+    }
+    tl_secure_zero(k, sizeof(k));
+    return rc;
+}
+
+int derp_parse_server_info_k(const uint8_t *payload, size_t plen,
+                             const uint8_t k[DERP_KEY_LEN],
+                             int *out_version)
+{
+    if (payload == NULL || k == NULL) return -1;
     if (plen < DERP_NONCE_LEN + DERP_TAG_LEN) return -1;
 
     const uint8_t *nonce = payload;
@@ -150,8 +211,7 @@ int derp_parse_server_info(const uint8_t *payload, size_t plen,
     uint8_t pt[256];
     if (ptlen > sizeof(pt)) return -1;
 
-    if (nacl_box_open(pt, box, boxlen, nonce, server_pub,
-                      client_priv) != 0) {
+    if (nacl_box_open_after_shared(pt, box, boxlen, nonce, k) != 0) {
         return -1;
     }
     if (out_version != NULL) {
