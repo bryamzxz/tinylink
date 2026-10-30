@@ -1901,6 +1901,9 @@ static void long_poll_task(void *arg)
             if (s_ep_push_pending && s_conn.aborted) {
                 ESP_LOGI(TAG, "long-poll stream recycled for endpoint push "
                               "(0x%x) — reconnecting", err);
+            } else if (s_conn.resp_expired) {
+                /* ts2021 has the W line (round 1.3.8, C1) */
+                ESP_LOGI(TAG, "long-poll stream recycled (no response) — reconnecting");
             } else {
                 ESP_LOGW(TAG, "long-poll stream ended: 0x%x — reconnecting", err);
             }

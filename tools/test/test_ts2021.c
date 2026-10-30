@@ -1329,6 +1329,15 @@ static void young_case(const char *name, int64_t age_s, int how, const char *wan
     } else if (how == 2) {
         ts2021_abort_reads();
         (void)ts2021_recv_record(&s_conn, &got);
+    } else if (how == 4 || how == 5) {
+        /* round 1.3.8, C1: the map stream unanswered past its first-
+         * response deadline (armed from a request already that old); 5:
+         * the second in a row, which h2_post_json_stream marks failed */
+        ts2021_response_deadline(&s_conn, TS2021_RESP_TIMEOUT_MS,
+                                 s_now_us - (int64_t)TS2021_RESP_TIMEOUT_MS * 1000 - 1);
+        const esp_err_t rr = ts2021_recv_record(&s_conn, &got);
+        if (rr == ESP_OK || !s_conn.resp_expired || s_conn.io_failed) s_fails++;
+        if (how == 5) s_conn.io_failed = true;
     }
     ts2021_close(&s_conn);
     s_abort_reads = false;
@@ -1355,6 +1364,10 @@ static void test_addr_young_failure(void)
     young_case("fin_121s", TS2021_PLAIN_EARLY_DROP_S + 1, 0, "A80");
     young_case("recycle_5s", 5, 2, "A80");
     young_case("clean_5s", 5, 3, "A80");
+    /* round 1.3.8, C1: a stream the server did not answer is no :80 or
+     * address failure (A80); the second in a row is (N443) */
+    young_case("no_response_15s", 15, 4, "A80");
+    young_case("no_response_again_30s", 30, 5, "N443");
 }
 
 static void test_addr_443(void)
@@ -1579,6 +1592,107 @@ static void test_request_deadline(void)
           s_conn.req_deadline_us == 0);
 }
 
+/* ---- Round 1.3.8, C1: the map stream's first-response deadline -------- */
+
+static void test_response_deadline(void)
+{
+    /* A stream request on :80 meets a server that never answers: the
+     * conn fails after the deadline (400 ms in 100-ms polls here; 15 s in
+     * 2-s polls on the device) as a recycle — resp_expired, not a
+     * transport failure, not a one-shot expiry. */
+    boot_reset();
+    script(ESP_OK, RP_OK, false, 1, RP_OK);
+    esp_err_t rc = dial(true);
+    s_conn.h2_rx_off = s_conn.h2_rx_len;
+    const esp_err_t arm = ts2021_response_deadline(&s_conn, TS2021_RESP_TIMEOUT_MS,
+                                                   esp_timer_get_time());
+    const long armed_ms = rcvtimeo_ms(s_conn.sock);
+    const uint16_t idle = s_conn.req_idle;
+    const bool waiting = s_conn.resp_wait;
+    struct timespec w0;
+    clock_gettime(CLOCK_MONOTONIC, &w0);
+    size_t got = 0;
+    esp_err_t rr = ts2021_recv_record(&s_conn, &got);
+    const long ms = wall_ms_since(&w0);
+    check("resp_deadline_silent_server_recycles",
+          rc == ESP_OK && s_conn.plain && arm == ESP_OK && armed_ms == TS2021_REQ_POLL_MS &&
+          waiting && idle == (TS2021_RESP_TIMEOUT_MS + TS2021_REQ_POLL_MS - 1) / TS2021_REQ_POLL_MS &&
+          rr != ESP_OK && s_conn.resp_expired && !s_conn.req_expired && !s_conn.io_failed &&
+          !s_conn.aborted &&
+          ms >= TS2021_RESP_TIMEOUT_MS - 50 && ms < TS2021_RESP_TIMEOUT_MS + 2 * TS2021_REQ_POLL_MS);
+    /* not an early drop: the next dial stays on :80 */
+    ts2021_close(&s_conn);
+    const bool next_tls = s_tls_next;
+    script(ESP_OK, RP_OK, false, 1, RP_OK);
+    rc = dial(true);
+    check("resp_deadline_80_next_dial_80", !next_tls && rc == ESP_OK && s_conn.plain &&
+                                           strcmp(s_dials, "N80") == 0);
+
+    /* Counted from the request, not from the arming: one armed after
+     * part of it has passed keeps only the rest (polls), and one past
+     * already fails at the first read, without a poll. */
+    s_conn.h2_rx_off = s_conn.h2_rx_len;
+    const int64_t t0 = esp_timer_get_time();
+    ts2021_response_deadline(&s_conn, TS2021_RESP_TIMEOUT_MS,
+                             t0 - (int64_t)TS2021_RESP_TIMEOUT_MS * 1000 / 2);
+    const uint16_t half = s_conn.req_idle;
+    const int64_t until = s_conn.req_deadline_us;
+    ts2021_response_deadline(&s_conn, TS2021_RESP_TIMEOUT_MS,
+                             t0 - (int64_t)TS2021_RESP_TIMEOUT_MS * 1000 - 1);
+    clock_gettime(CLOCK_MONOTONIC, &w0);
+    rr = ts2021_recv_record(&s_conn, &got);
+    check("resp_deadline_from_the_request",
+          half == (TS2021_RESP_TIMEOUT_MS / 2 + TS2021_REQ_POLL_MS - 1) / TS2021_REQ_POLL_MS &&
+          until == t0 + (int64_t)TS2021_RESP_TIMEOUT_MS * 1000 / 2 && s_conn.req_idle == 1 &&
+          rr != ESP_OK && s_conn.resp_expired && wall_ms_since(&w0) < TS2021_REQ_POLL_MS);
+    ts2021_close(&s_conn);
+
+    /* An answer in time is read; disarming (ts2021_request_deadline 0)
+     * ends it too, back on the stream's 30-s polls. */
+    boot_reset();
+    script(ESP_OK, RP_OK, false, 1, RP_OK);
+    rc = dial(true);
+    s_conn.h2_rx_off = s_conn.h2_rx_len;
+    ts2021_response_deadline(&s_conn, TS2021_RESP_TIMEOUT_MS, esp_timer_get_time());
+    uint8_t in[128];
+    size_t inn = 0;
+    put_record(in, &inn, "hdrs", 4);
+    const bool wrote = write(s_srv_fd, in, inn) == (ssize_t)inn;
+    rr = ts2021_recv_record(&s_conn, &got);
+    const esp_err_t dis = ts2021_request_deadline(&s_conn, 0);
+    check("resp_deadline_answer_in_time_then_disarmed",
+          wrote && rr == ESP_OK && got == 4 && dis == ESP_OK && rcvtimeo_ms(s_conn.sock) == 30000 &&
+          s_conn.req_idle == 0 && s_conn.req_deadline_us == 0 && !s_conn.resp_wait &&
+          !s_conn.resp_expired && !s_conn.io_failed && idle_budget(&s_conn) == TS2021_MAX_IDLE_POLLS);
+
+    /* The write side expires the same way (a SETTINGS ACK past it). */
+    ts2021_response_deadline(&s_conn, TS2021_RESP_TIMEOUT_MS,
+                             esp_timer_get_time() - (int64_t)TS2021_RESP_TIMEOUT_MS * 1000 - 1);
+    const uint8_t ack[9] = { 0, 0, 0, 4, 1, 0, 0, 0, 0 };
+    const esp_err_t ws = ts2021_send(&s_conn, ack, sizeof(ack));
+    check("resp_deadline_write_side", ws != ESP_OK && s_conn.resp_expired && !s_conn.req_expired &&
+                                      !s_conn.io_failed);
+    /* an argument of 0 is no deadline */
+    check("resp_deadline_zero_refused",
+          ts2021_response_deadline(&s_conn, 0, esp_timer_get_time()) == ESP_ERR_INVALID_ARG);
+    ts2021_close(&s_conn);
+
+    /* A one-shot deadline armed after it is a one-shot again. */
+    boot_reset();
+    script(ESP_OK, RP_OK, false, 1, RP_OK);
+    rc = dial(true);
+    s_conn.h2_rx_off = s_conn.h2_rx_len;
+    ts2021_response_deadline(&s_conn, TS2021_RESP_TIMEOUT_MS, esp_timer_get_time());
+    ts2021_request_deadline(&s_conn, TS2021_REQ_TIMEOUT_MS);
+    s_clock_step = (int64_t)TS2021_REQ_TIMEOUT_MS * 1000 * 2;
+    rr = ts2021_recv_record(&s_conn, &got);
+    s_clock_step = 0;
+    check("resp_then_request_deadline_is_a_request_one",
+          rc == ESP_OK && rr != ESP_OK && s_conn.req_expired && !s_conn.resp_expired &&
+          s_conn.io_failed);
+    ts2021_close(&s_conn);
+}
+
 /* ---- Round 1.3.5: a requested recycle is marked, not a failure -------- */
 
 static void test_recycle_marked(void)
@@ -1706,6 +1820,7 @@ int main(void)
     test_addr_443();
     test_addr_ttl();
     test_request_deadline();
+    test_response_deadline();
     test_recycle_marked();
     test_precompute();
     if (s_srv_fd >= 0) close(s_srv_fd);
