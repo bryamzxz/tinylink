@@ -241,6 +241,7 @@ typedef struct {
     int64_t since_us;           /* entered the current mode */
     int64_t off_direct_us;      /* left DIRECT (or start) */
     int64_t proof_us;           /* last pong / direct-proving keepalive; 0 none */
+    int64_t ka_us;              /* last keepalive while DIRECT, proving or not */
     int64_t await_us;           /* first data frame since the proof (DIRECT) or
                                    since the doubt began (DOUBT); 0 none */
     int64_t last_data_us;       /* last data frame sent; 0 none */
@@ -392,11 +393,13 @@ static inline uint32_t wg_path_check_answer_(wg_path_t *p, int64_t now)
 /* A transport frame is about to go out (wg_tx). `data`: it carries a
  * payload (keepalives are never answered). *mode is how to send it.
  *
- * After a pause — no frame for a window, no proof for a window — the
- * first frame goes DUAL with a ping. With a telemetry period above
- * ~WG_PATH_ANSWER_MS (Kconfig allows up to 600 s; the default is 5 s)
- * that is every sample: one DERP copy and one ping / pong each (the ping
- * is sealed with the cached key, no X25519). Kept on purpose: the proof
+ * After a pause — no frame for a window, no keepalive or proof for a
+ * window — the first frame goes DUAL with a ping. With a telemetry
+ * period above ~22 s (KEEPALIVE_TIMEOUT + WG_PATH_ANSWER_MS: the
+ * keepalive answering a sample comes 10 s after it; Kconfig allows up
+ * to 600 s, the default is 5 s) that is every sample: one DERP copy and
+ * one ping / pong each (the ping is sealed with the cached key, no
+ * X25519). Kept on purpose: the proof
  * is a keepalive ~10 s old by construction, and after minutes nothing
  * says the path still works — magicsock does the same (any send after
  * trustBestAddrUntil, 6.5 s past the last pong, goes to both and pings).
@@ -414,10 +417,17 @@ static inline uint32_t wg_path_on_send(wg_path_t *p, int64_t now, bool data,
     }
     uint32_t act = wg_path_check_answer_(p, now);
     if (data) {
+        /* Any keepalive counts here, not only a direct-proving one: after
+         * a first frame that went both ways, the keepalive answering it
+         * proves only the session — but the path is not idle, and the
+         * next frame (a period of 12-22 s) must not be "first after a
+         * pause" again (simulated: every sample of the hour after one
+         * pause). */
         const int64_t win = (int64_t)WG_PATH_ANSWER_MS * 1000LL;
+        const int64_t seen = p->ka_us > p->proof_us ? p->ka_us : p->proof_us;
         if (p->mode == WG_PATH_DIRECT &&
             (p->last_data_us == 0 || wg_timer_due(now, p->last_data_us, win)) &&
-            wg_timer_due(now, p->proof_us, win)) {
+            wg_timer_due(now, seen, win)) {
             act |= wg_path_lapse_(p, now, WG_PATH_WHY_IDLE, p->proof_us);
         }
         if ((p->mode == WG_PATH_DIRECT || WG_PATH_IN_DOUBT(p)) && p->await_us == 0) {
@@ -600,6 +610,7 @@ static inline uint32_t wg_path_on_keepalive(wg_path_t *p, int64_t now)
     if (WG_PATH_IN_DOUBT(p)) return wg_path_resolve_(p, now);
     if (p->mode != WG_PATH_DIRECT) return 0;   /* our frames went via DERP too */
     p->await_us = 0;
+    p->ka_us    = now;
     if (p->last_relay_data_us == 0 ||
         wg_timer_due(now, p->last_relay_data_us, (int64_t)WG_PATH_ANSWER_MS * 1000LL)) {
         p->proof_us = now;

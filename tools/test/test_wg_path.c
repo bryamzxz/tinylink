@@ -683,6 +683,7 @@ static void test_doubt(void)
 typedef struct {
     wg_path_t p;
     int64_t t, next_data, ka_at, pong_at;
+    int64_t period;                 /* telemetry period; 0: 5 s */
     bool ka_pending;
     int frame;
     int lose_frame;                 /* this data frame never arrives; -1 none */
@@ -728,7 +729,7 @@ static void tl_run(tl_t *s, int64_t end)
         tl_act(s, wg_path_tick(&s->p, t));
         if (t >= s->next_data) {
             const uint32_t act = wg_path_on_send(&s->p, t, true, &m);
-            s->next_data += S(5);
+            s->next_data += s->period != 0 ? s->period : S(5);
             bool got = s->frame != s->lose_frame;
             if (m == WG_PATH_DIRECT && t >= s->up_wg_dead_at) got = false;
             if (m == WG_PATH_DUAL) s->dual_frames++;
@@ -841,6 +842,41 @@ static void test_review(void)
     const int64_t wake = T1 + MS(4) + MS(wg_recv_timeout_ms(T1 + MS(4), dl, 5000, 10));
     pings += (wg_path_tick(&p, wake) & WG_PATH_ACT_PING) ? 1u : 0u;
     ok("review/endpoint-change-one-ping", pings == 1 && dl > T2);
+
+    /* Finding 5's battery note: a period above KEEPALIVE_TIMEOUT + the
+     * window (~22 s) makes every sample a first after a pause (DUAL + a
+     * ping); below it the keepalive answering the last sample — even one
+     * that went both ways, proving only the session — keeps it quiet. */
+    s = tl_base();
+    s.period = S(15);
+    tl_run(&s, T0 + S(3600));
+    ok("idle/period-15s-quiet", s.p.lapses == 0 && s.pings == 0 && s.rekeys == 0);
+    /* ...and after a disturbance (one lost keepalive: DUAL frames, whose
+     * keepalives prove only the session), back to quiet. */
+    s = tl_base();
+    s.period = S(15);
+    s.lose_ka_after = 120;
+    tl_run(&s, T0 + S(3600));
+    printf("  1 h at a 15-s period, one keepalive lost: lapses=%u pings=%u DUAL frames=%u\n",
+           s.p.lapses, s.pings, s.dual_frames);
+    ok("idle/period-15s-recovers", s.p.lapses <= 3 && s.dual_frames <= 4 && s.rekeys == 0);
+    /* ...and after a pause (the first frame goes both ways with a ping:
+     * the keepalive answering it must keep the next one quiet). */
+    s = tl_base();
+    s.period = S(15);
+    tl_run(&s, T0 + S(600));
+    s.next_data = T0 + S(700);
+    tl_run(&s, T0 + S(1800));
+    printf("  15-s period, a 100-s pause: lapses=%u pings=%u DUAL frames=%u\n",
+           s.p.lapses, s.pings, s.dual_frames);
+    ok("idle/period-15s-after-pause", s.p.lapses == 1 && s.dual_frames == 1);
+    s = tl_base();
+    s.period = S(30);
+    tl_run(&s, T0 + S(3600));
+    printf("  1 h at a 30-s period: lapses=%u pings=%u DUAL frames=%u (of %d)\n",
+           s.p.lapses, s.pings, s.dual_frames, s.frame);
+    ok("idle/period-30s-each-sample", s.dual_frames >= (uint32_t)s.frame - 2 &&
+                                      s.rekeys == 0 && s.rescues == 0);
 }
 
 /* Any tick, however late (wg_rx can wake up to a second past a deadline
