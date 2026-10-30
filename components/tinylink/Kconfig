@@ -82,6 +82,25 @@ menu "tinylink core"
             transition, so it is for diagnostic images only
             (tools/power/sdkconfig.power-diag).
 
+    config TINYLINK_TLS_RSA_FIRST
+        bool "TLS: offer the ECDHE-RSA suites first (RSA certificate chain)"
+        default y
+        help
+            Round 1.3.8. The Tailscale servers (DERP, controlplane on
+            :443, the first-boot /key fetch) serve an ECDSA chain to a
+            ClientHello that lists an ECDHE-ECDSA suite and an RSA chain
+            to one that does not: leaf RSA-2048 <- YR2 <- Root YR <- ISRG
+            Root X1 instead of leaf P-256 <- YE2 <- Root YE <- ISRG Root
+            X2 <- X1. Verifying the RSA chain and its ServerKeyExchange is
+            four RSA public-key operations (exponent 65537, on the RSA
+            accelerator) instead of three P-384 and one P-256 ECDSA
+            verifies in software. Same bundle, same chain validation,
+            same X25519 ECDHE and AES-128-GCM records; the server is
+            authenticated by RSA-2048 (about 112-bit) instead of P-256
+            (about 128-bit). A server that refuses the offer is dialled
+            again at once with the full mbedTLS offer, and asked with it
+            directly for 6 h (src/tls_offer.h).
+
     config TINYLINK_BENCH_AEAD
         bool "Run ChaCha20-Poly1305 AEAD and X25519 micro-benchmarks on boot"
         default n

@@ -10,6 +10,7 @@ idf_component_register(
         "src/noise_ik.c"
         "src/tls_io.c"
         "src/tls_resume.c"
+        "src/tls_offer.c"
         "src/ts2021_client.c"
         "src/h2_client.c"
         "src/h2_core.c"
