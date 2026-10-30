@@ -60,7 +60,7 @@ typedef struct {
      * 2 KiB) = one TCP segment with TCP_NODELAY. It used to be three
      * writes (header, dst key, packet): three records, and Nagle held the
      * last two until the first was ACKed — ~1 RTT per relayed packet.
-     * Guarded by write_lock, like the wire itself. */
+     * Guarded by the write lock (wl), like the wire itself. */
     uint8_t           tx_stage[DERP_FRAME_HDR_LEN + DERP_TX_STAGE_MAX];
 } derp_client_t;
 
@@ -107,8 +107,8 @@ esp_err_t derp_client_connect_login(derp_client_t *out,
  * connected client. Only the connecting task closes (the supervisor). A
  * writer still inside a frame after DERP_WL_GRACE_MS (1 s) is cut off
  * (the socket's shutdown; its frame fails) and waited for in slices that
- * feed the task WDT (round 1.3.9) — the TLS context is freed under the
- * lock. */
+ * feed the task WDT, for 240 s at most (round 1.3.9) — the TLS context is
+ * freed under the lock. */
 void derp_client_close(derp_client_t *c);
 
 /* Drive the recv loop on top of an already-logged-in client. Wraps
@@ -128,7 +128,7 @@ esp_err_t derp_client_run(derp_client_t *c,
                           derp_event_cb_t cb, void *cb_ctx);
 
 /* Send one DERP FrameSendPacket relaying `packet` to peer `dst_pub`.
- * Atomic on the wire: holds c->write_lock across header + payload, so
+ * Atomic on the wire: holds the write lock across header + payload, so
  * concurrent calls (and the recv-loop's pongs) cannot interleave; up to
  * DERP_TX_STAGE_MAX of payload it is a single TLS record.
  *

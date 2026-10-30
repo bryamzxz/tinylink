@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Bryam (bryamzxz)
 
-#ifdef ESP_PLATFORM
+/* The host test (tools/test/test_derp_wlock.c) compiles this file over
+ * fakes of esp_tls, FreeRTOS and select(), with its own lock primitives
+ * (DERP_CLIENT_HOST_TEST). */
+#if defined(ESP_PLATFORM) || defined(DERP_CLIENT_HOST_TEST)
 
 #include "derp_client.h"
 
@@ -35,9 +38,21 @@ static const char *TAG = "derp_client";
  * dead, our address changed, or a relay switch — and is cut. A cut frame
  * is a failed one, which its sender handles as before (kept for the
  * re-send, a refused INIT copy, the direct send). */
+#ifndef DERP_WL_SLICE_MS
 #define DERP_WL_SLICE_MS 1000u
+#endif
+#ifndef DERP_WL_GRACE_MS
 #define DERP_WL_GRACE_MS 1000u
+#endif
+/* The fed waits' total: twice what a stalled write holds the lock (4 ×
+ * 30 s). A wait past it is a lock never given back — no more feeds, one
+ * E line, and the 60-s task WDT resets the board, as before 1.3.9's
+ * slices, instead of leaving the relay hung for good. */
+#ifndef DERP_WL_FED_MAX_MS
+#define DERP_WL_FED_MAX_MS 240000u
+#endif
 
+#ifndef DERP_CLIENT_HOST_TEST
 static bool derp_wl_take(void *lock, uint32_t ms)
 {
     return xSemaphoreTake((SemaphoreHandle_t)lock, pdMS_TO_TICKS(ms)) == pdTRUE;
@@ -66,6 +81,18 @@ static void derp_wl_cut(void *io)
         (void)shutdown(fd, SHUT_RDWR);
     }
 }
+
+static __attribute__((noinline)) void derp_wl_overdue(uint32_t waited_ms)
+{
+    ESP_LOGE(TAG, "DERP write lock held over %u s: no more WDT feeds for it",
+             (unsigned)(waited_ms / 1000));
+}
+#endif /* !DERP_CLIENT_HOST_TEST */
+
+/* select() for the writability check; the host test's fake conns answer. */
+#ifndef DERP_SELECT
+#define DERP_SELECT select
+#endif
 
 /* TLS session of the last DERP connect (round 1.3.5, D9; tls_resume.h),
  * for a reconnect to the same relay: one per firmware — the supervisor
@@ -489,7 +516,7 @@ esp_err_t derp_client_connect_login(derp_client_t *out,
         out->wl.lock = xSemaphoreCreateMutex();
     }
     if (out->wl.lock == NULL) {
-        ESP_LOGE(TAG, "write_lock create failed");
+        ESP_LOGE(TAG, "write lock create failed");
         return ESP_ERR_NO_MEM;
     }
 
@@ -545,7 +572,7 @@ void derp_client_close(derp_client_t *c)
     }
     const int64_t t0 = esp_timer_get_time();
     const bool cut = derp_wl_close_lock(&c->wl, c->tls, DERP_WL_GRACE_MS,
-                                        DERP_WL_SLICE_MS);
+                                        DERP_WL_SLICE_MS, DERP_WL_FED_MAX_MS);
     if (c->tls != NULL) {
         esp_tls_conn_destroy(c->tls);
         c->tls = NULL;
@@ -627,7 +654,7 @@ static bool socket_writable_now(derp_client_t *c)
     FD_ZERO(&wfds);
     FD_SET(fd, &wfds);
     struct timeval tv = { 0, 0 };
-    return select(fd + 1, NULL, &wfds, NULL, &tv) == 1;
+    return DERP_SELECT(fd + 1, NULL, &wfds, NULL, &tv) == 1;
 }
 
 /* One frame on the conn the caller found up: the write lock — waited for
@@ -645,7 +672,7 @@ static esp_err_t send_frame(derp_client_t *c, derp_frame_type_t type,
     if (c->wl.lock == NULL || !derp_wl_admits(&c->wl, &gen)) {
         return ESP_ERR_INVALID_STATE;
     }
-    switch (derp_wl_acquire(&c->wl, gen, no_wait, DERP_WL_SLICE_MS)) {
+    switch (derp_wl_acquire(&c->wl, gen, no_wait, DERP_WL_SLICE_MS, DERP_WL_FED_MAX_MS)) {
     case DERP_WL_HELD:
         break;
     case DERP_WL_BUSY:
@@ -717,4 +744,4 @@ esp_err_t derp_client_try_send_packet(derp_client_t *c,
     return send_packet(c, dst_pub, packet, plen, true);
 }
 
-#endif /* ESP_PLATFORM */
+#endif /* ESP_PLATFORM || DERP_CLIENT_HOST_TEST */

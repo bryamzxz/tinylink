@@ -404,12 +404,18 @@ test_derp: test_derp.c \
 	    $(CRYPTO)/poly1305_donna.c
 
 # The DERP write lock (round 1.3.9): close vs a writer on a stalled conn,
-# waits that feed the task WDT, a failed write closing the conn to frames
-# — the header's protocol over pthreads and the real tls_io_write_full.
-test_derp_wlock: test_derp_wlock.c $(TL_SRC)/derp_wlock.h \
-                 $(TL_SRC)/tls_io.c $(TL_SRC)/tls_io.h host_include/mbedtls/ssl.h
-	$(CC) $(CFLAGS) -pthread -I$(TL_SRC) -Ihost_include -o $@ \
-	    test_derp_wlock.c $(TL_SRC)/tls_io.c
+# waits that feed the task WDT (capped), a failed write closing the conn
+# to frames — derp_client.c itself (#included) over fakes of esp_tls,
+# FreeRTOS and select(), a scripted DERP login, pthreads.
+DERP_WLOCK_SRCS := $(TL_SRC)/derp.c $(TL_SRC)/tls_io.c $(TL_SRC)/tls_offer.c \
+                   $(CRYPTO)/nacl_box.c $(CRYPTO)/curve25519.c $(CRYPTO)/curve25519_fiat32.c \
+                   $(CRYPTO)/salsa20.c $(CRYPTO)/poly1305_donna.c
+test_derp_wlock: test_derp_wlock.c $(TL_SRC)/derp_client.c $(TL_SRC)/derp_client.h \
+                 $(TL_SRC)/derp_wlock.h $(TL_SRC)/derp.h $(TL_SRC)/tls_io.h $(TL_SRC)/tls_offer.h \
+                 $(DERP_WLOCK_SRCS) host_include/esp_tls.h host_include/freertos/semphr.h \
+                 host_include/esp_random.h host_include/mbedtls/ssl.h
+	$(CC) $(CFLAGS) -pthread -I$(TL_SRC) -I$(TL_INC) -I$(CRYPTO) -Ihost_include -o $@ \
+	    test_derp_wlock.c $(DERP_WLOCK_SRCS)
 
 # HTTP/2 Retry-After header parser (RFC 7231 §7.1.3 delta-seconds).
 # Header-only; the test just compiles the .c against the .h. No platform

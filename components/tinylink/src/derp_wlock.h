@@ -17,7 +17,10 @@
 //
 //   - Every wait for the lock goes in slices with a WDT feed between
 //     them, and a writer stops waiting, without the lock, once the conn
-//     it set out for is closing or gone (derp_wl_acquire).
+//     it set out for is closing or gone (derp_wl_acquire). The feeds
+//     stop after `fed_max_ms` of waiting in total, with one call to
+//     derp_wl_overdue: a lock never given back (a leak) then ends in the
+//     task WDT's reset instead of a DERP hung for good.
 //   - `connected` is the writers' abort flag: a frame's write stops at its
 //     next poll once the conn is closing (derp_wl_may_write).
 //   - A close drops `connected`, gives a writer mid-frame a grace to end
@@ -36,10 +39,11 @@
 //     written on the next one.
 //
 // Header-only. The type and derp_wl_up are for anyone (derp_client.h);
-// the protocol is compiled where DERP_WL_IMPL is defined, and the four
+// the protocol is compiled where DERP_WL_IMPL is defined, and the five
 // primitives it declares are the includer's — a FreeRTOS mutex,
-// tl_wdt_feed and shutdown() in derp_client.c; pthreads with counters and
-// forced interleavings in tools/test/test_derp_wlock.c — so the host test
+// tl_wdt_feed, shutdown() and an E line in derp_client.c; pthreads with
+// counters and forced interleavings in tools/test/test_derp_wlock.c,
+// which builds derp_client.c itself over host fakes — so the host test
 // drives this exact code.
 
 #ifndef DERP_WLOCK_H_TYPES
@@ -77,6 +81,8 @@ static void derp_wl_give(void *lock);
 static void derp_wl_feed(void);
 /* Make the conn's blocked and later I/O fail at once. */
 static void derp_wl_cut(void *io);
+/* A wait passed its fed_max_ms (`waited_ms` so far): the last feed. */
+static void derp_wl_overdue(uint32_t waited_ms);
 
 static inline uint32_t derp_wl_gen(const derp_wl_t *w)
 {
@@ -97,6 +103,19 @@ static inline void derp_wl_set_up(derp_wl_t *w)
     __atomic_store_n(&w->connected, true, __ATOMIC_RELEASE);
 }
 
+/* One more wait of `ms` for the lock: fed while the wait's total stays
+ * under fed_max_ms; past it, said once and no more feeds. */
+static inline void derp_wl_waited(uint32_t *total, uint32_t ms, uint32_t fed_max_ms)
+{
+    if (*total >= fed_max_ms) return;
+    *total = ms > fed_max_ms - *total ? fed_max_ms : *total + ms;
+    if (*total < fed_max_ms) {
+        derp_wl_feed();
+    } else {
+        derp_wl_overdue(*total);
+    }
+}
+
 /* A writer's first step, unlocked: the conn it sets out for (`*gen`, read
  * before `connected`) and whether that one takes frames. */
 static inline bool derp_wl_admits(const derp_wl_t *w, uint32_t *gen)
@@ -106,12 +125,15 @@ static inline bool derp_wl_admits(const derp_wl_t *w, uint32_t *gen)
 }
 
 /* A writer's turn on conn `gen`: the lock, waited for in `slice_ms`
- * slices with a feed after each, or one try with no_wait. A wait ends
- * without the lock once that conn is closing or replaced. */
+ * slices with a feed after each (derp_wl_waited), or one try with
+ * no_wait. A wait ends without the lock once that conn is closing or
+ * replaced. */
 static inline derp_wl_turn_t derp_wl_acquire(derp_wl_t *w, uint32_t gen,
-                                             bool no_wait, uint32_t slice_ms)
+                                             bool no_wait, uint32_t slice_ms,
+                                             uint32_t fed_max_ms)
 {
     void *const lock = w->lock;
+    uint32_t waited = 0;
     for (;;) {
         if (derp_wl_take(lock, no_wait ? 0u : slice_ms)) {
             if (derp_wl_up(w) && derp_wl_gen(w) == gen) return DERP_WL_HELD;
@@ -120,7 +142,7 @@ static inline derp_wl_turn_t derp_wl_acquire(derp_wl_t *w, uint32_t gen,
         }
         if (!derp_wl_up(w) || derp_wl_gen(w) != gen) return DERP_WL_CLOSED;
         if (no_wait) return DERP_WL_BUSY;
-        derp_wl_feed();
+        derp_wl_waited(&waited, slice_ms, fed_max_ms);
     }
 }
 
@@ -144,17 +166,19 @@ static inline bool derp_wl_write_failed(derp_wl_t *w)
 
 /* derp_client_close's wait, on the only task that closes: refuse new
  * frames, let a writer mid-frame end it within grace_ms, then cut `io`
- * (NULL: no conn) and wait for the lock in slice_ms slices, feeding.
- * Returns with the lock held — always — and whether a writer was cut. */
-static inline bool derp_wl_close_lock(derp_wl_t *w, void *io,
-                                      uint32_t grace_ms, uint32_t slice_ms)
+ * (NULL: no conn) and wait for the lock in slice_ms slices, fed as in
+ * derp_wl_acquire. Returns with the lock held — always — and whether a
+ * writer was cut. */
+static inline bool derp_wl_close_lock(derp_wl_t *w, void *io, uint32_t grace_ms,
+                                      uint32_t slice_ms, uint32_t fed_max_ms)
 {
     void *const lock = w->lock;
     __atomic_store_n(&w->connected, false, __ATOMIC_RELEASE);
     if (derp_wl_take(lock, grace_ms)) return false;
-    derp_wl_feed();
+    uint32_t waited = 0;
+    derp_wl_waited(&waited, grace_ms, fed_max_ms);
     if (io != NULL) derp_wl_cut(io);
-    while (!derp_wl_take(lock, slice_ms)) derp_wl_feed();
+    while (!derp_wl_take(lock, slice_ms)) derp_wl_waited(&waited, slice_ms, fed_max_ms);
     return true;
 }
 
