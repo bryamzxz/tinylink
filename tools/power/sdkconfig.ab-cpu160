@@ -1,0 +1,7 @@
+# A/B (round 1.3.7): CPU at 160 MHz instead of 240 — at boot and as the DFS
+# maximum (main.c configure_pm takes CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ). 80
+# and 160 MHz both run from the 320-MHz PLL, 240 from the 480-MHz one, so
+# every DFS step between 80 and the max no longer changes the PLL
+# (docs/esp32/REFERENCE.md §5.1). CPU-bound work takes 1.5× as long
+# (X25519 ~13 → ~20 ms per handshake, AEAD ~390 → ~590 µs per MTU frame).
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_160=y

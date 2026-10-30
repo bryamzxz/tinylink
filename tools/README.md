@@ -101,6 +101,31 @@ CMD=$(python -c "import json;print([e['command'] for e in json.load(open('$B/com
 python tools/iram_access_check.py --objdump xtensa-esp32-elf-objdump --section .iram.bss $B/neg.o
 ```
 
+## `power/`
+
+sdkconfig fragments for the steady-state power work (round 1.3.7). Each
+is stacked after `sdkconfig.defaults`; none is meant for production as
+is.
+
+| fragment | what |
+|---|---|
+| `sdkconfig.power-diag` | `CONFIG_TINYLINK_POWER_DIAG=y`: three `pwr diag:` lines in each 60-s stack diag (light-sleep residency, sleeps/s by what ended them, sleep-length bins, RTOS-tick drift, CPU per task; format in `components/tinylink/src/pwr_diag.h`) |
+| `sdkconfig.ab-wifi-active20` | radio awake 20 ms instead of 50 after each frame under modem sleep |
+| `sdkconfig.ab-maxmodem-li3` | `WIFI_PS_MAX_MODEM`, listen interval 3, instead of `MIN_MODEM` |
+| `sdkconfig.ab-tcp-tmr500` | lwIP TCP timer 500 ms instead of 250 (initial RTO 1–2 s) |
+| `sdkconfig.ab-pm-iram` | `PM_SLP_IRAM_OPT` + `PM_RTOS_IDLE_OPT` |
+| `sdkconfig.ab-cpu160` | 160 MHz instead of 240 (boot and DFS max) |
+| `sdkconfig.ab-idle2` | light sleep from 2 idle ticks instead of 3 |
+| `sdkconfig.ab-txpower13` | Wi-Fi TX power cap 13 dBm instead of 20 |
+
+A measured variant is the diag fragment plus one A/B fragment, in a
+fresh build dir:
+
+```bash
+idf.py -B work/artifacts/ab -D SDKCONFIG=work/artifacts/ab/sdkconfig \
+    -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;tools/power/sdkconfig.power-diag;tools/power/sdkconfig.ab-wifi-active20" build
+```
+
 ## `credentials.csv.example`
 
 Template consumed by `nvs_provision.py`. **Never** commit a populated copy

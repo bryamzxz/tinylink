@@ -242,6 +242,35 @@ menu "tinylink application"
             cadence of Tailscale long-poll reconnects so the freshest
             endpoint is in HostInfo when the next /machine/map fires.
 
+    menu "Steady-state power A/B (round 1.3.7)"
+
+        config TINYLINK_WIFI_PS_MAX_MODEM
+            bool "Steady-state modem sleep: MAX_MODEM (listen interval) instead of MIN_MODEM"
+            default n
+            help
+                A/B knob, off in production (tools/power/). The station
+                switches from WIFI_PS_NONE to modem sleep once the WG
+                session is up (app_wifi.c). MIN_MODEM wakes for every DTIM
+                beacon; MAX_MODEM wakes every TINYLINK_WIFI_LISTEN_INTERVAL
+                beacons instead, so with a DTIM-1 AP it takes a third of
+                the beacon wakes. Unicast frames for the station wait at
+                the AP up to one listen interval (~307 ms at 3); broadcast
+                and multicast frames sent at a DTIM the station sleeps
+                through are lost — on this LAN that is the router's ARP
+                requests, which the periodic gratuitous ARP
+                (CONFIG_LWIP_ESP_GRATUITOUS_ARP, 60 s) and the station's
+                own traffic every 5 s make up for. The listen interval
+                goes into the association request, so an AP may size its
+                buffering by it or refuse it.
+
+        config TINYLINK_WIFI_LISTEN_INTERVAL
+            int "Listen interval (beacon intervals)"
+            depends on TINYLINK_WIFI_PS_MAX_MODEM
+            default 3
+            range 1 10
+
+    endmenu
+
     menu "Telemetry (M3)"
 
         config TINYLINK_TELEMETRY_ENABLE
