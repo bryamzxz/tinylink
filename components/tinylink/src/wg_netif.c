@@ -2363,24 +2363,6 @@ esp_err_t wg_netif_start(const struct wg_netif_peer_config *peer)
     if (!g.initialized) return ESP_ERR_INVALID_STATE;
     if (peer == NULL) return ESP_ERR_INVALID_ARG;
 
-    /* Precompute the NaCl-box shared key for the direct DISCO RX hot
-     * path. Done here (not at init time) because the peer DiscoKey is
-     * peer config, not local config. If the X25519 yields zero (peer
-     * pub is low-order) we mark the cache invalid and fall through to
-     * the per-frame compute path — the same path also handles bringups
-     * that don't pass a DiscoKey at all (has_peer_disco_pub == false).
-     * Computed outside g.lock, like wg_netif_update_peer_keys. */
-    uint8_t k[WG_KEY_LEN];
-    bool    k_ok = false;
-    if (peer->has_peer_disco_pub) {
-        k_ok = nacl_box_compute_shared(k, peer->peer_disco_pub,
-                                       g.local.disco_priv) == 0;
-        if (!k_ok) {
-            ESP_LOGW(TAG,
-                "peer_disco_pub low-order; shared-K cache disabled");
-        }
-    }
-
     /* Under g.lock (round 1.3.5): the DERP supervisor connects at boot
      * now, so its task is live while this runs and reads g.peer under
      * g.lock (wg_netif_inject_packet's source check, the relayed-DISCO
@@ -2389,13 +2371,11 @@ esp_err_t wg_netif_start(const struct wg_netif_peer_config *peer)
     xSemaphoreTake(g.lock, portMAX_DELAY);
     memcpy(&g.peer, peer, sizeof(*peer));
     rebuild_peer_sockaddr();
-    if (k_ok) memcpy(g.peer_disco_shared_k, k, WG_KEY_LEN);
-    g.peer_disco_shared_k_valid = k_ok;
+    g.peer_disco_shared_k_valid = false;   /* computed after the INIT, below */
     /* Nothing proven yet: the first INIT goes direct + DERP, and the
      * netmap-time prepunch pongs (or wg_rx's first ping) confirm. */
     wg_path_init(&g.path, now_us(), peer->has_peer_disco_pub);
     xSemaphoreGive(g.lock);
-    tl_secure_zero(k, sizeof(k));
 
     g.handshake_attempt = 0;
     g.rekey_attempt = 0;
@@ -2409,6 +2389,34 @@ esp_err_t wg_netif_start(const struct wg_netif_peer_config *peer)
     const int kick_rc = kick_off_handshake();
     xSemaphoreGive(g.hs_lock);
     if (kick_rc != 0) return ESP_FAIL;
+
+    /* Precompute the NaCl-box shared key for the DISCO hot paths (direct
+     * RX, path pings, the relayed gate). Done here (not at init time)
+     * because the peer DiscoKey is peer config, not local config — and,
+     * since round 1.3.7, after the INIT: its X25519 (~12.5 ms) went
+     * ahead of the handshake's three on every boot (netmap → INIT 50 ms
+     * on the 1.3.6 sensor logs). Nothing reads K before this: wg_rx is
+     * spawned below, relayed DISCO is dropped until the caller marks the
+     * data plane started, path pings come from wg_rx / app frames, and
+     * a key update runs on the caller's task. If the X25519 yields zero
+     * (peer pub is low-order) the cache stays invalid and the per-frame
+     * compute path takes over — the same path also handles bringups
+     * that don't pass a DiscoKey at all (has_peer_disco_pub == false).
+     * Computed outside g.lock, like wg_netif_update_peer_keys. */
+    if (peer->has_peer_disco_pub) {
+        uint8_t k[WG_KEY_LEN];
+        const bool k_ok = nacl_box_compute_shared(k, peer->peer_disco_pub,
+                                                  g.local.disco_priv) == 0;
+        if (!k_ok) {
+            ESP_LOGW(TAG,
+                "peer_disco_pub low-order; shared-K cache disabled");
+        }
+        xSemaphoreTake(g.lock, portMAX_DELAY);
+        if (k_ok) memcpy(g.peer_disco_shared_k, k, WG_KEY_LEN);
+        g.peer_disco_shared_k_valid = k_ok;
+        xSemaphoreGive(g.lock);
+        tl_secure_zero(k, sizeof(k));
+    }
 
     BaseType_t ok = xTaskCreate(rx_task, "wg_rx",
                                 WG_RX_TASK_STACK_BYTES, NULL,
