@@ -1370,6 +1370,7 @@ static int stream_chunk_cb(const uint8_t *data, size_t len, void *ctx)
 /* The endpoint push riding with the stream has its outcome (round
  * 1.3.7, B1): the push's own log line, at the time it lands — the stream
  * goes on — then the caller's on_push. */
+#if CONFIG_TINYLINK_CONTROL_PUSH_PIPELINE
 static void push_side_done(const h2_side_result_t *r, void *ctx)
 {
     const mapreq_push_fn on_push = *(const mapreq_push_fn *)ctx;
@@ -1393,6 +1394,7 @@ static void push_side_done(const h2_side_result_t *r, void *ctx)
     on_push(status, h2_rate_limit_wait_ms(status, r->retry_after_present,
                                           r->retry_after_s, esp_random()));
 }
+#endif
 
 static esp_err_t run_stream_in(ts2021_conn_t *conn,
                                const tinylink_keys_t *keys,
@@ -1420,11 +1422,14 @@ static esp_err_t run_stream_in(ts2021_conn_t *conn,
     int status = 0;
     esp_err_t err = ESP_ERR_INVALID_SIZE;
     if (on_push != NULL) {
+#if CONFIG_TINYLINK_CONTROL_PUSH_PIPELINE
         /* The endpoint push goes as a second HTTP/2 stream ahead of the
          * map stream, in the same burst (round 1.3.7, B1) — upstream's
          * updateRoutine runs its lite update alongside the poll the same
          * way. Its body sits in the element area: h2_post_json_stream_side
-         * sends it whole before the first response byte can land there. */
+         * sends it whole before the first response byte can land there.
+         * Off by default: tailscale.com later ended such a connection's
+         * map stream cleanly and stalled the next poll (Kconfig help). */
         const int push_len = build_request_body(keys, /*stream=*/false,
                                                 /*omit_peers=*/true,
                                                 (char *)buf, TL_CTRL_REQ_CAP);
@@ -1435,6 +1440,7 @@ static esp_err_t run_stream_in(ts2021_conn_t *conn,
                                        push_side_done, &on_push,
                                        (const uint8_t *)body, (size_t)body_len,
                                        &status, stream_chunk_cb, &s);
+#endif
         if (err == ESP_ERR_INVALID_SIZE) {
             /* A server window under the push's size (never seen), or one
              * stream at a time: push, then the stream, one after the

@@ -317,6 +317,16 @@ the sensor.
   `endpoint push: HTTP 200 (with the map stream)`. Tests: `test_h2_core`
   +31, `test_h2_interop` +12 (nghttp2's server: answered first /
   mid-stream / never, RST, 429, the deadline and its doubling).
+  **Off by default after the hardware runs** (`CONFIG_TINYLINK_CONTROL_PUSH_PIPELINE`,
+  default n): against tailscale.com the map stream of both such boot
+  connections was later ended cleanly by the server (h2 END_STREAM at
+  229 s and 645 s — never on 1.3.6, which pushed first: 0 clean ends in
+  its soaks), and the next poll got no answer for 120 s, the one after
+  it its netmap 26–55 s late (~1.3 s normally). A host probe of the
+  reconnect (`h2_client` / `h2_core` / `ts2021_client` against nghttp2,
+  55 checks) found no client fault, so the server is reacting to the
+  pair; the push goes first again and the stream after it on the same
+  connection (the sequential path above), −0.2 s of the boot given back.
 - **B2 — Noise DH while Wi-Fi associates.** `tinylink_preload` (main.c,
   between `app_wifi_start` and `app_wifi_wait_connected`: RF on, so
   `esp_fill_random` is a TRNG) derives the three public keys (3 X25519,
