@@ -897,7 +897,22 @@ The 1.3.6 `ota_0` backup from round 1.3.7 stays the rollback image.
   median ~6.6 s (3.8–8.7). One boot lost both TCP conns for ~20 s right
   after the association and came up at 52 s on the fixed 30-s register
   retry — the ladder above.
-- **Soak (`24f1d14`):** running.
+- **Soak (`24f1d14`, 161 min, cut to flash 1.3.9):** 0 resets / panics
+  / WDT / brown-outs, **0 RX-stale**, 0 roams; first boot got-ip 1.62 s,
+  netmap 7.74 s (its 26 KB body took 5.1 s after the HEADERS — round
+  1.3.9 times it), WG up 7.89 s. 90 rekeys (one needed a retry, answered
+  in 70 ms). Path selection: 4 lapses — three doubts settled by the
+  peer's WireGuard 0.1–0.6 s after the doubt handshake, one undelivered
+  (the peer answered only DERP copies; 9 frames re-sent via DERP behind
+  the doubt INIT, direct re-confirmed by a pong 20.2 s later), 0 dead.
+  One long-poll end: the boot connection's FIN at 397 s (the known
+  tailscale.com pattern), reconnect in 0.78 s, netmap 3 s later; the
+  3 E lines are that end. Telemetry 1 940 samples, the only failure the
+  boot's first (fixed in 1.3.9). heap_free min **154 892 B**, largest
+  block 110 592 B; stack lows (B free) `tinylink_lp` 4 264 of 7 168,
+  `tinylink_derp` 4 724 of 8 192, `wg_rx` 3 988 of 8 192, `wg_tx`
+  2 760 of 5 120, `tinylink_tlm` 2 616 of 4 608, `esp_timer` 3 032 of
+  4 608.
 
 ### Optimization round 1.3.7 — Wi-Fi association, boot control path, steady-state power (branch `feat/opt-1.3.7`)
 
