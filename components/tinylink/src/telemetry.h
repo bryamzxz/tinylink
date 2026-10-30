@@ -11,7 +11,8 @@
 // Since 1.3.2 the same task also runs the periodic STUN re-probe
 // (tinylink_stun_reprobe_poll, formerly its own 3 KiB task) and the 60-s
 // housekeeping (stack diag, NVS time floor, since 1.3.5 the address
-// cache), so it exists in every build: with
+// cache, since 1.3.7 the application's tinylink_set_persist_hook — the
+// Wi-Fi association hint), so it exists in every build: with
 // CONFIG_TINYLINK_TELEMETRY_ENABLE=n it does only those.
 
 #pragma once
