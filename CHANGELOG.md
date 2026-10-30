@@ -7,6 +7,142 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Optimization round 1.3.8 (in progress, branch `feat/opt-1.3.8`)
+
+#### TLS handshake (`feat/r138-tls`)
+
+The DERP TLS full handshake was on the boot's critical path: on the
+1.3.7 boots the DERP login landed at got-ip +1.8–2.2 s, the netmap at
++1.7 s, so half the boots' first WireGuard INIT waited for DERP. In the
+logs a full handshake took 1.72 s: 1.15 s from the connect attempt to
+`Certificate validated` (two ~60-ms round trips plus the chain verify),
+0.57 s from there to `TLS up` (one round trip plus the ServerKeyExchange
+verify and both ECDHE halves). Image 731 952 → **735 200 B (+3 248)**;
+static DRAM 58 116 → 58 292 B (+176), IRAM ±0, RTC slow +1 140 B. Host
+suite 2 092 → **2 164 OK** (CI floor 2 164), ASan + UBSan clean, 0
+warnings. Static stack worst cases unchanged (`tinylink_derp` 5 248 /
+8 192, `tinylink_lp` 5 168 / 7 168); the DERP connect subtree 4 400 →
+4 352 B, `ts2021_connect` 4 832 unchanged. Not yet on the sensor.
+
+- **T1 — what a full handshake verifies.** `openssl s_client`,
+  2026-10-30, derp16b and controlplane alike. To mbedTLS's default offer
+  (ECDHE-ECDSA suites listed) both serve leaf P-256 ← YE2 / YE1 (P-384) ←
+  Root YE (P-384) ← ISRG Root X2 (P-384, cross-signed by X1, RSA-4096),
+  plus on DERP the Ed25519 `derpkey…` meta certificate (skipped by
+  mbedTLS: unknown signature algorithm), ServerKeyExchange
+  ecdsa_secp256r1_sha256, ECDHE X25519. mbedTLS walks the served chain
+  to its top (the bundle callback only anchors the last link), so the
+  client does three P-384 ECDSA verifies, one RSA-4096 (X2 ← X1 from the
+  bundle), one P-256 (the ServerKeyExchange) and two X25519. Cost per
+  primitive from `CONFIG_TINYLINK_BENCH_TLS` on Espressif QEMU with
+  `-icount shift=0` (k-instructions; the in-tree X25519's 2 436 matches
+  the 2.43 M of 1.3.3, i.e. 12.55 ms on the chip, CPI 1.24; the RSA unit
+  is emulated with zero latency), 1.3.7 configuration → 1.3.8:
+  P-384 verify 38 079 → 47 317 (software multiplication, below); P-256
+  verify 20 722 → 21 325; RSA-2048 verify 899 → 580; RSA-4096 4 213 →
+  2 620; whole ECDSA chain through the bundle 118 789; whole RSA chain
+  9 749 → 6 188; X25519 keygen + shared 9 014 + 9 021 (mbedTLS) → 2 436 +
+  2 437 (in-tree); ECDHE P-256 4 722 + 13 440, P-384 8 064 + 24 586. The
+  client's handshake crypto (chain parse + verify, ServerKeyExchange,
+  ECDHE): **157.7 M → 11.7 M instructions (−93 %)**, ≈ 0.81 s → 60 ms at
+  CPI 1.24 plus the RSA unit's own time; on the chip the 1.3.7 path took
+  ≈ 1.5 s, so the unit's latency was ≈ 0.5 s of it.
+- **ECDHE-RSA offered first (`src/tls_offer.{c,h}`,
+  `CONFIG_TINYLINK_TLS_RSA_FIRST=y`).** Both servers pick their
+  certificate from the ClientHello (Go autocert's supportsECDSA): with no
+  ECDHE-ECDSA suite listed they serve leaf RSA-2048 ← YR2 (RSA-2048) ←
+  Root YR (RSA-4096) ← ISRG Root X1 (in the common bundle) and sign the
+  ServerKeyExchange rsa_pkcs1_sha256; ECDHE stays X25519, records
+  AES-128-GCM. The DERP, control (:443) and TOFU `/key` connects offer
+  TLS_ECDHE_RSA_WITH_AES_{128,256}_GCM only: four RSA public-exponent
+  operations instead of four ECDSA verifies. A handshake failure on that
+  offer (an ECDSA-only server, a chain the bundle does not anchor —
+  esp-tls `ESP_ERR_MBEDTLS_SSL_HANDSHAKE_FAILED`, not a TCP failure or a
+  timeout) redials at once with the full mbedTLS offer and no session; a
+  success there makes that host:port take the full offer directly for 6
+  h. A saved session is offered under the suite family it was made in.
+  Log: `TLS up to … (full handshake, RSA offer, N ms)`. **Security:** the
+  chain is verified in full by the same code against the same bundle
+  (names, dates, CA and key-usage bits, path length, the bundle anchor);
+  forward secrecy and record protection are unchanged (X25519,
+  AES-128-GCM). The server is authenticated by RSA-2048 (≈ 112-bit,
+  NIST SP 800-57: acceptable through 2030) instead of P-256 (≈ 128-bit),
+  the strength Let's Encrypt issues for RSA; both chains end at ISRG
+  roots. An attacker can only force the full offer (by failing the RSA
+  handshake), which is the pre-1.3.8 behaviour. The ts2021 traffic on
+  :443 is Noise IK inside (pinned key), DERP's login is a NaCl box to the
+  server key: TLS is the outer layer of both. No pinning.
+- **X25519 on the in-tree Curve25519 (`src/tls_x25519.c`,
+  `CONFIG_TINYLINK_TLS_X25519_INTREE=y`).** The link wraps
+  `mbedtls_ecp_mul_restartable` (`-Wl,--wrap`; ecdh.c's two calls go to
+  the wrapper, ecp.c's internal ones keep the original) and diverts
+  Curve25519 to the constant-time fiat32 code: same argument checks
+  (`mbedtls_ecp_check_privkey` / `_pubkey`), same R = (X, Z = 1), an
+  all-zero result an error. −13.2 M instructions per full handshake
+  (−19.9 M against software multiplication). The bench checks both
+  halves (d·9, d·Q) against mbedTLS's ladder: 16/16 equal. +240 B.
+- **Bignum multiplication in software, RSA exponentiation on the
+  accelerator (`CONFIG_TINYLINK_TLS_MPI_MUL_SW=y`, `mbedtls_user_config.h`
+  undefines `MBEDTLS_MPI_MUL_MPI_ALT`).** With `HARDWARE_MPI` alone every
+  multiplication goes to the RSA unit padded to ≥ 512 bits, with a lock,
+  a clock enable + reset and DPORT copies per call. On the RSA path the
+  R² mod N of each fresh key (a long division) multiplies the 4096-bit
+  modulus by one limb per step — two padded 2048-bit unit multiplications
+  each: RSA chain 9 749 → 6 188 k-instructions before the unit's latency
+  is even counted. The ECDSA fallback path goes 38 → 47 M per P-384 in
+  instructions but sheds the unit's per-call latency; the on-chip bench
+  decides it (`tools/tls_bench/sdkconfig.mul-hw`). `HARDWARE_MPI=n`
+  (D10's A/B) is rejected: RSA chain 48.9 M (software exponentiation).
+- **Measured and left alone.** `MBEDTLS_ECP_WINDOW_SIZE`
+  (`CONFIG_TINYLINK_TLS_ECP_WINDOW`, A/B knob, default 4): P-384 verify
+  w=2 +11 %, w=3 +2.8 %, w=5..7 −0.3 % for +3.5 KB transient heap (5.8 →
+  9.2 KB); P-256 never goes past 4. `ECP_FIXED_POINT_OPTIM` off: P-384
+  +45 %, P-256 +41 %, −5.6 KB — kept for the fallback path and P-256/384
+  ECDHE. Group order: both servers already take X25519 first. Signature
+  algorithm order: the ServerKeyExchange algorithm follows the
+  certificate's key, only the certificate choice moves it (above).
+- **TLS sessions across warm resets (`src/tls_rtc.h`, `tls_resume.c`,
+  `CONFIG_TINYLINK_TLS_RESUME_RTC=y`).** Every kept session is also
+  serialized by mbedTLS (`mbedtls_ssl_session_save`: master secret,
+  ticket, suite, server-certificate digest, behind a version /
+  configuration header `mbedtls_ssl_session_load` checks) into one of two
+  564-B records in RTC slow memory; the first connect to that host:port
+  after a software / panic / watchdog reset resumes (157 ms on the
+  sensor, 1.3.6 soak) instead of a full handshake. Same bounds as the RAM
+  copy: host:port, 24 h of master-secret age counted on the RTC timer
+  (which runs through those resets), a failed connect clears it, plus an
+  FNV checksum against the garbage RTC memory holds after a power-on or
+  an EN reset, and one restore per record per boot. Log: `tls_resume: TLS
+  session for … from RTC memory (master secret N s old)`. +2 272 B
+  (mbedTLS's session (de)serializer). **NVS rejected:** NVS is not
+  encrypted here; a TLS 1.2 master secret at rest there would let anyone
+  holding the board decrypt every recorded connection resumed from it
+  for up to 24 h (resumption has no fresh ECDHE), every keep would be a
+  flash write (a sector erase stalls both CPUs 70–500 ms), and after the
+  RSA offer a cold boot's full handshake costs ~0.1 s more than a resumed
+  one.
+- **Rejected after the RSA offer.** Anchoring the ECDSA chain at the
+  served X2 (bundle name + key) to skip its X1 cross-sign: one RSA-4096,
+  2.9 M instructions, ECDSA path only. Memoizing verified signatures
+  (digests of key, hash and signature, in RAM / RTC / NVS — semantically
+  pure): would save the chain verify after the first handshake, 6.2 M
+  instructions now — not worth a flash writer. A faster P-256 (p256-m)
+  for the ServerKeyExchange: moot with an RSA one.
+- **Boot bench `CONFIG_TINYLINK_BENCH_TLS` (default n,
+  `src/tinylink_bench_tls.c`, `tools/tls_bench/`).** Runs first thing in
+  bringup(), before NVS and Wi-Fi, then the firmware boots as usual:
+  single verifies from the served certificates (P-384, P-256, RSA-2048,
+  RSA-4096 ×2, each key parsed fresh), each whole chain through the
+  bundle callback, ECDHE X25519 (in-tree and mbedTLS, cross-checked),
+  P-256, P-384, best of 3, heap peak per operation, stack high-water
+  mark; `bench-tls:` lines (the source lists them). One image per
+  configuration (`sdkconfig.bench` + `sdkconfig.mul-hw` / `mpi-off` /
+  `win*` / `nofp`; `sdkconfig.qemu` for the emulator). Vectors:
+  `tools/tls_bench/gen_vectors.py`, public data only.
+- Expected on the sensor: a full DERP handshake ≈ 3 round trips + ~0.1 s
+  (was 1.45–4.19 s), the boot's DERP login at ≈ got-ip +0.5 s (ahead of
+  the netmap), the same on every reconnect that cannot resume.
+
 ### Optimization round 1.3.7 (in progress, branch `feat/opt-1.3.7`)
 
 #### Wi-Fi association (`feat/r137-wifi`)
