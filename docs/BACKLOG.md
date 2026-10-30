@@ -64,6 +64,32 @@ the sensor logs in CHANGELOG.md.
   whether the 600-s bound (`CONFIG_TINYLINK_WARM_START_MAX_S`) and the
   30-day record age are right.
 
+## Cryptography (post-quantum, before 2031)
+
+- **What RSA-first changes, and what it does not.** Since 1.3.8 the TLS
+  client offers the ECDHE-RSA suites first (TLS 1.2), so the DERP and
+  control :443 servers present their RSA chains. That choice only
+  selects the servers' certificate signatures: we verify them (RSA
+  verify is cheap on the chip, 976 → 66 ms of handshake CPU), and the
+  key exchange is X25519 ECDHE in both offers. A server without an RSA
+  chain gets the full offer (`tls_offer_fallback`). Authentication only
+  has to hold during the handshake, within a certificate's ≤ 90-day
+  life, so the 112-bit vs 128-bit difference and a future quantum
+  forgery do not reach past sessions.
+- **Harvest now, decrypt later is the key exchange.** All of it is
+  X25519: TLS (outer layer for DERP and the :443 fallback), Noise IK to
+  control (:80, the main path, control key pinned), and WireGuard to
+  the peers (end to end, inside DERP). A hybrid X25519MLKEM768 for TLS
+  needs TLS 1.3 (compiled out today) and an ML-KEM implementation
+  (mbedTLS 3.6 has none). Noise and WireGuard are Tailscale's protocol:
+  post-quantum there follows upstream.
+- **NIST IR 8547 calendar.** The 2024 draft deprecates the 112-bit
+  parameters (RSA-2048) after 2030 and disallows classical RSA / ECDSA
+  after 2035. The owner reports that the final (2026-10-27) deprecates
+  P-256 and RSA-3072 after 2030 as well; check the published text. When
+  the WebPKI chains move (ML-DSA, new hierarchies), the client must
+  verify them: TLS stack and certificate bundle update.
+
 ## Wi-Fi
 
 - **PMF comeback on every quick reboot (+1.1 s).** The AP still holds
