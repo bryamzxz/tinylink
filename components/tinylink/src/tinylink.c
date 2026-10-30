@@ -211,8 +211,6 @@ esp_err_t tinylink_init(void)
 {
     /* Task-WDT feed for every blocking TLS poll (see tl_wdt.h). */
     tls_io_set_poll_hook(tl_wdt_feed);
-    /* Scrub unusable warm-reset TLS sessions before any TLS (round 1.3.8). */
-    tls_resume_boot();
     esp_err_t err = ESP_OK;
     if (!s_keys_loaded) {
         err = keys_load_or_generate(&s_keys);
@@ -2090,6 +2088,14 @@ void tinylink_bootstat_record(void)
 {
     if (s_bootstat_done) return;
     s_bootstat_done = true;
+    /* The warm-reset TLS sessions' boot sweep (round 1.3.8, tls_rtc.h)
+     * belongs here too, before anything can restart: a boot that is not
+     * a warm reset must scrub them now. Left to the first TLS connect, a
+     * cold boot that never got that far (no Wi-Fi: bringup fails, and 60 s
+     * later esp_restart) would hand them to a software-reset boot, which
+     * restores — a secret from before an RTC-timer restart, its age
+     * counted from that restart (review 138b). */
+    tls_resume_boot();
     const bool kept = tl_bootstat_count(&s_bootstat, (int)esp_reset_reason());
     ESP_LOGI(TAG, "boots=%u (brown-out %u, panic %u, task WDT %u, int WDT %u)%s",
              (unsigned)s_bootstat.boots, (unsigned)s_bootstat.brownout,
