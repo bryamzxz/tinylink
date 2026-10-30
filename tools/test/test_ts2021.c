@@ -1607,6 +1607,76 @@ static void test_recycle_marked(void)
     ts2021_close(&s_conn);
 }
 
+/* Round 1.3.7, B2: msg1's DH work ahead of the connect — ss once per key
+ * pair, the boot's precomputed ephemeral for one handshake only. */
+static void test_precompute(void)
+{
+    static const uint8_t zero[32] = { 0 };
+    uint8_t req[1024];
+
+    /* the cache is keyed to this pair after any connect, ss kept, no e */
+    boot_reset();
+    script(ESP_OK, RP_OK, false, 1, RP_OK);
+    esp_err_t rc = dial(true);
+    check("pre_ss_kept_after_connect",
+          rc == ESP_OK && s_pre.keyed && s_pre.pre.have_ss && !s_pre.pre.have_e &&
+          memcmp(s_pre.machine_pub, s_machine_pub, 32) == 0 &&
+          memcmp(s_pre.control_pub, s_control_pub, 32) == 0);
+    ts2021_close(&s_conn);
+
+    /* the cached ss is what msg1 uses: a corrupted one fails msg2 */
+    uint8_t good_ss[32];
+    memcpy(good_ss, s_pre.pre.ss, 32);
+    s_pre.pre.ss[0] ^= 1;
+    boot_reset();
+    script(ESP_OK, RP_OK, false, 1, RP_OK);
+    rc = dial(true);
+    check("pre_ss_is_used", rc != ESP_OK && !s_conn.connected);
+    memcpy(s_pre.pre.ss, good_ss, 32);
+
+    /* the precomputed ephemeral: taken by the next handshake, scrubbed */
+    ts2021_precompute(kMachinePriv, s_machine_pub, s_control_pub);
+    const bool armed = s_pre.pre.have_e && s_pre.pre.have_ss;
+    uint8_t e_pub[32];
+    memcpy(e_pub, s_pre.pre.e_pub, 32);
+    boot_reset();
+    script(ESP_OK, RP_OK, false, 1, RP_OK);
+    rc = dial(true);
+    size_t rn = srv_drain(req, sizeof(req));
+    check("pre_e_taken_once",
+          armed && rc == ESP_OK && request_ok(req, rn) && !s_pre.pre.have_e &&
+          memcmp(s_pre.pre.e_priv, zero, 32) == 0 && memcmp(s_pre.pre.es, zero, 32) == 0 &&
+          memcmp(s_pre.pre.e_pub, zero, 32) == 0 && memcmp(s_conn.noise.e_pub, e_pub, 32) == 0);
+    ts2021_close(&s_conn);
+
+    /* consumed even when the attempt fails (a :80 that never answers
+     * → :443): the fallback's handshake draws its own */
+    ts2021_precompute(kMachinePriv, s_machine_pub, s_control_pub);
+    boot_reset();
+    script(ESP_OK, RP_REDIRECT, false, 1, RP_OK);
+    rc = dial(true);
+    check("pre_e_single_use_across_fallback", rc == ESP_OK && !s_conn.plain &&
+          !s_pre.pre.have_e && s_pre.pre.have_ss);
+    ts2021_close(&s_conn);
+
+    /* a precompute for another control key is dropped at the connect */
+    uint8_t other[32];
+    curve25519_derive_pub(other, kAttackerPriv);
+    ts2021_precompute(kMachinePriv, s_machine_pub, other);
+    const bool other_keyed = memcmp(s_pre.control_pub, other, 32) == 0 && s_pre.pre.have_e;
+    boot_reset();
+    script(ESP_OK, RP_OK, false, 1, RP_OK);
+    rc = dial(true);
+    check("pre_other_key_rekeyed",
+          other_keyed && rc == ESP_OK && memcmp(s_pre.control_pub, s_control_pub, 32) == 0 &&
+          !s_pre.pre.have_e && s_pre.pre.have_ss && memcmp(s_pre.pre.ss, good_ss, 32) == 0);
+    ts2021_close(&s_conn);
+
+    /* a low-order control key: nothing kept */
+    ts2021_precompute(kMachinePriv, s_machine_pub, zero);
+    check("pre_low_order_nothing_kept", !s_pre.keyed && !s_pre.pre.have_ss && !s_pre.pre.have_e);
+}
+
 int main(void)
 {
     s_build_reply = build_reply_int;
@@ -1632,6 +1702,7 @@ int main(void)
     test_addr_ttl();
     test_request_deadline();
     test_recycle_marked();
+    test_precompute();
     if (s_srv_fd >= 0) close(s_srv_fd);
     if (s_fails == 0) printf("\nALL OK\n");
     return s_fails ? 1 : 0;

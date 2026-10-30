@@ -259,6 +259,102 @@ yet on the sensor.
   "≤ 5 s" comments. Left: the stack-diag snapshot shared with the
   wedge-restart dump (pre-existing; only the dump before `esp_restart`).
 
+#### Boot control path (`feat/r137-boot`)
+
+got-ip → WG session up on the 1.3.6 boots: control conn up 0.42–0.66 s
+(TCP + Noise IK on :80), register, then the endpoint push and the
+streaming MapRequest as two more serial round trips, netmap → first
+INIT 50 ms, with 14 X25519 (~12.5 ms each at 240 MHz, 1.3.3 bench) on
+that path and the DERP login (TLS full handshake 1.45–1.76 s, 3.3 and
+4.2 s outliers) running beside it. Image 725 536 → **728 240 B
+(+2 704)**; static DRAM 57 644 → 58 044 B (+400), IRAM ±0. Host suite
+1 791 → **1 873 OK** (CI floor 1 873), ASan + UBSan clean, 0 warnings.
+Static worst cases (`tools/stack_worst.py`, fixed below): `tinylink_lp`
+5 136 → 5 184 / 7 168, `main` 5 312 → 5 408 / 8 192, `tinylink_derp`
+5 152 → 5 248 / 8 192, `wg_rx` 5 648 → 5 728 / 8 192, the rest
+unchanged. X25519 in a boot up to the first CallMeMaybe (4 peers, 3
+endpoints each, one CMM): 33 → **18**; on the got-ip → session-up
+path 14 → **7**. Expected got-ip → netmap −0.26–0.29 s, → first INIT
+−0.27–0.30 s; session up gains the same unless the DERP login comes
+later (half the projected boots: then the login bounds it). Not yet on
+the sensor.
+
+- **B1 — the endpoint push rides with the map stream.** The push
+  (Stream=false + OmitPeers=true lite update: at capver ≥ 68 a
+  Stream=true MapRequest is read-only, headscale's
+  handleEndpointUpdate takes the same path) took 0.18–0.21 s on the
+  1.3.6 boots before the stream request even left. It now goes as a
+  second HTTP/2 stream in the same burst as the map stream, on the
+  lower ID — upstream's updateRoutine runs its lite updates beside the
+  poll the same way; the server sees the same two requests in the same
+  order. `h2c_request_pair` (`h2_core.c`): a side stream parsed and
+  checked like the main one (status, content-length, windows,
+  RST_STREAM, GOAWAY) but kept off the `h2_io_on_*` hooks; it goes
+  whole or not at all (a small window falls back to push-then-stream).
+  The side runs under the one-shot deadline; a push not answered 200
+  (refused, reset, conn lost) goes again with the next connect's
+  stream. `tinylink_dataplane_start` no longer touches the wire. Log:
+  `endpoint push: HTTP 200 (with the map stream)`. Tests: `test_h2_core`
+  +31, `test_h2_interop` +12 (nghttp2's server: answered first /
+  mid-stream / never, RST, 429, the deadline and its doubling).
+- **B2 — Noise DH while Wi-Fi associates.** `tinylink_preload` (main.c,
+  between `app_wifi_start` and `app_wifi_wait_connected`: RF on, so
+  `esp_fill_random` is a TRNG) derives the three public keys (3 X25519,
+  ~40 ms after got-ip before) and, with a pinned control key, runs
+  `ts2021_precompute`: ss for the boot and one ephemeral + es for the
+  first handshake (`noise_ik_precompute`, `noise_ik_write_msg1_pre`;
+  same msg1 bytes). Expected −~75 ms got-ip → control conn up; every
+  later control connect −1 X25519 (ss kept, keyed by both public keys,
+  scrubbed on change; the ephemeral used once, scrubbed when taken).
+  Log: `sent init in X-Tailscale-Handshake (101 bytes, DH ahead: ss +
+  e)`. Tests: `test_noise_ik` +10, `test_ts2021` +6.
+- **B2 — the first INIT before the DISCO box key.** `wg_netif_start`
+  computed the peer's DISCO K (1 X25519) ahead of the INIT; now after
+  it, before wg_rx exists. netmap → `handshake init sent` 50 → ~37 ms.
+- **B2 — DERP box key once.** The login sealed ClientInfo and opened
+  ServerInfo with K derived twice from the same keys: once now
+  (`derp_login_key`), kept for a reconnect to the same server key
+  (none then), scrubbed on change, low-order key or a ServerInfo that
+  does not open. −12.5 ms per boot login, −25 ms per reconnect. Log:
+  `DERP login OK: server version=2 (box key new|reused)`. Tests:
+  `test_derp` +12.
+- **B2 — relayed DISCO gated before any X25519; one K per peer.**
+  Relayed DISCO was opened with our private key, then checked against
+  the active peer's DiscoKey: one X25519 per frame from any DERP client
+  that knows our NodeKey, two for a PING. The sender key is read off
+  the cleartext header first (`disco_gate`); the peer's frames use the
+  K wg_netif caches. A CallMeMaybe cost 2 + n X25519 (~60 ms of the
+  DERP task; 59 in 30 min of the 1.3.6 soak), now none; the netmap
+  prepunch 12 → 3 (one per peer, none for the active one, ~110 ms of
+  the long-poll task after the first netmap). K copies scrubbed after
+  use. Tests: `test_disco_handler` +11.
+- **B3 — the first INIT waits for the DERP login in flight (≤ 1 s).**
+  An INIT that reaches the peer before our DERP login is answered via
+  DERP into a relay not up yet, and the copy re-queued at the login is
+  the same INIT, a TAI64N replay: 1.3.5 boots with the login ≥ 0.21 s
+  after the INIT came up 1.2–2.2 s after the netmap (8 of 21; two far
+  later), the others 0.16–0.54 s but one. 1.3.6 had the login first by
+  40–390 ms, a margin the earlier netmap eats in two of six boots. The
+  first netmap now waits (static event group) for the outcome of the
+  supervisor's first connect attempt; a failed attempt, later netmaps
+  and reconnects never wait. Log: `first INIT waited N ms for the DERP
+  login`.
+- **B3 — analysed, not changed.** TLS session tickets: esp-tls v5.5.6
+  stores the session after the handshake and offers it on the next
+  connect (`tls_resume.c`, `test_tls_resume`); on the sensor a DERP
+  reconnect in the 1.3.6 soak resumed in 157 ms against 1.45–1.76 s for
+  a full handshake. Control uses :80 at boot (no TLS). The DERP full
+  handshake is the boot's next critical item: derp16b's chain is an
+  ECDSA P-256 leaf under three P-384 signatures (YE2, Root YE, ISRG
+  Root X2) plus the P-256 ServerKeyExchange, all software ECC. Options left for a later round, each with a cost:
+  mbedTLS ECC speed options (image / DRAM), a pinned intermediate
+  (needs a security review), a session kept across reboots in RTC RAM.
+- **`tools/stack_worst.py`: entries sharing a prefix.** Two variant
+  entries with the same prefix shared one node and the second replaced
+  the first's target: the long-poll's one-shot variant analysed only
+  the push. 1.3.6's `tinylink_lp` worst case is 5 136 B (the register's
+  reconnect), not 4 960. Rule for the push callback added.
+
 ### Optimization round 1.3.6 — data-plane path selection (in progress, branch `feat/opt-1.3.6`)
 
 What the 1.3.5 hardware runs showed about the direct path: any

@@ -231,6 +231,68 @@ static void test_client_info_handshake(void) {
                                        cli_priv, other_pub, &ver) == -1);
 }
 
+/* Round 1.3.7, B2: the login's box key, cached per server key. */
+static void test_login_key_cache(void) {
+    uint8_t cli_priv[32], cli_pub[32], srv_priv[32], srv_pub[32], oth_priv[32], oth_pub[32];
+    make_keypair("derp-client-info-cli", cli_priv, cli_pub);
+    make_keypair("derp-client-info-srv", srv_priv, srv_pub);
+    make_keypair("derp-other", oth_priv, oth_pub);
+    derp_login_key_t c;
+    memset(&c, 0, sizeof(c));
+
+    bool computed = false;
+    uint8_t want[32];
+    nacl_box_compute_shared(want, srv_pub, cli_priv);
+    fails += ok("loginkey/first-computes",
+                derp_login_key(&c, cli_pub, cli_priv, srv_pub, &computed) == 0 &&
+                computed && c.valid && memcmp(c.k, want, 32) == 0);
+    fails += ok("loginkey/same-server-reused",
+                derp_login_key(&c, cli_pub, cli_priv, srv_pub, &computed) == 0 &&
+                !computed && memcmp(c.k, want, 32) == 0);
+    /* the bytes of the cached path are the old path's */
+    uint8_t nonce[DERP_NONCE_LEN];
+    for (int i = 0; i < DERP_NONCE_LEN; i++) nonce[i] = (uint8_t)(0x10 + i);
+    uint8_t a[128], b[128];
+    const size_t na = derp_build_client_info(a, sizeof(a), cli_pub, cli_priv, srv_pub, nonce);
+    const size_t nb = derp_build_client_info_k(b, sizeof(b), cli_pub, c.k, nonce);
+    fails += ok("loginkey/clientinfo-same-bytes", na == 104 && nb == na && memcmp(a, b, na) == 0);
+    fails += ok("loginkey/clientinfo-cap", derp_build_client_info_k(b, 100, cli_pub, c.k, nonce) == 0);
+    static const char srv_json[] = "{\"version\":2}";
+    uint8_t sp[DERP_NONCE_LEN + DERP_TAG_LEN + 32];
+    memcpy(sp, nonce, DERP_NONCE_LEN);
+    nacl_box(sp + DERP_NONCE_LEN, (const uint8_t *)srv_json, sizeof(srv_json) - 1, nonce,
+             cli_pub, srv_priv);
+    const size_t sl = DERP_NONCE_LEN + DERP_TAG_LEN + sizeof(srv_json) - 1;
+    int ver = -1;
+    fails += ok("loginkey/serverinfo-opens", derp_parse_server_info_k(sp, sl, c.k, &ver) == 0 &&
+                ver == 2);
+    sp[sl - 1] ^= 1;
+    fails += ok("loginkey/serverinfo-tamper", derp_parse_server_info_k(sp, sl, c.k, &ver) == -1);
+    fails += ok("loginkey/serverinfo-short", derp_parse_server_info_k(sp, 39, c.k, &ver) == -1);
+
+    /* another server key (a new home node), another client key */
+    nacl_box_compute_shared(want, oth_pub, cli_priv);
+    fails += ok("loginkey/other-server-recomputed",
+                derp_login_key(&c, cli_pub, cli_priv, oth_pub, &computed) == 0 && computed &&
+                memcmp(c.k, want, 32) == 0 && memcmp(c.server_pub, oth_pub, 32) == 0);
+    nacl_box_compute_shared(want, oth_pub, srv_priv);
+    fails += ok("loginkey/other-client-recomputed",
+                derp_login_key(&c, srv_pub, srv_priv, oth_pub, &computed) == 0 && computed &&
+                memcmp(c.k, want, 32) == 0);
+    /* a low-order server key: refused, nothing kept */
+    static const uint8_t zero[32] = { 0 };
+    fails += ok("loginkey/low-order-refused",
+                derp_login_key(&c, cli_pub, cli_priv, zero, &computed) == -1 && computed &&
+                !c.valid && memcmp(c.k, zero, 32) == 0);
+    derp_login_key(&c, cli_pub, cli_priv, srv_pub, NULL);
+    derp_login_key_forget(&c);
+    uint8_t z[sizeof(c)];
+    memset(z, 0, sizeof(z));
+    fails += ok("loginkey/forget-scrubs", !c.valid && memcmp(&c, z, sizeof(c)) == 0);
+    fails += ok("loginkey/null-args", derp_login_key(NULL, cli_pub, cli_priv, srv_pub, NULL) == -1 &&
+                derp_login_key(&c, cli_pub, NULL, srv_pub, NULL) == -1);
+}
+
 /* ------------------------------------------------------------------ */
 /* FrameSendPacket / FrameRecvPacket                                  */
 /* ------------------------------------------------------------------ */
@@ -757,6 +819,7 @@ int main(void) {
     test_frame_header_roundtrip();
     test_server_key();
     test_client_info_handshake();
+    test_login_key_cache();
     test_send_recv_packet();
     test_ping_pong();
     test_note_preferred();

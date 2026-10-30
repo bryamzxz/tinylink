@@ -9,7 +9,10 @@
 //
 // Scope — exactly what tinylink's control plane needs:
 //  - client only, one connection, one stream at a time on increasing
-//    odd IDs (register, endpoint push, then the long-poll map stream);
+//    odd IDs (register, then the long-poll map stream) — plus, since
+//    round 1.3.7 (B1), one side stream opened in the same burst ahead
+//    of it (the endpoint push with the map stream), answered inside the
+//    engine: only its :status is kept;
 //  - preface + SETTINGS {HEADER_TABLE_SIZE 0, ENABLE_PUSH 0}, sent
 //    without waiting for the server's (B9); the server's SETTINGS are
 //    applied and ACKed;
@@ -157,7 +160,14 @@ typedef struct {
     bool     blk_error;     /* a stream error was raised in this block */
     hpack_dec_t hpack;
 
-    h2_stream_t s;
+    h2_stream_t s;          /* the request the hooks report on          */
+    /* The side request (h2c_request_pair): its frames are parsed and
+     * checked like the main stream's, but nothing of it reaches the
+     * h2_io_on_* hooks — status lands here, DATA is counted (flow
+     * control, content-length) and dropped. side.closed with
+     * side.final: answered (side.status); without: reset or refused
+     * (side.close_err). */
+    h2_stream_t side;
 
     uint8_t  ctl[H2_CTL_CAP];
     uint8_t  ctl_len;
@@ -191,6 +201,23 @@ int  h2c_start(h2_core_t *h);
  * h2c_pump as WINDOW_UPDATEs arrive. body may be NULL when body_len 0. */
 int  h2c_request(h2_core_t *h, const h2_field_t *fields, size_t n_fields,
                  const uint8_t *body, size_t body_len);
+
+typedef struct {
+    const h2_field_t *fields;
+    size_t            n_fields;
+    const uint8_t    *body;
+    size_t            body_len;
+} h2_req_t;
+
+/* h2c_request with a side request ahead of it in the same burst (round
+ * 1.3.7, B1): the side's HEADERS and its whole body first, on the lower
+ * ID, then req as h2c_request sends it — usually one record for both.
+ * The side request must go out whole now (windows, the lent buffer;
+ * side->body need not outlive the call): if it cannot, nothing is sent
+ * but the staged control frames and H2C_ERR_SIZE comes back with no ID
+ * spent. side NULL = h2c_request. H2C_ERR_STATE also while the previous
+ * side stream is still open. */
+int  h2c_request_pair(h2_core_t *h, const h2_req_t *side, const h2_req_t *req);
 /* Parse received bytes (any split). Consumes all of them; returns
  * H2C_ERR_PROTO on a connection error (GOAWAY already sent). */
 int  h2c_feed(h2_core_t *h, const uint8_t *buf, size_t len);

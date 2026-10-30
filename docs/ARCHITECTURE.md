@@ -38,10 +38,13 @@ primitives we did, see [`SECURITY-MODEL.md`](SECURITY-MODEL.md).
 |                                  own task, parallel to the    |
 |                                  register (1.3.5)             |
 |     tinylink_register loop                                    |
-|     tinylink_dataplane_start  ← waits ≤ 300 ms for STUN, then |
-|                                  Stream=false + OmitPeers=true|
-|                                  lite update with WorkingUDP  |
-|     tinylink_long_poll_start  ← stream=true read-only poll    |
+|     tinylink_dataplane_start  ← waits ≤ 300 ms for STUN,      |
+|                                  queues the endpoint push     |
+|     tinylink_long_poll_start  ← stream=true read-only poll,   |
+|                                  the Stream=false+OmitPeers   |
+|                                  lite update (WorkingUDP) as  |
+|                                  a 2nd HTTP/2 stream with it  |
+|                                  (1.3.7)                      |
 |     (telemetry: started by the first netmap)                  |
 |     (endpoint push: no task — flagged by the STUN reprobe,    |
 |      executed by the long-poll on its next reconnect)         |
@@ -61,9 +64,11 @@ primitives we did, see [`SECURITY-MODEL.md`](SECURITY-MODEL.md).
 |        │                                                      |
 |     register.c        POST /machine/register (Version=138)    |
 |     mapreq.c          POST /machine/map      (Version=138)    |
-|       ├── mapreq_push_endpoints  Stream=false+OmitPeers=true  |
-|       │                          (lite update — only writable |
-|       │                          shape at CapVer ≥ 68)        |
+|       ├── lite update            Stream=false+OmitPeers=true  |
+|       │                          (only writable shape at      |
+|       │                          CapVer ≥ 68): since 1.3.7 a  |
+|       │                          2nd HTTP/2 stream with the   |
+|       │                          map stream's request         |
 |       └── mapreq_run_stream      Stream=true (read-only       |
 |                                   netmap stream); skip_value  |
 |                                   depth-bounded (jsmn_skip.h, |
@@ -191,7 +196,10 @@ and on a solicited pong (direct). The re-sends are the same 148 bytes,
 not new attempts — the responder takes the first copy and drops the rest
 as a TAI64N replay — so new INITs stay one per `REKEY_TIMEOUT`
 (wireguard-go / kernel rule; magicsock queues the INIT on DERP and sends
-to both paths while `bestAddr` is untrusted). Until 1.3.5 a session
+to both paths while `bestAddr` is untrusted). Because a re-send cannot
+recover an answer lost to a relay that was still logging in, the first
+netmap holds the first INIT (since 1.3.7, at most 1 s) while the DERP
+supervisor's first connect attempt runs. Until 1.3.5 a session
 that came up on a DERP-relayed response sent every frame on both paths
 until something authenticated on the UDP socket ("direct path
 confirmed"); since 1.3.6 the path selection below decides. Wake cadence
@@ -384,7 +392,8 @@ anyone bisecting an unrelated regression to before the netstack switch.
    plane advertises is the same NAT mapping the WG keepalives keep
    alive. Without this, the advertised port is for an ephemeral STUN
    socket that closes immediately. Since 1.3.5 the boot probe runs
-   alongside the register and the endpoint push waits ≤ 300 ms for it;
+   alongside the register and the endpoint push (since 1.3.7 sent with
+   the first map stream) waits ≤ 300 ms for it;
    a later or failed probe hands over to the re-probe, which pushes the
    endpoint once the data plane is up (`stun_boot.h` has the socket
    hand-off).
@@ -394,8 +403,10 @@ anyone bisecting an unrelated regression to before the netstack switch.
    a peer's reflexive endpoint is NOT from our handshake destination,
    so the old "drop everything not from peer.endpoint" filter would
    have killed the punch ping.
-3. **Lite endpoint update** — `mapreq_push_endpoints` sends a
-   `Stream=false && OmitPeers=true` MapRequest at boot. Per upstream
+3. **Lite endpoint update** — a `Stream=false && OmitPeers=true`
+   MapRequest at boot; since 1.3.7 a second HTTP/2 stream opened in the
+   same burst as the map stream (`mapreq_run_stream`'s push,
+   `h2c_request_pair`), not a round trip before it. Per upstream
    `controlclient/auto.go:249-251`, that's the only shape modern
    Tailscale.com accepts as writable for Hostinfo / NetInfo /
    Endpoints. The success signal is HTTP 200 with body length 0 (the
@@ -451,9 +462,10 @@ anyone bisecting an unrelated regression to before the netstack switch.
    blocking record read returns `TS2021_ERR_READ_ABORTED` at its next
    30 s socket poll, the stream is dropped (logged as "recycled for
    endpoint push", healthy-stream backoff ≈ 1 s), and right after the
-   reconnect — before the read-only Stream=true cycle claims `s_conn` —
-   `long_poll_task` runs `mapreq_push_endpoints(&s_conn)`: the same
-   sequence bringup runs at boot. The in-place re-register path (M13)
+   reconnect `long_poll_task` sends the push with the read-only
+   Stream=true request, as a second HTTP/2 stream in the same burst
+   (1.3.7; a round trip before the stream until then): the same path
+   the boot's push takes. The in-place re-register path (M13)
    sets the same flag. History: until 2026-09 this was a dedicated
    persistent task (`tinylink_ep_up`, 12 KiB static stack) that opened
    its own ts2021 conn from a stack-local `ts2021_conn_t` (8 648 B)
@@ -464,8 +476,9 @@ anyone bisecting an unrelated regression to before the netstack switch.
    forced NAT rebind) was this overflow. Verified from the compiled
    `entry` frame sizes; removing the task freed 12.6 KiB of BSS.
    Upstream sends its lite update over the shared HTTP/2 client
-   (`controlclient.Auto.updateRoutine`); tinylink's h2_client is one
-   stream per conn, so the recycle is the equivalent.
+   (`controlclient.Auto.updateRoutine`) while the poll runs; tinylink's
+   side stream only opens together with a map stream (the long-poll
+   task sits in the stream's read loop), so the recycle stays.
 10. **Outbound DISCO prober + tx-id binding** (`disco_prober.{c,h}`,
    replaces the deleted `disco_replay.{c,h}` — commit `31de72d`) — NaCl
    box (XSalsa20-Poly1305) is a stateless AEAD: `nacl_box_open` is

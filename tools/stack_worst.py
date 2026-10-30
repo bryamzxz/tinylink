@@ -1220,8 +1220,12 @@ def main():
                     print('!! entry %s not found' % e)
                     continue
                 if len(ks) > 1:
-                    pre = '<%s>' % '>'.join(bare(k) for k in ks[:-1])
-                    g.nodes[pre] = Node(pre, pre, sum(g.node(k).frame for k in ks[:-1]),
+                    name = '<%s>' % '>'.join(bare(k) for k in ks[:-1])
+                    # keyed by the whole entry: two entries with one prefix
+                    # (long_poll_task>a, long_poll_task>b) shared one node,
+                    # and the second's target replaced the first's
+                    pre = '%s%s' % (name, bare(ks[-1]))
+                    g.nodes[pre] = Node(pre, name, sum(g.node(k).frame for k in ks[:-1]),
                                         'prefix', 'prefix')
                     g.prefix_next[pre] = ks[-1]
                     keys.append(pre)
@@ -1382,6 +1386,9 @@ def project_config():
           'derp_client.c:415'),
         R('h2_io_on_data', r'h2_cb', ['mapreq.c:stream_chunk_cb'],
           'h2_post_json_stream(.., stream_chunk_cb): mapreq_run_stream only'),
+        # round 1.3.7 (B1): the endpoint push riding with the map stream
+        R('h2_drive_request', r'side->cb', ['mapreq.c:push_side_done'],
+          'h2_post_json_stream_side(.., push_side_done, ..): run_stream_in only'),
         # round 1.3.4 (D2): the streaming parser's framing calls the frame
         # handler back, which calls the netmap handler
         R('mapresp_stream_feed', r'on_frame', ['mapreq.c:stream_frame'],
@@ -1753,12 +1760,16 @@ def project_config():
                  # the map stream: ensure_control_conn (TLS + Noise connect),
                  # mapreq_run_stream (h2 stream, netmap handler, data plane
                  # start/update, DISCO pre-punch), wedge restart
+                 # (round 1.3.7: the push rides with it; push_endpoints_in
+                 # is only the fallback one-shot, below)
                  {'name': 'stream', 'entry': ['long_poll_task'],
-                  'prune': ['register_node', 'mapreq_push_endpoints']},
+                  'prune': ['register_node', 'mapreq_push_endpoints',
+                            'mapreq.c:push_endpoints_in']},
                  # one-shot POSTs (h2_post_json: h2_cb == NULL, so no
                  # stream_chunk_cb below them)
                  {'name': 'one-shot', 'entry': ['long_poll_task>register_node',
-                                                'long_poll_task>mapreq_push_endpoints'],
+                                                'long_poll_task>mapreq_run_stream>'
+                                                'push_endpoints_in'],
                   'prune': ['stream_chunk_cb']},
              ]},
             {'name': DERP, 'alloc': 8192, 'entry': ['derp_supervised_task']},

@@ -99,6 +99,16 @@ typedef struct {
  *      subsystem seeds the entropy pool).
  *   2. DNS/TLS to controlplane.tailscale.com is reachable.
  */
+/* Optional, before tinylink_init (round 1.3.7): load the identity keys
+ * and, with a control key pinned in NVS, precompute the first control
+ * connect's Noise IK DH work — CPU only, no network, so it can run while
+ * Wi-Fi associates instead of after got-ip (~75 ms of X25519 off the
+ * boot path). Only once the radio is on (after esp_wifi_start): a
+ * missing key is generated here and the ephemeral is drawn, and
+ * esp_fill_random is a true RNG only with RF enabled (point 1 below).
+ * tinylink_init does whatever this did not. */
+esp_err_t tinylink_preload(void);
+
 esp_err_t tinylink_init(void);
 
 /* Floor the wall clock (build time / last NTP sync persisted in NVS)
@@ -202,17 +212,16 @@ esp_err_t tinylink_get_keys(tinylink_keys_t *out);
 
 /* M2 — fetch one MapResponse from the control plane and bring up the
  * WireGuard data plane against the first peer it announces. Internally:
- *   1. Open a fresh ts2021 Noise channel.
- *   2. POST /machine/map with `Stream:false`; parse the single
- *      MapResponse.
- *   3. Translate the netmap into a `wireguard_config_t` and call
- *      `esp_wireguard_init` + `esp_wireguard_connect`.
+ * Today (round 1.3.7): takes the boot STUN probe's result (waiting
+ * ≤ 300 ms for it) and queues the endpoint push, which the long-poll's
+ * first cycle sends as a second HTTP/2 stream with the map stream; the
+ * data plane comes up from that stream's first netmap. Nothing goes on
+ * the wire here.
  *
- * Returns ESP_OK once the WG netif is up. Note: this only means the
- * device is *trying* to handshake; whether the peer is reachable is a
- * separate poll via the underlying `esp_wireguardif_peer_is_up`. The
- * long-poll `Stream:true` form, which keeps the netmap fresh, lands
- * with the M3 DISCO loop.
+ * History: it opened a fresh ts2021 channel, POSTed a `Stream:false`
+ * MapRequest and brought the WireGuard netif up from that one
+ * MapResponse (M2); from M3 the long-poll's first frame did that and
+ * this pushed the endpoints, a round trip of its own, until 1.3.7.
  */
 esp_err_t tinylink_dataplane_start(void);
 
@@ -319,9 +328,9 @@ esp_err_t tinylink_wg_socket_init(void);
  * (`tinylink_stun`) while the register runs, through the WireGuard
  * socket, which it reads itself until wg_rx exists: it used to cost the
  * boot its whole duration (0.04–7.1 s on the sensor) ahead of the
- * register. tinylink_dataplane_start waits for it ≤ 300 ms and then
- * pushes without it; the STUN re-probe pushes the endpoint once the
- * data plane is up. ESP_OK when the probe runs (inline on this task if
+ * register. tinylink_dataplane_start waits for it ≤ 300 ms, and the
+ * push goes without it after that; the STUN re-probe pushes the
+ * endpoint once the data plane is up. ESP_OK when the probe runs (inline on this task if
  * the spawn fails — the 1.3.4 order); once per boot. */
 esp_err_t tinylink_stun_probe_start(void);
 

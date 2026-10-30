@@ -112,6 +112,42 @@ size_t derp_build_client_info(uint8_t *out, size_t out_cap,
                               const uint8_t server_pub[DERP_KEY_LEN],
                               const uint8_t nonce[DERP_NONCE_LEN]);
 
+/* The login's NaCl box key (round 1.3.7, B2): K = HSalsa20(X25519(
+ * client_priv, server_pub), 0^16) seals ClientInfo and opens ServerInfo
+ * — one X25519 per login instead of one per box — and is kept for the
+ * next login to the same server key, which then runs none (a reconnect
+ * to the home DERP node). Keyed by both public keys; the secret is
+ * scrubbed when it is replaced or forgotten. */
+typedef struct {
+    uint8_t client_pub[DERP_KEY_LEN];
+    uint8_t server_pub[DERP_KEY_LEN];
+    uint8_t k[DERP_KEY_LEN];
+    bool    valid;
+} derp_login_key_t;
+
+/* K for (client, server) in c->k: the cached one when both public keys
+ * match, else computed — the previous one scrubbed first. *computed
+ * (may be NULL) tells which. Returns 0, or -1 for a low-order server key
+ * (nothing cached then). */
+int derp_login_key(derp_login_key_t *c,
+                   const uint8_t client_pub[DERP_KEY_LEN],
+                   const uint8_t client_priv[DERP_KEY_LEN],
+                   const uint8_t server_pub[DERP_KEY_LEN],
+                   bool *computed);
+
+/* Scrub and invalidate. */
+void derp_login_key_forget(derp_login_key_t *c);
+
+/* derp_build_client_info / derp_parse_server_info with K from
+ * derp_login_key: the same bytes, no X25519. */
+size_t derp_build_client_info_k(uint8_t *out, size_t out_cap,
+                                const uint8_t client_pub[DERP_KEY_LEN],
+                                const uint8_t k[DERP_KEY_LEN],
+                                const uint8_t nonce[DERP_NONCE_LEN]);
+int derp_parse_server_info_k(const uint8_t *payload, size_t plen,
+                             const uint8_t k[DERP_KEY_LEN],
+                             int *out_version);
+
 /* FrameServerInfo payload = nonce[24] || box(json).
  *
  * Authenticates the server's reply with our client_priv against the

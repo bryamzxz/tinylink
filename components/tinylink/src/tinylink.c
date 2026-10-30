@@ -9,6 +9,7 @@
 #include <time.h>
 
 #include "freertos/FreeRTOS.h"
+#include "freertos/event_groups.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 
@@ -28,6 +29,8 @@
 #include "tl_wdt.h"
 #include "tl_time.h"
 #include "control_key.h"
+#include "crypto/nacl_box.h"
+#include "crypto/secure_zero.h"
 #include "derp_client.h"
 #include "disco.h"
 #include "disco_handler.h"
@@ -62,6 +65,7 @@ static const char *TAG = "tinylink";
 static const char k_version[] = TINYLINK_VERSION_STRING;
 
 static tinylink_keys_t s_keys;
+static bool            s_keys_loaded;   /* by tinylink_preload or tinylink_init */
 static uint8_t         s_control_pub[32];
 static bool            s_initialized;
 
@@ -181,14 +185,39 @@ void tinylink_diag_dump_stacks(void)
 static void reg_hint_load(void);
 static void addr_cache_load(void);
 
+/* Round 1.3.7, B2: the boot's static key work while Wi-Fi associates
+ * (main.c calls this between starting Wi-Fi and waiting for it; 3–9 s of
+ * idle CPU on the sensor) instead of in the first ~90 ms after got-ip:
+ * the three public keys derived from NVS (3 X25519 — the 40 ms between
+ * "sntp started" and the control-key line on the 1.3.6 logs) and, with a
+ * control key pinned in NVS, the first connect's Noise msg1 DH (ss, e,
+ * es: 3 more; ts2021_precompute). No network, nothing logged on
+ * success; a failure here is retried and reported by tinylink_init. */
+esp_err_t tinylink_preload(void)
+{
+    if (!s_keys_loaded) {
+        if (keys_load_or_generate(&s_keys) != ESP_OK) return ESP_FAIL;
+        s_keys_loaded = true;
+    }
+    uint8_t pub[32];
+    if (control_key_peek(pub) == ESP_OK) {
+        ts2021_precompute(s_keys.machine_priv, s_keys.machine_pub, pub);
+    }
+    return ESP_OK;
+}
+
 esp_err_t tinylink_init(void)
 {
     /* Task-WDT feed for every blocking TLS poll (see tl_wdt.h). */
     tls_io_set_poll_hook(tl_wdt_feed);
-    esp_err_t err = keys_load_or_generate(&s_keys);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "keys_load_or_generate failed: 0x%x", err);
-        return err;
+    esp_err_t err = ESP_OK;
+    if (!s_keys_loaded) {
+        err = keys_load_or_generate(&s_keys);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "keys_load_or_generate failed: 0x%x", err);
+            return err;
+        }
+        s_keys_loaded = true;
     }
     err = control_key_get(s_control_pub);
     if (err != ESP_OK) {
@@ -459,13 +488,17 @@ esp_err_t tinylink_dataplane_start(void)
      * `Addrs: null, Relay: ""` for sensor-cali after multiple
      * Stream=true cycles that included Endpoints + NetInfo.
      *
-     * Push the device's current endpoints + NetInfo via a one-shot
-     * Stream=false MapRequest before the long-poll grabs the conn.
-     * This is the "fresh state upload" that updates the server's
-     * cached Hostinfo/Endpoints record so peers see real dial
-     * candidates and a HomeDERP region in their MapResponse. The
-     * response (a full netmap) is parsed for status only — the
-     * long-poll will redeliver it as its first stream frame. */
+     * So the device's endpoints + NetInfo go up in a Stream=false,
+     * OmitPeers=true lite MapRequest — the "fresh state upload" that
+     * updates the server's cached Hostinfo/Endpoints record, so peers
+     * see real dial candidates and a HomeDERP region in their
+     * MapResponse. Until round 1.3.7 it ran here, a round trip on its
+     * own (~0.19 s on the sensor) between the register and the map
+     * stream. Now it is the long-poll's first push: a second HTTP/2
+     * stream in the same burst as the map stream (mapreq_run_stream),
+     * as upstream's updateRoutine sends its lite updates alongside the
+     * poll — the netmap no longer waits for it, and the endpoint is
+     * read when the burst is built, ~0.2 s later than here. */
     if (!s_initialized) return ESP_ERR_INVALID_STATE;
 
     /* The boot STUN probe ran alongside the register (round 1.3.5):
@@ -474,55 +507,26 @@ esp_err_t tinylink_dataplane_start(void)
      * socket (stun_boot.h). */
     stun_boot_join();
 
-    esp_err_t err = ensure_control_conn();
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "dataplane_start: ensure_conn failed: 0x%x — "
-                      "long-poll will retry the connect anyway", err);
-        return ESP_OK;  /* not fatal — long-poll task handles reconnect */
-    }
-
     /* Observability: was the STUN-discovered endpoint available when
-     * we built the MapRequest body? Log the actual state as a clear
-     * breadcrumb when an admin-panel "Endpoints" field comes up empty. */
+     * the boot handed over? The push body is built from the same
+     * accessor a moment later; an admin-panel "Endpoints" field that
+     * comes up empty starts here. */
     uint8_t  ep_addr[4];
     uint16_t ep_port;
-    bool stun_ready = tinylink_get_public_endpoint(ep_addr, &ep_port);
-    if (stun_ready) {
-        ESP_LOGI(TAG, "dataplane_start: pushing endpoint %u.%u.%u.%u:%u",
+    if (tinylink_get_public_endpoint(ep_addr, &ep_port)) {
+        ESP_LOGI(TAG, "dataplane_start: endpoint %u.%u.%u.%u:%u goes up "
+                      "with the map stream",
                  ep_addr[0], ep_addr[1], ep_addr[2], ep_addr[3],
                  (unsigned)ep_port);
     } else {
         ESP_LOGW(TAG, "dataplane_start: no STUN endpoint yet — the "
-                      "Stream=false MapRequest lands NetInfo only; the "
+                      "lite MapRequest lands NetInfo only; the "
                       "re-probe pushes the endpoint once the data plane "
                       "is up");
     }
-
-    err = mapreq_push_endpoints(&s_conn, &s_keys);
-    if (err != ESP_OK) {
-        /* Drop the conn so the long-poll's next ensure_control_conn
-         * gets a fresh one. Don't fail bringup — the long-poll path
-         * will keep trying and may eventually succeed (or surface a
-         * different error). Since round 1.3.5 a push that got no answer
-         * is retried there too, on the fresh conn before the stream:
-         * with the one-shot deadline a stalled push now fails after 10 s
-         * (it sat 52 s in one sensor boot), and nothing else would push
-         * an endpoint that does not change. A push the server answered
-         * with an error is not — as before, the stream runs without it,
-         * rather than wait for a push the server keeps refusing. */
-        const bool unanswered = s_conn.h2_status == 0;
-        ESP_LOGW(TAG, "dataplane_start: mapreq_push_endpoints: 0x%x — %s", err,
-                 unanswered ? "the long-poll pushes after its connect"
-                            : "the stream runs without it");
-        if (unanswered) s_ep_push_pending = true;
-        drop_control_conn();
-        return ESP_OK;
-    }
-    ESP_LOGI(TAG, "dataplane_start: pushed lite MapRequest "
-                  "(Stream=false, OmitPeers=true, stun=%s)",
-             stun_ready ? "ready" : "missing");
-    /* Keep s_conn open — the long-poll will reuse it for the
-     * Stream=true cycle. */
+    s_ep_push_pending = true;
+    /* s_conn stays open (the register's) — the long-poll's first cycle
+     * rides it. */
     return ESP_OK;
 }
 
@@ -715,6 +719,67 @@ esp_err_t tinylink_derp_smoke(void)
     return err;
 }
 
+/* ---- The first INIT waits for the relay (round 1.3.7) -------------------
+ *
+ * At boot the first INIT reaches the peer directly, and the peer, with
+ * no validated direct path to our new NAT mapping yet, answers via DERP.
+ * If our DERP login is still under way that answer is lost, and the copy
+ * re-queued at the login (WG_NETIF_KICK_RELAY_UP) is the same INIT — a
+ * TAI64N replay to the peer: the session waits for the new INIT of
+ * WG_FIRST_RETRY_MS. In the 1.3.5 reboot series the 8 boots whose login
+ * came 0.21 s or more after the first INIT had the session up 1.2-2.2 s
+ * after the netmap (two far later); all others but one, 0.16-0.54 s.
+ * 1.3.6 had the login first in all six boots, by 40-390 ms: a margin
+ * the ~0.28 s earlier netmap of 1.3.7 (the push rides with the map
+ * stream, Noise DH ahead) eats in two of them. So the first netmap waits
+ * for the outcome of the supervisor's first connect attempt, at most
+ * RELAY_BOOT_WAIT_MS — in those boots the login was 0.3 s away or less.
+ * A stalled attempt (TCP to a dead cached address took 4.6 s in one
+ * 1.3.5 boot) costs the cap, then the 1.3.6 order applies. One-shot: a
+ * failed first attempt, later netmaps and reconnects never wait. */
+#define RELAY_BOOT_WAIT_MS   1000
+#define RELAY_BOOT_LOGIN_OK  BIT0
+#define RELAY_BOOT_FAILED    BIT1
+
+static volatile bool s_relay_boot_pending;   /* the first attempt is running */
+static EventGroupHandle_t s_relay_boot;
+
+#if CONFIG_TINYLINK_DERP_SUPERVISED
+static StaticEventGroup_t s_relay_boot_buf;
+
+/* Supervisor, after its first connect attempt. The kick that precedes
+ * it is a no-op before the dataplane exists, so the INIT this releases
+ * carries its own DERP copy — no second one from the kick. */
+static void relay_boot_done(bool login_ok)
+{
+    if (!s_relay_boot_pending) return;
+    s_relay_boot_pending = false;
+    xEventGroupSetBits(s_relay_boot, login_ok ? RELAY_BOOT_LOGIN_OK
+                                              : RELAY_BOOT_FAILED);
+}
+#endif
+
+/* long_poll_handler, before the first INIT (wg_dataplane_start). */
+static void relay_boot_join(void)
+{
+    if (!s_relay_boot_pending) return;   /* no supervisor, or it is done */
+    const int64_t t0 = esp_timer_get_time();
+    /* The bits stay set: an outcome that lands between the check above
+     * and this wait returns at once. */
+    const EventBits_t got = xEventGroupWaitBits(
+        s_relay_boot, RELAY_BOOT_LOGIN_OK | RELAY_BOOT_FAILED, pdFALSE,
+        pdFALSE, pdMS_TO_TICKS(RELAY_BOOT_WAIT_MS));
+    const unsigned waited_ms = (unsigned)((esp_timer_get_time() - t0) / 1000);
+    if (got & RELAY_BOOT_LOGIN_OK) {
+        ESP_LOGI(TAG, "first INIT waited %u ms for the DERP login", waited_ms);
+    } else if (got & RELAY_BOOT_FAILED) {
+        ESP_LOGI(TAG, "first INIT waited %u ms: DERP connect failed", waited_ms);
+    } else {
+        ESP_LOGW(TAG, "DERP login still pending after %u ms — first INIT "
+                      "goes ahead", waited_ms);
+    }
+}
+
 /* ---- DERP supervised recv-loop task (M5 step 2b) -----------------------
  *
  * Long-running task: connect+login → run recv loop → close → backoff →
@@ -808,6 +873,11 @@ static bool disco_addr_is_v4_mapped(const uint8_t addr[16])
  * can cache JUST the peers array (~1 KiB) instead of the full netmap
  * struct (~2.5 KiB since 1.3.2 keeps one DERP region; ~8 KiB before). The function only
  * ever reads n_peers + peers[] anyway. */
+/* Each peer's pings are sealed with one NaCl box key K (round 1.3.7,
+ * B2): the active WG peer's cached one (no X25519), else computed once
+ * for the peer — every ping was a full nacl_box before, one X25519 per
+ * endpoint (12 at the 1.3.6 boots: 12 pings across 4 peers, ~150 ms of
+ * the long-poll task right after the first netmap; 3 now). */
 static void prepunch_pings_to_peers(const tl_peer_t *peers, size_t n_peers)
 {
     if (peers == NULL || n_peers == 0) return;
@@ -815,11 +885,23 @@ static void prepunch_pings_to_peers(const tl_peer_t *peers, size_t n_peers)
     int sock = wg_netif_get_socket();
     if (sock < 0) return;  /* WG netif not yet bound: nothing to punch from */
 
+    disco_peer_key_t active;
+    memset(&active, 0, sizeof(active));
+    active.has_pub = wg_netif_get_peer_disco_k(active.pub, active.k, &active.k_valid);
+
     size_t total_sent = 0;
     for (size_t pi = 0; pi < n_peers; pi++) {
         const tl_peer_t *peer = &peers[pi];
         if (!peer->has_disco_pub) continue;        /* can't seal without DiscoKey */
         if (peer->n_endpoints == 0) continue;
+
+        uint8_t k[NACL_BOX_KEY_LEN];
+        if (active.has_pub && active.k_valid &&
+            memcmp(peer->disco_pub, active.pub, DISCO_KEY_LEN) == 0) {
+            memcpy(k, active.k, sizeof(k));
+        } else if (nacl_box_compute_shared(k, peer->disco_pub, s_keys.disco_priv) != 0) {
+            continue;                              /* low-order DiscoKey */
+        }
 
         for (size_t ei = 0; ei < peer->n_endpoints; ei++) {
             /* "ip:port" → split. Mirror of wg_dataplane.c::parse_endpoint
@@ -860,10 +942,9 @@ static void prepunch_pings_to_peers(const tl_peer_t *peers, size_t n_peers)
             esp_fill_random(nonce, sizeof(nonce));
 
             uint8_t wire[DISCO_HANDLER_REPLY_MAX];
-            size_t wire_len = disco_seal(wire, sizeof(wire),
-                                         inner, inner_len, nonce,
-                                         s_keys.disco_pub, peer->disco_pub,
-                                         s_keys.disco_priv);
+            size_t wire_len = disco_seal_with_shared(wire, sizeof(wire),
+                                                     inner, inner_len, nonce,
+                                                     s_keys.disco_pub, k);
             if (wire_len == 0) continue;
 
 #ifdef ESP_PLATFORM
@@ -889,7 +970,9 @@ static void prepunch_pings_to_peers(const tl_peer_t *peers, size_t n_peers)
                      ep, ping.txid[0], ping.txid[1],
                      ping.txid[2], ping.txid[3]);
         }
+        tl_secure_zero(k, sizeof(k));
     }
+    tl_secure_zero(&active, sizeof(active));
     if (total_sent > 0) {
         /* %u + casts: newlib-nano printf has no %zu (it printed "zu"). */
         ESP_LOGI(TAG, "prepunch on netmap-receive: sent %u pings across %u peers",
@@ -897,25 +980,39 @@ static void prepunch_pings_to_peers(const tl_peer_t *peers, size_t n_peers)
     }
 }
 
-static void send_disco_pings_to_cmm_endpoints(const derp_event_t *e)
+/* `peer`: the gate's view of the sender (handle_disco_relayed). */
+static void send_disco_pings_to_cmm_endpoints(const derp_event_t *e,
+                                              const disco_peer_key_t *peer)
 {
     /* Re-decrypt + re-parse: handle_disco_relayed already did this
-     * through disco_handle_recv, but that helper doesn't expose the
-     * parsed CallMeMaybe payload. Doing it twice is a few KB of
-     * NaCl-box CPU per CMM, which is rare enough to not matter. */
+     * through disco_handle_recv_from_peer, but that helper doesn't
+     * expose the parsed CallMeMaybe payload. With one key K for the
+     * sender — the active peer's cached one, else computed once — the
+     * second open and the punch pings cost no X25519 (round 1.3.7, B2:
+     * the open was one more, and each ping one per endpoint). */
+    uint8_t k[NACL_BOX_KEY_LEN];
+    if (disco_gate(e->data, e->data_len, peer) == DISCO_GATE_K) {
+        memcpy(k, peer->k, sizeof(k));
+    } else if (e->data_len < DISCO_MIN_WIRE_LEN ||
+               nacl_box_compute_shared(k, e->data + DISCO_MAGIC_LEN,
+                                       s_keys.disco_priv) != 0) {
+        return;
+    }
     uint8_t pt[256];
     uint8_t peer_disco_pub[DISCO_KEY_LEN];
-    size_t pt_len = disco_open(pt, sizeof(pt), peer_disco_pub,
-                               e->data, e->data_len, s_keys.disco_priv);
-    if (pt_len == 0) return;
-
+    size_t pt_len = disco_open_with_shared(pt, sizeof(pt), peer_disco_pub,
+                                           e->data, e->data_len, k);
     disco_msg_t msg;
-    if (disco_parse(pt, pt_len, &msg) != 0) return;
-    if (msg.type != DISCO_TYPE_CALLMEMAYBE) return;
-
-    int sock = wg_netif_get_socket();
+    int sock = -1;
+    if (pt_len == 0 || disco_parse(pt, pt_len, &msg) != 0 ||
+        msg.type != DISCO_TYPE_CALLMEMAYBE) {
+        tl_secure_zero(k, sizeof(k));
+        return;
+    }
+    sock = wg_netif_get_socket();
     if (sock < 0) {
         ESP_LOGW(TAG, "cmm: wg socket not up — cannot punch");
+        tl_secure_zero(k, sizeof(k));
         return;
     }
 
@@ -940,10 +1037,9 @@ static void send_disco_pings_to_cmm_endpoints(const derp_event_t *e)
         esp_fill_random(nonce, sizeof(nonce));
 
         uint8_t wire[DISCO_HANDLER_REPLY_MAX];
-        size_t wire_len = disco_seal(wire, sizeof(wire),
-                                     inner, inner_len, nonce,
-                                     s_keys.disco_pub, peer_disco_pub,
-                                     s_keys.disco_priv);
+        size_t wire_len = disco_seal_with_shared(wire, sizeof(wire),
+                                                 inner, inner_len, nonce,
+                                                 s_keys.disco_pub, k);
         if (wire_len == 0) continue;
 
 #ifdef ESP_PLATFORM
@@ -969,6 +1065,7 @@ static void send_disco_pings_to_cmm_endpoints(const derp_event_t *e)
                  (unsigned)ep->port,
                  ping.txid[0], ping.txid[1], ping.txid[2], ping.txid[3]);
     }
+    tl_secure_zero(k, sizeof(k));
     if (sent == 0 && msg.u.cmm.n > 0) {
         ESP_LOGW(TAG, "cmm: %u endpoints but none v4-mapped",
                  (unsigned)msg.u.cmm.n);
@@ -1004,29 +1101,34 @@ static void handle_disco_relayed(const derp_event_t *e,
     uint8_t peer_disco_pub[DISCO_KEY_LEN] = {0};
     uint8_t txid[DISCO_TXID_LEN] = {0};
 
-    size_t reply_len = disco_handle_recv(reply, sizeof(reply),
-                                         e->data, e->data_len,
-                                         s_keys.disco_priv, s_keys.disco_pub,
-                                         &type, peer_disco_pub, txid);
-
     /* knownPeerDiscoKey gate (mirrors the direct-UDP path's gate in
-     * wg_netif.c handle_disco_direct). disco_handle_recv only proves the
-     * frame was sealed TO us — any tailnet node can do that. Before we
-     * answer a PING or, worse, punch the endpoints in a CallMeMaybe (a
-     * UDP ping flood to attacker-chosen addresses), require the sender's
-     * DiscoKey to match the active WG peer's. Only DISCO message types
-     * are gated; the default case below is relayed WireGuard traffic,
-     * which wg_netif_inject_packet gates separately by src NodeKey. When
-     * the WG peer has no DiscoKey the gate is permissive, same as the
-     * direct path (before the first netmap DISCO never gets here). */
-    if (type == DISCO_TYPE_PING || type == DISCO_TYPE_PONG ||
-        type == DISCO_TYPE_CALLMEMAYBE) {
-        uint8_t known_disco[WG_KEY_LEN];
-        if (wg_netif_get_peer_disco_pub(known_disco) &&
-            memcmp(peer_disco_pub, known_disco, DISCO_KEY_LEN) != 0) {
-            ESP_LOGD(TAG, "drop relayed DISCO from unknown DiscoKey");
-            return;
-        }
+     * wg_netif.c handle_disco_direct). Opening a frame only proves it
+     * was sealed TO us — any tailnet node can do that. Before we answer
+     * a PING or, worse, punch the endpoints in a CallMeMaybe (a UDP ping
+     * flood to attacker-chosen addresses), the sender's DiscoKey must be
+     * the active WG peer's. Since round 1.3.7 (B2) it is read off the
+     * cleartext header before any crypto — another key cost an X25519
+     * to open (two for a PING: the pong was sealed before the gate) —
+     * and the peer's frames are opened and answered with its cached box
+     * key K, no X25519 at all (1–2 per relayed frame before; the
+     * relay's CallMeMaybe burst after each session up was ~60 ms of this
+     * task). Only DISCO frames are gated; anything else (type 0) is
+     * relayed WireGuard traffic, which wg_netif_inject_packet gates
+     * separately by src NodeKey. When the WG peer has no DiscoKey the
+     * gate is permissive, same as the direct path (before the first
+     * netmap DISCO never gets here). */
+    disco_peer_key_t peer;
+    memset(&peer, 0, sizeof(peer));
+    peer.has_pub = wg_netif_get_peer_disco_k(peer.pub, peer.k, &peer.k_valid);
+    bool gated = false;
+    size_t reply_len = disco_handle_recv_from_peer(reply, sizeof(reply),
+                                                   e->data, e->data_len, &peer,
+                                                   s_keys.disco_priv, s_keys.disco_pub,
+                                                   &type, peer_disco_pub, txid, &gated);
+    if (gated) {
+        tl_secure_zero(&peer, sizeof(peer));
+        ESP_LOGD(TAG, "drop relayed DISCO from unknown DiscoKey (pre-AEAD)");
+        return;
     }
 
     switch (type) {
@@ -1054,7 +1156,7 @@ static void handle_disco_relayed(const derp_event_t *e,
     case DISCO_TYPE_CALLMEMAYBE:
         st->disco_cmms_seen++;
         ESP_LOGI(TAG, "disco call-me-maybe — punching endpoints");
-        send_disco_pings_to_cmm_endpoints(e);
+        send_disco_pings_to_cmm_endpoints(e, &peer);
         /* The peer is punching towards us: if our handshake is still
          * pending, its INIT can get through now (B7). */
         wg_netif_handshake_kick(WG_NETIF_KICK_CALL_ME_MAYBE);
@@ -1076,6 +1178,7 @@ static void handle_disco_relayed(const derp_event_t *e,
         break;
     }
     }
+    tl_secure_zero(&peer, sizeof(peer));
 }
 
 static int derp_sup_event_cb(const derp_event_t *e, void *ctx)
@@ -1237,10 +1340,14 @@ static void derp_supervised_task(void *arg)
                  * + netmap (1.3.4: every boot, the INIT went out ~2 s
                  * before this login) — gets its INIT relayed now instead
                  * of after REKEY_TIMEOUT (B7). Before the first netmap
-                 * there is none: a no-op. */
+                 * there is none: a no-op — and since 1.3.7 a first netmap
+                 * that lands during this attempt holds its INIT until
+                 * here (relay_boot_join). */
                 wg_netif_handshake_kick(WG_NETIF_KICK_RELAY_UP);
+                relay_boot_done(true);
                 break;
             }
+            relay_boot_done(false);
             const uint32_t delay_ms = tl_backoff_ms(fail, base_ms, cap_ms,
                                                     esp_random());
             if (fail < 1000u) fail++;              /* saturate the counter */
@@ -1359,9 +1466,14 @@ esp_err_t tinylink_derp_supervised_start(void)
      * a pristine heap: in the 2026-05 tree, spawned after the
      * long-poll, xTaskCreate failed with ESP_ERR_NO_MEM in 3 soaks and
      * every DERP-dependent feature stayed dead. */
+    /* Armed before the spawn: a netmap can only come later (the
+     * register follows this call), but the flag must not trail it. */
+    s_relay_boot = xEventGroupCreateStatic(&s_relay_boot_buf);
+    s_relay_boot_pending = true;
     BaseType_t ok = xTaskCreate(derp_supervised_task, "tinylink_derp",
                                 8192, NULL, tskIDLE_PRIORITY + 3, NULL);
     if (ok != pdPASS) {
+        s_relay_boot_pending = false;
         ESP_LOGE(TAG, "xTaskCreate(derp supervisor) failed — "
                       "heap_free=%u largest=%u (need 8 KiB contiguous)",
                  (unsigned)esp_get_free_heap_size(),
@@ -1591,6 +1703,7 @@ static esp_err_t long_poll_handler(const tl_netmap_t *nm, void *ctx)
                  (unsigned long)(nm->self_id & 0xFFFFFFFFul),
                  (unsigned)s_last_peers_count,
                  (unsigned)nm->n_derp_regions);
+        relay_boot_join();
         esp_err_t err = wg_dataplane_start(&s_keys, s_self_addrs, s_self_addrs_count,
                                            s_last_peers, s_last_peers_count);
         if (err != ESP_OK) {
@@ -1684,15 +1797,30 @@ static void long_poll_task(void *arg)
         uint32_t rate_limit_ms = 0;
         int      http_status   = 0;
         esp_err_t err = ensure_control_conn();
-        if (err == ESP_OK && s_ep_push_pending) {
+        if (err == ESP_OK) {
             /* Endpoint push (Stream=false lite MapRequest) on the freshly
-             * connected s_conn, BEFORE the read-only Stream=true cycle
-             * claims it — the same sequence bringup runs at boot. This
-             * task has the stack the ts2021 path needs; the old dedicated
-             * ep_up task did not (see the "Endpoint push" section). */
+             * connected s_conn — since round 1.3.7 as a second HTTP/2
+             * stream in the same burst as the read-only Stream=true
+             * request, not a round trip before it (the boot's push is
+             * this one too). This task has the stack the ts2021 path
+             * needs; the old dedicated ep_up task did not (see the
+             * "Endpoint push" section). Taken now: a request raised
+             * during the stream is a new one (and recycles it). */
+            const bool push = s_ep_push_pending;
             s_ep_push_pending = false;
-            esp_err_t perr = mapreq_push_endpoints(&s_conn, &s_keys);
-            if (perr == ESP_OK) {
+            int push_status = 0;
+            const int64_t t0 = esp_timer_get_time();
+            err = mapreq_run_stream(&s_conn, &s_keys, long_poll_handler, NULL,
+                                    push ? &push_status : NULL);
+            /* Stream ended: either the server closed it (idle / ping
+             * failure / restart), our side errored, the push went
+             * unanswered within the one-shot deadline, or the handler
+             * left an expired-node frame. Capture the rate-limit wait and
+             * the HTTP status before drop_control_conn clears the conn. */
+            rate_limit_ms = control_rate_limit_ms();
+            http_status   = s_conn.h2_status;
+            const int64_t up_us = esp_timer_get_time() - t0;
+            if (push && push_status == 200) {
                 s_stat_ep_pushes++;
                 uint8_t  ep_addr[4];
                 uint16_t ep_port = 0;
@@ -1701,34 +1829,20 @@ static void long_poll_task(void *arg)
                              ep_addr[0], ep_addr[1], ep_addr[2], ep_addr[3],
                              (unsigned)ep_port);
                 }
-            } else {
-                /* Retry on the next connect; the loop's backoff below
-                 * paces it and a server Retry-After is honored like any
-                 * other map failure. */
-                s_ep_push_pending = true;
-                rate_limit_ms = control_rate_limit_ms();
-                http_status   = s_conn.h2_status;
-                ESP_LOGW(TAG, "endpoint push failed: 0x%x — retrying after "
-                              "reconnect", perr);
-                drop_control_conn();
-                err = perr;
             }
-        }
-        if (err == ESP_OK) {
-            const int64_t t0 = esp_timer_get_time();
-            err = mapreq_run_stream(&s_conn, &s_keys, long_poll_handler, NULL);
-            /* Stream ended: either the server closed it (idle / ping
-             * failure / restart), our side errored, or the handler left
-             * an expired-node frame. Capture the rate-limit wait and the
-             * HTTP status before drop_control_conn clears the conn. */
-            rate_limit_ms = control_rate_limit_ms();
-            http_status   = s_conn.h2_status;
-            const int64_t up_us = esp_timer_get_time() - t0;
             if (s_ep_push_pending) {
                 ESP_LOGI(TAG, "long-poll stream recycled for endpoint push "
                               "(0x%x) — reconnecting", err);
             } else {
                 ESP_LOGW(TAG, "long-poll stream ended: 0x%x — reconnecting", err);
+            }
+            if (push && push_status != 200) {
+                /* Not pushed — unanswered (deadline, conn lost, reset) or
+                 * refused: again with the next connect's stream. A refusing
+                 * server sees one push per reconnect, as the stream does. */
+                ESP_LOGW(TAG, "endpoint push %s — retrying with the next "
+                              "stream", push_status > 0 ? "refused" : "unanswered");
+                s_ep_push_pending = true;
             }
             drop_control_conn();
             s_stat_lp_reconnects++;
@@ -2019,8 +2133,9 @@ esp_err_t tinylink_wg_socket_init(void)
  * (objdump of the release objects) and -fstack-usage.
  *
  * Now: the push runs on the long-poll task, on s_conn, right after the
- * (re)connect and before the stream starts — the exact sequence bringup
- * runs at boot (tinylink_dataplane_start). tinylink_endpoint_push_async()
+ * (re)connect — since round 1.3.7 as a second HTTP/2 stream in the same
+ * burst as the map stream (mapreq_run_stream; the boot's push is the
+ * first one). tinylink_endpoint_push_async()
  * records the request and kicks the long-poll out of its blocking
  * stream read (ts2021_abort_reads); the reconnect then follows the
  * normal healthy-stream backoff (~1 s), so a push lands within one 30 s
@@ -2031,8 +2146,10 @@ esp_err_t tinylink_wg_socket_init(void)
  * change (rare), in exchange for −12.6 KiB of BSS (stack + TCB), no
  * second Noise/TLS conn (−8.6 KiB peak stack, ~−12 KiB TLS heap
  * transient) and no overflow. Upstream sends its lite update over the
- * shared HTTP/2 client (controlclient.Auto.updateRoutine); tinylink's
- * h2_client is one stream per conn, so the recycle is the equivalent. */
+ * shared HTTP/2 client (controlclient.Auto.updateRoutine) while the
+ * poll runs; tinylink's opens its side stream only together with a map
+ * stream (the long-poll task sits in the stream's read loop), so a push
+ * after the boot still recycles the stream. */
 
 /* Signal that the public endpoint changed. Idempotent; callable from
  * any task (STUN re-probe on the telemetry task, event handlers). */

@@ -34,6 +34,12 @@ extern "C" {
  */
 esp_err_t control_key_get(uint8_t out_pub[CONTROL_KEY_LEN]);
 
+/* The NVS pin alone (path 1): no fallback install, no fetch, no log,
+ * no change to control_key_pinned(). For the boot's Noise precompute
+ * (round 1.3.7), which runs before Wi-Fi is up; ESP_OK when a pin is
+ * stored. control_key_get stays the authority. */
+esp_err_t control_key_peek(uint8_t out_pub[CONTROL_KEY_LEN]);
+
 /* True when the key control_key_get returned was pinned before this
  * boot's network activity — path 1 or 2 — and false after a TOFU fetch
  * (path 3) or before any call. Gates ts2021 over plain HTTP :80 (round

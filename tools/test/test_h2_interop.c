@@ -78,11 +78,14 @@ enum {
     SC_OK, SC_429, SC_503_DATE, SC_BIG, SC_STREAM, SC_PING, SC_GOAWAY_MID,
     SC_GOAWAY_REFUSE, SC_RST_AFTER_HEADERS, SC_RST_BEFORE, SC_PADDING,
     SC_BIG_HEADER, SC_TRAILERS, SC_1XX, SC_EOF_MID, SC_HEADERS_ONLY,
+    SC_DEFER,                    /* no answer until the stream's pause_at */
 };
 
 typedef struct {
     nghttp2_session *ng;
     int      sc;                 /* response scenario for the next request */
+    int      sc_req[8];          /* per request, overriding sc (0 = sc) */
+    int32_t  deferred;           /* SC_DEFER's stream, answered 200 at pause_at */
     int      nreq;
     int32_t  sid[8];
     char     path[8][48];
@@ -264,7 +267,13 @@ static int on_frame_recv(nghttp2_session *s, const nghttp2_frame *f, void *ud)
     if (f->hd.type == NGHTTP2_PING && (f->hd.flags & NGHTTP2_FLAG_ACK)) S.ping_acks++;
     if ((f->hd.type == NGHTTP2_DATA || f->hd.type == NGHTTP2_HEADERS) &&
         (f->hd.flags & NGHTTP2_FLAG_END_STREAM)) {
-        respond(f->hd.stream_id);
+        /* A per-request scenario answers without a data provider (the
+         * side request of round 1.3.7), so S.sc can come back at once. */
+        const int sc = S.sc;
+        if (S.nreq < 8 && S.sc_req[S.nreq] != 0) S.sc = S.sc_req[S.nreq];
+        if (S.sc == SC_DEFER) S.deferred = f->hd.stream_id;
+        else respond(f->hd.stream_id);
+        S.sc = sc;
         S.nreq++;
     }
     return 0;
@@ -352,7 +361,13 @@ static size_t srv_output(void)
         if (S.paused && !S.acted) {
             S.acted = true;
             S.paused = false;
-            if (S.sc == SC_PING) {
+            if (S.deferred != 0) {
+                /* the side request's late answer, mid-stream */
+                nghttp2_nv h[] = { NV(":status", "200") };
+                nghttp2_submit_response2(S.ng, S.deferred, h, 1, NULL);
+                S.deferred = 0;
+                nghttp2_session_resume_data(S.ng, S.cur);
+            } else if (S.sc == SC_PING) {
                 nghttp2_submit_ping(S.ng, NGHTTP2_FLAG_NONE, (const uint8_t *)"keepaliv");
                 nghttp2_session_resume_data(S.ng, S.cur);
             } else if (S.sc == SC_GOAWAY_MID) {
@@ -916,6 +931,188 @@ static void sc_sequence(void)
     conn_down();
 }
 
+#ifndef H2_REF
+/* Round 1.3.7, B1: the endpoint push as a side stream in the map
+ * stream's burst (h2_post_json_stream_side), against nghttp2's server —
+ * which, like Go's, answers each stream on its own. */
+static int    s_side_calls, s_side_status, s_side_err;
+static size_t s_side_at;   /* stream bytes delivered when the side closed */
+
+static void side_cb(int status, int err, void *ctx)
+{
+    (void)ctx;
+    s_side_calls++;
+    s_side_status = status;
+    s_side_err = err;
+    s_side_at = s_slen;
+}
+
+static const char kPushBody[] =
+    "{\"Version\":148,\"Compress\":\"\",\"NodeKey\":\"nodekey:0123456789abcdef0123456789abcdef"
+    "0123456789abcdef0123456789abcdef\",\"Stream\":false,\"KeepAlive\":true,\"OmitPeers\":true,"
+    "\"Hostinfo\":{\"OS\":\"esp32\",\"Hostname\":\"tinylink\"},\"Endpoints\":[\"192.0.2.10:41641\"]}";
+
+static res_t stream_side(void)
+{
+    res_t r;
+    memset(&r, 0, sizeof(r));
+    s_slen = 0;
+    s_scalls = 0;
+    s_side_calls = 0;
+    s_side_status = s_side_err = -1;
+    s_side_at = 0;
+    r.err = h2_post_json_stream_side(&s_conn, "/machine/map", AUTH,
+                                     (const uint8_t *)kPushBody, sizeof(kPushBody) - 1,
+                                     side_cb, NULL, (const uint8_t *)kRegBody,
+                                     sizeof(kRegBody) - 1, &r.status, stream_cb, NULL);
+    r.len = s_slen;
+    return r;
+}
+
+static bool disarmed(void)
+{
+    return sock_poll_ms() == 30000 && s_conn.req_idle == 0 && s_conn.req_deadline_us == 0;
+}
+
+static int silent_pair(void)
+{
+    srv_new(0);
+    conn_up(true);
+    s_silent = true;
+    s_silent_polls = 0;
+    res_t r = stream_side();
+    s_silent = false;
+    const bool failed = r.err == ESP_FAIL && s_conn.req_expired && s_side_calls == 0 &&
+                        disarmed();
+    const int polls = s_silent_polls;
+    conn_down();
+    return failed ? polls : -1;
+}
+
+static void sc_side(void)
+{
+    char want[512];
+
+    /* Answered at once, then the stream: two streams from one burst. */
+    srv_new(0);
+    conn_up(true);
+    S.sc = SC_STREAM;
+    S.sc_req[0] = SC_HEADERS_ONLY;
+    fill_mapresponses(2, 9000);
+    S.chunk = 5000;
+    s_reads_short = s_reads_stream = s_reads_other = 0;
+    const int rec0 = s_c2s_records;
+    res_t r = stream_side();
+    snprintf(want, sizeof(want), ":method: POST\n:scheme: https\n:path: /machine/map\n"
+             ":authority: " AUTH "\ncontent-type: application/json\ncontent-length: %zu\n",
+             sizeof(kPushBody) - 1);
+    check("side_push_stream1_map_stream3",
+          S.nreq == 2 && S.sid[0] == 1 && S.sid[1] == 3 && strcmp(S.hdrs[0], want) == 0 &&
+          S.body_len[0] == sizeof(kPushBody) - 1 &&
+          memcmp(S.body[0], kPushBody, S.body_len[0]) == 0 &&
+          S.body_len[1] == sizeof(kRegBody) - 1 &&
+          memcmp(S.body[1], kRegBody, S.body_len[1]) == 0 && S.bad == 0);
+    check("side_answered_200_once", s_side_calls == 1 && s_side_status == 200 && s_side_err == 0);
+    check("side_stream_bytes_exact",
+          r.err == ESP_OK && r.status == 200 && r.len == S.resp_len &&
+          memcmp(s_sbuf, S.resp, S.resp_len) == 0 && !s_conn.h2_retry_after_present);
+    check("side_deadline_then_stream_polls",
+          s_reads_short > 0 && s_reads_stream > 0 && s_reads_other == 0 && disarmed() &&
+          !s_conn.req_expired);
+    /* the burst (with the SETTINGS ACK) and the WINDOW_UPDATEs only */
+    check("side_burst_records", s_c2s_records - rec0 <= 1 + 4 && s_c2s_max_record <= 2048);
+    conn_down();
+
+    /* 429 + Retry-After on the push: its status only — the stream's
+     * response stays un-throttled. */
+    srv_new(0);
+    conn_up(true);
+    S.sc = SC_STREAM;
+    S.sc_req[0] = SC_429;
+    fill_mapresponses(1, 3000);
+    r = stream_side();
+    check("side_429_kept_apart", r.err == ESP_OK && r.status == 200 && s_side_calls == 1 &&
+          s_side_status == 429 && s_conn.h2_status == 200 && !s_conn.h2_retry_after_present &&
+          r.len == S.resp_len);
+    conn_down();
+
+    /* RST_STREAM instead of an answer: status 0 and the code. */
+    srv_new(0);
+    conn_up(true);
+    S.sc = SC_STREAM;
+    S.sc_req[0] = SC_RST_BEFORE;
+    fill_mapresponses(1, 3000);
+    r = stream_side();
+    check("side_reset_status0_code", r.err == ESP_OK && r.status == 200 && s_side_calls == 1 &&
+          s_side_status == 0 && s_side_err == NGHTTP2_INTERNAL_ERROR && r.len == S.resp_len &&
+          disarmed());
+    conn_down();
+
+    /* Answered mid-stream: the stream's first bytes under the deadline's
+     * polls, the rest under the stream's. */
+    srv_new(0);
+    conn_up(true);
+    S.sc = SC_STREAM;
+    S.sc_req[0] = SC_DEFER;
+    fill_mapresponses(3, 9000);
+    S.chunk = 3000;
+    S.pause_at = 12000;
+    s_reads_short = s_reads_stream = s_reads_other = 0;
+    r = stream_side();
+    check("side_late_answer_mid_stream",
+          r.err == ESP_OK && r.status == 200 && r.len == S.resp_len &&
+          memcmp(s_sbuf, S.resp, S.resp_len) == 0 && s_side_calls == 1 &&
+          s_side_status == 200 && s_side_at >= 12000 && s_side_at < S.resp_len);
+    check("side_late_polls", s_reads_short > 1 && s_reads_stream > 0 && s_reads_other == 0 &&
+          disarmed() && S.bad == 0);
+    conn_down();
+
+    /* Never answered, the stream ends: no callback, deadline off. */
+    srv_new(0);
+    conn_up(true);
+    S.sc = SC_STREAM;
+    S.sc_req[0] = SC_DEFER;
+    fill_mapresponses(1, 2000);
+    r = stream_side();
+    check("side_unanswered_stream_ended", r.err == ESP_OK && r.status == 200 &&
+          s_side_calls == 0 && disarmed() && !s_conn.req_expired && S.nreq == 2);
+    conn_down();
+
+    /* A silent conn: cut at the one-shot deadline, which doubles — the
+     * same s_req_ms h2_post_json uses — until an answer resets it. */
+    const int base = (TS2021_REQ_TIMEOUT_MS + TS2021_REQ_POLL_MS - 1) / TS2021_REQ_POLL_MS;
+    const int p1 = silent_pair(), p2 = silent_pair();
+    srv_new(0);
+    conn_up(true);
+    S.sc = SC_STREAM;
+    S.sc_req[0] = SC_HEADERS_ONLY;
+    fill_mapresponses(1, 100);
+    r = stream_side();
+    conn_down();
+    const int p3 = silent_post();
+    check("side_deadline_doubles_reset_by_answer",
+          p1 == base && p2 == 2 * base && r.err == ESP_OK && s_side_status == 200 && p3 == base);
+    srv_new(0);   /* leave it reset */
+    conn_up(true);
+    S.sc = SC_HEADERS_ONLY;
+    (void)post("/machine/map", kRegBody, 10, 256);
+    conn_down();
+
+    /* A server window under the push: nothing sent, session intact. */
+    srv_new(100);
+    conn_up(true);
+    S.sc = SC_STREAM;
+    r = stream_side();
+    const bool none = r.err == ESP_ERR_INVALID_SIZE && S.nreq == 0 && s_side_calls == 0 &&
+                      disarmed() && !s_conn.req_expired;
+    S.sc = SC_HEADERS_ONLY;
+    res_t r2 = post("/machine/map", kPushBody, sizeof(kPushBody) - 1, 256);
+    check("side_window_too_small_nothing_sent", none && r2.err == ESP_OK && r2.status == 200 &&
+          S.nreq == 1 && S.sid[0] == 1 && S.body_len[0] == sizeof(kPushBody) - 1 && S.bad == 0);
+    conn_down();
+}
+#endif
+
 static void sc_small_server_window(void)
 {
     /* The server lets us send 100 bytes per stream: the 2-KiB body of the
@@ -1063,6 +1260,7 @@ int main(void)
     sc_misc();
 #ifndef H2_REF
     sc_deadline_backoff();
+    sc_side();
 #endif
     if (s_fails == 0) printf("\nALL OK\n");
     return s_fails ? 1 : 0;
