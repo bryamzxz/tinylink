@@ -1406,6 +1406,8 @@ def project_config():
         R('rx_task', r'path_stale_cb', ['on_wg_path_stale'], 'tinylink.c:1829'),
         R('tx_task_fn', r'relay_cb', ['tinylink_relay_via_derp'], 'tinylink.c:1841'),
         R('wg_tai64n_now', r's_persist_fn', ['tai64n_persist_cb'], 'tinylink.c:194'),
+        R('telemetry_task', r'persist_hook\(\)', ['app_wifi.c:hint_persist'],
+          'tinylink_set_persist_hook(hint_persist), app_wifi.c (round 1.3.7)'),
         R('_printf_float', r'pfunc', ['__ssputs_r', '__sfputs_r'],
           'tl_libc_stubs.c float stub'),
         # ---- log / ROM console ----------------------------------------------
