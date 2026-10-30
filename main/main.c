@@ -77,6 +77,13 @@ static esp_err_t bringup(void)
              reset_reason_name(rst), (int)rst);
     tinylink_bootstat_record();   /* RTC boot counters for /stats */
 
+#if CONFIG_TINYLINK_BENCH_TLS
+    /* TLS handshake crypto (round 1.3.8) before anything else runs: no
+     * Wi-Fi interrupts, no other task, a pristine heap. A capture that
+     * opens the port resets the board, so it sees this from the start. */
+    (void)tinylink_bench_tls();
+#endif
+
     esp_err_t err = app_nvs_init();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "nvs init failed: 0x%x", err);

@@ -152,6 +152,21 @@ menu "tinylink core"
             stays. The generator's fixed-point tables
             (CONFIG_MBEDTLS_ECP_FIXED_POINT_OPTIM) do not depend on it.
 
+    config TINYLINK_BENCH_TLS
+        bool "Run the TLS handshake crypto benchmark on boot"
+        default n
+        help
+            Round 1.3.8. When y, bringup() calls tinylink_bench_tls()
+            first thing, before NVS and Wi-Fi: the signature verifies of
+            the two chains the Tailscale servers serve (ECDSA P-384 /
+            P-256, RSA-2048 / RSA-4096, from the certificates themselves),
+            the full chain verify of each through the certificate bundle,
+            and the ECDHE (keygen + shared secret) for X25519 (in-tree
+            and mbedTLS), P-256 and P-384, each timed on the chip with
+            the image's mbedTLS configuration, plus heap and stack use.
+            Build one image per configuration under test
+            (tools/tls_bench/). Off by default; opt-in for perf work.
+
     config TINYLINK_BENCH_AEAD
         bool "Run ChaCha20-Poly1305 AEAD and X25519 micro-benchmarks on boot"
         default n

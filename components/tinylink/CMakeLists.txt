@@ -46,6 +46,7 @@ idf_component_register(
         "src/crypto/chacha20poly1305.c"
         "src/crypto/secure_zero.c"
         "src/tinylink_bench.c"
+        "src/tinylink_bench_tls.c"
         "src/tl_time.c"
         "src/tl_libc_stubs.c"
     INCLUDE_DIRS
