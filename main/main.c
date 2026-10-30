@@ -20,6 +20,7 @@
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_pm.h"
+#include "esp_random.h"
 #include "esp_system.h"
 #include "sdkconfig.h"
 
@@ -27,6 +28,7 @@
 #include "tinylink_bench.h"
 
 #include "app_nvs.h"
+#include "backoff.h"
 #include "app_wifi.h"
 
 static const char *TAG = "tinylink";
@@ -224,9 +226,14 @@ static esp_err_t bringup(void)
     }
 
     /* Register loop: control plane may answer MachineAuthorized=false until
-     * the operator approves the new node. Retry on a slow cadence. When
-     * control rate-limits us (429, or 503 + Retry-After) wait what it
-     * asks instead of CONFIG_TINYLINK_REGISTER_RETRY_MS (capver 147). */
+     * the operator approves the new node. When control rate-limits us
+     * (429, or 503 + Retry-After) wait what it asks (capver 147). Else a
+     * jittered ladder 2 → 4 → 8 → 16 s up to CONFIG_TINYLINK_REGISTER_RETRY_MS
+     * (round 1.3.8): a fixed 30 s turned a ~20-s network stall right after
+     * association (both TCP conns dead at once, seen on the sensor) into a
+     * 40-s wait for the first retry; the slow cadence is still reached
+     * while the node waits for approval. */
+    uint32_t reg_attempt = 0;
     for (;;) {
         err = tinylink_register();
         if (err == ESP_OK) {
@@ -236,7 +243,10 @@ static esp_err_t bringup(void)
         const uint32_t rate_limit_ms = tinylink_last_rate_limit_ms();
         const uint32_t delay_ms = (rate_limit_ms > 0)
                                     ? rate_limit_ms
-                                    : (uint32_t)CONFIG_TINYLINK_REGISTER_RETRY_MS;
+                                    : tl_backoff_ms(reg_attempt, 2000u,
+                                                    (uint32_t)CONFIG_TINYLINK_REGISTER_RETRY_MS,
+                                                    esp_random());
+        if (reg_attempt < 16) reg_attempt++;
         ESP_LOGW(TAG, "register attempt failed: 0x%x — retrying in %u ms%s",
                  err, (unsigned)delay_ms,
                  rate_limit_ms > 0 ? " (rate limited by control)" : "");

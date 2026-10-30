@@ -77,13 +77,15 @@ menu "tinylink application"
             template.
 
     config TINYLINK_REGISTER_RETRY_MS
-        int "Retry interval after MachineAuthorized=false (ms)"
+        int "Longest wait between register retries (ms)"
         default 30000
         range 1000 600000
         help
-            How long to wait between retries when the control plane reports
-            MachineAuthorized=false (e.g. waiting for the operator to approve
-            the node in the admin panel).
+            Cap of the register retry ladder: a failed register (no answer,
+            MachineAuthorized=false while the operator approves the node in
+            the admin panel, ...) is retried after ~2, 4, 8, 16 s (±25 %
+            jitter) and then every this many ms. A rate-limit answer
+            (429, 503 + Retry-After) waits what control asks instead.
 
     config TINYLINK_STREAM_IDLE_TIMEOUT_S
         int "Control/DERP stream idle timeout (s)"
