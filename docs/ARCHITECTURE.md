@@ -849,13 +849,13 @@ or a stack size changes.
 
 | Task               | Stack    | Prio    | Where                              | Role                                                       |
 |--------------------|----------|---------|------------------------------------|------------------------------------------------------------|
-| `main`             | 8 KiB    | 1       | `CONFIG_ESP_MAIN_TASK_STACK_SIZE`  | bringup: WiFi, keys, register, dataplane (takes the STUN result), spawns; exits |
+| `main`             | 8 KiB    | 1       | `CONFIG_ESP_MAIN_TASK_STACK_SIZE`  | bringup: WiFi, keys, register, dataplane (takes the STUN result), spawns, warm start (1.3.9: WG from the cached netmap while the push / map stream run); exits |
 | `tinylink_lp`      | 7 KiB    | IDLE+4  | `tinylink.c::tinylink_long_poll_start` | control conn: ts2021 connect, endpoint push, map long-poll, re-register, wedge restart |
 | `tinylink_derp`    | 8 KiB    | IDLE+3  | `tinylink.c::tinylink_derp_supervised_start` | DERP TLS session from boot (1.3.5: connects alongside the register): relayed DISCO / WG inject, CMM punch |
 | `wg_rx`            | 8 KiB    | IDLE+3  | `wg_netif.c::wg_netif_start`       | UDP recv, demux (WG/DISCO/STUN), handshake, decrypt → lwIP  |
 | `wg_tx`            | 5 KiB    | IDLE+2  | `wg_netif.c::wg_netif_init`        | encrypted-frame queue → `sendto` (direct) or DERP relay     |
 | `tinylink_stun`    | 5 KiB    | IDLE+2  | `tinylink.c::tinylink_stun_probe_start` | boot STUN probe on the WG socket while the register runs (1.3.5), to the home DERP node's STUN at its cached address (no DNS) or `CONFIG_TINYLINK_STUN_HOST`; exits after one probe (≤ 3 s, + DNS without a record) |
-| `tinylink_tlm`     | 4.5 KiB  | IDLE+2  | `telemetry.c::telemetry_task_start` | TMP117 sample → JSON → UDP over the tunnel; `/stats`; periodic / GOT_IP-triggered STUN re-probe (flags endpoint push); 60 s stack diag + NVS time floor + address-cache records (1.3.5, on change only) |
+| `tinylink_tlm`     | 4.5 KiB  | IDLE+2  | `telemetry.c::telemetry_task_start` | TMP117 sample → JSON → UDP over the tunnel; `/stats`; periodic / GOT_IP-triggered STUN re-probe (flags endpoint push); 60 s stack diag + NVS time floor + address-cache records (1.3.5, on change only) + warm-start record (1.3.9, on change; endpoints / DiscoKey alone ≤ hourly) and its bound |
 | `tiT` (lwIP)       | 4.5 KiB  | 18      | `CONFIG_LWIP_TCPIP_TASK_STACK_SIZE`| TCP/IP thread (raised 3 → 4.5 KiB in #104)                 |
 
 Application task stacks total ≈ 36.5 KiB (the 8 KiB `main` stack is
@@ -888,6 +888,19 @@ mbedTLS handshake. Those buffers are gone (92c09dd; the record decrypt's
 its static worst case is 4 864 B against 7 KiB (see
 `tinylink_long_poll_start`); the 60-s `stack diag` line shows its
 high-water mark.
+
+The warm start (round 1.3.9, `tl_warm.h`) moves no task's deepest
+path (`tools/stack_worst.py`, static): on `main` it is 4 560 B
+(`main_task` 208 → `app_main` 64 → `tinylink_warm_start` 128 →
+`wg_dataplane_start` → netif / lwIP → Wi-Fi TX), under the register
+path's 5 424 B; on `tinylink_lp` the first netmap's `warm_reconcile`
+(320 B) sits beside `wg_dataplane_start` under `long_poll_handler`,
+and the erase + restart run at the task's top level (`warm_restart_now`
+→ `esp_restart` 2 720 B), not under the stream callback — the task
+stays at 5 232 B (stream variant 4 656 → 4 640). The record's NVS write
+in the `tinylink_tlm` housekeeping is 3 440 B (`telemetry_task` 96 →
+`tinylink_warm_persist_poll` 32 → `warm_persist` 496 → `nvs_set_blob`),
+its bound's restart 3 248 B, both under the task's 3 728 B.
 
 There is no dedicated endpoint-push task any more (2026-09): the push
 runs on `tinylink_lp` — see item 9 below.
