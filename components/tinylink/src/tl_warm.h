@@ -501,12 +501,12 @@ static inline void tl_warm_age_str(char *out, size_t cap, int64_t now_unix, bool
                                    uint32_t written)
 {
     if (written == 0 || now_unix < (int64_t)written) {
-        snprintf(out, cap, "cached, age unknown%s", synced ? "" : " (clock not synced)");
+        snprintf(out, cap, "cached, age unknown%s", synced ? "" : ", clock not synced");
         return;
     }
     const int64_t a = now_unix - (int64_t)written;
     const char *pre = synced ? "" : "≥ ";
-    const char *post = synced ? "" : " (clock not synced)";
+    const char *post = synced ? "" : ", clock not synced";
     if (a < 120) {
         snprintf(out, cap, "cached %s%u s ago%s", pre, (unsigned)a, post);
     } else if (a < 2 * 3600) {

@@ -675,9 +675,9 @@ static void test_misc(void)
     tl_warm_age_str(s, sizeof(s), 1700000000 + 9 * 86400, true, 1700000000u);
     check("age/days", strcmp(s, "cached 9 d ago") == 0);
     tl_warm_age_str(s, sizeof(s), 1700000000 + 3 * 3600, false, 1700000000u);
-    check("age/unsynced-lower-bound", strcmp(s, "cached ≥ 3 h ago (clock not synced)") == 0);
+    check("age/unsynced-lower-bound", strcmp(s, "cached ≥ 3 h ago, clock not synced") == 0);
     tl_warm_age_str(s, sizeof(s), 1600000000, false, 1700000000u);
-    check("age/floor-behind-write", strcmp(s, "cached, age unknown (clock not synced)") == 0);
+    check("age/floor-behind-write", strcmp(s, "cached, age unknown, clock not synced") == 0);
     tl_warm_age_str(s, sizeof(s), 1700000000, true, 0);
     check("age/never-synced-write", strcmp(s, "cached, age unknown") == 0);
 
