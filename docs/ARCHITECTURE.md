@@ -224,22 +224,29 @@ probed (10 s, doubling to 60 s, while data flows). A pong from the
 current endpoint with nothing authenticated from the peer since the
 unanswered frame puts the path in doubt: still DUAL — one lost
 keepalive or frame looks exactly like that — until any WireGuard packet
-from the peer (back to DIRECT). A second window, opened by a frame sent
-both ways, without one is SILENT (DISCO works, WireGuard does not; 1.3.5
-soak: 30 s of it, fixed by the RX-stale rekey in 60 ms): RELAY and a
-make-before-break rekey, the first of a streak only — in practice the
-RX-stale rekey's own time. A second doubt ended before a keepalive
+from the peer (back to DIRECT). Since 1.3.8 a doubt is tested at once
+with a make-before-break handshake (one INIT in flight, REKEY_TIMEOUT
+apart, once per silent streak): its response settles it within a round
+trip and replaces a session that only an INIT revives (1.3.5 / 1.3.6
+soaks: 30 s of silence until the RX-stale rekey; now 12–13 s after the
+first unanswered frame). A second window, opened by a frame sent
+both ways, without one is SILENT (DISCO works, WireGuard does not):
+RELAY and a make-before-break rekey, the first of a streak only — in
+practice the doubt's test is in flight by then. A second doubt ended before a keepalive
 proved the direct path (one no DERP copy within a window can explain)
 is UNDELIVERED: the peer gets what goes via DERP only — RELAY, no rekey.
 Both back the direct re-tests off to one a minute; pongs between
 re-tests do not end them. When a lapse is confirmed — that ping
 unanswered, SILENT, UNDELIVERED, or the endpoint moved elsewhere first —
-the direct-only frames of the last 40 s (and those whose DERP copy was
-refused) are re-sent via DERP (`wg_tx`'s rescue ring, kept while the
-relay is down; the peer's replay window drops those it has). Steady
-state costs no packet (upstream heartbeats a ping every 3 s); 0.5 / 1 /
-2 % random loss costs ~11 / 22 / 62 one-ping lapses per 6 h and no
-rekey (test_wg_path). A pong from another endpoint
+the direct-only frames sent since the last one proven delivered (a
+keepalive that proves the direct path answers a frame sent
+KEEPALIVE_TIMEOUT before it; 180 s at most; the last 40 s until 1.3.7),
+and those whose DERP copy was refused, are re-sent via DERP (`wg_tx`'s
+10-slot rescue ring, kept while the relay is down; the peer's replay
+window drops those it has). Steady state costs no packet (upstream
+heartbeats a ping every 3 s); 0.5 / 1 / 2 % random loss costs ~13 / 25 /
+54 one-ping lapses per 6 h, a handshake per doubt (+6 / +12 / +26 on
+195) and no forced or RX-stale rekey (test_wg_path). A pong from another endpoint
 moves a valid current one only if clearly better (upstream `betterAddr`
 points, +20 private, > 15 points and > 25 ms, compared within one ping
 round); an authenticated packet from another source roams only while

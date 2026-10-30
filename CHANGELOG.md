@@ -7,6 +7,121 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Optimization round 1.3.8 (in progress, branch `feat/opt-1.3.8`)
+
+#### Data plane (`feat/r138-dp`)
+
+What the 1.3.6 soak (3.5 h) showed about WireGuard silence: 25 doubts
+(the direct path answers DISCO, the peer's WireGuard has been silent for
+a 12-s window), two of which ran into the RX-stale rekey 13 s after the
+doubt, 30 s after the peer's last packet (`seen direct=0 derp=0`). In one
+nothing came until that rekey's response, ~130 ms after its INIT — the
+1.3.5 failure, a session only an INIT revives; in the other (doubt 10) a
+keepalive under the old keys, answering our first frame sent both ways,
+arrived 30 ms after the INIT and before its response (the 1.3.6 entry
+credits both to the rekey). The rest were a lost frame or keepalive,
+settled by the peer's own WireGuard 1.3–8.0 s after the lapse. And with
+only our direct WireGuard toward the peer dropped, the first episode lost
+the frames older than the 40-s re-send window (1.3.6 "Known gap"). Image
+731 952 → **732 800 B (+848)**; static DRAM 58 116 → 58 132 B (+16), IRAM
+±0, ~480 B more heap in use (rescue ring 8 → 10 slots). Host suite 2 092 → **2 110
+OK** (CI floor 2 110), ASan + UBSan clean, 0 warnings. Static worst cases
+unchanged: `wg_rx` 5 728 / 8 192, `wg_tx` 3 440 / 5 120 (`start_rekey`
+and `tx_rescue` +16 B each, off the deepest chains). Not yet on the
+sensor.
+
+- **D1 — a doubt is tested at once with a handshake (`WG_PATH_ACT_TEST`).**
+  The pong that puts the path in doubt owes a test; the RX task's timer
+  pass, which runs right after the pong, starts a make-before-break
+  rekey (`rekey init sent (… doubt test)`), direct and via DERP, the
+  current session carrying our data until the response. One INIT in
+  flight only — never while a handshake is pending (a responder that
+  gets a second INIT keeps only the second session, see
+  `WG_INIT_FRESH_AFTER_MS`), never within REKEY_TIMEOUT of the last
+  (whitepaper §6.1) — else the pending one's response does the same;
+  once per silent streak (after a silence no doubt is tested again until
+  a transport packet from the peer). The response is a WireGuard packet
+  from the peer and settles the doubt as a keepalive does: the first doubt
+  since a direct proof back to DIRECT, the second UNDELIVERED — the INIT
+  went both ways, so it proves the session, not our direct path. A broken
+  session is replaced by it. Simulated (100 random instants, the peer's
+  session dead until an INIT, DISCO alive): **the session is back 12.3–13.0
+  s after the first unanswered frame (1.3.7: 25.1–27.8 s), 16.6 s on
+  average / 17.9 s at most after the peer's last packet (1.3.7: 30.0 /
+  30.5 s)**, frames sealed with the dead keys 2.2 on average (1.3.7: 5.0).
+  Cost, healthy path with random WireGuard loss, 6 h, 20 runs each:
+  **+6 / +12 / +26 / +40 handshakes on 195** at 0.5 / 1 / 2 / 3 % (~13 /
+  25 / 53 / 79 doubts; a doubt's handshake also moves the next proactive
+  one 110 s on; each ~25 ms of CPU, the INIT direct and via DERP, the
+  response and the two adverts); 2 % is a doubt every
+  ~7 min, the soak's rate was one per 8.4 min. A doubt now ends within a
+  round trip, so fewer frames go both ways during one: DERP copies 20 /
+  41 / 91 / 135 → 1 / 4 / 15 / 34, frames lost to the random loss within
+  ±2.3, and the RX-stale rekeys the loss caused (0.25 / 0.45 / 1.9 / 2.8,
+  each after 30 s of silence) are gone. UNDELIVERED under random loss
+  0.15 / 0.55 / 2.1 / 4.4 → 0.2 / 0.75 / 2.8 / 6.6 (a second doubt before
+  a direct proof is now settled in a round trip; each costs 10–20 s of
+  DERP only and a re-send). With our direct WireGuard dropped for an
+  hour: 47 tests, 79 handshakes (1.3.7: 67, 10 of them RX-stale), 0
+  forced rekeys, re-tests still backed off to one a minute.
+- **Rejected: an in-tunnel probe.** An empty keepalive is never answered
+  (wireguard-go arms its passive keepalive only for packets with a
+  payload). A TSMP ping is answered by tailscaled without a new session,
+  but into a session only an INIT revives it goes unanswered: that
+  failure would need a probe timeout and then the INIT anyway, 1–2 s
+  later, to save ~25 ms of X25519 per doubt (about seven an hour), and it
+  depends on the peer being tailscaled. Also rejected: the doubt's INIT
+  direct only (its answer would prove our direct path) — a lost INIT
+  (1–2 % on the sensor's Wi-Fi) would read as UNDELIVERED, and the
+  attempt-to-path bookkeeping is new state; not counting a handshake
+  response that lands between a lapse and its pong (it proves only the
+  session) — no difference in any simulation once the advert's timing was
+  faithful, so `wg_path.h` keeps the 1.3.6 rule.
+- **D2 — the rescue ring ages by the last proof of delivery
+  (`wg_path_rescue_from`, `WG_PATH_RESCUE_MAX_MS`).** A keepalive that
+  proves the direct path answers a frame the peer received
+  KEEPALIVE_TIMEOUT before sending it: frames sent before that instant got
+  through, those after stay in the ring until re-sent or proven — 180 s at
+  most (REJECT_AFTER_TIME: an older frame can never be accepted), 10
+  slots (8 lose up to 3 frames of the worst episode, 9 up to 1); a pong,
+  a keepalive within a window of a DERP copy or one ending a doubt prove
+  nothing. Our TSMP advert no longer takes a slot (not application data;
+  with D1's extra handshakes it pushed out a lost sample). The known gap,
+  first episode with only our direct WireGuard toward the peer dropped
+  (direct → doubt → direct → lapse → doubt → UNDELIVERED, up to 9
+  direct-only samples): **1.3.7's rules lose 2.5 on average, up to 8, in
+  1 000 random block instants; now 0 in 2 000** (host test: 500).
+  `re-sent via DERP the N direct-only frames sent since the last one
+  proven delivered, X s ago (rescued: M)`.
+- **The simulation now models wg_netif's handshakes**: one INIT in
+  flight, REKEY_TIMEOUT retries replacing it (an answer to a replaced
+  INIT dropped), the proactive rekey 110 s after the last completed one
+  (was every 110 s whatever happened), RX-stale only with no rekey in
+  flight, the fallback to a cold handshake after 12 unanswered attempts
+  (data refused), INIT loss, our advert sent after the response (sent at
+  the same instant, a lapse on it equalled `peer_wg_us` and its pong
+  confirmed instead of doubting), and the real rescue ring. Every
+  scenario prints the 1.3.7 behaviour beside it (the test action
+  ignored).
+- **Finding (pre-existing, not fixed): WireGuard dropped on the direct
+  path both ways with DISCO passing**, the peer keeping its direct path:
+  the peer gets what goes via DERP and answers on the blocked path, so no
+  handshake completes; the first rekey (1.3.8 the doubt's test, 1.3.7
+  the silence's or RX-stale's) gives up after 12 attempts and the cold
+  handshake refuses data — the tunnel is down while the block lasts
+  (~705 of ~720 frames in the simulated hour, 1.3.7 the same). The old simulation sent INITs
+  without retries and showed no loss. Only the peer's path choice can fix
+  it; the old keys would carry our frames via DERP at most until
+  REJECT_AFTER_TIME anyway.
+- On the sensor, a doubt should read `… answers DISCO (rtt N ms), but no
+  WireGuard packet from the peer for 12.x s — via DERP too until one
+  comes, testing the session with a handshake (doubt N)`, then `rekey
+  init sent (attempt 1, …, doubt test)`, `session rekeyed` 50–400 ms
+  later and `direct path re-confirmed (WireGuard from the peer, 0.x s off
+  direct)`; no `RX stale` within 30 s of a doubt; `session rekeyed` up by
+  about the doubts (minus the proactive ones they move); free heap ~480 B
+  lower. `wg_netif_get_stats` gains `doubt_rekeys`.
+
 ### Optimization round 1.3.7 (in progress, branch `feat/opt-1.3.7`)
 
 #### Wi-Fi association (`feat/r137-wifi`)
