@@ -191,6 +191,10 @@ int h2_io_tx_send(void *io, size_t len);
 void h2_io_on_status(void *io, int status);
 void h2_io_on_header(void *io, const hpack_field_t *f);   /* regular, validated */
 int  h2_io_on_data(void *io, const uint8_t *buf, size_t len);  /* < 0: stop */
+/* The same two for the side stream's header blocks (its DATA is
+ * dropped): the embedder reads a Retry-After off them. */
+void h2_io_on_side_status(void *io, int status);
+void h2_io_on_side_header(void *io, const hpack_field_t *f);
 void h2_io_on_goaway(void *io, uint32_t last_stream_id, uint32_t error_code);
 
 /* ---- engine ---- */
@@ -223,6 +227,10 @@ typedef struct {
  * session then dead. side NULL = h2c_request. H2C_ERR_STATE also while
  * the previous side stream is still open. */
 int  h2c_request_pair(h2_core_t *h, const h2_req_t *side, const h2_req_t *req);
+/* Give up on the open side stream: RST_STREAM(CANCEL), sent now; it is
+ * then closed with close_err CANCEL and no final status. No-op without
+ * an open side stream. */
+int  h2c_cancel_side(h2_core_t *h);
 /* Parse received bytes (any split). Consumes all of them; returns
  * H2C_ERR_PROTO on a connection error (GOAWAY already sent). */
 int  h2c_feed(h2_core_t *h, const uint8_t *buf, size_t len);

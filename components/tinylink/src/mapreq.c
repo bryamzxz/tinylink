@@ -1365,20 +1365,23 @@ static int stream_chunk_cb(const uint8_t *data, size_t len, void *ctx)
     return mapresp_stream_feed(&s->ms, data, len);
 }
 
-/* The endpoint push riding with the stream answered (round 1.3.7, B1):
- * the push's own log line, at the time it lands — the stream goes on. */
-static void push_side_done(int status, int stream_error, void *ctx)
+/* The endpoint push riding with the stream has its outcome (round
+ * 1.3.7, B1): the push's own log line, at the time it lands — the stream
+ * goes on. */
+static void push_side_done(const h2_side_result_t *r, void *ctx)
 {
+    const int status = r->status;
     *(int *)ctx = status > 0 ? status : -1;
     if (status == 200) {
         ESP_LOGI(TAG, "endpoint push: HTTP 200 (with the map stream)");
     } else if (status == 429 || status == 503) {
-        ESP_LOGW(TAG, "endpoint push throttled: HTTP %d", status);
+        ESP_LOGW(TAG, "endpoint push throttled: HTTP %d (Retry-After %s, %d s valid)",
+                 status, r->retry_after_present ? "set" : "absent", r->retry_after_s);
     } else if (status > 0) {
         ESP_LOGE(TAG, "endpoint push HTTP %d (server rejected lite update)", status);
-    } else {
+    } else if (!r->expired) {   /* expired: h2 has the line */
         ESP_LOGW(TAG, "endpoint push: stream reset (HTTP/2 error 0x%x)",
-                 (unsigned)stream_error);
+                 (unsigned)r->stream_error);
     }
 }
 

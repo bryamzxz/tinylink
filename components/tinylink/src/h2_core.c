@@ -252,6 +252,7 @@ static int field_cb(void *ctx, const hpack_field_t *f)
         s->have_status = true;
         s->status = (int)st;
         if (is_main) h2_io_on_status(h->io, s->status);
+        else         h2_io_on_side_status(h->io, s->status);
         return 0;
     }
     s->pseudo_done = true;
@@ -272,7 +273,10 @@ static int field_cb(void *ctx, const hpack_field_t *f)
     } else if (name_is(f, "te", 2) && !value_ieq(f, "trailers", 8)) {
         goto bad;
     }
-    if (!h->blk_trailer && is_main) h2_io_on_header(h->io, f);
+    if (!h->blk_trailer) {
+        if (is_main) h2_io_on_header(h->io, f);
+        else         h2_io_on_side_header(h->io, f);
+    }
     return 0;
 bad:
     (void)stream_error(h, H2_PROTOCOL_ERROR);
@@ -825,6 +829,16 @@ int h2c_request_pair(h2_core_t *h, const h2_req_t *side, const h2_req_t *req)
     rc = tx_end(h, off);
     if (rc != H2C_OK) return rc;
     return h2c_pump(h);
+}
+
+int h2c_cancel_side(h2_core_t *h)
+{
+    if (!h->side.open) return H2C_OK;
+    if (h->dead) return H2C_ERR_STATE;
+    int rc = ctl_u32(h, H2_RST_STREAM, h->side.id, H2_CANCEL);
+    close_stream(&h->side, H2_CANCEL);
+    if (rc == H2C_OK) rc = ctl_flush(h);
+    return rc;
 }
 
 int h2c_request(h2_core_t *h, const h2_field_t *fields, size_t n_fields,

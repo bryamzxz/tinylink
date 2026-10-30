@@ -18,6 +18,7 @@
 #include <time.h>
 
 #include "esp_log.h"
+#include "esp_timer.h"
 
 #include "h2_core.h"
 #include "h2_retry_after.h"
@@ -47,6 +48,42 @@ static void h2_request_reset(ts2021_conn_t *conn)
     /* h2_rx carries over: it may hold the start of the server's stream
      * (ts2021_connect) — parsed before the next request goes out. */
 }
+
+/* The one-shot deadline in force — see h2_post_json. Defined here for
+ * the side request's share of it (h2_drive_request). */
+static uint32_t s_req_ms = TS2021_REQ_TIMEOUT_MS;
+
+/* A side request riding with a stream (h2_post_json_stream_side). */
+typedef struct {
+    const uint8_t *body;
+    size_t         len;
+    h2_side_fn_t   cb;
+    void          *ctx;
+    uint32_t       ms;       /* its deadline: s_req_ms when it went out */
+    bool           armed;    /* sent, not closed yet */
+    /* The stream's final response came first: the conn is alive, and
+     * the side's deadline is its own from then on (deadline_us), no
+     * longer the conn's — past it the side is cancelled, the stream goes
+     * on (round 1.3.7 review). repoll: the conn's socket polls are still
+     * the deadline's, to be set back to the stream's. */
+    bool           detached;
+    bool           repoll;
+    bool           expired;  /* cancelled by us at its deadline */
+    int64_t        deadline_us;
+    h2_side_result_t res;    /* its Retry-After as it arrives */
+} h2_side_t;
+
+/* The side request in flight, for the hooks: one request at a time runs
+ * on the control conn (the long-poll task's). */
+static h2_side_t *s_side;
+
+/* A server that allows one stream at a time (SETTINGS_MAX_CONCURRENT_
+ * STREAMS < 2), seen on any conn: the side request then goes before its
+ * stream, alone (ESP_ERR_INVALID_SIZE to the caller), on every later
+ * conn too — a limit that arrives after a pair went out is only learned
+ * from the refusal of its second stream. Servers do not change it per
+ * conn; a reboot forgets it. */
+static bool s_one_stream;
 
 /* ---- h2_core hooks ---------------------------------------------------- */
 
@@ -83,6 +120,44 @@ void h2_io_on_status(void *io, int status)
     conn->h2_status = status;
     conn->h2_retry_after_s = 0;
     conn->h2_retry_after_present = false;
+    /* The stream's final response proves the conn alive: a side request
+     * still unanswered keeps its deadline, but as its own (h2_drive_
+     * request cancels it there). Moved here, before any DATA of this
+     * response reaches the stream callback — the map stream's handler
+     * can run for a while (the first netmap's data-plane start, the
+     * relay wait) — and before the flush that ends this feed: no read or
+     * write fails on the side's deadline any more. */
+    h2_side_t *side = s_side;
+    if (status >= 200 && side != NULL && side->armed && !side->detached) {
+        side->detached = true;
+        side->repoll = true;
+        side->deadline_us = conn->req_deadline_us;
+        conn->req_deadline_us = 0;
+    }
+}
+
+/* The side stream's response: only its Retry-After is kept — per
+ * header block, as for the stream's. */
+void h2_io_on_side_status(void *io, int status)
+{
+    (void)io;
+    (void)status;
+    if (s_side != NULL) {
+        s_side->res.retry_after_present = false;
+        s_side->res.retry_after_s = 0;
+    }
+}
+
+void h2_io_on_side_header(void *io, const hpack_field_t *f)
+{
+    (void)io;
+    if (s_side == NULL) return;
+    if (f->name_total == 11 && memcmp(f->name, "retry-after", 11) == 0) {
+        s_side->res.retry_after_present = f->value_total > 0;
+        s_side->res.retry_after_s = (f->flags & HPACK_F_VALUE_CUT) ? 0
+            : h2_parse_retry_after_seconds(f->value, f->value_len,
+                                           tl_time_synced() ? (int64_t)time(NULL) : 0);
+    }
 }
 
 void h2_io_on_header(void *io, const hpack_field_t *f)
@@ -203,27 +278,6 @@ static int feed_pending(ts2021_conn_t *conn)
     return rc;
 }
 
-/* The one-shot deadline in force — see h2_post_json. Defined here for
- * the side request's share of it (h2_drive_request). */
-static uint32_t s_req_ms = TS2021_REQ_TIMEOUT_MS;
-
-/* A side request riding with a stream (h2_post_json_stream_side). */
-typedef struct {
-    const uint8_t *body;
-    size_t         len;
-    h2_side_fn_t   cb;
-    void          *ctx;
-    bool           armed;    /* sent, not closed yet: under the deadline */
-} h2_side_t;
-
-/* A server that allows one stream at a time (SETTINGS_MAX_CONCURRENT_
- * STREAMS < 2), seen on any conn: the side request then goes before its
- * stream, alone (ESP_ERR_INVALID_SIZE to the caller), on every later
- * conn too — a limit that arrives after a pair went out is only learned
- * from the refusal of its second stream. Servers do not change it per
- * conn; a reboot forgets it. */
-static bool s_one_stream;
-
 /* The side stream closed: its deadline ends (the stream polls at the
  * stream budget from here), and the caller hears how — at once, not
  * when the stream ends hours later. */
@@ -231,9 +285,17 @@ static esp_err_t side_closed(ts2021_conn_t *conn, h2_side_t *side)
 {
     const h2_stream_t *ss = &conn->h2.side;
     side->armed = false;
-    s_req_ms = TS2021_REQ_TIMEOUT_MS;   /* answered (or reset): the conn is alive */
-    const esp_err_t err = ts2021_request_deadline(conn, 0);
-    side->cb(ss->final ? ss->status : 0, (int)ss->close_err, side->ctx);
+    /* Answered or reset: the conn is alive and the next one-shot request
+     * gets the base deadline. Cancelled unanswered: twice this one's, as
+     * after an expiry (h2_post_json). */
+    s_req_ms = !side->expired ? TS2021_REQ_TIMEOUT_MS
+             : side->ms < TS2021_REQ_TIMEOUT_MAX_MS / 2 ? 2 * side->ms
+                                                        : TS2021_REQ_TIMEOUT_MAX_MS;
+    const esp_err_t err = side->detached ? ESP_OK : ts2021_request_deadline(conn, 0);
+    side->res.status = ss->final ? ss->status : 0;
+    side->res.stream_error = (int)ss->close_err;
+    side->res.expired = side->expired;
+    side->cb(&side->res, side->ctx);
     return err;
 }
 
@@ -354,9 +416,23 @@ static esp_err_t h2_drive_request(ts2021_conn_t *conn,
             }
             return ESP_FAIL;
         }
-        if (side != NULL && side->armed && !h->side.open &&
-            side_closed(conn, side) != ESP_OK) {
-            return ESP_FAIL;
+        if (side != NULL && side->armed) {
+            if (side->repoll) {
+                /* The stream answered (h2_io_on_status): its own budget
+                 * and 30-s polls from here. */
+                side->repoll = false;
+                if (ts2021_request_deadline(conn, 0) != ESP_OK) return ESP_FAIL;
+            }
+            if (side->detached && h->side.open &&
+                esp_timer_get_time() > side->deadline_us) {
+                /* Checked as records arrive — on a quiet stream at its
+                 * next KeepAlive. */
+                ESP_LOGW(TAG, "side request: no answer within %u ms — "
+                              "cancelled, the stream goes on", (unsigned)side->ms);
+                side->expired = true;
+                if (h2c_cancel_side(h) != H2C_OK) return ESP_FAIL;
+            }
+            if (!h->side.open && side_closed(conn, side) != ESP_OK) return ESP_FAIL;
         }
         if (conn->h2_goaway && !h->s.closed) {
             /* GOAWAY with the stream still open: bail to the caller for
@@ -493,14 +569,18 @@ esp_err_t h2_post_json_stream_side(ts2021_conn_t *conn,
 
     /* The side request is a one-shot: s_req_ms from the burst to its
      * answer, as h2_post_json gives one (a conn that answers nothing is
-     * cut after 10 s, not after the stream's 120-s budget). The stream
-     * shares that deadline until then — its first bytes take ~1 s and
-     * prove nothing about the side request. */
-    h2_side_t side = { .body = side_body, .len = side_len,
-                       .cb = side_cb, .ctx = side_ctx };
+     * cut after 10 s, not after the stream's 120-s budget). The conn is
+     * under that deadline until the stream's final response proves it
+     * alive (h2_io_on_status); after that a late side request is only
+     * cancelled — a push answered after 52 s once cost the sensor three
+     * reconnects of a working map stream. */
     const uint32_t ms = s_req_ms;
+    h2_side_t side = { .body = side_body, .len = side_len,
+                       .cb = side_cb, .ctx = side_ctx, .ms = ms };
     esp_err_t err = ts2021_request_deadline(conn, ms);
+    s_side = &side;
     if (err == ESP_OK) err = h2_drive_request(conn, path, authority, body_len, &side);
+    s_side = NULL;
     if (side.armed || err == ESP_ERR_INVALID_SIZE) {
         /* Left with the side request unanswered (or never sent). */
         const esp_err_t derr = ts2021_request_deadline(conn, 0);
