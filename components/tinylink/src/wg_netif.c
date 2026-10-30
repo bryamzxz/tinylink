@@ -2787,6 +2787,22 @@ bool wg_netif_path_alive(void)
            (now_us() - last) <= (int64_t)WG_RX_STALE_THRESHOLD_MS * 1000LL;
 }
 
+bool wg_netif_get_peer_disco_k(uint8_t pub[WG_KEY_LEN], uint8_t k[WG_KEY_LEN],
+                               bool *k_valid)
+{
+    *k_valid = false;
+    if (!g.initialized) return false;
+    xSemaphoreTake(g.lock, portMAX_DELAY);
+    const bool have = g.peer.has_peer_disco_pub;
+    if (have) {
+        memcpy(pub, g.peer.peer_disco_pub, WG_KEY_LEN);
+        *k_valid = g.peer_disco_shared_k_valid;
+        if (*k_valid) memcpy(k, g.peer_disco_shared_k, WG_KEY_LEN);
+    }
+    xSemaphoreGive(g.lock);
+    return have;
+}
+
 bool wg_netif_get_peer_disco_pub(uint8_t out[WG_KEY_LEN])
 {
     if (!g.initialized) return false;

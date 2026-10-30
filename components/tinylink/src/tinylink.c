@@ -28,6 +28,8 @@
 #include "tl_wdt.h"
 #include "tl_time.h"
 #include "control_key.h"
+#include "crypto/nacl_box.h"
+#include "crypto/secure_zero.h"
 #include "derp_client.h"
 #include "disco.h"
 #include "disco_handler.h"
@@ -777,6 +779,11 @@ static bool disco_addr_is_v4_mapped(const uint8_t addr[16])
  * can cache JUST the peers array (~1 KiB) instead of the full netmap
  * struct (~2.5 KiB since 1.3.2 keeps one DERP region; ~8 KiB before). The function only
  * ever reads n_peers + peers[] anyway. */
+/* Each peer's pings are sealed with one NaCl box key K (round 1.3.7,
+ * B2): the active WG peer's cached one (no X25519), else computed once
+ * for the peer — every ping was a full nacl_box before, one X25519 per
+ * endpoint (12 at the 1.3.6 boots: 12 pings across 4 peers, ~150 ms of
+ * the long-poll task right after the first netmap; 3 now). */
 static void prepunch_pings_to_peers(const tl_peer_t *peers, size_t n_peers)
 {
     if (peers == NULL || n_peers == 0) return;
@@ -784,11 +791,23 @@ static void prepunch_pings_to_peers(const tl_peer_t *peers, size_t n_peers)
     int sock = wg_netif_get_socket();
     if (sock < 0) return;  /* WG netif not yet bound: nothing to punch from */
 
+    disco_peer_key_t active;
+    memset(&active, 0, sizeof(active));
+    active.has_pub = wg_netif_get_peer_disco_k(active.pub, active.k, &active.k_valid);
+
     size_t total_sent = 0;
     for (size_t pi = 0; pi < n_peers; pi++) {
         const tl_peer_t *peer = &peers[pi];
         if (!peer->has_disco_pub) continue;        /* can't seal without DiscoKey */
         if (peer->n_endpoints == 0) continue;
+
+        uint8_t k[NACL_BOX_KEY_LEN];
+        if (active.has_pub && active.k_valid &&
+            memcmp(peer->disco_pub, active.pub, DISCO_KEY_LEN) == 0) {
+            memcpy(k, active.k, sizeof(k));
+        } else if (nacl_box_compute_shared(k, peer->disco_pub, s_keys.disco_priv) != 0) {
+            continue;                              /* low-order DiscoKey */
+        }
 
         for (size_t ei = 0; ei < peer->n_endpoints; ei++) {
             /* "ip:port" → split. Mirror of wg_dataplane.c::parse_endpoint
@@ -829,10 +848,9 @@ static void prepunch_pings_to_peers(const tl_peer_t *peers, size_t n_peers)
             esp_fill_random(nonce, sizeof(nonce));
 
             uint8_t wire[DISCO_HANDLER_REPLY_MAX];
-            size_t wire_len = disco_seal(wire, sizeof(wire),
-                                         inner, inner_len, nonce,
-                                         s_keys.disco_pub, peer->disco_pub,
-                                         s_keys.disco_priv);
+            size_t wire_len = disco_seal_with_shared(wire, sizeof(wire),
+                                                     inner, inner_len, nonce,
+                                                     s_keys.disco_pub, k);
             if (wire_len == 0) continue;
 
 #ifdef ESP_PLATFORM
@@ -858,7 +876,9 @@ static void prepunch_pings_to_peers(const tl_peer_t *peers, size_t n_peers)
                      ep, ping.txid[0], ping.txid[1],
                      ping.txid[2], ping.txid[3]);
         }
+        tl_secure_zero(k, sizeof(k));
     }
+    tl_secure_zero(&active, sizeof(active));
     if (total_sent > 0) {
         /* %u + casts: newlib-nano printf has no %zu (it printed "zu"). */
         ESP_LOGI(TAG, "prepunch on netmap-receive: sent %u pings across %u peers",
@@ -866,25 +886,39 @@ static void prepunch_pings_to_peers(const tl_peer_t *peers, size_t n_peers)
     }
 }
 
-static void send_disco_pings_to_cmm_endpoints(const derp_event_t *e)
+/* `peer`: the gate's view of the sender (handle_disco_relayed). */
+static void send_disco_pings_to_cmm_endpoints(const derp_event_t *e,
+                                              const disco_peer_key_t *peer)
 {
     /* Re-decrypt + re-parse: handle_disco_relayed already did this
-     * through disco_handle_recv, but that helper doesn't expose the
-     * parsed CallMeMaybe payload. Doing it twice is a few KB of
-     * NaCl-box CPU per CMM, which is rare enough to not matter. */
+     * through disco_handle_recv_from_peer, but that helper doesn't
+     * expose the parsed CallMeMaybe payload. With one key K for the
+     * sender — the active peer's cached one, else computed once — the
+     * second open and the punch pings cost no X25519 (round 1.3.7, B2:
+     * the open was one more, and each ping one per endpoint). */
+    uint8_t k[NACL_BOX_KEY_LEN];
+    if (disco_gate(e->data, e->data_len, peer) == DISCO_GATE_K) {
+        memcpy(k, peer->k, sizeof(k));
+    } else if (e->data_len < DISCO_MIN_WIRE_LEN ||
+               nacl_box_compute_shared(k, e->data + DISCO_MAGIC_LEN,
+                                       s_keys.disco_priv) != 0) {
+        return;
+    }
     uint8_t pt[256];
     uint8_t peer_disco_pub[DISCO_KEY_LEN];
-    size_t pt_len = disco_open(pt, sizeof(pt), peer_disco_pub,
-                               e->data, e->data_len, s_keys.disco_priv);
-    if (pt_len == 0) return;
-
+    size_t pt_len = disco_open_with_shared(pt, sizeof(pt), peer_disco_pub,
+                                           e->data, e->data_len, k);
     disco_msg_t msg;
-    if (disco_parse(pt, pt_len, &msg) != 0) return;
-    if (msg.type != DISCO_TYPE_CALLMEMAYBE) return;
-
-    int sock = wg_netif_get_socket();
+    int sock = -1;
+    if (pt_len == 0 || disco_parse(pt, pt_len, &msg) != 0 ||
+        msg.type != DISCO_TYPE_CALLMEMAYBE) {
+        tl_secure_zero(k, sizeof(k));
+        return;
+    }
+    sock = wg_netif_get_socket();
     if (sock < 0) {
         ESP_LOGW(TAG, "cmm: wg socket not up — cannot punch");
+        tl_secure_zero(k, sizeof(k));
         return;
     }
 
@@ -909,10 +943,9 @@ static void send_disco_pings_to_cmm_endpoints(const derp_event_t *e)
         esp_fill_random(nonce, sizeof(nonce));
 
         uint8_t wire[DISCO_HANDLER_REPLY_MAX];
-        size_t wire_len = disco_seal(wire, sizeof(wire),
-                                     inner, inner_len, nonce,
-                                     s_keys.disco_pub, peer_disco_pub,
-                                     s_keys.disco_priv);
+        size_t wire_len = disco_seal_with_shared(wire, sizeof(wire),
+                                                 inner, inner_len, nonce,
+                                                 s_keys.disco_pub, k);
         if (wire_len == 0) continue;
 
 #ifdef ESP_PLATFORM
@@ -938,6 +971,7 @@ static void send_disco_pings_to_cmm_endpoints(const derp_event_t *e)
                  (unsigned)ep->port,
                  ping.txid[0], ping.txid[1], ping.txid[2], ping.txid[3]);
     }
+    tl_secure_zero(k, sizeof(k));
     if (sent == 0 && msg.u.cmm.n > 0) {
         ESP_LOGW(TAG, "cmm: %u endpoints but none v4-mapped",
                  (unsigned)msg.u.cmm.n);
@@ -973,29 +1007,34 @@ static void handle_disco_relayed(const derp_event_t *e,
     uint8_t peer_disco_pub[DISCO_KEY_LEN] = {0};
     uint8_t txid[DISCO_TXID_LEN] = {0};
 
-    size_t reply_len = disco_handle_recv(reply, sizeof(reply),
-                                         e->data, e->data_len,
-                                         s_keys.disco_priv, s_keys.disco_pub,
-                                         &type, peer_disco_pub, txid);
-
     /* knownPeerDiscoKey gate (mirrors the direct-UDP path's gate in
-     * wg_netif.c handle_disco_direct). disco_handle_recv only proves the
-     * frame was sealed TO us — any tailnet node can do that. Before we
-     * answer a PING or, worse, punch the endpoints in a CallMeMaybe (a
-     * UDP ping flood to attacker-chosen addresses), require the sender's
-     * DiscoKey to match the active WG peer's. Only DISCO message types
-     * are gated; the default case below is relayed WireGuard traffic,
-     * which wg_netif_inject_packet gates separately by src NodeKey. When
-     * the WG peer has no DiscoKey the gate is permissive, same as the
-     * direct path (before the first netmap DISCO never gets here). */
-    if (type == DISCO_TYPE_PING || type == DISCO_TYPE_PONG ||
-        type == DISCO_TYPE_CALLMEMAYBE) {
-        uint8_t known_disco[WG_KEY_LEN];
-        if (wg_netif_get_peer_disco_pub(known_disco) &&
-            memcmp(peer_disco_pub, known_disco, DISCO_KEY_LEN) != 0) {
-            ESP_LOGD(TAG, "drop relayed DISCO from unknown DiscoKey");
-            return;
-        }
+     * wg_netif.c handle_disco_direct). Opening a frame only proves it
+     * was sealed TO us — any tailnet node can do that. Before we answer
+     * a PING or, worse, punch the endpoints in a CallMeMaybe (a UDP ping
+     * flood to attacker-chosen addresses), the sender's DiscoKey must be
+     * the active WG peer's. Since round 1.3.7 (B2) it is read off the
+     * cleartext header before any crypto — another key cost an X25519
+     * to open (two for a PING: the pong was sealed before the gate) —
+     * and the peer's frames are opened and answered with its cached box
+     * key K, no X25519 at all (1–2 per relayed frame before; the
+     * relay's CallMeMaybe burst after each session up was ~60 ms of this
+     * task). Only DISCO frames are gated; anything else (type 0) is
+     * relayed WireGuard traffic, which wg_netif_inject_packet gates
+     * separately by src NodeKey. When the WG peer has no DiscoKey the
+     * gate is permissive, same as the direct path (before the first
+     * netmap DISCO never gets here). */
+    disco_peer_key_t peer;
+    memset(&peer, 0, sizeof(peer));
+    peer.has_pub = wg_netif_get_peer_disco_k(peer.pub, peer.k, &peer.k_valid);
+    bool gated = false;
+    size_t reply_len = disco_handle_recv_from_peer(reply, sizeof(reply),
+                                                   e->data, e->data_len, &peer,
+                                                   s_keys.disco_priv, s_keys.disco_pub,
+                                                   &type, peer_disco_pub, txid, &gated);
+    if (gated) {
+        tl_secure_zero(&peer, sizeof(peer));
+        ESP_LOGD(TAG, "drop relayed DISCO from unknown DiscoKey (pre-AEAD)");
+        return;
     }
 
     switch (type) {
@@ -1023,7 +1062,7 @@ static void handle_disco_relayed(const derp_event_t *e,
     case DISCO_TYPE_CALLMEMAYBE:
         st->disco_cmms_seen++;
         ESP_LOGI(TAG, "disco call-me-maybe — punching endpoints");
-        send_disco_pings_to_cmm_endpoints(e);
+        send_disco_pings_to_cmm_endpoints(e, &peer);
         /* The peer is punching towards us: if our handshake is still
          * pending, its INIT can get through now (B7). */
         wg_netif_handshake_kick(WG_NETIF_KICK_CALL_ME_MAYBE);
@@ -1045,6 +1084,7 @@ static void handle_disco_relayed(const derp_event_t *e,
         break;
     }
     }
+    tl_secure_zero(&peer, sizeof(peer));
 }
 
 static int derp_sup_event_cb(const derp_event_t *e, void *ctx)

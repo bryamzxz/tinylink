@@ -318,6 +318,13 @@ void wg_netif_get_stats(wg_netif_stats_t *out);
  * a PING/CallMeMaybe sealed by any tailnet node's DiscoKey. */
 bool wg_netif_get_peer_disco_pub(uint8_t out[WG_KEY_LEN]);
 
+/* The same, with the cached NaCl box key K for it (round 1.3.7, B2):
+ * *k_valid false (k untouched) when there is none — no DiscoKey, or a
+ * low-order one. Copied under one lock, so pub and k always belong
+ * together. k is a secret: the caller scrubs it. */
+bool wg_netif_get_peer_disco_k(uint8_t pub[WG_KEY_LEN], uint8_t k[WG_KEY_LEN],
+                               bool *k_valid);
+
 /* The live WG target (network-order v4 + port), which also moves on its
  * own (roam on authenticated packets, pong roam). False before start. */
 bool wg_netif_get_peer_endpoint(uint32_t *v4_be, uint16_t *port);

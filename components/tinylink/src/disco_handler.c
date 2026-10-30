@@ -152,3 +152,31 @@ size_t disco_handle_recv_with_shared(uint8_t *out_reply, size_t out_cap,
                              NULL, my_disco_pub,
                              out_type, out_peer_disco_pub, out_txid);
 }
+
+size_t disco_handle_recv_from_peer(uint8_t *out_reply, size_t out_cap,
+                                   const uint8_t *frame, size_t frame_len,
+                                   const disco_peer_key_t *peer,
+                                   const uint8_t my_disco_priv[DISCO_KEY_LEN],
+                                   const uint8_t my_disco_pub[DISCO_KEY_LEN],
+                                   disco_msg_type_t *out_type,
+                                   uint8_t out_peer_disco_pub[DISCO_KEY_LEN],
+                                   uint8_t out_txid[DISCO_TXID_LEN],
+                                   bool *gated)
+{
+    if (gated != NULL) *gated = false;
+    if (peer == NULL || frame == NULL) return 0;
+    if (!disco_looks_like(frame, frame_len)) return 0;
+    switch (disco_gate(frame, frame_len, peer)) {
+    case DISCO_GATE_DROP:
+        if (gated != NULL) *gated = true;
+        return 0;
+    case DISCO_GATE_K:
+        return disco_handle_recv_with_shared(out_reply, out_cap, frame, frame_len,
+                                             peer->k, my_disco_pub, out_type,
+                                             out_peer_disco_pub, out_txid);
+    default:
+        return disco_handle_recv(out_reply, out_cap, frame, frame_len,
+                                 my_disco_priv, my_disco_pub, out_type,
+                                 out_peer_disco_pub, out_txid);
+    }
+}
