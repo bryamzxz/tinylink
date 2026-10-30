@@ -229,7 +229,10 @@ with a make-before-break handshake (one INIT in flight, REKEY_TIMEOUT
 apart, once per silent streak): its response settles it within a round
 trip and replaces a session that only an INIT revives (1.3.5 / 1.3.6
 soaks: 30 s of silence until the RX-stale rekey; now 12–13 s after the
-first unanswered frame). A second window, opened by a frame sent
+first unanswered frame). The peer, as responder, deletes its previous
+keypair on that INIT, so when the rescue ring still holds frames sealed
+under it the test goes via DERP only, behind their re-send (no relay: no
+test). A second window, opened by a frame sent
 both ways, without one is SILENT (DISCO works, WireGuard does not):
 RELAY and a make-before-break rekey, the first of a streak only — in
 practice the doubt's test is in flight by then. A second doubt ended before a keepalive
@@ -240,13 +243,16 @@ re-tests do not end them. When a lapse is confirmed — that ping
 unanswered, SILENT, UNDELIVERED, or the endpoint moved elsewhere first —
 the direct-only frames sent since the last one proven delivered (a
 keepalive that proves the direct path answers a frame sent
-KEEPALIVE_TIMEOUT before it; 180 s at most; the last 40 s until 1.3.7),
-and those whose DERP copy was refused, are re-sent via DERP (`wg_tx`'s
+KEEPALIVE_TIMEOUT before it, plus a round trip and the modem's wake: the
+proof covers frames up to 12 s before it; 180 s at most; the last 40 s
+until 1.3.7), and those whose DERP copy was refused (kept until sent),
+are re-sent via DERP (`wg_tx`'s
 10-slot rescue ring, kept while the relay is down; the peer's replay
 window drops those it has). Steady state costs no packet (upstream
-heartbeats a ping every 3 s); 0.5 / 1 / 2 % random loss costs ~13 / 25 /
-54 one-ping lapses per 6 h, a handshake per doubt (+6 / +12 / +26 on
-195) and no forced or RX-stale rekey (test_wg_path). A pong from another endpoint
+heartbeats a ping every 3 s); 0.5 / 1 / 2 % random loss costs ~14 / 27 /
+55 one-ping lapses per 6 h, a handshake per doubt (+6 / +12.5 / +27 on
+195) and no forced or RX-stale rekey (test_wg_path, the peer's keypair
+slots modelled). A pong from another endpoint
 moves a valid current one only if clearly better (upstream `betterAddr`
 points, +20 private, > 15 points and > 25 ms, compared within one ping
 round); an authenticated packet from another source roams only while
