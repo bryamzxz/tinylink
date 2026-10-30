@@ -1,11 +1,10 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Bryam (bryamzxz)
 //
-// Wi-Fi association hint and retry policy (round 1.3.7). The channel and
-// BSSID of the last AP the station joined, kept in RTC slow memory (a
-// software / panic / WDT reset) and NVS `tl_state` (any reset), so the
-// connect scan starts on that channel; plus what to do after each
-// STA_DISCONNECTED.
+// Wi-Fi association hint and retry policy (round 1.3.7). The channel of
+// the last AP the station joined, kept in RTC slow memory (a software /
+// panic / WDT reset) and NVS `tl_state` (any reset), so the connect scan
+// starts on that channel; plus what to do after each STA_DISCONNECTED.
 //
 // Why. On 68 captured boots of 1.3.1–1.3.6 the connect scan walked
 // channels 1..11 at ~110 ms each before it saw the AP on 11 (STA start
@@ -15,6 +14,9 @@
 // stale channel costs one extra dwell, never a lock-out. bssid_set is
 // not used: on the hinted channel the first match is the AP anyway, and a
 // replaced AP would turn every attempt into NO_AP_FOUND after a full scan.
+// So the record holds no BSSID either — nothing would read it, and on a
+// mesh / multi-BSSID network with one SSID on one channel every reconnect
+// to another node would have been an NVS write (review, 1.3.7).
 //
 // The retry. Every one of those boots was a hardware reset (the serial
 // DTR pulse) and every one was refused first ("Association refused
@@ -31,13 +33,15 @@
 // came first) yet walked every channel for 2.29 s before taking it anyway
 // ("no ap found, connect to ap in blacklist") — and that attempt finished
 // its handshake in 10–20 ms in 22 of 22 boots, the AP having dropped the
-// old association by then. So the first 4-way timeout
-// after an association with the recorded AP is retried at once, the
-// config re-applied (wifi_set_config_process clears the blacklist), the
-// hint kept: it found the right AP, the handshake is what failed. Any
-// other failure — and a second one — drops the hint (scan 1..N) and goes
-// through the backoff ladder as before. A successful connect, to any
-// channel / BSSID, rewrites the record.
+// old association by then. So the first 4-way timeout of a failure
+// streak is retried at once with the config re-applied
+// (wifi_set_config_process clears the blacklist) — with or without a
+// record: the skipped backoff and blacklisted rescan are worth it either
+// way. A hint is kept for it: the scan found the AP, the handshake is
+// what failed. Any other failure — and a second one — drops the hint
+// (scan 1..N) and goes through the backoff ladder as before. A wrong
+// passphrase (also reason 15) costs one extra attempt per streak. A
+// successful connect, on any channel, rewrites the record.
 //
 // Everything here is pure and host-tested (tools/test/test_wifi_hint.c);
 // the driver calls, RTC_NOINIT_ATTR and NVS are in app_wifi.c.
@@ -63,7 +67,6 @@ extern "C" {
 
 typedef struct {
     uint8_t  channel;        /* 1..14; 0 = none */
-    uint8_t  bssid[6];
     uint32_t ssid_hash;      /* tl_wifi_ssid_hash() of the SSID it was joined on */
 } tl_wifi_ap_t;
 
@@ -80,42 +83,39 @@ static inline uint32_t tl_wifi_ssid_hash(const uint8_t *ssid, size_t n)
     return h;
 }
 
-/* Worth a hint: channel 1..14, a unicast non-zero BSSID, this SSID. */
+/* Worth a hint: channel 1..14, this SSID. */
 static inline bool tl_wifi_ap_ok(const tl_wifi_ap_t *a, uint32_t ssid_hash)
 {
-    static const uint8_t zero[6];
     return a != NULL && a->channel >= 1 && a->channel <= TL_WIFI_CH_MAX &&
-           a->ssid_hash == ssid_hash && (a->bssid[0] & 1u) == 0 &&
-           memcmp(a->bssid, zero, sizeof(zero)) != 0;
+           a->ssid_hash == ssid_hash;
 }
 
 /* ---- The record: NVS blob and RTC copy ------------------------------- */
 
-/* version ‖ channel ‖ BSSID ‖ SSID hash (LE32) */
-#define TL_WIFI_AP_REC_V1     1
-#define TL_WIFI_AP_BLOB_LEN   12
+/* version ‖ channel ‖ SSID hash (LE32). v1 (with a BSSID, 12 B) was never
+ * on a device; its length alone is rejected. */
+#define TL_WIFI_AP_REC_V2     2
+#define TL_WIFI_AP_BLOB_LEN   6
 
 static inline void tl_wifi_ap_encode(const tl_wifi_ap_t *a, uint8_t b[TL_WIFI_AP_BLOB_LEN])
 {
-    b[0] = TL_WIFI_AP_REC_V1;
+    b[0] = TL_WIFI_AP_REC_V2;
     b[1] = a->channel;
-    memcpy(b + 2, a->bssid, 6);
-    b[8]  = (uint8_t)a->ssid_hash;
-    b[9]  = (uint8_t)(a->ssid_hash >> 8);
-    b[10] = (uint8_t)(a->ssid_hash >> 16);
-    b[11] = (uint8_t)(a->ssid_hash >> 24);
+    b[2] = (uint8_t)a->ssid_hash;
+    b[3] = (uint8_t)(a->ssid_hash >> 8);
+    b[4] = (uint8_t)(a->ssid_hash >> 16);
+    b[5] = (uint8_t)(a->ssid_hash >> 24);
 }
 
-/* Exactly one v1 record for this SSID, else false (out untouched). */
+/* Exactly one v2 record for this SSID, else false (out untouched). */
 static inline bool tl_wifi_ap_decode(const uint8_t *b, size_t n, uint32_t ssid_hash,
                                      tl_wifi_ap_t *out)
 {
-    if (b == NULL || n != TL_WIFI_AP_BLOB_LEN || b[0] != TL_WIFI_AP_REC_V1) return false;
+    if (b == NULL || n != TL_WIFI_AP_BLOB_LEN || b[0] != TL_WIFI_AP_REC_V2) return false;
     tl_wifi_ap_t a;
-    a.channel = b[1];
-    memcpy(a.bssid, b + 2, 6);
-    a.ssid_hash = (uint32_t)b[8] | ((uint32_t)b[9] << 8) | ((uint32_t)b[10] << 16) |
-                  ((uint32_t)b[11] << 24);
+    a.channel   = b[1];
+    a.ssid_hash = (uint32_t)b[2] | ((uint32_t)b[3] << 8) | ((uint32_t)b[4] << 16) |
+                  ((uint32_t)b[5] << 24);
     if (!tl_wifi_ap_ok(&a, ssid_hash)) return false;
     *out = a;
     return true;
@@ -126,7 +126,7 @@ static inline bool tl_wifi_ap_decode(const uint8_t *b, size_t n, uint32_t ssid_h
  * tl_bootstat.h it carries a magic and a checksum: after a power-on or
  * an EN-pin reset (the serial DTR pulse — `boots=1 … RTC record
  * restarted` on every captured boot) the bytes are garbage. */
-#define TL_WIFI_RTC_MAGIC     0x544C5701u      /* "TLW" + layout version */
+#define TL_WIFI_RTC_MAGIC     0x544C5702u      /* "TLW" + layout version */
 
 typedef struct {
     uint32_t magic;
@@ -183,8 +183,8 @@ static inline tl_wifi_hint_src_t tl_wifi_ap_boot(const tl_wifi_rtc_t *rtc, const
 
 /* What NVS holds, mirrored in RAM (loaded at boot, compared before every
  * write) — tl_addr.h's rule: a flash write may erase a 4-KB sector and
- * stall both CPUs, so it happens only when the bytes change, from the
- * 60-s housekeeping, never on the boot path. len 0 = nothing stored. */
+ * stall both CPUs, so it happens only when the bytes change, never on
+ * the boot path. len 0 = nothing stored. */
 typedef struct {
     uint8_t len;
     uint8_t b[TL_WIFI_AP_BLOB_LEN];
@@ -239,28 +239,23 @@ static inline uint8_t tl_wifi_channel(const tl_wifi_retry_t *s)
 }
 
 /* STA_CONNECTED (the 4-way handshake is done). True when the record
- * changed, i.e. RTC and, at the next housekeeping, NVS take the new one. */
-static inline bool tl_wifi_on_connected(tl_wifi_retry_t *s, uint8_t channel,
-                                        const uint8_t bssid[6], uint32_t ssid_hash)
+ * changed — a new channel (or SSID) —, i.e. NVS takes it at the next
+ * persist; another node of the same network on the same channel is not
+ * a change. */
+static inline bool tl_wifi_on_connected(tl_wifi_retry_t *s, uint8_t channel, uint32_t ssid_hash)
 {
     s->joined     = true;
     s->fast_spent = false;
-    tl_wifi_ap_t a;
-    a.channel = channel;
-    memcpy(a.bssid, bssid, 6);
-    a.ssid_hash = ssid_hash;
+    const tl_wifi_ap_t a = { channel, ssid_hash };
     if (!tl_wifi_ap_ok(&a, ssid_hash)) return false;      /* keep what we had */
-    const bool changed = s->ap.channel != a.channel || s->ap.ssid_hash != a.ssid_hash ||
-                         memcmp(s->ap.bssid, a.bssid, 6) != 0;
+    const bool changed = s->ap.channel != a.channel || s->ap.ssid_hash != a.ssid_hash;
     s->ap   = a;
     s->hint = true;
     return changed;
 }
 
-/* STA_DISCONNECTED: how to make the next attempt. `bssid` is the event's
- * (the AP the attempt was on; NULL = unknown). */
-static inline tl_wifi_next_t tl_wifi_on_disconnected(tl_wifi_retry_t *s, uint16_t reason,
-                                                     const uint8_t *bssid)
+/* STA_DISCONNECTED: how to make the next attempt. */
+static inline tl_wifi_next_t tl_wifi_on_disconnected(tl_wifi_retry_t *s, uint16_t reason)
 {
     tl_wifi_next_t n = { false, false, 0 };
     const bool was_joined = s->joined;
@@ -270,24 +265,31 @@ static inline tl_wifi_next_t tl_wifi_on_disconnected(tl_wifi_retry_t *s, uint16_
         n.channel = tl_wifi_channel(s);
         return n;
     }
-    const bool have = s->ap.channel != 0;
     const bool handshake = reason == TL_WIFI_REASON_4WAY || reason == TL_WIFI_REASON_HS;
-    const bool same_ap = !have || bssid == NULL || memcmp(bssid, s->ap.bssid, 6) == 0;
-    if (handshake && same_ap && !s->fast_spent) {
+    if (handshake && !s->fast_spent) {
         s->fast_spent = true;
         n.now     = true;
         n.reapply = true;                  /* drop the driver's blacklist entry */
-        n.channel = tl_wifi_channel(s);
+        n.channel = tl_wifi_channel(s);    /* 0 without a record: 1..N */
         return n;
     }
     s->hint = false;                       /* scan 1..N until the next connect */
     return n;
 }
 
-/* Whether the attempt needs an esp_wifi_set_config first. */
-static inline bool tl_wifi_needs_config(const tl_wifi_next_t *n, uint8_t applied_channel)
+/* The reconnect path: whether this attempt needs an esp_wifi_set_config
+ * first (`pending` is what the event handler queued). */
+static inline bool tl_wifi_needs_config(const tl_wifi_next_t *pending, uint8_t applied_channel)
 {
-    return n->reapply || n->channel != applied_channel;
+    return pending->reapply || pending->channel != applied_channel;
+}
+
+/* After that esp_wifi_set_config: the blacklist clear is done only if it
+ * succeeded — on a failure (ESP_ERR_WIFI_STATE…) it stays pending for the
+ * next attempt. */
+static inline void tl_wifi_config_done(tl_wifi_next_t *pending, bool ok)
+{
+    if (ok) pending->reapply = false;
 }
 
 #ifdef __cplusplus

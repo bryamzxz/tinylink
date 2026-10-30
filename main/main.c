@@ -234,6 +234,9 @@ static esp_err_t bringup(void)
                  err, (unsigned)delay_ms,
                  rate_limit_ms > 0 ? " (rate limited by control)" : "");
         vTaskDelay(pdMS_TO_TICKS(delay_ms));
+        /* The Wi-Fi hint's NVS copy, if it changed (round 1.3.7): the
+         * telemetry task's housekeeping only exists once registered. */
+        app_wifi_persist_hint();
     }
 
     err = tinylink_dataplane_start();
