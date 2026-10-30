@@ -320,9 +320,10 @@ the sensor.
   **Off by default after the hardware runs** (`CONFIG_TINYLINK_CONTROL_PUSH_PIPELINE`,
   default n): against tailscale.com the map stream of both such boot
   connections was later ended cleanly by the server (h2 END_STREAM at
-  229 s and 645 s — never on 1.3.6, which pushed first: 0 clean ends in
-  its soaks), and the next poll got no answer for 120 s, the one after
-  it its netmap 26–55 s late (~1.3 s normally). A host probe of the
+  229 s and 645 s; with the push first a clean end came once in ~30
+  boot connections of 1.3.5–1.3.6 and twice mid-soak on 1.2.0), and the
+  next poll got no answer for 120 s, the one after it its netmap 26–55 s
+  late (~1.3 s normally; 59–112 s after the earlier clean ends too). A host probe of the
   reconnect (`h2_client` / `h2_core` / `ts2021_client` against nghttp2,
   55 checks) found no client fault, so the server is reacting to the
   pair; the push goes first again and the stream after it on the same

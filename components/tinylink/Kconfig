@@ -45,9 +45,11 @@ menu "tinylink core"
             trip less (~0.2 s to the netmap). Off by default: against
             tailscale.com the map stream of every such connection was
             later ended cleanly by the server (2 of 2 on the sensor, at
-            229 s and 645 s; never on 1.3.6, which pushes first) and the
-            next poll then got no answer for 120 s, the one after it its
-            netmap only 26–55 s late. Off, the push goes first and the
+            229 s and 645 s; with the push first that happened once in
+            ~30 boot connections of 1.3.5–1.3.6, plus twice mid-soak on
+            1.2.0) and the next poll then got no answer for 120 s, the
+            one after it its netmap only 26–55 s late (59–112 s after
+            the earlier clean ends). Off, the push goes first and the
             stream after it on the same connection, as up to 1.3.6.
 
     config TINYLINK_CRYPTO_IN_IRAM
