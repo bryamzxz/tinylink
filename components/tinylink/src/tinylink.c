@@ -1753,6 +1753,13 @@ static esp_err_t long_poll_handler(const tl_netmap_t *nm, void *ctx)
 #define LP_BACKOFF_BASE_MS 1000u
 #define LP_BACKOFF_CAP_MS  ((uint32_t)CONFIG_TINYLINK_REGISTER_RETRY_MS)
 #define LP_HEALTHY_MS      10000LL
+/* After such a stream the redial goes at once (round 1.3.8, C2), the
+ * backoff only from its failure on: upstream's mapRoutine resets its
+ * backoff with every netmap and then waits n² × 10 ms × [0.5, 1.5] —
+ * 5–15 ms — before the next poll; 0.75–1.25 s here was most of the
+ * 1.4 s from a stream's end to the next connect's handshake on the 1.3.7
+ * sensor (stream end 647.86 s → init sent 649.26 s). */
+#define LP_REDIAL_MS       10u
 
 /* Endpoint-push request flag, consumed by long_poll_task right after
  * each control (re)connect. Set from the STUN re-probe path (any task)
@@ -1873,6 +1880,7 @@ static void long_poll_task(void *arg)
         tl_wdt_feed();
         uint32_t rate_limit_ms = 0;
         int      http_status   = 0;
+        bool     redial_now    = false;
         esp_err_t err = ensure_control_conn();
         if (err == ESP_OK) {
             /* Endpoint push (Stream=false lite MapRequest) on the freshly
@@ -1918,8 +1926,12 @@ static void long_poll_task(void *arg)
             }
             drop_control_conn();
             s_stat_lp_reconnects++;
-            /* The stream was a healthy working connection — recover fast. */
-            if (up_us >= LP_HEALTHY_MS * 1000LL) fail_attempt = 0;
+            /* The stream was a healthy working connection — recover fast:
+             * redial now, the backoff from base if that fails. */
+            if (up_us >= LP_HEALTHY_MS * 1000LL) {
+                fail_attempt = 0;
+                redial_now = true;
+            }
         } else {
             ESP_LOGW(TAG, "long-poll connect failed: 0x%x — backing off", err);
         }
@@ -2009,6 +2021,8 @@ static void long_poll_task(void *arg)
             delay_ms = rate_limit_ms;
             ESP_LOGI(TAG, "long-poll: rate limited by control — waiting %u ms",
                      (unsigned)delay_ms);
+        } else if (redial_now) {
+            delay_ms = tl_backoff_ms(0, LP_REDIAL_MS, LP_REDIAL_MS, esp_random());
         } else {
             delay_ms = tl_backoff_ms(fail_attempt, LP_BACKOFF_BASE_MS,
                                      LP_BACKOFF_CAP_MS, esp_random());
