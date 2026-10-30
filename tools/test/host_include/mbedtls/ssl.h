@@ -26,4 +26,14 @@ typedef struct {
     size_t         ticket_len;
 } mbedtls_ssl_session;
 
+/* Session (de)serialization (tls_resume.c's RTC copy, round 1.3.8): the
+ * host test defines them over the fields above. */
+#define MBEDTLS_ERR_SSL_BUFFER_TOO_SMALL  -0x6A00
+#define MBEDTLS_ERR_SSL_BAD_INPUT_DATA    -0x7100
+void mbedtls_ssl_session_init(mbedtls_ssl_session *session);
+int mbedtls_ssl_session_save(const mbedtls_ssl_session *session, unsigned char *buf,
+                             size_t buf_len, size_t *olen);
+int mbedtls_ssl_session_load(mbedtls_ssl_session *session, const unsigned char *buf,
+                             size_t len);
+
 #endif

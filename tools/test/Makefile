@@ -33,7 +33,7 @@ TARGETS := test_blake2s test_curve25519 test_x25519 test_mapresp \
            test_backoff test_keys_regen test_stun_boot test_skip_value test_jsmn_split \
            test_tai64n test_nacl_box test_tsmp test_tl_date test_stats test_noise_ik \
            test_http1 test_ctrl_json test_ts2021 test_hpack test_h2_core test_tls_resume \
-           test_addr test_wifi_hint test_pwr_diag test_tlm_sched test_tls_offer
+           test_addr test_wifi_hint test_pwr_diag test_tlm_sched test_tls_offer test_tls_rtc
 
 all: $(TARGETS) $(H2_INTEROP)
 
@@ -202,6 +202,13 @@ test_tls_offer: test_tls_offer.c $(TL_SRC)/tls_offer.c $(TL_SRC)/tls_offer.h \
                 host_include/esp_tls.h host_include/mbedtls/ssl.h host_include/esp_timer.h
 	$(CC) $(CFLAGS) -DCONFIG_ESP_TLS_CLIENT_SESSION_TICKETS=1 -DCONFIG_TINYLINK_TLS_RSA_FIRST=1 \
 	    -I$(TL_SRC) -Ihost_include -o $@ test_tls_offer.c
+
+# TLS sessions across warm resets (round 1.3.8): the RTC record (tls_rtc.h)
+# and tls_resume.c's glue over a fake RTC timer and session serializer.
+test_tls_rtc: test_tls_rtc.c $(TL_SRC)/tls_resume.c $(TL_SRC)/tls_resume.h $(TL_SRC)/tls_rtc.h \
+              host_include/esp_tls.h host_include/mbedtls/ssl.h host_include/esp_timer.h
+	$(CC) $(CFLAGS) -DCONFIG_ESP_TLS_CLIENT_SESSION_TICKETS=1 -DCONFIG_TINYLINK_TLS_RESUME_RTC=1 \
+	    -I$(TL_SRC) -Ihost_include -o $@ test_tls_rtc.c
 
 # In-tree HTTP/2 client (round 1.3.4, D1): HPACK (RFC 7541 Appendix C,
 # Huffman, fuzz) and the frame / connection engine against a scripted
@@ -460,7 +467,10 @@ test: test_blake2s.run test_curve25519.run test_x25519.run test_mapresp.run \
       test_nacl_box.run test_tsmp.run test_tl_date.run test_stats.run test_noise_ik.run \
       test_http1.run test_ctrl_json.run test_ts2021.run test_hpack.run test_h2_core.run \
       test_tls_resume.run test_addr.run test_wifi_hint.run test_pwr_diag.run \
-      test_tlm_sched.run test_tls_offer.run h2_interop.run
+      test_tlm_sched.run test_tls_offer.run test_tls_rtc.run h2_interop.run
+
+test_tls_rtc.run: test_tls_rtc
+	$(RUNNER) ./test_tls_rtc
 
 test_tls_offer.run: test_tls_offer
 	$(RUNNER) ./test_tls_offer
