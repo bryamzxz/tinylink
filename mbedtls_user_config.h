@@ -60,3 +60,24 @@
 // firmware parses no private keys at all (TLS is server-auth only, the
 // bundle is DER certificates).
 #undef MBEDTLS_PKCS12_C
+
+// Round 1.3.8 A/B knobs (components/tinylink/Kconfig, TLS section;
+// esp_config.h includes sdkconfig.h before this file).
+//
+// CONFIG_TINYLINK_TLS_MPI_MUL_SW (default y): mbedtls_mpi_mul_mpi /
+// mbedtls_mpi_mul_int in software instead of on the RSA accelerator
+// (esp_bignum.c builds its versions only under MBEDTLS_MPI_MUL_MPI_ALT,
+// bignum.c its own only without it). mbedtls_mpi_exp_mod — the RSA
+// exponentiation — keeps the accelerator (MBEDTLS_MPI_EXP_MOD_ALT is
+// untouched). Kconfig help has the measurements.
+#if defined(CONFIG_TINYLINK_TLS_MPI_MUL_SW) && CONFIG_TINYLINK_TLS_MPI_MUL_SW
+#undef MBEDTLS_MPI_MUL_MPI_ALT
+#endif
+
+// CONFIG_TINYLINK_TLS_ECP_WINDOW: the comb window for a non-generator
+// point (ecp.c ecp_pick_window); mbedTLS's default is 4. No public struct
+// depends on it.
+#if defined(CONFIG_TINYLINK_TLS_ECP_WINDOW)
+#undef MBEDTLS_ECP_WINDOW_SIZE
+#define MBEDTLS_ECP_WINDOW_SIZE CONFIG_TINYLINK_TLS_ECP_WINDOW
+#endif
