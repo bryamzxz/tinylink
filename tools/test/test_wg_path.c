@@ -486,6 +486,7 @@ static void doubt_at(wg_path_t *p, int64_t s1, int64_t pong)
     (void)send_data(p, s1 + S(5), &m);
     (void)wg_path_tick(p, s1 + MS(WG_PATH_ANSWER_MS) + 1);
     (void)wg_path_on_pong(p, pong, 80000, true, 0, 0, false, false, NULL);
+    (void)wg_path_tick(p, pong);                /* the test asked for (1.3.8) */
 }
 
 static void test_doubt(void)
@@ -508,10 +509,19 @@ static void test_doubt(void)
        WG_PATH_PONG_DOUBT && act == 0 && p.mode == WG_PATH_DUAL &&
        p.why == WG_PATH_WHY_DOUBT && p.doubts == 1 && p.doubts_total == 1 &&
        p.silences == 0 && p.unconfirmed_us == pong - s1 && p.rtt_us == 80000);
-    /* Nothing to wait for until a frame goes out both ways. */
+    /* Round 1.3.8: tested at once — the next timer pass (the RX task runs
+     * one right after the pong) asks for a handshake, once. */
+    ok("doubt/test-owed", wg_path_next_deadline(&p) == pong && p.test_at_us == pong);
+    {
+        wg_path_t q = p;
+        ok("doubt/test-not-before", wg_path_tick(&q, pong - 1) == 0);
+    }
+    ok("doubt/test", wg_path_tick(&p, pong) == WG_PATH_ACT_TEST && p.tests == 1 &&
+                     p.test_at_us == 0 && WG_PATH_IN_DOUBT(&p));
+    /* Then nothing to wait for until a frame goes out both ways. */
     ok("doubt/no-deadline-idle", wg_path_next_deadline(&p) == INT64_MAX &&
                                  wg_path_tick(&p, pong + S(6)) == 0 &&
-                                 WG_PATH_IN_DOUBT(&p));
+                                 WG_PATH_IN_DOUBT(&p) && p.tests == 1);
     const int64_t d1 = pong + S(2);
     ok("doubt/frames-dual", send_data(&p, d1, &m) == 0 && m == WG_PATH_DUAL &&
                             p.await_us == d1 && p.last_relay_data_us == d1 &&
@@ -570,6 +580,11 @@ static void test_doubt(void)
     ok("silent/again-doubt",
        wg_path_on_pong(&p, t + MS(WG_PATH_ANSWER_MS) + MS(80), 80000, true, 0, 0,
                        false, false, &act) == WG_PATH_PONG_DOUBT && p.doubts == 2);
+    /* ...and not tested again: its test (or the silence's rekey) was the
+     * fresh session that stayed silent (1.3.8, once per streak). */
+    ok("silent/again-no-test", p.test_at_us == 0 &&
+                               wg_path_tick(&p, t + MS(WG_PATH_ANSWER_MS) + MS(80)) == 0 &&
+                               p.tests == 1);
     t += MS(WG_PATH_ANSWER_MS) + S(1);
     (void)send_data(&p, t, &m);
     act = wg_path_tick(&p, t + MS(WG_PATH_ANSWER_MS) + 1);
@@ -578,6 +593,33 @@ static void test_doubt(void)
     /* Any transport packet from the peer ends the streak. */
     (void)wg_path_on_peer_data(&p, t + S(13));
     ok("silent/transport-ends-streak", p.silent_streak == 0);
+
+    /* The test owed is dropped when the doubt ends first (a keepalive
+     * between the pong and the timer pass: the DERP task). */
+    wg_path_init(&p, T0, true);
+    confirm_at(&p, T0, 50000);
+    (void)send_data(&p, s1, &m);
+    (void)wg_path_tick(&p, lapse);
+    (void)wg_path_on_pong(&p, pong, 80000, true, 0, 0, false, false, NULL);
+    (void)wg_path_on_keepalive(&p, pong + MS(5));
+    ok("test/dropped-when-settled", p.mode == WG_PATH_DIRECT &&
+                                    wg_path_next_deadline(&p) == INT64_MAX &&
+                                    wg_path_tick(&p, pong + MS(6)) == 0 && p.tests == 0);
+    /* A tick late past window 2 asks for both: one rekey either way. */
+    wg_path_init(&p, T0, true);
+    confirm_at(&p, T0, 50000);
+    (void)send_data(&p, s1, &m);
+    (void)wg_path_tick(&p, lapse);
+    (void)wg_path_on_pong(&p, pong, 80000, true, 0, 0, false, false, NULL);
+    (void)send_data(&p, pong + MS(1), &m);
+    act = wg_path_tick(&p, pong + MS(1) + MS(WG_PATH_ANSWER_MS) + 1);
+    ok("test/late-tick-silent", act == (WG_PATH_ACT_TEST | WG_PATH_ACT_RESCUE |
+                                        WG_PATH_ACT_REKEY) && p.why == WG_PATH_WHY_SILENT);
+    /* Its response settles the doubt like any WireGuard packet: the first
+     * doubt since a direct proof back to DIRECT, the second UNDELIVERED. */
+    doubt_at(&p, s1, pong);
+    ok("test/response-settles", wg_path_on_handshake(&p, pong + MS(150)) == 0 &&
+                                p.mode == WG_PATH_DIRECT && p.doubts == 1 && p.tests == 1);
 
     /* WireGuard answers only what went via DERP: the first doubt ends in
      * DIRECT, the second (no direct proof between) in UNDELIVERED. */
@@ -679,7 +721,10 @@ static void test_doubt(void)
  * test. The peer here is wireguard-go's passive keepalive at 10-ms
  * resolution: a data frame received while none is pending arms one for
  * +10 s, it reaches us 0.2 s later; DISCO answered in 50 ms; telemetry
- * every 5 s. */
+ * every 5 s. A rekey (SILENT, a doubt's test) is answered 100 ms later,
+ * one at a time; the response is a send (no keepalive owed), our TSMP
+ * advert follows under the new keys and the peer's own advert answers it
+ * 100 ms later (a send too). */
 typedef struct {
     wg_path_t p;
     int64_t t, next_data, ka_at, pong_at;
@@ -689,7 +734,8 @@ typedef struct {
     int lose_frame;                 /* this data frame never arrives; -1 none */
     int lose_ka_after;              /* the first keepalive after this frame is lost */
     int64_t up_wg_dead_at;          /* our direct WireGuard dropped from then */
-    uint32_t rekeys, rescues, pings, dual_frames, relay_frames;
+    int64_t hs_at, padv_at;         /* a handshake response / the peer's advert due */
+    uint32_t rekeys, tests, rescues, pings, dual_frames, relay_frames;
 } tl_t;
 
 static tl_t tl_base(void)
@@ -713,10 +759,10 @@ static void tl_act(tl_t *s, uint32_t act)
         s->pong_at = s->t + MS(50);
     }
     if (act & WG_PATH_ACT_RESCUE) s->rescues++;
-    if (act & WG_PATH_ACT_REKEY) {
-        s->rekeys++;
-        act = wg_path_on_handshake(&s->p, s->t + MS(100));   /* answered at once */
-        if (act & WG_PATH_ACT_RESCUE) s->rescues++;
+    if ((act & (WG_PATH_ACT_REKEY | WG_PATH_ACT_TEST)) && s->hs_at == 0) {
+        if (act & WG_PATH_ACT_REKEY) s->rekeys++;
+        if (act & WG_PATH_ACT_TEST) s->tests++;
+        s->hs_at = s->t + MS(100);
     }
 }
 
@@ -755,6 +801,19 @@ static void tl_run(tl_t *s, int64_t end)
             (void)wg_path_on_pong(&s->p, t, 50000, true, 0, 0, false, false, &pact);
             tl_act(s, pact);
         }
+        if (s->hs_at != 0 && t >= s->hs_at) {
+            s->hs_at = 0;
+            s->ka_pending = false;                  /* the response is a send */
+            tl_act(s, wg_path_on_handshake(&s->p, t));
+            const uint32_t act = wg_path_on_send(&s->p, t, true, &m);   /* our advert */
+            if (m != WG_PATH_DIRECT || t < s->up_wg_dead_at) s->padv_at = t + MS(100);
+            tl_act(s, act);
+        }
+        if (s->padv_at != 0 && t >= s->padv_at) {
+            s->padv_at = 0;
+            s->ka_pending = false;                  /* its advert is a send */
+            tl_act(s, wg_path_on_peer_data(&s->p, t));
+        }
     }
 }
 
@@ -762,8 +821,10 @@ static void test_review(void)
 {
     /* Finding 1 (silent_false_pos A/B): one lost keepalive, or our first
      * frame after a proof lost (the keepalive then comes one period
-     * late): a short DUAL period, no rekey, no re-send. 1.3.6 as first
-     * committed: a rekey, 10 s of DERP only, a probe, 8 re-sent frames. */
+     * late): no forced rekey, no re-send, no DERP only. 1.3.6 as first
+     * committed: a rekey, 10 s of DERP only, a probe, 8 re-sent frames.
+     * Since 1.3.8 the doubt costs one handshake, whose response settles
+     * it before the next frame (1.3.6: 1–3 frames both ways). */
     tl_t s = tl_base();
     tl_run(&s, T0 + S(3600));
     ok("review/healthy-quiet", s.rekeys == 0 && s.rescues == 0 && s.pings == 0 &&
@@ -771,12 +832,14 @@ static void test_review(void)
     s = tl_base();
     s.lose_ka_after = 360;
     tl_run(&s, T0 + S(3600));
-    printf("  one keepalive lost: lapses=%u doubts=%u rekeys=%u re-sends=%u pings=%u "
-           "DUAL frames=%u DERP-only=%u\n", s.p.lapses, s.p.doubts_total, s.rekeys,
-           s.rescues, s.pings, s.dual_frames, s.relay_frames);
+    printf("  one keepalive lost: lapses=%u doubts=%u tests=%u forced rekeys=%u "
+           "re-sends=%u pings=%u DUAL frames=%u DERP-only=%u\n", s.p.lapses,
+           s.p.doubts_total, s.tests, s.rekeys, s.rescues, s.pings, s.dual_frames,
+           s.relay_frames);
     ok("review/lost-ka-no-rekey", s.p.lapses == 1 && s.rekeys == 0 && s.rescues == 0 &&
-                                  s.relay_frames == 0 && s.dual_frames <= 3 &&
-                                  s.pings == 1 && s.p.mode == WG_PATH_DIRECT);
+                                  s.relay_frames == 0 && s.dual_frames <= 1 &&
+                                  s.tests == 1 && s.pings == 1 &&
+                                  s.p.mode == WG_PATH_DIRECT);
     int found = 0, good = 1;
     for (int f = 355; f < 380; f++) {          /* every frame position in a cycle */
         s = tl_base();
@@ -785,7 +848,7 @@ static void test_review(void)
         if (s.p.lapses == 0) continue;
         found++;
         good &= s.rekeys == 0 && s.rescues == 0 && s.relay_frames == 0 &&
-                s.dual_frames <= 3 && s.p.mode == WG_PATH_DIRECT;
+                s.dual_frames <= 3 && s.tests <= 1 && s.p.mode == WG_PATH_DIRECT;
     }
     ok("review/lost-frame-no-rekey", found > 0 && good);
 
@@ -797,9 +860,10 @@ static void test_review(void)
     s = tl_base();
     s.up_wg_dead_at = T0 + S(600);
     tl_run(&s, T0 + S(600 + 3600));
-    printf("  our direct WireGuard dropped, 1 h: rekeys=%u undelivered=%u re-sends=%u "
-           "pings=%u\n", s.rekeys, s.p.undelivered, s.rescues, s.pings);
-    ok("review/oneway-wg-no-rekey", s.rekeys == 0 && s.p.silences == 0);
+    printf("  our direct WireGuard dropped, 1 h: forced rekeys=%u tests=%u undelivered=%u "
+           "re-sends=%u pings=%u\n", s.rekeys, s.tests, s.p.undelivered, s.rescues, s.pings);
+    ok("review/oneway-wg-no-rekey", s.rekeys == 0 && s.p.silences == 0 &&
+                                    s.tests <= s.p.undelivered + 2);
     ok("review/oneway-wg-backs-off", s.p.undelivered >= 40 && s.p.undelivered <= 60 &&
                                      s.pings <= 3 * s.p.undelivered + 6);
 
@@ -964,7 +1028,7 @@ static void test_rescue_ring(void)
 {
     static wg_rescue_ring_t r;
     memset(&r, 0, sizeof(r));
-    const int64_t age = MS(WG_PATH_RESCUE_MS);
+    const int64_t age = MS(WG_PATH_RESCUE_MAX_MS);
     uint8_t f[WG_RESCUE_MAX + 1];
     for (int i = 0; i < 3; i++) {
         memset(f, 0xA0 + i, sizeof(f));
@@ -972,20 +1036,20 @@ static void test_rescue_ring(void)
     }
     rescue_sink_t k = { 0 };
     unsigned kept = 99;
-    ok("rescue/refused-kept", wg_rescue_flush(&r, T0 + S(12), age, rescue_sink, &k, &kept) == 0 &&
+    ok("rescue/refused-kept", wg_rescue_flush(&r, T0 + S(12), 0, age, rescue_sink, &k, &kept) == 0 &&
                               kept == 3 && k.calls == 0);
     k = (rescue_sink_t){ .accept = 1 };
-    ok("rescue/partial", wg_rescue_flush(&r, T0 + S(13), age, rescue_sink, &k, &kept) == 1 &&
+    ok("rescue/partial", wg_rescue_flush(&r, T0 + S(13), 0, age, rescue_sink, &k, &kept) == 1 &&
                          kept == 2 && k.order[0] == 0xA0);
     k = (rescue_sink_t){ .accept = -1 };
-    ok("rescue/relay-back", wg_rescue_flush(&r, T0 + S(20), age, rescue_sink, &k, &kept) == 2 &&
+    ok("rescue/relay-back", wg_rescue_flush(&r, T0 + S(20), 0, age, rescue_sink, &k, &kept) == 2 &&
                             kept == 0 && k.order[0] == 0xA1 && k.order[1] == 0xA2);
-    ok("rescue/once", wg_rescue_flush(&r, T0 + S(21), age, rescue_sink, &k, &kept) == 0 &&
+    ok("rescue/once", wg_rescue_flush(&r, T0 + S(21), 0, age, rescue_sink, &k, &kept) == 0 &&
                       k.calls == 2);
     /* Past the age bound: dropped, not sent late. */
     wg_rescue_keep(&r, f, 112, T0 + S(30));
     k = (rescue_sink_t){ .accept = -1 };
-    ok("rescue/age-bound", wg_rescue_flush(&r, T0 + S(30) + age + 1, age, rescue_sink, &k,
+    ok("rescue/age-bound", wg_rescue_flush(&r, T0 + S(30) + age + 1, 0, age, rescue_sink, &k,
                                            &kept) == 0 && kept == 0 && k.calls == 0);
     /* Full: the oldest goes; too big: not kept. */
     for (int i = 0; i < WG_RESCUE_SLOTS + 1; i++) {
@@ -995,8 +1059,50 @@ static void test_rescue_ring(void)
     wg_rescue_keep(&r, f, WG_RESCUE_MAX + 1, T0 + S(110));
     k = (rescue_sink_t){ .accept = -1 };
     ok("rescue/ring-oldest-out",
-       wg_rescue_flush(&r, T0 + S(111), age, rescue_sink, &k, &kept) == WG_RESCUE_SLOTS &&
+       wg_rescue_flush(&r, T0 + S(111), 0, age, rescue_sink, &k, &kept) == WG_RESCUE_SLOTS &&
        k.order[0] == 1 && k.order[WG_RESCUE_SLOTS - 1] == WG_RESCUE_SLOTS);
+
+    /* Round 1.3.8: aged by the last proof of delivery, not 40 s. Frames
+     * sent before it are dropped unsent, those at or after it go — 60 s
+     * old too (the 1.3.6 known gap) — up to WG_PATH_RESCUE_MAX_MS. */
+    for (int i = 0; i < 4; i++) {
+        memset(f, 0xB0 + i, sizeof(f));
+        wg_rescue_keep(&r, f, 112, T0 + S(200 + 20 * i));      /* 200, 220, 240, 260 */
+    }
+    k = (rescue_sink_t){ .accept = -1 };
+    ok("rescue/from-proof",
+       wg_rescue_flush(&r, T0 + S(280), T0 + S(220), age, rescue_sink, &k, &kept) == 3 &&
+       kept == 0 && k.order[0] == 0xB1 && k.order[2] == 0xB3);
+    wg_rescue_keep(&r, f, 112, T0 + S(300));
+    k = (rescue_sink_t){ .accept = -1 };
+    ok("rescue/max-age", wg_rescue_flush(&r, T0 + S(300) + age + 1, 0, age, rescue_sink, &k,
+                                         &kept) == 0 && k.calls == 0);
+
+    /* The proof: a keepalive that proves the direct path — its frame went
+     * out KEEPALIVE_TIMEOUT before it. Not one within a window of a DERP
+     * copy (it may answer that), not one ending a doubt, not a pong. */
+    wg_path_t p;
+    wg_path_mode_t m;
+    wg_path_init(&p, T0, true);
+    ok("proof/none-at-start", wg_path_rescue_from(&p) == 0);
+    confirm_at(&p, T0, 50000);
+    ok("proof/not-a-pong", wg_path_rescue_from(&p) == 0);
+    (void)wg_path_on_send(&p, T0 + S(1), true, &m);
+    (void)wg_path_on_keepalive(&p, T0 + S(11));
+    ok("proof/direct-ka", wg_path_rescue_from(&p) == T0 + S(1));
+    wg_path_init(&p, T0, true);
+    (void)wg_path_on_send(&p, T0 + S(1), true, &m);          /* DUAL: via DERP too */
+    confirm_at(&p, T0 + S(2), 50000);
+    (void)wg_path_on_send(&p, T0 + S(3), true, &m);
+    (void)wg_path_on_keepalive(&p, T0 + S(13));               /* within a window of S(1) */
+    ok("proof/not-after-derp", p.mode == WG_PATH_DIRECT && wg_path_rescue_from(&p) == 0);
+    (void)wg_path_on_send(&p, T0 + S(14), true, &m);
+    (void)wg_path_on_keepalive(&p, T0 + S(24));
+    ok("proof/then-direct-ka", wg_path_rescue_from(&p) == T0 + S(14));
+    doubt_at(&p, T0 + S(1), T0 + S(1) + MS(WG_PATH_ANSWER_MS) + MS(81));
+    const int64_t before = wg_path_rescue_from(&p);
+    (void)wg_path_on_keepalive(&p, T0 + S(30));
+    ok("proof/not-a-doubt-ka", p.mode == WG_PATH_DIRECT && wg_path_rescue_from(&p) == before);
 }
 
 static void test_unmanaged(void)
@@ -1077,14 +1183,15 @@ static uint32_t rnd(uint32_t n)
 }
 
 typedef enum {
-    EV_TELEMETRY, EV_REKEY,
+    EV_TELEMETRY,
     EV_PEER_GOT_DATA, EV_PEER_GOT_INIT, EV_PEER_GOT_PING, EV_PEER_CHAT,
     EV_US_GOT_KA, EV_US_GOT_DATA, EV_US_GOT_RESP, EV_US_GOT_PONG,
 } ev_kind_t;
 
 /* arg — EV_US_GOT_KA / _DATA / _RESP: the source, 0 = via DERP, 1 + the
- * peer endpoint it came from if direct; pings and pongs: the ping's time
- * in ms since T0, times 2, plus the endpoint pinged. */
+ * peer endpoint it came from if direct, plus (_RESP) 4 times the id of the
+ * INIT it answers; EV_PEER_GOT_INIT: that id; pings and pongs: the ping's
+ * time in ms since T0, times 2, plus the endpoint pinged. */
 typedef struct { int64_t t; ev_kind_t k; int arg; } ev_t;
 
 typedef struct {
@@ -1103,6 +1210,7 @@ typedef struct {
                                            mille: ours direct, the peer's any path */
     bool    peer_chatty;                /* peer sends data every second */
     bool    peer_advert;                /* TSMP advert on every new keypair */
+    bool    advert_kept;                /* ours takes a rescue slot (1.3.7) */
     int64_t end;
     /* results */
     uint32_t frames, lost, lost_after_break, derp_copies, direct_after_relay;
@@ -1114,23 +1222,59 @@ typedef struct {
     int      final_ep;
     uint32_t silences, forced_rekeys, doubts, undelivered;
     uint32_t stale_rekeys;              /* wg_netif's RX-stale rekey (30 s) */
-    uint32_t lost_open;                 /* lost, still in the re-send window at the end */
+    uint32_t tests;                     /* doubts' handshake tests started (1.3.8) */
+    uint32_t inits, hs_done;            /* INITs sent (retries too); handshakes done */
+    uint32_t exhausted, lost_cold;      /* rekeys given up (cold), frames refused then */
+    bool     no_test;                   /* ignore WG_PATH_ACT_TEST: 1.3.7's behaviour */
+    uint32_t lost_open;                 /* lost, still to be re-sent at the end */
     int      p_mode_end;
-    int64_t  rekey_after_rx;            /* first rekey after the break, after the
-                                           peer's last WG packet before it */
+    int64_t  rekey_after_rx;            /* first path- or RX-stale-driven INIT after
+                                           the break, after the peer's last WG
+                                           packet before it */
+    int64_t  fixed_at;                  /* first handshake completed after the break */
+    int64_t  unanswered_at;             /* the first lapse after the break: the frame
+                                           left unanswered (wg_path lapse_from_us) */
+    int64_t  fixed_after_rx;            /* ...after the peer's last WG packet before it */
     int64_t  silent_at;                 /* first SILENT after the break */
     int64_t  silent_after_rx;           /* ...after the peer's last WG packet */
     int64_t  direct_after_silent;       /* first DIRECT after it */
     bool     wg_fixed;                  /* runtime: the peer got an INIT since */
 } sim_t;
 
-/* Our direct-only frames of the last WG_PATH_RESCUE_MS (wg_netif keeps
- * the wire bytes; here only whether the frame got through). */
-#define RESCUE_N 8
-typedef struct { int64_t t; bool lost; bool dead_keys; } sent_t;
-static sent_t s_sent[RESCUE_N];
-static int    s_sent_head;
-static int    s_cur;                    /* our current endpoint, 0 or 1 */
+/* Our direct-only data frames go into a real rescue ring (wg_rescue.h),
+ * as wg_tx keeps them; the wire bytes carry the frame's number, s_fr says
+ * whether it got through. (`tlm` false: a frame that takes a slot but is
+ * not telemetry — wg_netif keeps none since 1.3.8, see test_known_gap.) */
+#define FR_N 1024
+typedef struct { int64_t t; bool lost; bool dead_keys; bool tlm; } frame_t;
+static frame_t          s_fr[FR_N];
+static uint32_t         s_fr_next;
+static wg_rescue_ring_t s_ring;
+static int              s_cur;          /* our current endpoint, 0 or 1 */
+
+static void ring_keep(int64_t t, bool lost, bool dead_keys, bool tlm)
+{
+    const uint32_t id = s_fr_next++;
+    s_fr[id % FR_N] = (frame_t){ t, lost, dead_keys, tlm };
+    uint8_t b[112] = { 0 };
+    memcpy(b, &id, sizeof(id));
+    wg_rescue_keep(&s_ring, b, sizeof(b), t);
+}
+
+/* wg_netif's handshake state: one INIT in flight, retried every
+ * REKEY_TIMEOUT (a retry replaces it: an answer to the old one is
+ * dropped), a proactive rekey 110 s after the last completed one; a
+ * rekey unanswered for 12 attempts falls back to a cold handshake, which
+ * refuses data (wg_netif_send_plaintext) until a response. */
+typedef struct {
+    bool     in_flight;
+    bool     cold;                      /* HANDSHAKE_PENDING */
+    int      attempts;                  /* g.rekey_attempt */
+    int64_t  init_at;                   /* g.last_handshake_us */
+    int64_t  done_at;                   /* g.last_handshake_completed_us */
+    uint32_t id;                        /* the INIT in flight */
+} hs_t;
+static hs_t s_hs;
 
 #define MAXEV 256
 static ev_t s_q[MAXEV];
@@ -1177,13 +1321,13 @@ static bool wg_broken(const sim_t *s, int64_t t)
 
 /* Peer → us (WireGuard): direct if it works, else DERP (the peer's own
  * path choice — DISCO passing, it keeps a WG-blocked path). */
-static void peer_send(const sim_t *s, int64_t t, ev_kind_t k)
+static void peer_send(const sim_t *s, int64_t t, ev_kind_t k, int tag)
 {
     const bool direct = down_ok(s, t);
     if (direct && t >= s->wg_block_at) return;
     if (s->loss_pm && rnd(1000) < s->loss_pm) return;
     push(t + (direct ? one_way() : derp_way()) + dtim(), k,
-         direct ? 1 + peer_ep(s, t) : 0);
+         (direct ? 1 + peer_ep(s, t) : 0) + 4 * tag);
 }
 
 static void sim_ping(sim_t *s, int64_t t, int ep)
@@ -1192,43 +1336,72 @@ static void sim_ping(sim_t *s, int64_t t, int ep)
     if (up_ok(s, t, ep)) push(t + one_way(), EV_PEER_GOT_PING, (int)((t - T0) / 1000) * 2 + ep);
 }
 
-/* An authenticated packet from `arg`: roam there unless the current
- * endpoint is valid (wg_netif's handle_transport / response roam). */
-static uint32_t sim_from(sim_t *s, wg_path_t *p, int64_t t, int arg)
+/* An authenticated packet from `src` (arg & 3): roam there unless the
+ * current endpoint is valid (wg_netif's handle_transport / response roam). */
+static uint32_t sim_from(sim_t *s, wg_path_t *p, int64_t t, int src)
 {
-    if (arg == 0 || arg - 1 == s_cur || !wg_path_may_roam(p, t)) return 0;
-    s_cur = arg - 1;
+    if (src == 0 || src - 1 == s_cur || !wg_path_may_roam(p, t)) return 0;
+    s_cur = src - 1;
     s->roams++;
     return wg_path_on_endpoint_change(p, t);
 }
 
-/* An INIT from us: direct, plus DERP unless the path is valid. */
-static bool sim_init(const sim_t *s, wg_path_t *p, int64_t t)
+/* A new INIT (a new attempt): direct, plus DERP unless the path is valid;
+ * the peer answers the first copy that arrives. */
+static void sim_init(sim_t *s, wg_path_t *p, int64_t t)
 {
+    s_hs.in_flight = true;
+    s_hs.init_at = t;
+    s_hs.id++;
+    s_hs.attempts++;
+    s->inits++;
     const bool relay = wg_path_init_wants_relay(p, t);
-    const bool direct = up_ok(s, t, s_cur) && t < s->wg_block_at && t < s->wg_upblock_at;
-    if (!direct && !relay) return false;
-    push(t + (direct ? one_way() : derp_way()), EV_PEER_GOT_INIT, 0);
+    bool direct = up_ok(s, t, s_cur) && t < s->wg_block_at && t < s->wg_upblock_at;
+    if (direct && s->loss_pm && rnd(1000) < s->loss_pm) direct = false;
+    if (!direct && !relay) return;
+    push(t + (direct ? one_way() : derp_way()), EV_PEER_GOT_INIT, (int)s_hs.id);
+}
+
+/* wg_netif's rekey for a path action (SILENT, a doubt's test): unless one
+ * is in flight, and REKEY_TIMEOUT after the last INIT. */
+static bool sim_rekey(sim_t *s, wg_path_t *p, int64_t t)
+{
+    if (s_hs.in_flight || !wg_timer_due(t, s_hs.init_at, S(5))) return false;
+    s_hs.attempts = 0;
+    sim_init(s, p, t);
     return true;
 }
 
-/* The lapse's re-send: every frame of the window goes via DERP; the
- * peer's replay window drops the ones it has, the lost ones arrive —
- * unless the peer lost the keys they are sealed with. */
-static void sim_rescue(sim_t *s, int64_t t, int64_t break_at)
+/* The lapse's re-send (wg_tx's tx_rescue): the ring's frames since the
+ * last proof of delivery go via DERP; the peer's replay window drops the
+ * ones it has, the lost ones arrive — unless the peer lost the keys they
+ * are sealed with. */
+typedef struct { sim_t *s; int64_t t, break_at; } rsink_t;
+
+static bool sim_rescue_send(const uint8_t *buf, size_t len, void *user)
 {
-    for (int i = 0; i < RESCUE_N; i++) {
-        if (s_sent[i].t == 0 || wg_timer_due(t, s_sent[i].t, MS(WG_PATH_RESCUE_MS))) continue;
-        s->rescue_copies++;
-        if (s_sent[i].lost && !s_sent[i].dead_keys) {
-            s->rescued++;
-            s->lost--;
-            if (s_sent[i].t >= break_at) s->lost_after_break--;
-            if (t - s_sent[i].t > s->rescue_delay_max) s->rescue_delay_max = t - s_sent[i].t;
-            push(t + derp_way(), EV_PEER_GOT_DATA, 0);
-        }
-        s_sent[i].t = 0;
+    rsink_t *k = (rsink_t *)user;
+    uint32_t id;
+    (void)len;
+    memcpy(&id, buf, sizeof(id));
+    frame_t *f = &s_fr[id % FR_N];
+    k->s->rescue_copies++;
+    if (f->tlm && f->lost && !f->dead_keys) {
+        k->s->rescued++;
+        k->s->lost--;
+        if (f->t >= k->break_at) k->s->lost_after_break--;
+        if (k->t - f->t > k->s->rescue_delay_max) k->s->rescue_delay_max = k->t - f->t;
+        f->lost = false;
+        push(k->t + derp_way(), EV_PEER_GOT_DATA, 0);
     }
+    return true;
+}
+
+static void sim_rescue(sim_t *s, const wg_path_t *p, int64_t t, int64_t break_at)
+{
+    rsink_t k = { s, t, break_at };
+    (void)wg_rescue_flush(&s_ring, t, wg_path_rescue_from(p), MS(WG_PATH_RESCUE_MAX_MS),
+                          sim_rescue_send, &k, NULL);
 }
 
 typedef struct {
@@ -1255,16 +1428,17 @@ static void run_sim(sim_t *s)
     s->lapse_after_break = 0;
     s->direct_again_at = 0;
     s->silent_at = s->silent_after_rx = s->direct_after_silent = 0;
-    s->forced_rekeys = s->stale_rekeys = 0;
-    s->rekey_after_rx = 0;
+    s->forced_rekeys = s->stale_rekeys = s->tests = s->inits = s->hs_done = 0;
+    s->exhausted = s->lost_cold = 0;
+    s->rekey_after_rx = s->fixed_at = s->fixed_after_rx = s->unanswered_at = 0;
     s->wg_fixed = false;
     int64_t last_rx = t;                        /* the peer's last WG packet */
     int64_t stale_clock = t;                    /* wg_netif last_transport_recv_us */
-    int64_t forced_init_at = 0;                 /* a SILENT rekey in flight (5 s) */
-    memset(s_sent, 0, sizeof(s_sent));
-    s_sent_head = 0;
+    memset(&s_ring, 0, sizeof(s_ring));
+    memset(s_fr, 0, sizeof(s_fr));
+    s_fr_next = 0;
+    s_hs = (hs_t){ false, false, 0, t, t, 0 };  /* the session is up at T0 */
     push(t + S(1), EV_TELEMETRY, 0);
-    push(t + S(110), EV_REKEY, 0);
     if (s->peer_chatty) push(t + S(1), EV_PEER_CHAT, 0);
     bool relayed_once = false;
     ev_t e = { 0, EV_TELEMETRY, 0 };
@@ -1276,8 +1450,11 @@ static void run_sim(sim_t *s)
         for (int i = 0; i < s_n; i++) if (s_q[i].t < q_min) q_min = s_q[i].t;
         int64_t next_tick = dl < t + S(5) ? dl : t + S(5);
         if (last_rx > stale_clock) stale_clock = last_rx;
-        const int64_t stale_dl = stale_clock + MS(30000) + 1;
+        const int64_t stale_dl = s_hs.in_flight ? INT64_MAX : stale_clock + MS(30000) + 1;
+        const int64_t hs_dl = s_hs.in_flight ? s_hs.init_at + S(5) + 1
+                                             : s_hs.done_at + S(110) + 1;
         if (stale_dl < next_tick) next_tick = stale_dl;
+        if (hs_dl < next_tick) next_tick = hs_dl;
         if (next_tick < t) next_tick = t;
         if (peer.ka_pending && peer.ka_at < q_min) q_min = peer.ka_at;
         if (q_min > s->end && next_tick > s->end) break;
@@ -1286,36 +1463,55 @@ static void run_sim(sim_t *s)
         const uint32_t silences0 = p.silences;
         if (next_tick <= q_min) {
             t = next_tick;
-            act = wg_path_tick(&p, t);
-            if (t >= stale_dl && forced_init_at != 0 && !wg_timer_due(t, forced_init_at, S(5))) {
-                stale_clock = t - MS(25000);    /* rekey_in_flight: look again in 5 s */
-            } else if (t >= stale_dl) {
+            /* wg_netif's rx_task: retry / proactive rekey, RX-stale, then
+             * the path's timers. */
+            if (s_hs.in_flight && wg_timer_due(t, s_hs.init_at, S(5))) {
+                if (!s_hs.cold && s_hs.attempts >= 12) {
+                    s_hs.cold = true;           /* "proactive rekey exhausted" */
+                    s->exhausted++;
+                }
+                sim_init(s, &p, t);             /* (cold: no 30-s back-off here) */
+            } else if (!s_hs.in_flight && wg_timer_due(t, s_hs.done_at, S(110))) {
+                s_hs.attempts = 0;
+                sim_init(s, &p, t);
+            }
+            if (!s_hs.in_flight && wg_timer_due(t, stale_clock, MS(30000))) {
                 /* wg_netif's RX-stale watchdog: a rekey and a probe of
                  * every endpoint, the clock restarted. */
                 stale_clock = t;
                 s->stale_rekeys++;
                 if (t >= break_at && s->rekey_after_rx == 0) s->rekey_after_rx = t - last_rx;
-                (void)sim_init(s, &p, t);
+                s_hs.attempts = 0;
+                sim_init(s, &p, t);
                 act |= WG_PATH_ACT_PROBE;
             }
-            if (act == 0 && dl <= t) {          /* deadline without an action: spin */
+            const uint32_t pact = wg_path_tick(&p, t);
+            if (pact == 0 && dl <= t) {          /* deadline without an action: spin */
                 printf("  sim: deadline %lld without action\n", (long long)dl);
                 fails++;
                 break;
             }
+            act |= pact;
         } else if (peer.ka_pending && peer.ka_at == q_min) {
             t = q_min;
             peer.ka_pending = false;              /* the keepalive is a send */
-            if (!wg_broken(s, t)) peer_send(s, t, EV_US_GOT_KA);
+            if (!wg_broken(s, t)) peer_send(s, t, EV_US_GOT_KA, 0);
             continue;
         } else {
             if (!pop(&e)) break;
             t = e.t;
             switch (e.k) {
             case EV_TELEMETRY: {
+                push(t + S(5) + MS(rnd(500)) - MS(250), EV_TELEMETRY, 0);
+                s->frames++;
+                if (s_hs.cold) {                /* refused: no session */
+                    s->lost++;
+                    s->lost_cold++;
+                    if (t >= break_at) s->lost_after_break++;
+                    break;
+                }
                 wg_path_mode_t m;
                 act = wg_path_on_send(&p, t, true, &m);
-                s->frames++;
                 const bool direct = m != WG_PATH_RELAY;
                 const bool derp   = m != WG_PATH_DIRECT;
                 if (derp) s->derp_copies++;
@@ -1333,34 +1529,40 @@ static void run_sim(sim_t *s)
                     s->lost++;
                     if (t >= break_at) s->lost_after_break++;
                 }
-                if (m == WG_PATH_DIRECT) {
-                    s_sent[s_sent_head] = (sent_t){ t, !(keys && via_direct), !keys };
-                    s_sent_head = (s_sent_head + 1) % RESCUE_N;
-                }
-                push(t + S(5) + MS(rnd(500)) - MS(250), EV_TELEMETRY, 0);
+                if (m == WG_PATH_DIRECT) ring_keep(t, !(keys && via_direct), !keys, true);
                 break;
             }
-            case EV_REKEY:                        /* else the REKEY_TIMEOUT retry */
-                push(t + (sim_init(s, &p, t) ? S(110) : S(5)), EV_REKEY, 0);
-                break;
             case EV_PEER_GOT_INIT:
                 if (t >= s->wg_dead_at) s->wg_fixed = true;
                 peer.ka_pending = false;          /* the response is a send */
                 peer.new_keypair = true;
-                peer_send(s, t, EV_US_GOT_RESP);
+                peer_send(s, t, EV_US_GOT_RESP, e.arg);
                 break;
             case EV_US_GOT_RESP: {
+                if (!s_hs.in_flight || (uint32_t)(e.arg >> 2) != s_hs.id) break;
+                s_hs.in_flight = false;
+                s_hs.cold = false;
+                s_hs.attempts = 0;
+                s_hs.done_at = t;
+                s->hs_done++;
+                if (t >= break_at && s->fixed_at == 0) {
+                    s->fixed_at = t;
+                    s->fixed_after_rx = t - last_rx;
+                }
                 last_rx = t;
                 act = wg_path_on_handshake(&p, t);
-                act |= sim_from(s, &p, t, e.arg);
-                /* Our TSMP advert: data under the new keys at once. */
+                act |= sim_from(s, &p, t, e.arg & 3);
+                /* Our TSMP advert: data under the new keys, right after
+                 * (wg_tx sends it after the response was handled). */
                 wg_path_mode_t m;
-                act |= wg_path_on_send(&p, t, true, &m);
-                const bool via_direct = m != WG_PATH_RELAY && up_ok(s, t, s_cur) &&
-                                        t < s->wg_block_at && t < s->wg_upblock_at;
+                act |= wg_path_on_send(&p, t + 1, true, &m);
+                bool via_direct = m != WG_PATH_RELAY && up_ok(s, t, s_cur) &&
+                                  t < s->wg_block_at && t < s->wg_upblock_at;
+                if (via_direct && s->loss_pm && rnd(1000) < s->loss_pm) via_direct = false;
                 if (via_direct || m != WG_PATH_DIRECT) {
                     push(t + (via_direct ? one_way() : derp_way()), EV_PEER_GOT_DATA, 0);
                 }
+                if (m == WG_PATH_DIRECT && s->advert_kept) ring_keep(t, !via_direct, false, false);
                 break;
             }
             case EV_PEER_GOT_DATA:
@@ -1368,12 +1570,12 @@ static void run_sim(sim_t *s)
                 if (peer.new_keypair && s->peer_advert) {
                     peer.new_keypair = false;
                     peer.ka_pending = false;      /* its advert is a send */
-                    peer_send(s, t, EV_US_GOT_DATA);
+                    peer_send(s, t, EV_US_GOT_DATA, 0);
                 }
                 break;
             case EV_PEER_CHAT:
                 peer.ka_pending = false;
-                peer_send(s, t, EV_US_GOT_DATA);
+                peer_send(s, t, EV_US_GOT_DATA, 0);
                 push(t + S(1), EV_PEER_CHAT, 0);
                 break;
             case EV_PEER_GOT_PING:
@@ -1383,12 +1585,12 @@ static void run_sim(sim_t *s)
             case EV_US_GOT_KA:
                 last_rx = t;
                 act = wg_path_on_keepalive(&p, t);
-                act |= sim_from(s, &p, t, e.arg);
+                act |= sim_from(s, &p, t, e.arg & 3);
                 break;
             case EV_US_GOT_DATA:
                 last_rx = t;
                 act = wg_path_on_peer_data(&p, t);
-                act |= sim_from(s, &p, t, e.arg);
+                act |= sim_from(s, &p, t, e.arg & 3);
                 break;
             case EV_US_GOT_PONG: {
                 const int ep = e.arg & 1;
@@ -1410,6 +1612,7 @@ static void run_sim(sim_t *s)
         }
         if (p.lapses != lapses0 && t >= break_at && s->lapse_after_break == 0) {
             s->lapse_after_break = t;
+            s->unanswered_at = p.lapse_from_us;
         }
         if (p.silences != silences0 && t >= break_at && s->silent_at == 0) {
             s->silent_at = t;
@@ -1419,13 +1622,16 @@ static void run_sim(sim_t *s)
             s->direct_after_silent == 0) {
             s->direct_after_silent = t;
         }
-        if (act & WG_PATH_ACT_REKEY) {          /* wg_netif: unless one is in flight */
-            s->forced_rekeys++;
-            if (t >= break_at && s->rekey_after_rx == 0) s->rekey_after_rx = t - last_rx;
-            forced_init_at = t;
-            (void)sim_init(s, &p, t);
+        if (s->no_test) act &= ~WG_PATH_ACT_TEST;
+        if (act & (WG_PATH_ACT_REKEY | WG_PATH_ACT_TEST)) {
+            /* wg_netif's rx_path_tick: unless one is in flight. */
+            if (act & WG_PATH_ACT_REKEY) s->forced_rekeys++;
+            if (sim_rekey(s, &p, t)) {
+                if (act & WG_PATH_ACT_TEST) s->tests++;
+                if (t >= break_at && s->rekey_after_rx == 0) s->rekey_after_rx = t - last_rx;
+            }
         }
-        if (act & WG_PATH_ACT_RESCUE) sim_rescue(s, t, break_at);
+        if (act & WG_PATH_ACT_RESCUE) sim_rescue(s, &p, t, break_at);
         if (act & WG_PATH_ACT_PING) sim_ping(s, t, s_cur);
         if (act & WG_PATH_ACT_PROBE) {          /* every endpoint the netmap lists */
             s->probes++;
@@ -1441,11 +1647,15 @@ static void run_sim(sim_t *s)
     s->undelivered = p.undelivered;
     s->p_mode_end = p.mode;
     s->lost_open = 0;
-    for (int i = 0; i < RESCUE_N; i++) {
-        if (s_sent[i].t != 0 && s_sent[i].lost && !s_sent[i].dead_keys &&
-            !wg_timer_due(t, s_sent[i].t, MS(WG_PATH_RESCUE_MS))) {
-            s->lost_open++;
-        }
+    const int64_t from = wg_path_rescue_from(&p);
+    for (int i = 0; i < WG_RESCUE_SLOTS; i++) {
+        const wg_rescue_t *r = &s_ring.slot[i];
+        if (r->at_us == 0 || r->at_us < from ||
+            wg_timer_due(t, r->at_us, MS(WG_PATH_RESCUE_MAX_MS))) continue;
+        uint32_t id;
+        memcpy(&id, r->buf, sizeof(id));
+        const frame_t *f = &s_fr[id % FR_N];
+        if (f->tlm && f->lost && !f->dead_keys) s->lost_open++;
     }
     s->final_ep = s_cur;
 }
@@ -1473,7 +1683,8 @@ static void test_sim(void)
     ok("sim/healthy-one-ping", s.pings == 1);
     ok("sim/healthy-no-loss", s.lost == 0);
     ok("sim/healthy-no-derp", s.derp_copies <= 1 && s.rescue_copies == 0);
-    ok("sim/healthy-no-rekey", s.silences == 0 && s.forced_rekeys == 0);
+    ok("sim/healthy-no-rekey", s.silences == 0 && s.forced_rekeys == 0 && s.tests == 0 &&
+                               s.stale_rekeys == 0 && s.hs_done >= 190);
 
     /* Same without the peer's advert (older tailscaled): still nothing. */
     s = sim_base();
@@ -1495,7 +1706,7 @@ static void test_sim(void)
     /* The lapse comes 12 s after the first unanswered frame, which a
      * keepalive in flight can push one period past the break. */
     ok("sim/dead-lapse", fo > 0 && fo <= MS(WG_PATH_ANSWER_MS) + S(17));
-    ok("sim/dead-relay", s.deaths == 1 && s.direct_after_relay == 0);
+    ok("sim/dead-relay", s.deaths == 1 && s.direct_after_relay == 0 && s.tests == 0);
     /* 30 min of RELAY: back-off to one probe round a minute. */
     ok("sim/dead-reprobe-rate", s.probes >= 25 && s.probes <= 40);
 
@@ -1524,8 +1735,10 @@ static void test_sim(void)
            s.lost_after_break, s.lapses - 1, s.rescue_copies);
     ok("sim/chatty-oneway-no-loss", s.lost_after_break == 0);
     ok("sim/chatty-oneway-relay", s.deaths >= 1);
-    ok("sim/chatty-no-rescue-bursts", s.rescue_copies <= RESCUE_N * s.deaths);
-    ok("sim/chatty-no-rekey", s.silences == 0 && s.forced_rekeys == 0);
+    ok("sim/chatty-no-rescue-bursts", s.rescue_copies <= WG_RESCUE_SLOTS * s.deaths);
+    /* Its data says the session lives: lapses confirmed by their pongs,
+     * never a doubt, so never a test (a handshake every 12 s otherwise). */
+    ok("sim/chatty-no-rekey", s.silences == 0 && s.forced_rekeys == 0 && s.tests == 0);
 
     /* Reverse one-way: peer -> us dies; our direct sends still arrive and
      * the peer's keepalives come by DERP — we stay direct. */
@@ -1564,107 +1777,197 @@ static void test_sim(void)
     ok("sim/rebind-no-loss", s.lost_after_break == 0);
     ok("sim/rebind-one-roam", s.roams == 1);
 
-    /* The 1.3.5 soak: the peer's session breaks — nothing from it by any
-     * path, DISCO answered — until it gets an INIT (there the RX-stale
-     * rekey at 30 s, answered in 60 ms). Between two proactive rekeys.
-     * The doubt needs a second window, so the rekey comes when RX-stale's
-     * does: robust to one lost packet, not faster (see wg_path.h). */
+    /* The 1.3.5 / 1.3.6 soaks: the peer's session breaks — nothing from it
+     * by any path, DISCO answered — until it gets an INIT (there the
+     * RX-stale rekey at 30 s, answered in ~130 ms). Between two proactive
+     * rekeys. Since 1.3.8 the doubt is tested with a handshake at once:
+     * the session is back 12–13 s after the first unanswered frame. The
+     * same run with the test ignored is 1.3.7. */
     s = sim_base();
-    s.wg_dead_at = T0 + S(3525);
-    s.end = T0 + S(3525 + 600);
+    s.wg_dead_at = T0 + S(1150);
+    s.end = T0 + S(1150 + 600);
+    sim_t o = s;
+    o.no_test = true;
     run_sim(&s);
-    printf("  WG silent, DISCO alive: first rekey %.1f s after the peer's last packet "
-           "(%u RX-stale, %u on a silence), %u lost (sealed with the dead keys), "
-           "doubts=%u silences=%u\n", s.rekey_after_rx / 1e6, s.stale_rekeys,
-           s.forced_rekeys, s.lost_after_break, s.doubts, s.silences);
-    ok("sim/silent-rekeys", s.rekey_after_rx > 0 && s.rekey_after_rx <= S(30) + MS(100) &&
-                            s.deaths == 0);
-    ok("sim/silent-then-healthy", s.lost_after_break <= 7 && s.p_mode_end == WG_PATH_DIRECT);
+    run_sim(&o);
+    printf("  WG silent, DISCO alive: session back %.1f s after the first unanswered frame, "
+           "%.1f s after the peer's last packet (1.3.7: %.1f / %.1f s); %u lost (sealed with "
+           "the dead keys; 1.3.7: %u), doubts=%u tests=%u silences=%u RX-stale=%u\n",
+           (s.fixed_at - s.unanswered_at) / 1e6, s.fixed_after_rx / 1e6,
+           (o.fixed_at - o.unanswered_at) / 1e6, o.fixed_after_rx / 1e6,
+           s.lost_after_break, o.lost_after_break, s.doubts, s.tests, s.silences,
+           s.stale_rekeys);
+    ok("sim/silent-test-fixes", s.tests == 1 && s.silences == 0 && s.stale_rekeys == 0 &&
+                                s.fixed_at - s.unanswered_at <= MS(WG_PATH_ANSWER_MS) + S(1) &&
+                                s.deaths == 0 && s.p_mode_end == WG_PATH_DIRECT);
+    ok("sim/silent-1.3.7-rx-stale", o.tests == 0 && o.fixed_after_rx >= S(24) &&
+                                    o.fixed_after_rx <= S(31));
+    ok("sim/silent-fewer-lost", s.lost_after_break < o.lost_after_break);
 
-    /* ...at random instants (1.3.5: the rekey 30 s after that packet). */
-    int64_t sworst = 0, ssum = 0;
-    uint32_t slost = 0, slost_worst = 0, sn = 0, sforced = 0;
+    /* ...at random instants. */
+    int64_t sworst = 0, ssum = 0, fsum = 0, fworst = 0, osum = 0, oworst = 0, bsum = 0;
+    int64_t ufbest = INT64_MAX, ufworst = 0, oufbest = INT64_MAX, oufworst = 0;
+    uint32_t slost = 0, slost_worst = 0, sn = 0, sforced = 0, olost = 0, stests = 0;
     int sgood = 1;
     for (int trial = 0; trial < 100; trial++) {
         s = sim_base();
         const int64_t brk = T0 + S(552) + MS((trial * 7919) % 40000);
         s.wg_dead_at = brk;
         s.end = brk + S(120);
+        o = s;
+        o.no_test = true;
         run_sim(&s);
-        sgood &= s.rekey_after_rx > 0 && s.p_mode_end == WG_PATH_DIRECT;
+        run_sim(&o);
+        sgood &= s.fixed_at != 0 && s.p_mode_end == WG_PATH_DIRECT;
         if (s.rekey_after_rx > sworst) sworst = s.rekey_after_rx;
         ssum += s.rekey_after_rx;
+        fsum += s.fixed_after_rx;
+        if (s.fixed_after_rx > fworst) fworst = s.fixed_after_rx;
+        bsum += s.fixed_at - brk;
+        if (s.unanswered_at != 0) {
+            const int64_t uf = s.fixed_at - s.unanswered_at;
+            if (uf < ufbest) ufbest = uf;
+            if (uf > ufworst) ufworst = uf;
+        }
+        if (o.unanswered_at != 0) {
+            const int64_t uf = o.fixed_at - o.unanswered_at;
+            if (uf < oufbest) oufbest = uf;
+            if (uf > oufworst) oufworst = uf;
+        }
+        osum += o.fixed_after_rx;
+        if (o.fixed_after_rx > oworst) oworst = o.fixed_after_rx;
         slost += s.lost_after_break;
+        olost += o.lost_after_break;
         sforced += s.forced_rekeys;
+        stests += s.tests;
         if (s.lost_after_break > slost_worst) slost_worst = s.lost_after_break;
         sn++;
     }
-    printf("  100 random WG-silent breaks: first rekey mean %.1f s, max %.1f s after "
-           "the peer's last packet (%u on a silence); lost mean %.1f, max %u\n",
-           ssum / 1e6 / sn, sworst / 1e6, sforced, (double)slost / sn, slost_worst);
+    printf("  100 random WG-silent breaks: session back mean %.1f s, max %.1f s after the "
+           "peer's last packet (1.3.7: %.1f / %.1f s), %.1f–%.1f s after the first "
+           "unanswered frame (1.3.7: %.1f–%.1f s), mean %.1f s after the break; first "
+           "rekey mean %.1f s, max %.1f s; %u tests, %u silences' rekeys; lost mean %.1f, "
+           "max %u (1.3.7: %.1f)\n",
+           fsum / 1e6 / sn, fworst / 1e6, osum / 1e6 / sn, oworst / 1e6,
+           ufbest / 1e6, ufworst / 1e6, oufbest / 1e6, oufworst / 1e6,
+           bsum / 1e6 / sn, ssum / 1e6 / sn, sworst / 1e6,
+           stests, sforced, (double)slost / sn, slost_worst, (double)olost / sn);
     ok("sim/silent-random-recovers", sgood);
-    ok("sim/silent-random-bounded", sworst <= S(30) + MS(500) && slost_worst <= 7);
+    /* The lapse 12 s after the frame, the pong and the response one round
+     * trip each (≤ 0.6 s here, DTIM wake included). */
+    ok("sim/silent-random-bounded", fworst <= S(18) &&
+                                    ufworst <= MS(WG_PATH_ANSWER_MS) + MS(1300) &&
+                                    slost_worst <= 4);
+    ok("sim/silent-random-faster", fsum * 10 < osum * 6 && slost < olost);
 
     /* WireGuard dropped on the direct path both ways, DISCO passing (a
-     * DPI box): the first silence rekeys, the fresh session is silent
-     * too; DERP carries everything, the direct re-tests back off. The
-     * frames of the last 40 s may still be in their re-test. */
+     * DPI box), the peer keeping its direct path: the peer gets what goes
+     * via DERP, we get nothing — not even handshake responses. The first
+     * rekey (1.3.8: the doubt's test; 1.3.7: the silence's or RX-stale's)
+     * is never answered, gives up after 12 attempts and falls back to a
+     * cold handshake, which refuses data: the tunnel is down while the
+     * block lasts — 1.3.7 the same (pre-existing; until 1.3.8 the
+     * simulation did not model the rekey's retries and hid it). */
     s = sim_base();
     s.wg_block_at = T0 + S(3600);
     s.end = T0 + S(3600 + 3600);
+    o = s;
+    o.no_test = true;
     run_sim(&s);
-    printf("  WG blocked on direct both ways, DISCO passes, 1 h: %u lost (+%u in the "
-           "last 40 s), %u re-sent, silences=%u rekeys=%u+%u RX-stale, pings=%u\n",
-           s.lost_after_break - s.lost_open, s.lost_open, s.rescued, s.silences,
-           s.forced_rekeys, s.stale_rekeys, s.pings);
-    ok("sim/blocked-no-loss", s.lost_after_break == s.lost_open);
-    ok("sim/blocked-one-rekey", s.forced_rekeys == 1);
-    ok("sim/blocked-backs-off", s.silences >= 40 && s.silences <= 60);
+    run_sim(&o);
+    printf("  WG blocked on direct both ways, DISCO passes, 1 h: %u lost, %u of them refused "
+           "by the cold handshake after %u exhausted rekey (1.3.7: %u lost, %u refused, %u "
+           "exhausted); tests=%u silences=%u\n", s.lost_after_break, s.lost_cold,
+           s.exhausted, o.lost_after_break, o.lost_cold, o.exhausted, s.tests, s.silences);
+    ok("sim/blocked-as-1.3.7", s.exhausted == 1 && o.exhausted == 1 &&
+                               s.lost_after_break <= o.lost_after_break + 3);
+    ok("sim/blocked-one-rekey", s.forced_rekeys <= 1 && s.tests == 1);
 
     /* Review of 1.3.6 (sim_loss.c): our WireGuard dropped on the direct
      * path only — DISCO and the peer's WireGuard pass. The keepalives
      * answering our DERP copies used to renew the direct proof: 122
-     * rekeys, 383 pings an hour. Now UNDELIVERED: no rekey, re-tests at
-     * one a minute. */
+     * rekeys, 383 pings an hour. Now UNDELIVERED: no forced rekey,
+     * re-tests at one a minute — each re-test's doubt tested with a
+     * handshake (1.3.8), which also keeps the RX-stale rekeys away. */
     s = sim_base();
     s.wg_upblock_at = T0 + S(3600);
     s.end = T0 + S(3600 + 3600);
+    o = s;
+    o.no_test = true;
     run_sim(&s);
-    printf("  our direct WireGuard dropped, DISCO + peer's WG pass, 1 h: %u lost (+%u "
-           "in the last 40 s), rekeys=%u+%u RX-stale, undelivered=%u, pings=%u "
-           "probes=%u\n", s.lost_after_break - s.lost_open, s.lost_open, s.forced_rekeys,
-           s.stale_rekeys, s.undelivered, s.pings, s.probes);
-    /* (The RX-stale rekeys are wg_netif's: each direct re-test leaves
-     * ~25 s without a packet from the peer.) */
+    run_sim(&o);
+    printf("  our direct WireGuard dropped, DISCO + peer's WG pass, 1 h: %u lost (+%u still "
+           "to re-send), forced rekeys=%u, RX-stale=%u, tests=%u, handshakes=%u, "
+           "undelivered=%u, pings=%u probes=%u (1.3.7 rules: %u lost, RX-stale=%u, "
+           "handshakes=%u, undelivered=%u)\n",
+           s.lost_after_break - s.lost_open, s.lost_open, s.forced_rekeys, s.stale_rekeys,
+           s.tests, s.hs_done, s.undelivered, s.pings, s.probes,
+           o.lost_after_break - o.lost_open, o.stale_rekeys, o.hs_done, o.undelivered);
     ok("sim/upblock-no-rekey", s.forced_rekeys == 0 && s.silences == 0);
     ok("sim/upblock-backs-off", s.undelivered >= 30 && s.undelivered <= 60 &&
-                                s.pings <= 150);
-    /* The first test's frames are past the 40-s window when the second
-     * doubt ends it. */
-    ok("sim/upblock-loss-bounded", s.lost_after_break - s.lost_open <= 4);
+                                s.pings <= 150 && s.tests <= s.undelivered + 2);
+    ok("sim/upblock-no-loss", s.lost_after_break == s.lost_open);
+
+    /* The 1.3.6 "Known gap": with only our direct WireGuard toward the
+     * peer dropped, the first episode (direct → doubt → direct → lapse →
+     * doubt → UNDELIVERED) outlasted the 40-s re-send window and lost its
+     * first frames (1.3.7's rules, 8 slots, 1 000 instants: mean 2.5, up
+     * to 8 per episode). Aged by the last proof of delivery, the advert
+     * out of the ring, 10 slots: none at any block instant (2 000 in the
+     * round's sweep; 8 slots lost up to 3, 9 up to 1). */
+    uint32_t glost = 0, gworst = 0, gopen = 0, gtests = 0;
+    for (int trial = 0; trial < 500; trial++) {
+        s = sim_base();
+        s.wg_upblock_at = T0 + S(600) + MS((trial * 7919) % 110000) + trial;
+        s.end = s.wg_upblock_at + S(240);
+        run_sim(&s);
+        const uint32_t l = s.lost_after_break - s.lost_open;
+        glost += l;
+        if (l > gworst) gworst = l;
+        gopen += s.lost_open;
+        gtests += s.tests;
+    }
+    printf("  known gap (our direct WireGuard dropped), 500 random block instants, 4 min "
+           "each: %u frames lost (max %u in one), %u still to re-send at the end, %u "
+           "tests\n", glost, gworst, gopen, gtests);
+    ok("sim/known-gap-closed", glost == 0);
 
     /* Review of 1.3.6 (sim_loss.c): random loss of WireGuard datagrams on
      * a healthy path, 6 h each. Declaring WG silent on the first window
-     * cost 9 / 21 / 47 forced rekeys at 0.5 / 1 / 2 %. */
+     * cost 9 / 21 / 47 forced rekeys at 0.5 / 1 / 2 %. Since 1.3.8 each
+     * doubt costs a handshake (its response settles it within a round
+     * trip); a doubt's handshake also moves the next proactive one 110 s
+     * on, so the extra handshakes are fewer than the tests. 2 %: a doubt
+     * every ~6 min (the 1.3.6 soak: one every 8.4 min). */
     printf("  healthy 6 h with random WireGuard loss (ours direct, the peer's any path):\n"
-           "    loss  lapses doubts silences undelivered rekeys(+RX-stale) pings probes "
-           "derp-copies re-sent lost\n");
-    const uint32_t loss_pm[] = { 0, 5, 10, 20 };
-    uint32_t rekeys_at[4] = { 0 };
-    for (int i = 0; i < 4; i++) {
+           "    loss  lapses doubts tests silences undeliv. rekeys(+RX-stale) handshakes "
+           "(1.3.7) extra pings derp-copies re-sent lost (1.3.7)\n");
+    const uint32_t loss_pm[] = { 0, 5, 10, 15, 20 };
+    uint32_t rekeys_at[5] = { 0 }, hs0 = 0;
+    int lgood = 1;
+    for (int i = 0; i < 5; i++) {
         s = sim_base();
         s.loss_pm = loss_pm[i];
+        o = s;
+        o.no_test = true;
         run_sim(&s);
+        run_sim(&o);
+        if (i == 0) hs0 = s.hs_done;
         rekeys_at[i] = s.forced_rekeys;
-        printf("    %u.%u%%  %6u %6u %8u %11u %6u(+%u) %5u %6u %11u %7u %4u\n",
-               loss_pm[i] / 10, loss_pm[i] % 10, s.lapses, s.doubts, s.silences,
-               s.undelivered, s.forced_rekeys, s.stale_rekeys, s.pings, s.probes,
-               s.derp_copies, s.rescue_copies, s.lost);
+        printf("    %u.%u%%  %6u %6u %5u %8u %8u %6u(+%u) %10u (%5u) %5d %5u %11u %7u %4u (%4u)\n",
+               loss_pm[i] / 10, loss_pm[i] % 10, s.lapses, s.doubts, s.tests, s.silences,
+               s.undelivered, s.forced_rekeys, s.stale_rekeys, s.hs_done, o.hs_done,
+               (int)s.hs_done - (int)hs0, s.pings, s.derp_copies, s.rescue_copies, s.lost,
+               o.lost);
+        lgood &= s.tests <= s.doubts && s.hs_done <= hs0 + s.doubts &&
+                 s.exhausted == 0 && s.lost_cold == 0;
         if (i == 1) ok("sim/loss-0.5-no-rekey", s.forced_rekeys == 0 && s.stale_rekeys == 0 &&
                                               s.silences == 0);
+        if (i == 0) ok("sim/loss-0-nothing", s.tests == 0 && s.doubts == 0 &&
+                                           s.hs_done == o.hs_done && s.hs_done >= 190);
     }
-    ok("sim/loss-0-nothing", rekeys_at[0] == 0);
-    ok("sim/loss-rekeys-rare", rekeys_at[2] <= 1 && rekeys_at[3] <= 3);
+    ok("sim/loss-tests-bounded", lgood);
+    ok("sim/loss-rekeys-rare", rekeys_at[2] <= 1 && rekeys_at[4] <= 3);
 
     /* Random break instants, both ways and one way: never a frame lost,
      * and the worst lapse delay. */

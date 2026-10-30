@@ -52,7 +52,7 @@
 // none (the test simulates hours of it); a lapse costs one ping. The
 // price is detection latency — a keepalive answers a frame ~10 s old —
 // paid back by re-sending, once a lapse is confirmed, the direct-only
-// frames that may have been lost (WG_PATH_RESCUE_MS).
+// frames that may have been lost (WG_PATH_RESCUE_MAX_MS).
 //
 // Exceptions handled: the peer's handshake response and its first data
 // packet after a handshake (the capver-144 TSMP disco advert on every new
@@ -94,6 +94,46 @@
 // means the peer gets what goes via DERP and not what goes direct:
 // UNDELIVERED, DERP only, no rekey, the direct re-tests backed off
 // 10 → 60 s with the doubts.
+//
+// Round 1.3.8: a doubt is tested at once with a handshake
+// (WG_PATH_ACT_TEST). In the 1.3.6 soak (25 doubts in 3.5 h) two ran into
+// the RX-stale rekey 13 s after the doubt, 30 s after the peer's last
+// packet (seen direct=0 derp=0): in one nothing came until that rekey's
+// response, ~130 ms after its INIT — the 1.3.5 failure, a session only an
+// INIT revives; in the other a keepalive answering our first frame sent
+// both ways came 30 ms after the INIT. The others were a lost frame or
+// keepalive, settled by the peer's own WireGuard 1.3–8.0 s after the
+// lapse. A make-before-break INIT, sent direct and via DERP while the
+// current session keeps carrying our data, settles every kind within a
+// round trip: its response is a WireGuard packet from the peer and ends
+// the doubt like a keepalive does (wg_path_resolve_ — the INIT went both
+// ways, so it proves the session, not our direct path), and a broken
+// session is replaced by the response. Recovery from
+// that failure (test_wg_path, 100 random instants): the session is back
+// 12.3–13.0 s after the first unanswered frame, 16.6 s on average after
+// the peer's last packet — 1.3.7: 25.1–27.8 s and 30.0 s (the RX-stale
+// rekey). The price: a handshake per doubt, +6 / +12 / +26 handshakes
+// per 6 h on 195 at 0.5 / 1 / 2 % loss (20 runs each; a doubt's
+// handshake also moves the next proactive one 110 s on). A doubt now
+// ends within a round trip, so fewer frames go both ways during one (DERP
+// copies 20 / 41 / 91 → 1 / 4 / 15 per 6 h, frames lost to the random
+// loss within ±2.3), and the RX-stale rekeys the loss caused (0.25 / 0.45
+// / 1.9 per 6 h, each after 30 s of silence) are gone. Only one INIT in
+// flight: the caller starts it only when no handshake is pending,
+// REKEY_TIMEOUT after the last INIT (whitepaper §6.1, wireguard-go
+// SendHandshakeInitiation), else the pending one's response does the
+// same. Once per silent streak: after a silence (the test's own session
+// silent too) a doubt is not tested again until a transport packet from
+// the peer arrives.
+//
+// An in-tunnel probe was considered instead. An empty keepalive is never
+// answered (wireguard-go arms its passive keepalive only for packets with
+// a payload). A TSMP ping is answered by tailscaled (tstun, before the
+// filter) without a new session, but into a broken session it goes
+// unanswered, so the failure above would still need a timeout and then
+// the INIT — 1–2 s later than the INIT alone — for ~25 ms of X25519
+// saved per doubt (a few per hour), and it depends on the peer being
+// tailscaled.
 //
 // Endpoint choice (upstream betterAddr): while the current endpoint is
 // valid — DIRECT with a proof within WG_PATH_TRUST_MS — another
@@ -193,27 +233,40 @@ typedef enum {
 /* When a lapse is confirmed — its ping got no pong (DUAL → RELAY), the
  * doubt after its pong ended SILENT or UNDELIVERED, or the endpoint
  * moved elsewhere before the current one answered — the data frames sent
- * direct-only within this long are re-sent via DERP (WG_PATH_ACT_RESCUE),
- * and frames whose DERP copy was refused count as direct-only. Passive
- * evidence is late by construction: a keepalive answers the frame the
- * peer got KEEPALIVE_TIMEOUT before sending it, so one sent just before
- * the path died still arrives ~10 s after, restarts the window, and the
- * lapse comes up to ~27 s after the break (test_wg_path, 200 random
- * break instants: mean 20 s; without the re-send 3–5 frames lost per
- * break). The peer's replay window drops every frame it already got; the
- * lost ones arrive up to ~35 s late (the telemetry carries its sequence
- * number). The same ciphertexts: if the peer lost the session keys they
- * are lost again — the rekey only saves what follows. Not at the lapse
- * itself: a lapse whose ping is answered while the peer's packets keep
- * coming sends nothing twice — with a peer that streams data to us (no
- * keepalives) that is every lapse. */
-#define WG_PATH_RESCUE_MS 40000
+ * direct-only since the last proof of their delivery are re-sent via
+ * DERP (WG_PATH_ACT_RESCUE), and frames whose DERP copy was refused count
+ * as direct-only. Passive evidence is late by construction: a keepalive
+ * answers the frame the peer got KEEPALIVE_TIMEOUT before sending it, so
+ * one sent just before the path died still arrives ~10 s after, restarts
+ * the window, and the lapse comes up to ~27 s after the break
+ * (test_wg_path, 200 random break instants: mean 20 s; without the
+ * re-send 3–5 frames lost per break). The peer's replay window drops
+ * every frame it already got; the lost ones arrive late (the telemetry
+ * carries its sequence number). The same ciphertexts: if the peer lost
+ * the session keys they are lost again — the rekey only saves what
+ * follows. Not at the lapse itself: a lapse whose ping is answered while
+ * the peer's packets keep coming sends nothing twice — with a peer that
+ * streams data to us (no keepalives) that is every lapse.
+ *
+ * The proof (round 1.3.8, wg_path_rescue_from): a keepalive that proves
+ * the direct path (no frame via DERP within a window before it) answers
+ * a frame the peer received KEEPALIVE_TIMEOUT before sending it — frames
+ * sent before that instant got through the direct path, those after may
+ * not have. Until 1.3.7 the ring kept the last 40 s instead: with only
+ * our direct WireGuard toward the peer dropped, the first episode
+ * (direct → doubt → direct again → doubt → UNDELIVERED) outlasts 40 s and
+ * lost the 3–6 frames sent first (1.3.6 "Known gap"). The ring
+ * (WG_RESCUE_SLOTS) bounds how many; this bounds how old — the peer
+ * rejects anything sealed under a keypair older than REJECT_AFTER_TIME
+ * (whitepaper §6.2), so an older frame can never be accepted. */
+#define WG_PATH_RESCUE_MAX_MS 180000
 
 /* Actions for the caller (bitmask). */
 #define WG_PATH_ACT_PING   0x01u   /* DISCO ping to the current endpoint */
 #define WG_PATH_ACT_PROBE  0x02u   /* ping every endpoint the netmap lists */
 #define WG_PATH_ACT_RESCUE 0x04u   /* lapse confirmed: re-send recent direct-only frames via DERP */
 #define WG_PATH_ACT_REKEY  0x08u   /* SILENT: start a rekey unless one is in flight */
+#define WG_PATH_ACT_TEST   0x10u   /* DOUBT: the same, to test the session (1.3.8) */
 
 /* DUAL because the path lapsed, and neither the endpoint nor WireGuard
  * has answered since: the direct-only frames before it may be lost. */
@@ -249,6 +302,9 @@ typedef struct {
     int64_t hs_us;              /* last completed handshake; 0 none */
     int64_t peer_wg_us;         /* last authenticated WG packet from the peer */
     int64_t lapse_from_us;      /* at a lapse: the unanswered frame / proof */
+    int64_t test_at_us;         /* DOUBT: a handshake test is owed from then; 0 none */
+    int64_t delivered_us;       /* direct-only data frames sent before this were
+                                   delivered (wg_path_rescue_from); 0 none */
     uint8_t doubts;             /* doubts since a keepalive that proved direct
                                    (any endpoint): the re-test back-off */
     uint8_t silent_streak;      /* silences since a transport packet from the peer */
@@ -275,6 +331,7 @@ typedef struct {
     uint32_t doubts_total;      /* → DOUBT */
     uint32_t silences;          /* DOUBT → RELAY: no WG packet for two windows */
     uint32_t undelivered;       /* DOUBT → RELAY: WG answered via DERP only */
+    uint32_t tests;             /* doubts tested with a handshake (asked for) */
 } wg_path_t;
 
 /* RFC 1918 or link-local, host-order IPv4 (upstream: IsPrivate +20,
@@ -342,6 +399,7 @@ static inline void wg_path_set_managed(wg_path_t *p, int64_t now, bool managed)
         p->doubts_total = old.doubts_total;
         p->silences = old.silences;
         p->undelivered = old.undelivered;
+        p->tests    = old.tests;
     } else {
         p->managed = false;
     }
@@ -406,7 +464,7 @@ static inline uint32_t wg_path_check_answer_(wg_path_t *p, int64_t now)
  * period would save those two packets per sample but deliver a sample
  * sent into a path that died during the pause only once a lapse is
  * confirmed (≥ 17 s late) — and never when the doubt needs a second
- * window the next sample opens minutes later, past WG_PATH_RESCUE_MS. */
+ * window the next sample opens minutes later, past WG_PATH_RESCUE_MAX_MS. */
 static inline uint32_t wg_path_on_send(wg_path_t *p, int64_t now, bool data,
                                        wg_path_mode_t *mode)
 {
@@ -529,11 +587,17 @@ static inline uint32_t wg_path_tick(wg_path_t *p, int64_t now)
         return wg_path_check_answer_(p, now);
     case WG_PATH_DUAL:
         if (p->why == WG_PATH_WHY_DOUBT) {
+            uint32_t act = 0;
+            if (p->test_at_us != 0 && now >= p->test_at_us) {
+                p->test_at_us = 0;
+                p->tests++;
+                act = WG_PATH_ACT_TEST;
+            }
             if (p->await_us != 0 &&
                 wg_timer_due(now, p->await_us, (int64_t)WG_PATH_ANSWER_MS * 1000LL)) {
-                return wg_path_silent_(p, now);
+                act |= wg_path_silent_(p, now);
             }
-            return 0;
+            return act;
         }
         if (p->ping_us < p->since_us) {          /* none asked in this mode yet */
             /* Once per entry even when `now` predates it (the caller's
@@ -579,9 +643,10 @@ static inline int64_t wg_path_next_deadline(const wg_path_t *p)
             : INT64_MAX;
     case WG_PATH_DUAL:
         if (p->why == WG_PATH_WHY_DOUBT) {
-            return p->await_us != 0
+            const int64_t w2 = p->await_us != 0
                 ? wg_timer_at(p->await_us, (int64_t)WG_PATH_ANSWER_MS * 1000LL)
                 : INT64_MAX;
+            return p->test_at_us != 0 && p->test_at_us < w2 ? p->test_at_us : w2;
         }
         return p->ping_us < p->since_us
             ? p->since_us
@@ -614,8 +679,21 @@ static inline uint32_t wg_path_on_keepalive(wg_path_t *p, int64_t now)
         wg_timer_due(now, p->last_relay_data_us, (int64_t)WG_PATH_ANSWER_MS * 1000LL)) {
         p->proof_us = now;
         p->doubts   = 0;
+        /* The frame it answers was sent before now - KEEPALIVE_TIMEOUT
+         * (the peer's timer, plus the round trip): see
+         * WG_PATH_RESCUE_MAX_MS. */
+        const int64_t d = now - (int64_t)WG_PATH_KEEPALIVE_TIMEOUT_MS * 1000LL;
+        if (d > p->delivered_us) p->delivered_us = d;
     }
     return 0;
+}
+
+/* Data frames sent direct-only before this instant are proven delivered
+ * (0: none): a confirmed lapse re-sends via DERP the ones sent at or
+ * after it (wg_rescue_flush), WG_PATH_RESCUE_MAX_MS at most. */
+static inline int64_t wg_path_rescue_from(const wg_path_t *p)
+{
+    return p->delivered_us;
 }
 
 /* A transport packet with a payload from the peer, either path. Proves
@@ -715,6 +793,9 @@ static inline wg_path_pong_t wg_path_on_pong(wg_path_t *p, int64_t now,
             p->await_us       = 0;               /* the next frame opens window 2 */
             p->unconfirmed_us = now - p->lapse_from_us;
             p->cand_valid     = false;
+            /* Tested at the next timer pass (the RX task runs one right
+             * after the pong), once per silent streak: see the header. */
+            p->test_at_us     = p->silent_streak == 0 ? now : 0;
             return WG_PATH_PONG_DOUBT;
         }
         wg_path_confirm_(p, now);
