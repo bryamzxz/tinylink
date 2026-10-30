@@ -320,9 +320,10 @@ the sensor.
   **Off by default after the hardware runs** (`CONFIG_TINYLINK_CONTROL_PUSH_PIPELINE`,
   default n): against tailscale.com the map stream of both such boot
   connections was later ended cleanly by the server (h2 END_STREAM at
-  229 s and 645 s — never on 1.3.6, which pushed first: 0 clean ends in
-  its soaks), and the next poll got no answer for 120 s, the one after
-  it its netmap 26–55 s late (~1.3 s normally). A host probe of the
+  229 s and 645 s; with the push first a clean end came once in ~30
+  boot connections of 1.3.5–1.3.6 and twice mid-soak on 1.2.0), and the
+  next poll got no answer for 120 s, the one after it its netmap 26–55 s
+  late (~1.3 s normally; 59–112 s after the earlier clean ends too). A host probe of the
   reconnect (`h2_client` / `h2_core` / `ts2021_client` against nghttp2,
   55 checks) found no client fault, so the server is reacting to the
   pair; the push goes first again and the stream after it on the same
@@ -503,8 +504,10 @@ CRC OK; flashed `827c1b9` (reports `gf7d95e1`, the pre-rewrite hash).
   DERP; **1 endpoint roam** (the peer's restart; 149 in 6 h on 1.3.5).
   **3 RX-stale:** two with the direct path answering DISCO and nothing
   from the peer's WireGuard on either path (`seen direct=0 derp=0`),
-  fixed by the forced rekey in ~130 ms — the 1.3.5 soak's post-rekey
-  silences, which path selection cannot see; the third the peer's
+  over within ~130 ms of the forced rekey's INIT (in the second a packet
+  under the old keys arrived 30 ms after the INIT, before its response)
+  — the 1.3.5 soak's post-rekey silences, which path selection cannot
+  see; the third the peer's
   nightly restart at 02:00 (DERP `peer-gone`, the peer back with a new
   DiscoKey 48 s later, session up 6.3 s after that, on the 5-s INIT
   retry). One WAN event at 00:12: the DERP server's stream ended (TLS
@@ -2567,7 +2570,7 @@ Measured impact (PR-D0 + PR-D1, esp32, IDF v5.5.4):
   total app .bin    +0.39 KiB  (1015145 → 1015533)
   bootloader.bin     0
 
-Smoke validated on hardware (30 min, INTELCOM-CARDONA WPA2+PMF):
+Smoke validated on hardware (30 min, the production WPA2+PMF AP):
   - 0 panics / asserts / WDT / xTaskCreate fails (3 prior soaks had
     the supervisor xTaskCreate fail; this one didn't)
   - derp supervisor task spawned t=5.9 s + login OK t=16.9 s on
@@ -2623,7 +2626,7 @@ telemetry @ 5 s, PR #75 `KeepAlive:true` confirmed on-wire). The
 round targets sdkconfig only — no `.c`/`.h` changes, no API surface
 change. Each PR was validated independently by a 60-120 s smoke
 (boot + register + initial netmap + ≥5 telemetry @ 5 s + 0 panic /
-assert / WDT) on the same INTELCOM-CARDONA WPA2+PMF AP, then
+assert / WDT) on the same production WPA2+PMF AP, then
 pushed.
 
 | PR (branch) | Δ flash app | Δ DRAM | Δ IRAM | Other |
@@ -3213,7 +3216,7 @@ each flash.
   `tools/test/test_disco_replay.c` covers first-arrival, immediate
   replay, distinct-non-collide, ring-buffer eviction, and reset
   semantics. On-device verified with 30 s of normal traffic
-  (peer 191.89.194.5:3176 + 192.168.1.38:41641 LAN endpoint,
+  (peer 203.0.113.5:3176 + 192.168.1.38:41641 LAN endpoint,
   ~2-3 PING→Pong/s, all unique txids → all unique nonces → zero false
   positives).
 - **`parse_keyed_hex` partial-write hardening (mapreq.c).** On a
@@ -3398,7 +3401,7 @@ each flash.
   catching both binding requests and responses (the prior shape only
   caught requests; a STUN response with byte 0 = 0x01 collided with
   WG `MSG_RESPONSE` and got DISCARDed). Verified on hardware: 7-min
-  capture shows `stun re-probe ok via wg socket: 190.109.12.37:53174`
+  capture shows `stun re-probe ok via wg socket: 198.51.100.37:53174`
   (the WG socket's actual port), 3 clean rekey cycles, 80 telemetry
   packets uninterrupted, 0 crashes. Removes the *"followup PR
   re-probes via wg socket"* TODO from `tinylink.c`.

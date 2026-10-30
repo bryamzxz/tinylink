@@ -35,7 +35,7 @@ CONFIG_ESP_WIFI_NVS_ENABLED=y
 # WiFi mgmt buffer pool — IDF default is 32, sized for clients that
 # scan + roam across multiple APs (each scan response/beacon/probe
 # response burst needs a free buffer). Tinylink associates to ONE
-# fixed AP (INTELCOM-CARDONA), never roams, doesn't scan post-assoc.
+# fixed production AP, never roams, doesn't scan post-assoc.
 # 8 buffers cover the worst-case probe-response burst during the
 # initial scan + leave headroom for unsolicited beacons / deauth
 # frames the supplicant still has to process. ~700 B per buffer,
@@ -53,7 +53,7 @@ CONFIG_ESP_WIFI_MGMT_SBUF_NUM=8
 # state machines from wpa_supplicant (~20 KiB flash). 2026-09.
 # CONFIG_ESP_WIFI_ENTERPRISE_SUPPORT is not set
 # WPA3-Personal (SAE) handshake codepath: not needed; the production
-# AP (INTELCOM-CARDONA) is WPA2-PSK-SHA256 + PMF, not WPA3-Personal.
+# production AP is WPA2-PSK-SHA256 + PMF, not WPA3-Personal.
 # Removes SAE-PWE Dragonfly + SAE-H2E variants.
 # CONFIG_ESP_WIFI_ENABLE_WPA3_SAE is not set
 # WPA3-OWE-STA (Opportunistic Wireless Encryption for open networks).
@@ -77,7 +77,7 @@ CONFIG_FREERTOS_IDLE_TIME_BEFORE_SLEEP=2
 #
 # ESP_WIFI_SLP_IRAM_OPT and ESP_WIFI_SLP_BEACON_LOST_OPT are documented
 # as the "always-on station" pair, but with WPA2-PSK + PMF on
-# INTELCOM-CARDONA they break initial association — the AP kicks the
+# the production AP they break initial association — the AP kicks the
 # client between AUTH-ASSOC handshake and DHCP. Verified empirically:
 # enabling SLP_IRAM_OPT alone (which auto-selects PM_SLP_DEFAULT_PARAMS_OPT)
 # is enough to reproduce the disconnect-retry-loop seen in the previous
@@ -464,7 +464,7 @@ CONFIG_LWIP_MAX_SOCKETS=6
 # the netif_loop integration code. esp_netif still works without it.
 # CONFIG_LWIP_NETIF_LOOPBACK is not set
 # DNS resolution path stays via the regular WiFi netif's DNS list
-# (set via DHCP from INTELCOM-CARDONA). mDNS query support is unused
+# (set via DHCP from the production AP). mDNS query support is unused
 # — tinylink resolves controlplane.tailscale.com / derp*.tailscale.com
 # via standard DNS, never via mdns. The IDF mdns component is also
 # excluded by EXCLUDE_COMPONENTS in CMakeLists.txt, but the lwIP-side

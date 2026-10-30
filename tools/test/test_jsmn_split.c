@@ -150,7 +150,7 @@ int main(void)
     /* --- a MapResponse-shaped document, split then re-split ------ */
     {
         const char *js =
-            "{\"Node\":{\"ID\":7,\"Addresses\":[\"100.67.60.92/32\"]},"
+            "{\"Node\":{\"ID\":7,\"Addresses\":[\"100.64.0.10/32\"]},"
             "\"PeersChanged\":[{\"ID\":1,\"Key\":\"nodekey:00\",\"Endpoints\":[\"1.1.1.1:1\",\"2.2.2.2:2\"]},"
                               "{\"ID\":2,\"Key\":\"nodekey:11\"}],"
             "\"DERPMap\":{\"Regions\":{\"1\":{\"RegionID\":1,\"Nodes\":[{\"HostName\":\"derp1\"}]},"

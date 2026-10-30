@@ -165,7 +165,7 @@ static void test_stats_json(void)
     st.heap_free = 62700; st.heap_min = 31000; st.heap_largest = 31000;
     st.ntp_synced = true; st.control_open = true;
     snprintf(st.derp_host, sizeof(st.derp_host), "derp16b.tailscale.com");
-    int typ = tl_stats_json(out, sizeof(out), &st, "sensor-cali",
+    int typ = tl_stats_json(out, sizeof(out), &st, "sensor-test",
                             TINYLINK_VERSION_STRING, 4320);
     printf("stats typical: %d B\n", typ);
     fails += ok("stats/typical-fits", typ > 0 && typ < len);
