@@ -203,8 +203,35 @@ static int feed_pending(ts2021_conn_t *conn)
     return rc;
 }
 
+/* The one-shot deadline in force — see h2_post_json. Defined here for
+ * the side request's share of it (h2_drive_request). */
+static uint32_t s_req_ms = TS2021_REQ_TIMEOUT_MS;
+
+/* A side request riding with a stream (h2_post_json_stream_side). */
+typedef struct {
+    const uint8_t *body;
+    size_t         len;
+    h2_side_fn_t   cb;
+    void          *ctx;
+    bool           armed;    /* sent, not closed yet: under the deadline */
+} h2_side_t;
+
+/* The side stream closed: its deadline ends (the stream polls at the
+ * stream budget from here), and the caller hears how — at once, not
+ * when the stream ends hours later. */
+static esp_err_t side_closed(ts2021_conn_t *conn, h2_side_t *side)
+{
+    const h2_stream_t *ss = &conn->h2.side;
+    side->armed = false;
+    s_req_ms = TS2021_REQ_TIMEOUT_MS;   /* answered (or reset): the conn is alive */
+    const esp_err_t err = ts2021_request_deadline(conn, 0);
+    side->cb(ss->final ? ss->status : 0, (int)ss->close_err, side->ctx);
+    return err;
+}
+
 /* One HTTP/2 request on the persistent session bound to `conn`. Caller
- * pre-fills h2_req_body / h2_resp_buf / h2_cb on conn.
+ * pre-fills h2_req_body / h2_resp_buf / h2_cb on conn; `side` (NULL for
+ * none) goes out ahead of it in the same burst.
  *
  * Return mapping (the callers' contract, kept from the nghttp2 client):
  *  - ESP_OK: the stream closed — normally, or reset by the server or by
@@ -220,7 +247,7 @@ static int feed_pending(ts2021_conn_t *conn)
  *    drops the conn. */
 static esp_err_t h2_drive_request(ts2021_conn_t *conn,
                                   const char *path, const char *authority,
-                                  size_t body_len)
+                                  size_t body_len, h2_side_t *side)
 {
     h2_core_t *h = &conn->h2;
     if (!h->started || h->dead) {
@@ -251,8 +278,25 @@ static esp_err_t h2_drive_request(ts2021_conn_t *conn,
         { "content-type",   "application/json" },
         { "content-length", content_length },
     };
-    int rc = h2c_request(h, hdrs, sizeof(hdrs) / sizeof(hdrs[0]),
-                         conn->h2_req_body, body_len);
+    const h2_req_t req = { hdrs, sizeof(hdrs) / sizeof(hdrs[0]),
+                           conn->h2_req_body, body_len };
+    /* The side request: the same path and fields, its own length. */
+    char side_length[16];
+    h2_field_t side_hdrs[sizeof(hdrs) / sizeof(hdrs[0])];
+    h2_req_t side_req;
+    if (side != NULL) {
+        snprintf(side_length, sizeof(side_length), "%u", (unsigned)side->len);
+        memcpy(side_hdrs, hdrs, sizeof(hdrs));
+        side_hdrs[5].value = side_length;
+        side_req = (h2_req_t){ side_hdrs, sizeof(hdrs) / sizeof(hdrs[0]),
+                               side->body, side->len };
+    }
+    int rc = h2c_request_pair(h, side != NULL ? &side_req : NULL, &req);
+    if (rc == H2C_ERR_SIZE && side != NULL) {
+        /* Nothing of either request went out; the session is intact. */
+        ESP_LOGW(TAG, "side request does not fit the opening burst");
+        return ESP_ERR_INVALID_SIZE;
+    }
     if (rc != H2C_OK) {
         if (conn->req_expired) {
             ESP_LOGD(TAG, "request send left: request deadline");
@@ -262,6 +306,7 @@ static esp_err_t h2_drive_request(ts2021_conn_t *conn,
         return ESP_FAIL;
     }
     conn->h2_stream_id = (int32_t)h->s.id;
+    if (side != NULL) side->armed = true;
 
     /* One Noise record per iteration: parse it, flush what it asked for
      * (ACKs, WINDOW_UPDATEs — h2c_feed sends them before returning), then
@@ -295,6 +340,10 @@ static esp_err_t h2_drive_request(ts2021_conn_t *conn,
             }
             return ESP_FAIL;
         }
+        if (side != NULL && side->armed && !h->side.open &&
+            side_closed(conn, side) != ESP_OK) {
+            return ESP_FAIL;
+        }
         if (conn->h2_goaway && !h->s.closed) {
             /* GOAWAY with the stream still open: bail to the caller for
              * reconnection (as with nghttp2). */
@@ -314,17 +363,16 @@ static esp_err_t h2_drive_request(ts2021_conn_t *conn,
     return ESP_OK;
 }
 
-/* The one-shot deadline in force (round 1.3.5): TS2021_REQ_TIMEOUT_MS,
- * doubled after each request that ran out of it, up to
- * TS2021_REQ_TIMEOUT_MAX_MS — the budget a one-shot request had before
- * — and back to TS2021_REQ_TIMEOUT_MS once a request is answered. A
- * dead conn is still cut after 10 s; a control plane that is slow for a
- * while rather than gone (a push answered after 52 s, say) still gets
- * an answer within four tries, where a fixed 10 s would fail every
- * retry of the register loop and of the long-poll's push. Register and
- * the pushes run one at a time on the one control conn; a word-sized
- * value, so no lock. */
-static uint32_t s_req_ms = TS2021_REQ_TIMEOUT_MS;
+/* The one-shot deadline in force (round 1.3.5, s_req_ms above):
+ * TS2021_REQ_TIMEOUT_MS, doubled after each request that ran out of it,
+ * up to TS2021_REQ_TIMEOUT_MAX_MS — the budget a one-shot request had
+ * before — and back to TS2021_REQ_TIMEOUT_MS once a request is
+ * answered. A dead conn is still cut after 10 s; a control plane that is
+ * slow for a while rather than gone (a push answered after 52 s, say)
+ * still gets an answer within four tries, where a fixed 10 s would fail
+ * every retry of the register loop and of the long-poll's push. Register
+ * and the pushes run one at a time on the one control conn; a
+ * word-sized value, so no lock. */
 
 esp_err_t h2_post_json(ts2021_conn_t *conn,
                        const char *path,
@@ -352,7 +400,7 @@ esp_err_t h2_post_json(ts2021_conn_t *conn,
      * drop the conn and the next dial is fresh. */
     const uint32_t ms = s_req_ms;
     esp_err_t err = ts2021_request_deadline(conn, ms);
-    if (err == ESP_OK) err = h2_drive_request(conn, path, authority, body_len);
+    if (err == ESP_OK) err = h2_drive_request(conn, path, authority, body_len, NULL);
     const esp_err_t derr = ts2021_request_deadline(conn, 0);
     if (err == ESP_OK) err = derr;   /* not usable for a stream at 2-s polls */
     if (conn->req_expired) {
@@ -390,7 +438,7 @@ esp_err_t h2_post_json_stream(ts2021_conn_t *conn,
     conn->h2_cb           = cb;
     conn->h2_cb_ctx       = cb_ctx;
 
-    esp_err_t err = h2_drive_request(conn, path, authority, body_len);
+    esp_err_t err = h2_drive_request(conn, path, authority, body_len, NULL);
 
     *status_out = conn->h2_status;
 
@@ -398,5 +446,54 @@ esp_err_t h2_post_json_stream(ts2021_conn_t *conn,
     conn->h2_cb       = NULL;
     conn->h2_cb_ctx   = NULL;
     conn->h2.s.body   = NULL;
+    return err;
+}
+
+esp_err_t h2_post_json_stream_side(ts2021_conn_t *conn,
+                                   const char *path,
+                                   const char *authority,
+                                   const uint8_t *side_body, size_t side_len,
+                                   h2_side_fn_t side_cb, void *side_ctx,
+                                   const uint8_t *body, size_t body_len,
+                                   int *status_out,
+                                   h2_data_callback cb, void *cb_ctx)
+{
+    if (conn == NULL || path == NULL || authority == NULL || side_body == NULL ||
+        side_cb == NULL || cb == NULL || status_out == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    h2_request_reset(conn);
+    conn->h2_req_body     = body;
+    conn->h2_req_body_len = body_len;
+    conn->h2_cb           = cb;
+    conn->h2_cb_ctx       = cb_ctx;
+
+    /* The side request is a one-shot: s_req_ms from the burst to its
+     * answer, as h2_post_json gives one (a conn that answers nothing is
+     * cut after 10 s, not after the stream's 120-s budget). The stream
+     * shares that deadline until then — its first bytes take ~1 s and
+     * prove nothing about the side request. */
+    h2_side_t side = { .body = side_body, .len = side_len,
+                       .cb = side_cb, .ctx = side_ctx };
+    const uint32_t ms = s_req_ms;
+    esp_err_t err = ts2021_request_deadline(conn, ms);
+    if (err == ESP_OK) err = h2_drive_request(conn, path, authority, body_len, &side);
+    if (side.armed || err == ESP_ERR_INVALID_SIZE) {
+        /* Left with the side request unanswered (or never sent). */
+        const esp_err_t derr = ts2021_request_deadline(conn, 0);
+        if (err == ESP_OK) err = derr;
+        if (conn->req_expired) {
+            s_req_ms = ms < TS2021_REQ_TIMEOUT_MAX_MS / 2 ? 2 * ms : TS2021_REQ_TIMEOUT_MAX_MS;
+        }
+    }
+
+    *status_out = conn->h2_status;
+
+    conn->h2_req_body = NULL;
+    conn->h2_cb       = NULL;
+    conn->h2_cb_ctx   = NULL;
+    conn->h2.s.body   = NULL;
+    conn->h2.side.body = NULL;
     return err;
 }

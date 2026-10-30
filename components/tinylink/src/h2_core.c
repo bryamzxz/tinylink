@@ -86,22 +86,32 @@ static int conn_error(h2_core_t *h, uint32_t code)
     return H2C_ERR_PROTO;
 }
 
-static void close_stream(h2_core_t *h, uint32_t code)
+static void close_stream(h2_stream_t *s, uint32_t code)
 {
-    h->s.open = false;
-    h->s.closed = true;
-    h->s.close_err = code;
+    s->open = false;
+    s->closed = true;
+    s->close_err = code;
 }
 
-/* Stream error (§5.4.2) on the stream in flight: RST_STREAM, closed with
- * that code — what nghttp2's stream_close_cb reported. The rest of the
- * frame / header block is parsed and ignored. */
+/* The open stream `sid` names: the main one or the side one (round
+ * 1.3.7, B1); NULL for any other — closed, never ours, or 0. */
+static h2_stream_t *stream_of(h2_core_t *h, uint32_t sid)
+{
+    if (h->s.open && sid == h->s.id) return &h->s;
+    if (h->side.open && sid == h->side.id) return &h->side;
+    return NULL;
+}
+
+/* Stream error (§5.4.2) on the stream of the frame being parsed:
+ * RST_STREAM, closed with that code — what nghttp2's stream_close_cb
+ * reported. The rest of the frame / header block is parsed and ignored. */
 static int stream_error(h2_core_t *h, uint32_t code)
 {
     int rc = H2C_OK;
-    if (h->s.open) {
-        rc = ctl_u32(h, H2_RST_STREAM, h->s.id, code);
-        close_stream(h, code);
+    h2_stream_t *s = stream_of(h, h->f_sid);
+    if (s != NULL) {
+        rc = ctl_u32(h, H2_RST_STREAM, s->id, code);
+        close_stream(s, code);
     }
     h->f_ignore = true;
     h->blk_error = true;
@@ -114,11 +124,6 @@ static int stream_error(h2_core_t *h, uint32_t code)
 static bool idle_stream(const h2_core_t *h, uint32_t sid)
 {
     return sid != 0 && ((sid & 1u) == 0 || sid > h->last_id);
-}
-
-static bool mine(const h2_core_t *h, uint32_t sid)
-{
-    return h->s.open && sid == h->s.id;
 }
 
 /* ---- received DATA: flow control + delivery ------------------------- */
@@ -138,12 +143,13 @@ static int data_consumed(h2_core_t *h, uint32_t n)
         h->conn_consumed = 0;
         if (rc != H2C_OK) return rc;
     }
-    if (!h->f_ignore && mine(h, h->f_sid)) {
-        h->s.consumed += (int32_t)n;
-        if (h->s.consumed >= H2_WU_THRESHOLD && !(h->f_flags & H2_F_END_STREAM)) {
-            rc = ctl_u32(h, H2_WINDOW_UPDATE, h->s.id, (uint32_t)h->s.consumed);
-            h->s.recv_win += h->s.consumed;
-            h->s.consumed = 0;
+    h2_stream_t *s = h->f_ignore ? NULL : stream_of(h, h->f_sid);
+    if (s != NULL) {
+        s->consumed += (int32_t)n;
+        if (s->consumed >= H2_WU_THRESHOLD && !(h->f_flags & H2_F_END_STREAM)) {
+            rc = ctl_u32(h, H2_WINDOW_UPDATE, s->id, (uint32_t)s->consumed);
+            s->recv_win += s->consumed;
+            s->consumed = 0;
         }
     }
     return rc;
@@ -151,34 +157,35 @@ static int data_consumed(h2_core_t *h, uint32_t n)
 
 static int data_bytes(h2_core_t *h, const uint8_t *p, uint32_t n)
 {
-    if (h->f_ignore || !mine(h, h->f_sid)) return H2C_OK;
-    h2_stream_t *s = &h->s;
+    h2_stream_t *s = h->f_ignore ? NULL : stream_of(h, h->f_sid);
+    if (s == NULL) return H2C_OK;
     s->recv_len += n;
     /* nghttp2_http_on_data_chunk: DATA before the final response, or
      * past content-length, is a stream error — and is not delivered. */
     if (!s->final || (s->content_length >= 0 && s->recv_len > s->content_length))
         return stream_error(h, H2_PROTOCOL_ERROR);
-    if (!s->stop && n > 0 && h2_io_on_data(h->io, p, n) < 0) s->stop = true;
+    /* The side stream's body is counted (flow control, content-length)
+     * and dropped: only its status matters (h2_core.h). */
+    if (s == &h->s && !s->stop && n > 0 && h2_io_on_data(h->io, p, n) < 0) s->stop = true;
     return H2C_OK;
 }
 
-/* The server ended the stream (END_STREAM on DATA or HEADERS). */
-static int remote_end(h2_core_t *h)
+/* The server ended stream s (END_STREAM on DATA or HEADERS). */
+static int remote_end(h2_core_t *h, h2_stream_t *s)
 {
-    h2_stream_t *s = &h->s;
     /* nghttp2_http_on_remote_end_stream */
     if (!s->final ||
         (s->content_length >= 0 && s->content_length != s->recv_len))
         return stream_error(h, H2_PROTOCOL_ERROR);
     s->remote_end = true;
     if (s->local_end) {
-        close_stream(h, H2_NO_ERROR);
+        close_stream(s, H2_NO_ERROR);
         return H2C_OK;
     }
     /* Complete response before our body was out (only with a tiny server
      * window): stop sending and release the stream (§8.1). */
     const int rc = ctl_u32(h, H2_RST_STREAM, s->id, H2_CANCEL);
-    close_stream(h, H2_NO_ERROR);
+    close_stream(s, H2_NO_ERROR);
     return rc;
 }
 
@@ -221,7 +228,9 @@ static int field_cb(void *ctx, const hpack_field_t *f)
 {
     h2_core_t *h = ctx;
     if (h->blk_ignore || h->blk_error) return 0;
-    h2_stream_t *s = &h->s;
+    h2_stream_t *s = stream_of(h, h->f_sid);
+    if (s == NULL) return 0;   /* not reached: blk_ignore / blk_error cover it */
+    const bool is_main = s == &h->s;
     const bool pseudo = f->name_len > 0 && f->name[0] == ':';
 
     if (f->flags & (HPACK_F_NAME_BAD | HPACK_F_NAME_UPPER)) {
@@ -242,7 +251,7 @@ static int field_cb(void *ctx, const hpack_field_t *f)
         if (st < 0 || st == 101) goto bad;
         s->have_status = true;
         s->status = (int)st;
-        h2_io_on_status(h->io, s->status);
+        if (is_main) h2_io_on_status(h->io, s->status);
         return 0;
     }
     s->pseudo_done = true;
@@ -263,7 +272,7 @@ static int field_cb(void *ctx, const hpack_field_t *f)
     } else if (name_is(f, "te", 2) && !value_ieq(f, "trailers", 8)) {
         goto bad;
     }
-    if (!h->blk_trailer) h2_io_on_header(h->io, f);
+    if (!h->blk_trailer && is_main) h2_io_on_header(h->io, f);
     return 0;
 bad:
     (void)stream_error(h, H2_PROTOCOL_ERROR);
@@ -275,8 +284,8 @@ static int block_end(h2_core_t *h)
 {
     if (hpack_dec_end(&h->hpack) != HPACK_OK) return conn_error(h, H2_COMPRESSION_ERROR);
     h->cont_sid = 0;
-    if (h->blk_ignore || h->blk_error || !mine(h, h->f_sid)) return H2C_OK;
-    h2_stream_t *s = &h->s;
+    h2_stream_t *s = stream_of(h, h->f_sid);
+    if (h->blk_ignore || h->blk_error || s == NULL) return H2C_OK;
     if (!h->blk_trailer) {
         /* nghttp2_http_on_response_headers */
         if (!s->have_status) return stream_error(h, H2_PROTOCOL_ERROR);
@@ -292,7 +301,7 @@ static int block_end(h2_core_t *h)
     } else if (!h->blk_end_stream) {
         return stream_error(h, H2_PROTOCOL_ERROR);   /* trailers must end it */
     }
-    return h->blk_end_stream ? remote_end(h) : H2C_OK;
+    return h->blk_end_stream ? remote_end(h, s) : H2C_OK;
 }
 
 static int block_bytes(h2_core_t *h, const uint8_t *p, uint32_t n)
@@ -314,10 +323,12 @@ static int setting(h2_core_t *h, uint16_t id, uint32_t v)
     case H2_SET_INITIAL_WINDOW_SIZE: {
         if (v > H2_MAX_WINDOW) return conn_error(h, H2_FLOW_CONTROL_ERROR);
         const int64_t delta = (int64_t)v - (int64_t)h->peer_initial_win;
-        if (h->s.open) {
-            const int64_t w = (int64_t)h->s.send_win + delta;
+        h2_stream_t *const both[2] = { &h->s, &h->side };
+        for (int i = 0; i < 2; i++) {
+            if (!both[i]->open) continue;
+            const int64_t w = (int64_t)both[i]->send_win + delta;
             if (w > H2_MAX_WINDOW) return conn_error(h, H2_FLOW_CONTROL_ERROR);
-            h->s.send_win = (int32_t)w;   /* may go negative (§6.9.2) */
+            both[i]->send_win = (int32_t)w;   /* may go negative (§6.9.2) */
         }
         h->peer_initial_win = v;
         break;
@@ -377,12 +388,15 @@ static int fixed_done(h2_core_t *h)
         h2_io_on_goaway(h->io, last, err);
         /* Streams above it were never processed: closed REFUSED_STREAM,
          * as nghttp2's session_close_stream_on_goaway does (no RST). */
-        if (h->s.open && h->s.id > last) close_stream(h, H2_REFUSED_STREAM);
+        if (h->s.open && h->s.id > last) close_stream(&h->s, H2_REFUSED_STREAM);
+        if (h->side.open && h->side.id > last) close_stream(&h->side, H2_REFUSED_STREAM);
         return H2C_OK;
     }
-    case H2_RST_STREAM:
-        if (mine(h, h->f_sid)) close_stream(h, get32(p));
+    case H2_RST_STREAM: {
+        h2_stream_t *s = stream_of(h, h->f_sid);
+        if (s != NULL) close_stream(s, get32(p));
         return H2C_OK;
+    }
     case H2_WINDOW_UPDATE: {
         const uint32_t inc = get32(p) & 0x7fffffffu;
         if (h->f_sid == 0) {
@@ -390,11 +404,13 @@ static int fixed_done(h2_core_t *h)
             if ((int64_t)h->conn_send_win + inc > H2_MAX_WINDOW)
                 return conn_error(h, H2_FLOW_CONTROL_ERROR);
             h->conn_send_win += (int32_t)inc;
-        } else if (mine(h, h->f_sid)) {
+        } else {
+            h2_stream_t *s = stream_of(h, h->f_sid);
+            if (s == NULL) return H2C_OK;
             if (inc == 0) return stream_error(h, H2_PROTOCOL_ERROR);
-            if ((int64_t)h->s.send_win + inc > H2_MAX_WINDOW)
+            if ((int64_t)s->send_win + inc > H2_MAX_WINDOW)
                 return stream_error(h, H2_FLOW_CONTROL_ERROR);
-            h->s.send_win += (int32_t)inc;
+            s->send_win += (int32_t)inc;
         }
         return H2C_OK;
     }
@@ -411,15 +427,15 @@ static int begin_data(h2_core_t *h)
     if ((h->f_flags & H2_F_PADDED) && h->f_len < 1) return conn_error(h, H2_FRAME_SIZE_ERROR);
     /* A stream the server ended is closed at once (remote_end), so a
      * later frame on it is one for a stream we no longer track. */
-    const bool m = mine(h, h->f_sid);
+    h2_stream_t *s = stream_of(h, h->f_sid);
     /* Flow control counts the whole payload, padding included (§6.9.1),
      * also for streams we no longer track. */
     h->conn_recv_win -= (int32_t)h->f_len;
     if (h->conn_recv_win < 0) return conn_error(h, H2_FLOW_CONTROL_ERROR);
-    h->f_ignore = !m;
-    if (m) {
-        h->s.recv_win -= (int32_t)h->f_len;
-        if (h->s.recv_win < 0) {
+    h->f_ignore = s == NULL;
+    if (s != NULL) {
+        s->recv_win -= (int32_t)h->f_len;
+        if (s->recv_win < 0) {
             const int rc = stream_error(h, H2_FLOW_CONTROL_ERROR);
             if (rc != H2C_OK) return rc;
         }
@@ -435,11 +451,11 @@ static int begin_headers(h2_core_t *h)
     const uint32_t min = ((h->f_flags & H2_F_PADDED) ? 1u : 0u) +
                          ((h->f_flags & H2_F_PRIORITY) ? 5u : 0u);
     if (h->f_len < min) return conn_error(h, H2_FRAME_SIZE_ERROR);
-    const bool m = mine(h, h->f_sid);
+    const h2_stream_t *s = stream_of(h, h->f_sid);
     hpack_dec_begin(&h->hpack);
-    h->blk_ignore = !m;
+    h->blk_ignore = s == NULL;
     h->blk_error = false;
-    h->blk_trailer = m && h->s.final;
+    h->blk_trailer = s != NULL && s->final;
     h->blk_end_stream = (h->f_flags & H2_F_END_STREAM) != 0;
     h->cont_sid = (h->f_flags & H2_F_END_HEADERS) ? 0 : h->f_sid;
     h->cont_count = 0;
@@ -520,10 +536,11 @@ static int frame_begin(h2_core_t *h)
 static int frame_end(h2_core_t *h)
 {
     switch (h->f_type) {
-    case H2_DATA:
-        if (!h->f_ignore && mine(h, h->f_sid) && (h->f_flags & H2_F_END_STREAM))
-            return remote_end(h);
+    case H2_DATA: {
+        h2_stream_t *s = h->f_ignore ? NULL : stream_of(h, h->f_sid);
+        if (s != NULL && (h->f_flags & H2_F_END_STREAM)) return remote_end(h, s);
         return H2C_OK;
+    }
     case H2_HEADERS:
     case H2_CONTINUATION:
         if (h->f_flags & H2_F_END_HEADERS) return block_end(h);
@@ -650,12 +667,11 @@ int h2c_feed_staged(h2_core_t *h, const uint8_t *p, size_t len)
 
 /* ---- sending ------------------------------------------------------------ */
 
-/* As many DATA frames of the body as the windows and the buffer allow;
- * the last one carries END_STREAM (an empty one for an empty body, as
- * nghttp2's data provider sends). Returns the new fill. */
-static size_t put_data(h2_core_t *h, uint8_t *b, size_t cap, size_t off)
+/* As many DATA frames of stream s's body as the windows and the buffer
+ * allow; the last one carries END_STREAM (an empty one for an empty
+ * body, as nghttp2's data provider sends). Returns the new fill. */
+static size_t put_data(h2_core_t *h, h2_stream_t *s, uint8_t *b, size_t cap, size_t off)
 {
-    h2_stream_t *s = &h->s;
     while (s->open && !s->local_end && cap - off >= H2_FRAME_HDR_LEN) {
         const size_t rem = s->body_len - s->body_off;
         const int32_t win = h->conn_send_win < s->send_win ? h->conn_send_win : s->send_win;
@@ -699,6 +715,8 @@ static int tx_end(h2_core_t *h, size_t off)
     return H2C_OK;
 }
 
+/* Only the main stream can have body left: a side request goes out
+ * whole in its opening burst (h2c_request_pair). */
 int h2c_pump(h2_core_t *h)
 {
     h2_stream_t *s = &h->s;
@@ -710,65 +728,98 @@ int h2c_pump(h2_core_t *h)
         size_t cap, off;
         uint8_t *b = tx_begin(h, &cap, &off);
         if (b == NULL) return H2C_ERR_IO;
-        off = put_data(h, b, cap, off);
+        off = put_data(h, s, b, cap, off);
         const int rc = tx_end(h, off);
         if (rc != H2C_OK) return rc;
     }
     return H2C_OK;
 }
 
-int h2c_request(h2_core_t *h, const h2_field_t *fields, size_t n_fields,
-                const uint8_t *body, size_t body_len)
+/* HEADERS opening stream s on the next ID at b[*off], then as much of
+ * its body as fits (put_data). H2C_ERR_SIZE when the header block does
+ * not fit the buffer or one frame; the caller rolls back. */
+static int open_stream(h2_core_t *h, h2_stream_t *s, const h2_req_t *r,
+                       uint8_t *b, size_t cap, size_t *off)
 {
-    if (!h->started || h->dead || h->goaway || h->s.open) return H2C_ERR_STATE;
-    if (h->next_id > 0x7fffffffu) return H2C_ERR_STATE;   /* IDs exhausted */
-
-    size_t cap, off;
-    uint8_t *b = tx_begin(h, &cap, &off);
-    if (b == NULL) return H2C_ERR_IO;
-    const size_t fh_at = off;
-    off += H2_FRAME_HDR_LEN;
-    const size_t blk_at = off;
+    size_t o = *off;
+    if (cap - o < H2_FRAME_HDR_LEN + 1) return H2C_ERR_SIZE;
+    const size_t fh_at = o;
+    o += H2_FRAME_HDR_LEN;
+    const size_t blk_at = o;
     /* nghttp2 (max_deflate_dynamic_table_size 0) opened its first block
      * with a table size update to 0: the server's decoder table is 0
      * from then on, so no SETTINGS_HEADER_TABLE_SIZE it may send later
      * can require another update from us. Same bytes here. */
-    if (!h->sent_size_update) b[off++] = 0x20;
-    for (size_t i = 0; i < n_fields; i++) {
-        const size_t n = hpack_put_field(b + off, cap - off,
-                                         fields[i].name, strlen(fields[i].name),
-                                         fields[i].value, strlen(fields[i].value));
-        if (n == 0) {
-            (void)tx_end(h, fh_at);                /* keep the control frames */
-            return H2C_ERR_SIZE;
-        }
-        off += n;
+    if (!h->sent_size_update) b[o++] = 0x20;
+    for (size_t i = 0; i < r->n_fields; i++) {
+        const size_t n = hpack_put_field(b + o, cap - o,
+                                         r->fields[i].name, strlen(r->fields[i].name),
+                                         r->fields[i].value, strlen(r->fields[i].value));
+        if (n == 0) return H2C_ERR_SIZE;
+        o += n;
     }
-    const size_t blk_len = off - blk_at;
-    if (blk_len > h->peer_max_frame) {
-        (void)tx_end(h, fh_at);
-        return H2C_ERR_SIZE;
-    }
+    const size_t blk_len = o - blk_at;
+    if (blk_len > h->peer_max_frame) return H2C_ERR_SIZE;
     const uint32_t sid = h->next_id;
     h->next_id += 2;
     h->last_id = sid;
     h->sent_size_update = true;
     put_fh(b + fh_at, (uint32_t)blk_len, H2_HEADERS, H2_F_END_HEADERS, sid);
 
-    h2_stream_t *s = &h->s;
     memset(s, 0, sizeof(*s));
     s->id = sid;
     s->open = true;
     s->send_win = (int32_t)h->peer_initial_win;
     s->recv_win = H2_DEFAULT_WINDOW;
     s->content_length = -1;
-    s->body = body;
-    s->body_len = body != NULL ? body_len : 0;
+    s->body = r->body;
+    s->body_len = r->body != NULL ? r->body_len : 0;
+    *off = put_data(h, s, b, cap, o);
+    return H2C_OK;
+}
 
-    off = put_data(h, b, cap, off);
-    const int rc = tx_end(h, off);
+int h2c_request_pair(h2_core_t *h, const h2_req_t *side, const h2_req_t *req)
+{
+    if (!h->started || h->dead || h->goaway || h->s.open ||
+        (side != NULL && h->side.open)) return H2C_ERR_STATE;
+    /* IDs exhausted */
+    if (h->next_id > (side != NULL ? 0x7ffffffdu : 0x7fffffffu)) return H2C_ERR_STATE;
+
+    size_t cap, off;
+    uint8_t *b = tx_begin(h, &cap, &off);
+    if (b == NULL) return H2C_ERR_IO;
+    /* All or nothing: on a size failure only the staged control frames
+     * go out, and no ID, window or size update is spent. */
+    const size_t ctl_at = off;
+    const uint32_t next_id = h->next_id, last_id = h->last_id;
+    const bool sent_size_update = h->sent_size_update;
+    const int32_t conn_send_win = h->conn_send_win;
+    int rc = H2C_OK;
+    if (side != NULL) {
+        rc = open_stream(h, &h->side, side, b, cap, &off);
+        if (rc == H2C_OK && !h->side.local_end) rc = H2C_ERR_SIZE;   /* not whole */
+    }
+    if (rc == H2C_OK) rc = open_stream(h, &h->s, req, b, cap, &off);
+    if (rc != H2C_OK) {
+        if (side != NULL) memset(&h->side, 0, sizeof(h->side));
+        h->s.open = false;
+        h->next_id = next_id;
+        h->last_id = last_id;
+        h->sent_size_update = sent_size_update;
+        h->conn_send_win = conn_send_win;
+        (void)tx_end(h, ctl_at);                   /* keep the control frames */
+        return rc;
+    }
+    rc = tx_end(h, off);
     if (rc != H2C_OK) return rc;
     return h2c_pump(h);
+}
+
+int h2c_request(h2_core_t *h, const h2_field_t *fields, size_t n_fields,
+                const uint8_t *body, size_t body_len)
+{
+    const h2_req_t r = { fields, n_fields, body, body_len };
+    return h2c_request_pair(h, NULL, &r);
 }
 
 int h2c_start(h2_core_t *h)

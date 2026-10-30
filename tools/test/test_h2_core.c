@@ -977,6 +977,279 @@ static void test_connection_errors(void)
 
 /* ---- fuzz ------------------------------------------------------------------- */
 
+/* ---- the side stream (round 1.3.7, B1) ------------------------------------ */
+
+static const h2_field_t kPushHdrs[] = {
+    { ":method", "POST" }, { ":scheme", "https" }, { ":path", "/machine/map" },
+    { ":authority", "controlplane.tailscale.com" },
+    { "content-type", "application/json" }, { "content-length", "4" },
+};
+static const h2_field_t kMapHdrs[] = {
+    { ":method", "POST" }, { ":scheme", "https" }, { ":path", "/machine/map" },
+    { ":authority", "controlplane.tailscale.com" },
+    { "content-type", "application/json" }, { "content-length", "5" },
+};
+
+/* A started client with the push (stream 1, "push") opened ahead of the
+ * map stream (stream 3, "hello") in one burst. */
+static int client_with_pair(void)
+{
+    io_reset();
+    h2c_init(&s_h, &s_io);
+    (void)h2c_start(&s_h);
+    s_io.out_len = 0;
+    s_io.sends = 0;
+    const h2_req_t side = { kPushHdrs, 6, (const uint8_t *)"push", 4 };
+    const h2_req_t req = { kMapHdrs, 6, kHello, 5 };
+    return h2c_request_pair(&s_h, &side, &req);
+}
+
+static void test_side_stream(void)
+{
+    /* The burst: one send, side first on the lower ID, both bodies whole. */
+    int rc = client_with_pair();
+    frm_t f[8];
+    int n = out_frames(f, 8);
+    check("pair_one_record_four_frames", rc == H2C_OK && s_io.sends == 1 && n == 4);
+    check("pair_side_first_stream1",
+          f[0].type == H2_HEADERS && f[0].sid == 1 && f[0].p[0] == 0x20 &&
+          f[1].type == H2_DATA && f[1].sid == 1 && f[1].flags == H2_F_END_STREAM &&
+          f[1].len == 4 && memcmp(f[1].p, "push", 4) == 0);
+    check("pair_main_second_stream3_no_size_update",
+          f[2].type == H2_HEADERS && f[2].sid == 3 && f[2].p[0] == 0x02 &&
+          f[3].type == H2_DATA && f[3].sid == 3 && f[3].flags == H2_F_END_STREAM &&
+          f[3].len == 5 && memcmp(f[3].p, "hello", 5) == 0);
+    check("pair_state", s_h.side.open && s_h.side.local_end && s_h.s.open &&
+          s_h.s.local_end && s_h.next_id == 5 && s_h.last_id == 3);
+    check("pair_refused_while_side_open",
+          h2c_request_pair(&s_h, &(h2_req_t){ kPushHdrs, 6, NULL, 0 },
+                           &(h2_req_t){ kMapHdrs, 6, NULL, 0 }) == H2C_ERR_STATE);
+
+    /* Side answered first (429 + Retry-After, a body), then the stream:
+     * the hooks see the main stream only, at every split. */
+    for (int mode = 0; mode < 3; mode++) {
+        (void)client_with_pair();
+        srv_reset();
+        static const char *const s429[] = { ":status", "429", "retry-after", "60",
+                                            "content-length", "11" };
+        headers(1, 0, s429, 3);
+        data(1, H2_F_END_STREAM, "slow down\r\n", 11);
+        static const char *const ok[] = { ":status", "200", "x-main", "1" };
+        headers(3, 0, ok, 2);
+        data(3, 0, "abc", 3);
+        const int r = feed(mode);
+        char nm[64];
+        snprintf(nm, sizeof(nm), "side_first_hooks_main_only_mode%d", mode);
+        check(nm, r == H2C_OK && s_io.n_status == 1 && s_io.status == 200 &&
+                  strcmp(s_io.hdrs, "x-main: 1\n") == 0 && s_io.data_len == 3 &&
+                  memcmp(s_io.data, "abc", 3) == 0 && s_h.s.open && !s_h.s.closed);
+        snprintf(nm, sizeof(nm), "side_first_status_kept_mode%d", mode);
+        check(nm, s_h.side.closed && !s_h.side.open && s_h.side.final &&
+                  s_h.side.status == 429 && s_h.side.close_err == 0 &&
+                  s_h.side.recv_len == 11);
+    }
+
+    /* Interleaved: the stream's DATA before, around and after the side's
+     * answer; the side's DATA never reaches on_data. */
+    for (int mode = 0; mode < 3; mode++) {
+        (void)client_with_pair();
+        srv_reset();
+        static const char *const ok[] = { ":status", "200" };
+        headers(3, 0, ok, 1);
+        data(3, 0, "one-", 4);
+        headers(1, 0, ok, 1);
+        data(3, 0, "two-", 4);
+        data(1, 0, "{}", 2);
+        data(3, 0, "three", 5);
+        data(1, H2_F_END_STREAM, NULL, 0);
+        data(3, 0, "-four", 5);
+        const int r = feed(mode);
+        char nm[64];
+        snprintf(nm, sizeof(nm), "interleaved_main_bytes_exact_mode%d", mode);
+        check(nm, r == H2C_OK && s_io.data_len == 18 &&
+                  memcmp(s_io.data, "one-two-three-four", 18) == 0 && s_io.n_status == 1);
+        snprintf(nm, sizeof(nm), "interleaved_side_closed_200_mode%d", mode);
+        check(nm, s_h.side.closed && s_h.side.status == 200 && s_h.side.recv_len == 2 &&
+                  s_h.s.open && s_io.tx_buf_in_feed == 0);
+    }
+
+    /* Stream ends first, side still open; then its late answer. */
+    (void)client_with_pair();
+    srv_reset();
+    static const char *const ok1[] = { ":status", "200" };
+    headers(3, H2_F_END_STREAM, ok1, 1);
+    rc = feed(0);
+    check("main_closes_side_stays_open", rc == H2C_OK && s_h.s.closed && s_h.side.open &&
+          !s_h.side.closed);
+    srv_reset();
+    headers(1, H2_F_END_STREAM, ok1, 1);
+    rc = feed(1);
+    check("side_late_answer_after_main", rc == H2C_OK && s_h.side.closed &&
+          s_h.side.status == 200 && s_io.n_status == 1);
+
+    /* RST_STREAM on the side: closed with the code, main untouched. */
+    (void)client_with_pair();
+    srv_reset();
+    frame_u32(H2_RST_STREAM, 1, H2_REFUSED_STREAM);
+    headers(3, 0, ok1, 1);
+    rc = feed(2);
+    check("side_rst_closed_with_code", rc == H2C_OK && s_h.side.closed && !s_h.side.final &&
+          s_h.side.close_err == H2_REFUSED_STREAM && s_h.s.open && s_io.status == 200);
+
+    /* A malformed side answer (DATA before HEADERS) is a stream error on
+     * the side's ID only. */
+    (void)client_with_pair();
+    srv_reset();
+    data(1, 0, "x", 1);
+    headers(3, 0, ok1, 1);
+    data(3, 0, "ok", 2);
+    rc = feed(1);
+    check("side_malformed_rst_side_only",
+          rc == H2C_OK && sent_rst(1) == H2_PROTOCOL_ERROR && sent_rst(3) == -1 &&
+          s_h.side.closed && s_h.side.close_err == H2_PROTOCOL_ERROR &&
+          s_h.s.open && s_io.data_len == 2 && memcmp(s_io.data, "ok", 2) == 0);
+    /* … and a content-length the side's body overruns. */
+    (void)client_with_pair();
+    srv_reset();
+    static const char *const cl1[] = { ":status", "200", "content-length", "1" };
+    headers(1, 0, cl1, 2);
+    data(1, H2_F_END_STREAM, "xy", 2);
+    rc = feed(0);
+    check("side_content_length_overrun", rc == H2C_OK && sent_rst(1) == H2_PROTOCOL_ERROR &&
+          s_h.side.closed && s_h.s.open && s_io.data_len == 0 && s_io.n_status == 0);
+
+    /* GOAWAY: last 1 refuses the main stream only, last 0 both. */
+    (void)client_with_pair();
+    srv_reset();
+    uint8_t ga[8] = { 0, 0, 0, 1, 0, 0, 0, 0 };
+    frame(H2_GOAWAY, 0, 0, ga, 8);
+    rc = feed(0);
+    check("goaway_last1_refuses_main_keeps_side",
+          rc == H2C_OK && s_h.s.closed && s_h.s.close_err == H2_REFUSED_STREAM &&
+          s_h.side.open);
+    (void)client_with_pair();
+    srv_reset();
+    ga[3] = 0;
+    frame(H2_GOAWAY, 0, 0, ga, 8);
+    rc = feed(0);
+    check("goaway_last0_refuses_both",
+          rc == H2C_OK && s_h.s.close_err == H2_REFUSED_STREAM &&
+          s_h.side.closed && s_h.side.close_err == H2_REFUSED_STREAM);
+
+    /* INITIAL_WINDOW_SIZE moves both send windows; WINDOW_UPDATE on the
+     * side's ID reaches the side; the connection window counts both. */
+    (void)client_with_pair();
+    srv_reset();
+    static const uint16_t iw[] = { H2_SET_INITIAL_WINDOW_SIZE };
+    static const uint32_t iv[] = { 1000 };
+    settings(1, iw, iv);
+    frame_u32(H2_WINDOW_UPDATE, 1, 7);
+    rc = feed(0);
+    check("settings_window_both_streams",
+          rc == H2C_OK && s_h.s.send_win == 1000 - 5 && s_h.side.send_win == 1000 - 4 + 7 &&
+          s_h.conn_send_win == 65535 - 9);
+    (void)client_with_pair();
+    srv_reset();
+    headers(1, 0, ok1, 1);
+    static uint8_t big[12000];
+    for (int i = 0; i < 3; i++) data(1, 0, big, sizeof(big));
+    headers(3, 0, ok1, 1);
+    data(3, 0, big, 1000);
+    rc = feed(0);
+    check("receive_window_counts_side_data",
+          rc == H2C_OK && wu_sum(0) == 36000 && wu_sum(1) == 36000 && wu_sum(3) == 0 &&
+          s_h.conn_consumed == 1000 && s_io.data_len == 1000);
+
+    /* The side does not fit: nothing but the staged control frames goes
+     * out, no ID spent, and a plain request still works on stream 1. */
+    io_reset();
+    h2c_init(&s_h, &s_io);
+    (void)h2c_start(&s_h);
+    srv_reset();
+    static const uint32_t tiny[] = { 3 };
+    settings(1, iw, tiny);
+    s_io.in_feed = true;
+    rc = h2c_feed_staged(&s_h, s_srv, s_srv_len);   /* its ACK stays staged */
+    s_io.in_feed = false;
+    s_io.out_len = 0;
+    s_io.sends = 0;
+    const h2_req_t side = { kPushHdrs, 6, (const uint8_t *)"push", 4 };
+    const h2_req_t req = { kMapHdrs, 6, kHello, 5 };
+    rc = h2c_request_pair(&s_h, &side, &req);
+    n = out_frames(f, 8);
+    check("side_not_whole_nothing_sent",
+          rc == H2C_ERR_SIZE && n == 1 && f[0].type == H2_SETTINGS &&
+          (f[0].flags & H2_F_ACK) && s_h.next_id == 1 && s_h.last_id == 0 &&
+          !s_h.sent_size_update && !s_h.side.open && !s_h.s.open &&
+          s_h.conn_send_win == 65535);
+    s_io.out_len = 0;
+    rc = h2c_request(&s_h, kMapHdrs, 6, kHello, 5);
+    n = out_frames(f, 8);
+    check("after_side_refusal_plain_request_stream1",
+          rc == H2C_OK && f[0].type == H2_HEADERS && f[0].sid == 1 && f[0].p[0] == 0x20 &&
+          f[1].type == H2_DATA && f[1].len == 3);
+    /* … and a side body larger than the lent buffer. */
+    io_reset();
+    h2c_init(&s_h, &s_io);
+    (void)h2c_start(&s_h);
+    s_io.tx_cap = 512;
+    static uint8_t sbody[600];
+    rc = h2c_request_pair(&s_h, &(h2_req_t){ kPushHdrs, 6, sbody, sizeof(sbody) }, &req);
+    check("side_over_buffer_refused", rc == H2C_ERR_SIZE && s_h.next_id == 1 &&
+          !s_h.side.open && !s_h.s.open);
+
+    /* The next pair after both closed: streams 5 and 7. */
+    (void)client_with_pair();
+    srv_reset();
+    headers(1, H2_F_END_STREAM, ok1, 1);
+    headers(3, H2_F_END_STREAM, ok1, 1);
+    rc = feed(0);
+    s_io.out_len = 0;
+    rc |= h2c_request_pair(&s_h, &side, &req);
+    n = out_frames(f, 8);
+    check("second_pair_streams_5_7", rc == H2C_OK && n == 4 && f[0].sid == 5 && f[2].sid == 7);
+
+    /* Fuzz: the two answers' frames interleaved at random, fed at random
+     * splits — the main body exact, the side's status kept, nothing of
+     * the side in the hooks. */
+    static uint8_t mb[20000];
+    int bad = 0;
+    for (int t = 0; t < 300; t++) {
+        (void)client_with_pair();
+        srv_reset();
+        const size_t mlen = rnd() % sizeof(mb);
+        for (size_t i = 0; i < mlen; i++) mb[i] = (uint8_t)rnd();
+        const int sst = 200 + (int)(rnd() % 3) * 100;   /* 200 / 300 / 400 */
+        char sbuf[4];
+        snprintf(sbuf, sizeof(sbuf), "%d", sst);
+        const char *sh[] = { ":status", sbuf, "retry-after", "5" };
+        static const char *const mh[] = { ":status", "200" };
+        bool side_hdr = false, side_end = false, main_hdr = false;
+        size_t moff = 0, sdat = 0;
+        while (!side_end || moff < mlen || !main_hdr) {
+            if (rnd() & 1) {
+                if (!side_hdr) { headers(1, 0, sh, 2); side_hdr = true; }
+                else if (!side_end && rnd() % 3) { data(1, 0, "zz", 2); sdat += 2; }
+                else if (!side_end) { data(1, H2_F_END_STREAM, NULL, 0); side_end = true; }
+            } else {
+                if (!main_hdr) { headers(3, 0, mh, 1); main_hdr = true; }
+                else if (moff < mlen) {
+                    size_t k = 1 + rnd() % 2500;
+                    if (k > mlen - moff) k = mlen - moff;
+                    data(3, 0, mb + moff, k);
+                    moff += k;
+                }
+            }
+        }
+        rc = feed(2);
+        if (rc != H2C_OK || s_io.n_status != 1 || s_io.status != 200 || s_io.data_len != mlen ||
+            memcmp(s_io.data, mb, mlen) != 0 || s_io.hdrs[0] != 0 || !s_h.side.closed ||
+            s_h.side.status != sst || s_h.side.recv_len != (int64_t)sdat || !s_h.s.open ||
+            s_io.tx_buf_in_feed != 0) bad++;
+    }
+    check("side_interleave_fuzz_300", bad == 0);
+}
+
 /* Random but well-formed server transcripts: SETTINGS, PINGs, unknown
  * frames, response HEADERS (padded / prioritised /
  * split over CONTINUATIONs, random fields), DATA with random padding and
@@ -1097,6 +1370,7 @@ int main(void)
     test_ping_goaway_rst();
     test_response_checks();
     test_connection_errors();
+    test_side_stream();
     test_structured_fuzz();
     test_garbage_fuzz();
     if (s_fails == 0) printf("\nALL OK\n");

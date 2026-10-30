@@ -65,6 +65,32 @@ esp_err_t h2_post_json_stream(ts2021_conn_t *conn,
                               int *status_out,
                               h2_data_callback cb, void *cb_ctx);
 
+/* The streaming request with a one-shot side request ahead of it in the
+ * same burst (round 1.3.7, B1): the endpoint push and the map stream,
+ * both POST `path`, as two streams instead of two round trips one after
+ * the other. Only the side request's status is kept: `side_cb` runs
+ * once, as soon as its stream closes — with the final :status, or 0 and
+ * the HTTP/2 error code when it was reset or refused — on the calling
+ * task, from inside the stream loop; not at all when the stream ends or
+ * fails first (the side request then counts as unanswered). Until then
+ * the conn is under the one-shot request deadline (h2_post_json), from
+ * then on under the stream budget.
+ *
+ * `side_body` need only live through the call's opening burst — it goes
+ * out whole there; when it cannot (a server window under its size),
+ * nothing is sent and ESP_ERR_INVALID_SIZE comes back with the session
+ * intact. Otherwise the returns of h2_post_json_stream. */
+typedef void (*h2_side_fn_t)(int status, int stream_error, void *ctx);
+
+esp_err_t h2_post_json_stream_side(ts2021_conn_t *conn,
+                                   const char *path,
+                                   const char *authority,
+                                   const uint8_t *side_body, size_t side_len,
+                                   h2_side_fn_t side_cb, void *side_ctx,
+                                   const uint8_t *body, size_t body_len,
+                                   int *status_out,
+                                   h2_data_callback cb, void *cb_ctx);
+
 /* Start the persistent HTTP/2 session bound to `conn` (state embedded in
  * the conn, no heap). Called once at the end of ts2021_connect. Sends
  * the client preface + our SETTINGS and returns without waiting for the
