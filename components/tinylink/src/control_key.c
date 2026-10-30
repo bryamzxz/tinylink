@@ -254,6 +254,12 @@ static esp_err_t load_pin(uint8_t out[CONTROL_KEY_LEN])
     return err;
 }
 
+esp_err_t control_key_peek(uint8_t out_pub[CONTROL_KEY_LEN])
+{
+    if (out_pub == NULL) return ESP_ERR_INVALID_ARG;
+    return load_pin(out_pub);
+}
+
 /* Decode the optional compile-in fallback pin from
  * CONFIG_TINYLINK_CONTROL_PUB_FALLBACK_HEX into 32 raw bytes.
  *

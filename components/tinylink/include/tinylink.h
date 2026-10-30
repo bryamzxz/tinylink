@@ -99,6 +99,16 @@ typedef struct {
  *      subsystem seeds the entropy pool).
  *   2. DNS/TLS to controlplane.tailscale.com is reachable.
  */
+/* Optional, before tinylink_init (round 1.3.7): load the identity keys
+ * and, with a control key pinned in NVS, precompute the first control
+ * connect's Noise IK DH work — CPU only, no network, so it can run while
+ * Wi-Fi associates instead of after got-ip (~75 ms of X25519 off the
+ * boot path). Only once the radio is on (after esp_wifi_start): a
+ * missing key is generated here and the ephemeral is drawn, and
+ * esp_fill_random is a true RNG only with RF enabled (point 1 below).
+ * tinylink_init does whatever this did not. */
+esp_err_t tinylink_preload(void);
+
 esp_err_t tinylink_init(void);
 
 /* Floor the wall clock (build time / last NTP sync persisted in NVS)

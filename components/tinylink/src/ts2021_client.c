@@ -157,6 +157,45 @@ void ts2021_set_addr(const uint8_t ip_v4[4])
 /* TLS session of the last :443 conn, for the next :443 connect (D9). */
 static tls_resume_slot_t s_resume;
 
+/* The DH work of msg1 kept out of the connect (round 1.3.7, B2): ss =
+ * DH(machine key, pinned control key), the same for every connect — one
+ * X25519 per boot instead of one per connect — and the ephemeral e + es
+ * ts2021_precompute makes at boot, while Wi-Fi associates, for the first
+ * handshake only (scrubbed when taken). Keyed by both public keys: any
+ * other pair scrubs it all. Touched by the task in ts2021_connect (main,
+ * then the long-poll) and, before the first connect, ts2021_precompute
+ * on the main task. */
+static struct {
+    uint8_t        machine_pub[NOISE_DHLEN];
+    uint8_t        control_pub[NOISE_DHLEN];
+    bool           keyed;
+    noise_ik_pre_t pre;
+} s_pre;
+
+static noise_ik_pre_t *pre_for(const uint8_t machine_pub[NOISE_DHLEN],
+                               const uint8_t control_pub[NOISE_DHLEN])
+{
+    if (!s_pre.keyed || memcmp(s_pre.machine_pub, machine_pub, NOISE_DHLEN) != 0 ||
+        memcmp(s_pre.control_pub, control_pub, NOISE_DHLEN) != 0) {
+        tl_secure_zero(&s_pre, sizeof(s_pre));
+        memcpy(s_pre.machine_pub, machine_pub, NOISE_DHLEN);
+        memcpy(s_pre.control_pub, control_pub, NOISE_DHLEN);
+        s_pre.keyed = true;
+    }
+    return &s_pre.pre;
+}
+
+void ts2021_precompute(const uint8_t machine_priv[NOISE_DHLEN],
+                       const uint8_t machine_pub[NOISE_DHLEN],
+                       const uint8_t control_pub[NOISE_DHLEN])
+{
+    if (machine_priv == NULL || machine_pub == NULL || control_pub == NULL) return;
+    noise_ik_pre_t *pre = pre_for(machine_pub, control_pub);
+    if (noise_ik_precompute(pre, machine_priv, control_pub, true) != ESP_OK) {
+        tl_secure_zero(&s_pre, sizeof(s_pre));   /* low-order: the connect says so */
+    }
+}
+
 /* base64 encoder used for the X-Tailscale-Handshake header. */
 static int b64_encode(const uint8_t *in, size_t in_len,
                       char *out, size_t out_size)
@@ -717,6 +756,15 @@ static esp_err_t handshake(ts2021_conn_t *out,
                       (const uint8_t *)prologue, (size_t)plen) != ESP_OK) {
         return ESP_FAIL;
     }
+    /* ss from the cache (computed here once per key pair); e + es from
+     * the boot's precompute when it is still waiting, else fresh. */
+    noise_ik_pre_t *pre = pre_for(machine_pub, control_pub);
+    const bool ss_ahead = pre->have_ss;
+    const bool e_ahead = pre->have_e;
+    if (noise_ik_precompute(pre, machine_priv, control_pub, false) != ESP_OK) {
+        HS_LOG_FAIL(out, "control key is a low-order point");
+        return ESP_FAIL;
+    }
 
     /* Build the 101-byte initiation frame: 5-byte header + 96-byte Noise. */
     uint8_t init[TS2021_INIT_HEADER_LEN + NOISE_IK_MSG1_LEN];
@@ -725,10 +773,16 @@ static esp_err_t handshake(ts2021_conn_t *out,
     init[2] = TS2021_MSG_INITIATION;
     init[3] = (uint8_t)((NOISE_IK_MSG1_LEN >> 8) & 0xFF);
     init[4] = (uint8_t)( NOISE_IK_MSG1_LEN       & 0xFF);
-    if (noise_ik_write_msg1(&out->noise,
-                            init + TS2021_INIT_HEADER_LEN) != ESP_OK) {
-        return ESP_FAIL;
+    const esp_err_t werr = noise_ik_write_msg1_pre(&out->noise,
+                                                   init + TS2021_INIT_HEADER_LEN, pre);
+    if (pre->have_e) {
+        /* one handshake per ephemeral, whatever happens next */
+        tl_secure_zero(pre->e_priv, sizeof(pre->e_priv));
+        tl_secure_zero(pre->es, sizeof(pre->es));
+        memset(pre->e_pub, 0, sizeof(pre->e_pub));
+        pre->have_e = false;
     }
+    if (werr != ESP_OK) return ESP_FAIL;
 
     /* base64-encode the init frame for the X-Tailscale-Handshake header. */
     char init_b64[((sizeof(init) + 2) / 3) * 4 + 1];
@@ -757,8 +811,9 @@ static esp_err_t handshake(ts2021_conn_t *out,
     if (tls_write_full(out, (const uint8_t *)req, (size_t)n) != ESP_OK) {
         return ESP_FAIL;
     }
-    ESP_LOGI(TAG, "ts2021: sent init in X-Tailscale-Handshake (%u bytes), waiting for 101",
-             (unsigned)sizeof(init));
+    ESP_LOGI(TAG, "ts2021: sent init in X-Tailscale-Handshake (%u bytes, DH ahead: %s), "
+                  "waiting for 101", (unsigned)sizeof(init),
+             e_ahead ? "ss + e" : ss_ahead ? "ss" : "none");
 
     /* Read 101 + headers into the (still idle) h2_rx ring instead of a
      * 4 KiB stack buffer — the response is a few hundred bytes and the

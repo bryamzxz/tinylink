@@ -237,6 +237,16 @@ esp_err_t ts2021_connect(ts2021_conn_t *out,
  * (out->peer_v4) for another TS2021_ADDR_TTL_S. */
 void ts2021_set_addr(const uint8_t ip_v4[4]);
 
+/* The next connect's Noise IK DH work, ahead of it (round 1.3.7, B2):
+ * ss for (machine key, control_pub) and one ephemeral e + es, which the
+ * first handshake with that pair takes (and scrubs); later connects
+ * reuse ss and draw a fresh e. tinylink_preload calls it at boot while
+ * Wi-Fi associates — 3 X25519 (~37 ms) that ran after got-ip before.
+ * Silently does nothing for a low-order control_pub. */
+void ts2021_precompute(const uint8_t machine_priv[NOISE_DHLEN],
+                       const uint8_t machine_pub[NOISE_DHLEN],
+                       const uint8_t control_pub[NOISE_DHLEN]);
+
 /* Arm (ms > 0) or disarm (0) the one-shot request deadline on a
  * connected conn: the socket's SO_RCVTIMEO / SO_SNDTIMEO go to
  * TS2021_REQ_POLL_MS — back to the stream's 30 s on disarm — and every
@@ -244,9 +254,10 @@ void ts2021_set_addr(const uint8_t ip_v4[4]);
  * `ms` have passed (io_failed and req_expired set, one W line), so the
  * caller drops the conn as after any transport failure; on :80 that is
  * also an early drop (the next dial goes to :443). h2_post_json brackets
- * each one-shot request with it; the map stream never arms it, so its
- * first frame (a netmap can take ~11 s server-side) and its KeepAlives
- * keep the stream budget. ESP_FAIL (io_failed) when the socket timeouts
+ * each one-shot request with it; the map stream arms it only until the
+ * endpoint push riding with it is answered (h2_post_json_stream_side,
+ * round 1.3.7), so its first frame (a netmap can take ~11 s server-side)
+ * and its KeepAlives otherwise keep the stream budget. ESP_FAIL (io_failed) when the socket timeouts
  * cannot be set: a conn left at the wrong poll period must not be used. */
 esp_err_t ts2021_request_deadline(ts2021_conn_t *c, uint32_t ms);
 

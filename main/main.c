@@ -86,6 +86,12 @@ static esp_err_t bringup(void)
         ESP_LOGE(TAG, "wifi start failed: 0x%x", err);
         return err;
     }
+    /* Key derivation + the first control connect's Noise DH while the
+     * AP associates (round 1.3.7): CPU the boot path no longer waits
+     * for after got-ip. After esp_wifi_start — the RNG draws the
+     * ephemeral, and it is a true RNG only with the radio on. Best
+     * effort — tinylink_init redoes what failed. */
+    (void)tinylink_preload();
     err = app_wifi_wait_connected(WIFI_TIMEOUT_MS);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "wifi did not connect within %d ms", WIFI_TIMEOUT_MS);

@@ -61,6 +61,7 @@ static const char *TAG = "tinylink";
 static const char k_version[] = TINYLINK_VERSION_STRING;
 
 static tinylink_keys_t s_keys;
+static bool            s_keys_loaded;   /* by tinylink_preload or tinylink_init */
 static uint8_t         s_control_pub[32];
 static bool            s_initialized;
 
@@ -177,14 +178,39 @@ void tinylink_diag_dump_stacks(void)
 static void reg_hint_load(void);
 static void addr_cache_load(void);
 
+/* Round 1.3.7, B2: the boot's static key work while Wi-Fi associates
+ * (main.c calls this between starting Wi-Fi and waiting for it; 3–9 s of
+ * idle CPU on the sensor) instead of in the first ~90 ms after got-ip:
+ * the three public keys derived from NVS (3 X25519 — the 40 ms between
+ * "sntp started" and the control-key line on the 1.3.6 logs) and, with a
+ * control key pinned in NVS, the first connect's Noise msg1 DH (ss, e,
+ * es: 3 more; ts2021_precompute). No network, nothing logged on
+ * success; a failure here is retried and reported by tinylink_init. */
+esp_err_t tinylink_preload(void)
+{
+    if (!s_keys_loaded) {
+        if (keys_load_or_generate(&s_keys) != ESP_OK) return ESP_FAIL;
+        s_keys_loaded = true;
+    }
+    uint8_t pub[32];
+    if (control_key_peek(pub) == ESP_OK) {
+        ts2021_precompute(s_keys.machine_priv, s_keys.machine_pub, pub);
+    }
+    return ESP_OK;
+}
+
 esp_err_t tinylink_init(void)
 {
     /* Task-WDT feed for every blocking TLS poll (see tl_wdt.h). */
     tls_io_set_poll_hook(tl_wdt_feed);
-    esp_err_t err = keys_load_or_generate(&s_keys);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "keys_load_or_generate failed: 0x%x", err);
-        return err;
+    esp_err_t err = ESP_OK;
+    if (!s_keys_loaded) {
+        err = keys_load_or_generate(&s_keys);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "keys_load_or_generate failed: 0x%x", err);
+            return err;
+        }
+        s_keys_loaded = true;
     }
     err = control_key_get(s_control_pub);
     if (err != ESP_OK) {
