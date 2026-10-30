@@ -19,12 +19,13 @@ and `session up` ~100–200 ms later: WireGuard waited for the whole
 control path. What it takes from the netmap is small and was in the
 previous boot's: our tailnet address(es) and the one target peer —
 NodeID, NodeKey, DiscoKey, endpoints, tailnet addresses (our keys,
-DiscoKey included, are in NVS). Image 746 848 → **755 904 B (+9 056**,
-of which +2 320 the review fixes); static DRAM 58 684 → 59 020 B (+336,
-`.bss`: the NVS mirror 160 B, the staged record 144 B), IRAM ±0, RTC
-slow +12 B (the crash guard). Host suite 2 452 → **2 643 OK** (CI floor
-2 643; counted serially — `make -j` without `-O` interleaves output and
-loses a line now and then), ASan + UBSan clean, 0 warnings. Static
+DiscoKey included, are in NVS). Image 746 848 → **756 272 B (+9 424**,
+of which +2 320 the first review's fixes, +368 the second's); static
+DRAM 58 684 → 59 020 B (+336, `.bss`: the NVS mirror 160 B, the staged
+record 144 B), IRAM ±0, RTC slow +12 B (the crash guard). Host suite
+2 452 → **2 682 OK** (CI floor 2 682; counted serially — `make -j`
+without `-O` interleaves output and loses a line now and then), ASan +
+UBSan clean, 0 warnings. Static
 worst cases unchanged (`main` 5 440 → 5 424, the rest equal; frame sums
 in docs/ARCHITECTURE.md). Not yet on the sensor.
 
@@ -71,16 +72,27 @@ in docs/ARCHITECTURE.md). Not yet on the sensor.
   prepunch works on them), `telemetry_start`, the prepunch to the cached
   peer. The long-poll's first netmap shuts the gate (a mutex): a warm
   start under way finishes first, none begins after; the long-poll waits
-  for it at most 30 s, fed to the WDT, then restarts cold. A failed
+  for it at most 30 s, fed to the WDT, then restarts cold (counted as a
+  crash, below: a warm start that hangs every time is switched off). A
+  failed
   `wg_dataplane_start` (the wg_rx task or the lwIP netif not created)
   leaves wg_netif as after its init (`wg_netif_abort_start`: the socket,
   wg_tx and every callback stay), and the netmap's start is the first.
 - **Crash guard** (RTC no-init, checksummed): a warm attempt is marked
-  before `relay_boot_join` and cleared when the netmap confirms it or its
-  start fails. A boot that finds the mark after any reset but a software
-  one (panic, task / interrupt WDT, brown-out) erases the record and
-  starts cold; after two such resets the warm start stays off until a
-  power cycle (power-on clears RTC memory, so it clears the guard).
+  before `relay_boot_join` and cleared when its start fails or once it
+  settled — the netmap confirmed it, its changes were applied to the
+  live session (`wg_dataplane_update_peers`, the full prepunch, the
+  staging: a sequence no cold boot runs at boot) and the next
+  housekeeping's store pass wrote the corrected record or found nothing
+  due (`tl_warm_sm_settle`, from `warm_persist`, ≤ ~60 s after the
+  netmap). A boot that finds the mark after any reset but a software one
+  (panic, task / interrupt WDT, brown-out) erases the record and starts
+  cold, so a fault in that update path costs the stale record and one
+  cold boot, not a loop on the same diff. Settling clears the count;
+  after two failures (crash or hang) the warm start stays off until a
+  power cycle (power-on clears RTC memory, so it clears the guard). A
+  netmap whose target cannot be stored (no endpoint) never settles: a
+  later non-software reset of that run counts too.
 - **The first netmap converges to a cold start's state**
   (`warm_netmap`, its verdict from `tl_warm_sm_netmap`). It replaces the
   seeded tables (an omitted `Peers`
@@ -108,6 +120,11 @@ in docs/ARCHITECTURE.md). Not yet on the sensor.
     flips with the STUN result between boots can loop: each such case
     costs one extra boot. The self-address restart of a cold session now
     erases the record first too.
+  - a peer entry without a DiscoKey clears the session's (a cached one
+    must not outlive the netmap): DISCO then runs as a cold start from
+    that netmap runs it — no DiscoKey gate, permissive, as for a peer
+    that never had one. This applies to cold sessions too (a full peer
+    entry without `DiscoKey`; patches keep it);
   - Left as it is: a target with no endpoint keeps the warm session (via
     DERP) where a cold start would refuse to start — what a cold session
     does when its peer loses its endpoints.
@@ -120,7 +137,13 @@ in docs/ARCHITECTURE.md). Not yet on the sensor.
   recycled the first map stream mid-body. A netmap's endpoint list now
   replaces the live endpoint unless that one is still listed or proven
   by a pong (`wg_netif_live_path_proven`): a session alive via DERP
-  alone no longer keeps a dead cached endpoint.
+  alone no longer keeps a dead cached endpoint. **This changes cold
+  sessions too**: one alive only via DERP now loses an unlisted live
+  endpoint to control's list (before, any live session kept it). The
+  bound is checked by the long-poll loop as well (after each stream and
+  each pass), so a warm session no netmap confirms ends even without a
+  telemetry task. While wg_netif is IDLE after a failed start, wg_rx
+  drops direct DISCO (with the zeroed peer the gate was permissive).
 - **Trade-off** (Kconfig help, docs/SECURITY-MODEL.md "Warm start"):
   until the netmap the device trusts the previous boot's binding — this
   NodeKey is the peer at that address — from an authenticated netmap,
@@ -138,17 +161,25 @@ in docs/ARCHITECTURE.md). Not yet on the sensor.
   within a run, as tinylink after its first netmap. No packet filter is
   skipped (none is enforced). `CONFIG_TINYLINK_WARM_START` default y, to
   be confirmed with the owner.
-- **Test (`test_warm`, +191):** the decisions live in `tl_warm.h` as a
+- **Test (`test_warm`, +230):** the decisions live in `tl_warm.h` as a
   pure state machine `tinylink.c` drives one call per event — the go
   verdict (`tl_warm_go`), seeding and the first frame's table reset,
-  the netmap verdict, the bound and age, the RTC guard, the target pick
-  `wg_dataplane.c` runs, the peer-address and register rules — tested
-  over boot sequences (crash → erase → cold, two crashes → off until a
-  power-on, restart mark → one cold boot); 31 mutants of those rules
-  (the reset of the seeded flag dropped, the warm dispatch moved, a
-  verdict that leaves the bound armed, the register rule inverted, the
-  skip cleared after the checks, off-by-ones in the pick, the address
-  rule's condition) all fail it. Also the text forms (accepted and refused),
+  the netmap verdict, settling, the bound and age (both tasks' poll),
+  the RTC guard, the boot's load behind an I/O seam (`tl_warm_load`:
+  reset reason, erase and not read after a crash), netmap-seen and the
+  refresh's freshness, the target pick `wg_dataplane.c` runs, the
+  DiscoKey, peer-address and register rules — tested over boot
+  sequences on a fake NVS (crash before settle → erased and counted,
+  settle then crash → not counted, a settle clears the count, two
+  failures → off until a power-on, hangs too, restart mark → one cold
+  boot); 52 mutants of those rules (the reset of the seeded flag
+  dropped, the warm dispatch moved, the crash count kept at settle, a
+  settle on a failed write or a cold session, the hang not counted, the
+  record read after a crash, the reset reason ignored, off-by-ones in
+  the pick and the freshness, the long-poll's restart dropped) all fail
+  it. Not reachable from the host: the glue's call sites themselves
+  (the handler's dispatch to `warm_netmap`, the `warm_poll` calls, the
+  `esp_reset_reason()` argument). Also the text forms (accepted and refused),
   the netmap → record → `wg_dataplane_start` inputs round trip for every
   target of a three-peer table, all 48 count shapes encoded and decoded,
   every truncation, each refused count / flag / address / port, 20 000
@@ -177,8 +208,10 @@ in docs/ARCHITECTURE.md). Not yet on the sensor.
   sleep (MAX_MODEM) on after N ms awake` comes after `netmap confirms`
   on a warm boot (`— no netmap yet` if the cap hit first), the boot STUN
   re-probe after the netmap. After a panic / WDT reset during a warm
-  start: W `warm start: the last one ended in a reset (reason N) before
-  its netmap — record erased`, then a cold boot.
+  start (until the first housekeeping after its netmap): W `warm start:
+  the last one ended in a reset (reason N) before it settled — record
+  erased`, then a cold boot; after two failures `warm start: off after
+  2 failed attempts (a reset or a hang) — until a power cycle; …`.
 
 #### The first telemetry sample of a boot
 

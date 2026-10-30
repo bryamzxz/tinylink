@@ -899,13 +899,16 @@ stays under `tinylink_init`'s TLS key fetch (4 336 B). On `tinylink_lp`
 the first netmap's `warm_netmap` (320 B) sits beside
 `wg_dataplane_start` under `long_poll_handler` (whose own subtree is
 3 952 B chain either way), and the restarts run either at the task's
-top level (`long_poll_task` → `warm_restart_now` → `esp_restart`,
-3 120 B) or, for the 30-s gate cap, from the handler (3 184 B) — the
-task stays at 5 232 B (stream variant 4 656 → 4 640). The record's NVS
+top level (`long_poll_task` → `warm_poll` → `warm_restart_now` →
+`esp_restart`, 3 152 B; the loop's bound check is the same call) or,
+for the 30-s gate cap, from the handler (3 184 B) — the task stays at
+5 232 B (stream variant 4 656 → 4 640). The record's NVS
 write in the `tinylink_tlm` housekeeping is 3 440 B (`telemetry_task`
 96 → `tinylink_warm_persist_poll` 32 → `warm_persist` 496 →
-`nvs_set_blob`), its bound's restart 3 232 B and the deferred STUN
-re-probe 3 632 B, all under the task's 3 728 B.
+`nvs_set_blob`; the settle after it is a spinlock section), its
+bound's restart 3 232 B and the deferred STUN re-probe 3 632 B, all
+under the task's 3 728 B. `wg_rx`'s IDLE check and the DiscoKey clear
+(long-poll, under `wg_dataplane_update_peers`' 3 648 B) move nothing.
 
 There is no dedicated endpoint-push task any more (2026-09): the push
 runs on `tinylink_lp` — see item 9 below.
