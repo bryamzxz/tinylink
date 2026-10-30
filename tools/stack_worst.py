@@ -1405,11 +1405,13 @@ def project_config():
         R('tls_io_read_full', r'\brd\(', ['ts2021_conn_read', 'ts2021_conn_write'],
           'ts2021_client.c:176/200 (:80 and :443, round 1.3.5)', tasks=[LP]),
         R('tls_io_read_full', r'\brd\(', ['derp_tls_read_raw', 'derp_tls_write_raw',
-                                          'derp_tls_read'],
-          'derp_client.c:65/81/369/375/415', tasks=[DERP, RX, TX, TLM]),
+                                          'derp_tls_read', 'derp_tls_write'],
+          'derp_client.c: the login (_raw), the recv loop, the frame writes '
+          '(derp_tls_write, round 1.3.9)', tasks=[DERP, RX, TX, TLM]),
         R('tls_io_read_full', r'\brd\(', ['ts2021_conn_read', 'ts2021_conn_write',
                                           'derp_tls_read_raw', 'derp_tls_write_raw',
-                                          'derp_tls_read', 'key_tls_write'], 'all adapters'),
+                                          'derp_tls_read', 'derp_tls_write',
+                                          'key_tls_write'], 'all adapters'),
         R('tls_io_read_full', r's_poll_hook', ['tl_wdt_feed'],
           'tls_io_set_poll_hook(tl_wdt_feed), tinylink.c:165'),
         R('handle_transport', r'cb\(p', ['wg_rx_inject'],
@@ -1417,6 +1419,10 @@ def project_config():
         R('rx_task', r'stun_cb', ['stun_response_handler'], 'tinylink.c:1977'),
         R('rx_task', r'path_stale_cb', ['on_wg_path_stale'], 'tinylink.c:1829'),
         R('tx_task_fn', r'relay_cb', ['tinylink_relay_via_derp'], 'tinylink.c:1841'),
+        # the re-send's sender (rescue_relay, inlined; round 1.3.9: was
+        # left unresolved, costed 0 B)
+        R('tx_rescue', r'relay_cb', ['tinylink_relay_via_derp'],
+          'wg_netif_set_relay_callback(tinylink_relay_via_derp)'),
         R('wg_tai64n_now', r's_persist_fn', ['tai64n_persist_cb'], 'tinylink.c:194'),
         R('telemetry_task', r'persist_hook\(\)', ['app_wifi.c:hint_persist'],
           'tinylink_set_persist_hook(hint_persist), app_wifi.c (round 1.3.7)'),

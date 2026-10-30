@@ -34,7 +34,7 @@ TARGETS := test_blake2s test_curve25519 test_x25519 test_mapresp \
            test_tai64n test_nacl_box test_tsmp test_tl_date test_stats test_noise_ik \
            test_http1 test_ctrl_json test_ts2021 test_hpack test_h2_core test_tls_resume \
            test_addr test_wifi_hint test_wifi_psk test_pwr_diag test_tlm_sched test_tls_offer \
-           test_tls_rtc test_ts2021_e2e
+           test_tls_rtc test_ts2021_e2e test_derp_wlock
 
 all: $(TARGETS) $(H2_INTEROP)
 
@@ -403,6 +403,20 @@ test_derp: test_derp.c \
 	    $(CRYPTO)/nacl_box.c $(CRYPTO)/curve25519.c $(CRYPTO)/curve25519_fiat32.c $(CRYPTO)/salsa20.c \
 	    $(CRYPTO)/poly1305_donna.c
 
+# The DERP write lock (round 1.3.9): close vs a writer on a stalled conn,
+# waits that feed the task WDT (capped), a failed write closing the conn
+# to frames — derp_client.c itself (#included) over fakes of esp_tls,
+# FreeRTOS and select(), a scripted DERP login, pthreads.
+DERP_WLOCK_SRCS := $(TL_SRC)/derp.c $(TL_SRC)/tls_io.c $(TL_SRC)/tls_offer.c \
+                   $(CRYPTO)/nacl_box.c $(CRYPTO)/curve25519.c $(CRYPTO)/curve25519_fiat32.c \
+                   $(CRYPTO)/salsa20.c $(CRYPTO)/poly1305_donna.c
+test_derp_wlock: test_derp_wlock.c $(TL_SRC)/derp_client.c $(TL_SRC)/derp_client.h \
+                 $(TL_SRC)/derp_wlock.h $(TL_SRC)/derp.h $(TL_SRC)/tls_io.h $(TL_SRC)/tls_offer.h \
+                 $(DERP_WLOCK_SRCS) host_include/esp_tls.h host_include/freertos/semphr.h \
+                 host_include/esp_random.h host_include/mbedtls/ssl.h
+	$(CC) $(CFLAGS) -pthread -I$(TL_SRC) -I$(TL_INC) -I$(CRYPTO) -Ihost_include -o $@ \
+	    test_derp_wlock.c $(DERP_WLOCK_SRCS)
+
 # HTTP/2 Retry-After header parser (RFC 7231 §7.1.3 delta-seconds).
 # Header-only; the test just compiles the .c against the .h. No platform
 # deps, no crypto.
@@ -490,7 +504,8 @@ test: test_blake2s.run test_curve25519.run test_x25519.run test_mapresp.run \
       test_nacl_box.run test_tsmp.run test_tl_date.run test_stats.run test_noise_ik.run \
       test_http1.run test_ctrl_json.run test_ts2021.run test_hpack.run test_h2_core.run \
       test_tls_resume.run test_addr.run test_wifi_hint.run test_wifi_psk.run test_pwr_diag.run \
-      test_tlm_sched.run test_tls_offer.run test_tls_rtc.run test_ts2021_e2e.run h2_interop.run
+      test_tlm_sched.run test_tls_offer.run test_tls_rtc.run test_ts2021_e2e.run \
+      test_derp_wlock.run h2_interop.run
 
 test_tls_rtc.run: test_tls_rtc
 	$(RUNNER) ./test_tls_rtc
@@ -623,6 +638,9 @@ test_stun.run: test_stun
 
 test_tls_io.run: test_tls_io
 	$(RUNNER) ./test_tls_io
+
+test_derp_wlock.run: test_derp_wlock
+	$(RUNNER) ./test_derp_wlock
 
 test_derp.run: test_derp
 	$(RUNNER) ./test_derp

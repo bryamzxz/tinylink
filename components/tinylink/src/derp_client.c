@@ -1,9 +1,15 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Bryam (bryamzxz)
 
-#ifdef ESP_PLATFORM
+/* The host test (tools/test/test_derp_wlock.c) compiles this file over
+ * fakes of esp_tls, FreeRTOS and select(), with its own lock primitives
+ * (DERP_CLIENT_HOST_TEST). */
+#if defined(ESP_PLATFORM) || defined(DERP_CLIENT_HOST_TEST)
 
 #include "derp_client.h"
+
+#define DERP_WL_IMPL
+#include "derp_wlock.h"
 
 #include <string.h>
 #include <stdio.h>
@@ -17,11 +23,76 @@
 
 #include "esp_timer.h"
 #include "tl_addr.h"
+#include "tl_wdt.h"
 #include "tls_io.h"
 #include "tls_offer.h"
 #include "tls_resume.h"
 
 static const char *TAG = "derp_client";
+
+/* The write lock's waits (round 1.3.9, derp_wlock.h). A slice is how long
+ * anyone waits for it between two task-WDT feeds (60-s budget). The grace
+ * is what a close gives a writer to finish the frame it is in: lwIP takes
+ * a frame at once while its send buffer has room, so a writer still in
+ * one after a second waits for ACKs, on a conn being closed — the stream
+ * dead, our address changed, or a relay switch — and is cut. A cut frame
+ * is a failed one, which its sender handles as before (kept for the
+ * re-send, a refused INIT copy, the direct send). */
+#ifndef DERP_WL_SLICE_MS
+#define DERP_WL_SLICE_MS 1000u
+#endif
+#ifndef DERP_WL_GRACE_MS
+#define DERP_WL_GRACE_MS 1000u
+#endif
+/* The fed waits' total: twice what a stalled write holds the lock (4 ×
+ * 30 s). A wait past it is a lock never given back — no more feeds, one
+ * E line, and the 60-s task WDT resets the board, as before 1.3.9's
+ * slices, instead of leaving the relay hung for good. */
+#ifndef DERP_WL_FED_MAX_MS
+#define DERP_WL_FED_MAX_MS 240000u
+#endif
+
+#ifndef DERP_CLIENT_HOST_TEST
+static bool derp_wl_take(void *lock, uint32_t ms)
+{
+    return xSemaphoreTake((SemaphoreHandle_t)lock, pdMS_TO_TICKS(ms)) == pdTRUE;
+}
+
+static void derp_wl_give(void *lock)
+{
+    xSemaphoreGive((SemaphoreHandle_t)lock);
+}
+
+static void derp_wl_feed(void)
+{
+    tl_wdt_feed();
+}
+
+/* shutdown(SHUT_RDWR) on the conn's socket: with LWIP_NETCONN_FULLDUPLEX
+ * (ESP-IDF's lwipopts.h) lwIP aborts a send blocked on it with ERR_CLSD
+ * and wakes a blocked recv; later I/O fails at once. The fd stays
+ * allocated until esp_tls_conn_destroy closes it, so it cannot be reused
+ * meanwhile. Same TCP close as that close() would do (tcp_close: a FIN
+ * after the queued data, an RST with unread data). */
+static void derp_wl_cut(void *io)
+{
+    int fd = -1;
+    if (esp_tls_get_conn_sockfd((esp_tls_t *)io, &fd) == ESP_OK && fd >= 0) {
+        (void)shutdown(fd, SHUT_RDWR);
+    }
+}
+
+static __attribute__((noinline)) void derp_wl_overdue(uint32_t waited_ms)
+{
+    ESP_LOGE(TAG, "DERP write lock held over %u s: no more WDT feeds for it",
+             (unsigned)(waited_ms / 1000));
+}
+#endif /* !DERP_CLIENT_HOST_TEST */
+
+/* select() for the writability check; the host test's fake conns answer. */
+#ifndef DERP_SELECT
+#define DERP_SELECT select
+#endif
 
 /* TLS session of the last DERP connect (round 1.3.5, D9; tls_resume.h),
  * for a reconnect to the same relay: one per firmware — the supervisor
@@ -89,6 +160,14 @@ static ssize_t derp_tls_read(void *ctx, uint8_t *buf, size_t len) {
     derp_client_t *c = (derp_client_t *)ctx;
     if (c->abort_reads) return DERP_ERR_READ_ABORTED;
     return esp_tls_conn_read(c->tls, buf, len);
+}
+/* A frame's writes, lock held (write_frame_locked): each poll first asks
+ * whether the conn is closing — a writer that a close's cut did not wake
+ * (shutdown refused) stops at its next SO_SNDTIMEO poll, ≤ 30 s. */
+static ssize_t derp_tls_write(void *ctx, const uint8_t *buf, size_t len) {
+    derp_client_t *c = (derp_client_t *)ctx;
+    if (!derp_wl_may_write(&c->wl)) return DERP_ERR_WRITE_ABORTED;
+    return esp_tls_conn_write(c->tls, (const void *)buf, len);
 }
 
 /* The login's reads and writes: `idle` silent socket polls each at most
@@ -397,7 +476,7 @@ static esp_err_t connect_on(derp_client_t *out, const char *server_host, uint16_
         derp_client_close(out);
         return err;
     }
-    out->connected = true;
+    derp_wl_set_up(&out->wl);
     ESP_LOGI(TAG, "DERP login OK: server version=%d (box key %s)",
              out->server_version, s_login_key_reused ? "reused" : "new");
     return ESP_OK;
@@ -421,18 +500,23 @@ esp_err_t derp_client_connect_login(derp_client_t *out,
     /* The write lock outlives individual connections: it is created on
      * the first connect of a (zero-initialised) derp_client_t and never
      * deleted (see derp_client_close), so a concurrent sender blocked on
-     * it can never wake up on a freed semaphore. Preserve it across the
-     * per-connect reset. Callers must zero the struct before the first
-     * connect (static storage or `= {0}`). */
-    SemaphoreHandle_t lock = out->write_lock;
-    memset(out, 0, sizeof(*out));
-    out->write_lock = lock;
+     * it can never wake up on a freed semaphore. `wl` is never rewritten
+     * here but through derp_wlock.h — a sender may be reading it (round
+     * 1.3.9: until then a memset of the whole struct zeroed the lock
+     * handle for an instant) — and the per-connect state is reset field
+     * by field (tx_stage needs none). Callers must zero the struct before
+     * the first connect (static storage or `= {0}`). */
+    derp_wl_new_conn(&out->wl);
+    out->tls            = NULL;
+    out->server_version = 0;
+    out->abort_reads    = false;
+    memset(out->server_pub, 0, sizeof(out->server_pub));
 
-    if (out->write_lock == NULL) {
-        out->write_lock = xSemaphoreCreateMutex();
+    if (out->wl.lock == NULL) {
+        out->wl.lock = xSemaphoreCreateMutex();
     }
-    if (out->write_lock == NULL) {
-        ESP_LOGE(TAG, "write_lock create failed");
+    if (out->wl.lock == NULL) {
+        ESP_LOGE(TAG, "write lock create failed");
         return ESP_ERR_NO_MEM;
     }
 
@@ -469,31 +553,47 @@ void derp_client_close(derp_client_t *c)
      * esp_tls_conn_write or blocked on xSemaphoreTake — a use-after-free
      * of c->tls and a wait on a deleted semaphore. Now:
      *   1. drop `connected` first, so the relay's unlocked fast-path
-     *      check stops admitting new sends;
+     *      check stops admitting new sends, and a sender waiting for the
+     *      lock gives up;
      *   2. take the write lock, so a sender already past its check
-     *      finishes (or fails) its frame before the TLS context goes;
+     *      finishes (or fails) its frame before the TLS context goes —
+     *      within DERP_WL_GRACE_MS, or it is cut (round 1.3.9: a waiting
+     *      write on a stalled conn held the lock up to 4 × 30 s while
+     *      this task, unfed, waited on it with portMAX_DELAY — the 60-s
+     *      task WDT reset the board; derp_wlock.h);
      *   3. destroy TLS under the lock and NULL it, so a sender that
-     *      wins the lock afterwards sees c->tls == NULL and bails;
-     *   4. never delete the lock — it is created once per client. */
-    c->connected = false;
-    if (c->write_lock != NULL) {
-        xSemaphoreTake(c->write_lock, portMAX_DELAY);
+     *      wins the lock afterwards sees the conn gone and bails;
+     *   4. never delete the lock — it is created once per client.
+     * Only this client's connecting task (the supervisor) closes, so
+     * c->tls is read here without the lock. */
+    if (c->wl.lock == NULL) {   /* never connected: the lock create failed */
+        __atomic_store_n(&c->wl.connected, false, __ATOMIC_RELEASE);
+        return;
     }
+    const int64_t t0 = esp_timer_get_time();
+    const bool cut = derp_wl_close_lock(&c->wl, c->tls, DERP_WL_GRACE_MS,
+                                        DERP_WL_SLICE_MS, DERP_WL_FED_MAX_MS);
     if (c->tls != NULL) {
         esp_tls_conn_destroy(c->tls);
         c->tls = NULL;
     }
-    if (c->write_lock != NULL) {
-        xSemaphoreGive(c->write_lock);
+    derp_wl_give(c->wl.lock);
+    if (cut) {
+        ESP_LOGW(TAG, "DERP close: a write still held the conn after %u ms — cut, "
+                      "the lock free after %u ms",
+                 (unsigned)DERP_WL_GRACE_MS,
+                 (unsigned)((esp_timer_get_time() - t0) / 1000));
     }
 }
 
 /* Write one frame: header, then `key` (DERP_KEY_LEN bytes, NULL = none),
- * then `payload`. Caller holds c->write_lock and has re-checked c->tls.
- * Up to DERP_TX_STAGE_MAX of key + payload the frame is assembled in
+ * then `payload`. Caller holds the write lock for a conn that takes
+ * frames (derp_wl_acquire: DERP_WL_HELD, so c->tls is set). Up to
+ * DERP_TX_STAGE_MAX of key + payload the frame is assembled in
  * c->tx_stage and leaves as one write (one TLS record); anything bigger
  * — nothing tinylink sends today — as separate writes, still atomic on
- * the wire because the lock is held. */
+ * the wire because the lock is held. Every write call first checks that
+ * the conn is not closing (derp_tls_write). */
 static int write_frame_locked(derp_client_t *c, derp_frame_type_t type,
                               const uint8_t *key,
                               const uint8_t *payload, size_t plen)
@@ -505,50 +605,105 @@ static int write_frame_locked(derp_client_t *c, derp_frame_type_t type,
         derp_write_frame_header(f, type, (uint32_t)body);
         if (klen > 0) memcpy(f + DERP_FRAME_HDR_LEN, key, klen);
         if (plen > 0) memcpy(f + DERP_FRAME_HDR_LEN + klen, payload, plen);
-        return tls_io_write_full(derp_tls_write_raw, c->tls, f,
+        return tls_io_write_full(derp_tls_write, c, f,
                                  DERP_FRAME_HDR_LEN + body,
                                  DERP_MAX_IDLE_POLLS);
     }
     uint8_t hdr[DERP_FRAME_HDR_LEN];
     derp_write_frame_header(hdr, type, (uint32_t)body);
-    int rc = tls_io_write_full(derp_tls_write_raw, c->tls, hdr, sizeof(hdr),
+    int rc = tls_io_write_full(derp_tls_write, c, hdr, sizeof(hdr),
                                DERP_MAX_IDLE_POLLS);
     if (rc == 0 && klen > 0) {
-        rc = tls_io_write_full(derp_tls_write_raw, c->tls, key, klen,
+        rc = tls_io_write_full(derp_tls_write, c, key, klen,
                                DERP_MAX_IDLE_POLLS);
     }
     if (rc == 0 && plen > 0) {
-        rc = tls_io_write_full(derp_tls_write_raw, c->tls, payload, plen,
+        rc = tls_io_write_full(derp_tls_write, c, payload, plen,
                                DERP_MAX_IDLE_POLLS);
     }
     return rc;
 }
 
-/* Atomic-frame writer used by the recv loop's pongs (via derp_run_loop).
- * Holds c->write_lock across the whole frame so concurrent senders
- * (derp_client_send_packet) cannot interleave and corrupt the framing. */
+/* A frame's write failed, lock held (round 1.3.9, derp_wlock.h): it may
+ * have left part of a TLS record on the stream, and mbedtls would flush
+ * that record's tail on the next write and report the next frame as
+ * written. Until 1.3.9 the conn stayed up — the next waiting write sat
+ * out another 4 × 30 s, and one that got through was reported sent but
+ * never went. Now the conn takes no more frames (the relay reads as down)
+ * and the reader leaves at its next poll (≤ 30 s), so the supervisor
+ * closes and reconnects. Nothing to do when a close cut the frame — the
+ * close does the rest. Not inlined: the log line's frame stays off the
+ * write's chain. */
+static __attribute__((noinline)) void frame_failed_locked(derp_client_t *c, int rc)
+{
+    if (!derp_wl_write_failed(&c->wl)) return;
+    c->abort_reads = true;
+    ESP_LOGW(TAG, "DERP write failed (%s0x%x) — no more frames on this conn, "
+                  "reconnecting", rc < 0 ? "-" : "", (unsigned)(rc < 0 ? -rc : rc));
+}
+
+/* True when the conn's socket can take a frame without blocking: lwIP's
+ * select() marks a TCP socket writable only above TCP_SNDLOWAT free
+ * send-buffer bytes (≈ 2.9 KB here), more than one DERP frame + TLS
+ * record (≤ ~1.6 KB). Caller holds the write lock. */
+static bool socket_writable_now(derp_client_t *c)
+{
+    int fd = -1;
+    if (esp_tls_get_conn_sockfd(c->tls, &fd) != ESP_OK || fd < 0) return false;
+    fd_set wfds;
+    FD_ZERO(&wfds);
+    FD_SET(fd, &wfds);
+    struct timeval tv = { 0, 0 };
+    return DERP_SELECT(fd + 1, NULL, &wfds, NULL, &tv) == 1;
+}
+
+/* One frame on the conn the caller found up: the write lock — waited for
+ * in slices that feed the task WDT (the other writer may sit in a stalled
+ * write for 4 × 30 s), or one try with no_wait — re-validated against
+ * that conn (a close or a reconnect since ends the wait; derp_wlock.h),
+ * the writability check of a try, the frame, and a failure closing the
+ * conn to frames. Held across the whole frame, so the recv loop's pongs
+ * and the relay never interleave on the wire. */
+static esp_err_t send_frame(derp_client_t *c, derp_frame_type_t type,
+                            const uint8_t *key, const uint8_t *payload,
+                            size_t plen, bool no_wait)
+{
+    uint32_t gen;
+    if (c->wl.lock == NULL || !derp_wl_admits(&c->wl, &gen)) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    switch (derp_wl_acquire(&c->wl, gen, no_wait, DERP_WL_SLICE_MS, DERP_WL_FED_MAX_MS)) {
+    case DERP_WL_HELD:
+        break;
+    case DERP_WL_BUSY:
+        return ESP_ERR_TIMEOUT;
+    default:
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (no_wait && !socket_writable_now(c)) {
+        derp_wl_give(c->wl.lock);
+        return ESP_ERR_TIMEOUT;
+    }
+    const int rc = write_frame_locked(c, type, key, payload, plen);
+    if (rc != 0) frame_failed_locked(c, rc);
+    derp_wl_give(c->wl.lock);
+    return (rc == 0) ? ESP_OK : ESP_FAIL;
+}
+
+/* The recv loop's pongs (via derp_run_loop). */
 static int derp_send_frame_locked(void *ctx, derp_frame_type_t type,
                                   const uint8_t *payload, size_t plen)
 {
     derp_client_t *c = (derp_client_t *)ctx;
-    if (c == NULL || c->tls == NULL) return -1;
-    if (plen > 0xffffffffU) return -1;
-
-    xSemaphoreTake(c->write_lock, portMAX_DELAY);
-    if (c->tls == NULL) {           /* closed while we waited for the lock */
-        xSemaphoreGive(c->write_lock);
-        return -1;
-    }
-    int rc = write_frame_locked(c, type, NULL, payload, plen);
-    xSemaphoreGive(c->write_lock);
-    return rc;
+    if (c == NULL || plen > 0xffffffffU) return -1;
+    return send_frame(c, type, NULL, payload, plen, false) == ESP_OK ? 0 : -1;
 }
 
 esp_err_t derp_client_run(derp_client_t *c,
                           uint8_t *frame_buf, size_t frame_cap,
                           derp_event_cb_t cb, void *cb_ctx)
 {
-    if (c == NULL || c->tls == NULL || !c->connected || frame_buf == NULL) {
+    if (c == NULL || c->tls == NULL || !derp_wl_up(&c->wl) || frame_buf == NULL) {
         return ESP_ERR_INVALID_STATE;
     }
     int rc = derp_run_loop(derp_tls_read, derp_send_frame_locked, c,
@@ -561,54 +716,18 @@ esp_err_t derp_client_run(derp_client_t *c,
     }
 }
 
-/* True when the conn's socket can take a frame without blocking: lwIP's
- * select() marks a TCP socket writable only above TCP_SNDLOWAT free
- * send-buffer bytes (≈ 2.9 KB here), more than one DERP frame + TLS
- * record (≤ ~1.6 KB). Caller holds c->write_lock. */
-static bool socket_writable_now(derp_client_t *c)
-{
-    int fd = -1;
-    if (esp_tls_get_conn_sockfd(c->tls, &fd) != ESP_OK || fd < 0) return false;
-    fd_set wfds;
-    FD_ZERO(&wfds);
-    FD_SET(fd, &wfds);
-    struct timeval tv = { 0, 0 };
-    return select(fd + 1, NULL, &wfds, NULL, &tv) == 1;
-}
-
 static esp_err_t send_packet(derp_client_t *c,
                              const uint8_t dst_pub[DERP_KEY_LEN],
                              const uint8_t *packet, size_t plen,
                              bool no_wait)
 {
-    if (c == NULL || c->tls == NULL || !c->connected || c->write_lock == NULL) {
-        return ESP_ERR_INVALID_STATE;
-    }
+    if (c == NULL || !derp_client_is_connected(c)) return ESP_ERR_INVALID_STATE;
     if (dst_pub == NULL || (plen > 0 && packet == NULL)) {
         return ESP_ERR_INVALID_ARG;
     }
     if (plen > DERP_MAX_PACKET) return ESP_ERR_INVALID_SIZE;
-
-    /* FrameSendPacket payload = dstPub[32] || packet[plen], one frame
-     * written under the write lock so the recv loop's pongs cannot land
-     * inside it. */
-    if (xSemaphoreTake(c->write_lock, no_wait ? 0 : portMAX_DELAY) != pdTRUE) {
-        return ESP_ERR_TIMEOUT;
-    }
-    /* Re-validate under the lock: derp_client_close may have torn the
-     * connection down between the unlocked pre-check above and here. */
-    if (c->tls == NULL || !c->connected) {
-        xSemaphoreGive(c->write_lock);
-        return ESP_ERR_INVALID_STATE;
-    }
-    if (no_wait && !socket_writable_now(c)) {
-        xSemaphoreGive(c->write_lock);
-        return ESP_ERR_TIMEOUT;
-    }
-    int rc = write_frame_locked(c, DERP_FRAME_SEND_PACKET, dst_pub,
-                                packet, plen);
-    xSemaphoreGive(c->write_lock);
-    return (rc == 0) ? ESP_OK : ESP_FAIL;
+    /* FrameSendPacket payload = dstPub[32] || packet[plen]. */
+    return send_frame(c, DERP_FRAME_SEND_PACKET, dst_pub, packet, plen, no_wait);
 }
 
 esp_err_t derp_client_send_packet(derp_client_t *c,
@@ -625,4 +744,4 @@ esp_err_t derp_client_try_send_packet(derp_client_t *c,
     return send_packet(c, dst_pub, packet, plen, true);
 }
 
-#endif /* ESP_PLATFORM */
+#endif /* ESP_PLATFORM || DERP_CLIENT_HOST_TEST */

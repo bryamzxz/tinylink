@@ -903,7 +903,14 @@ at least every 30 s while idle; long sleeps (Retry-After, reconnect
 ladders) go through `tl_wdt_sleep_ms` in 10-s slices. `tinylink_tlm` waits in ≤ 5-s slices and feeds on both sides of
 a STUN re-probe, whose worst case (lwIP DNS 7 s × 3 servers + the 3-s
 response wait ≈ 24 s) fits the budget; the re-probe ran on an
-unsubscribed task before 1.3.2. Budget: `CONFIG_ESP_TASK_WDT_TIMEOUT_S=60`, the Kconfig maximum
+unsubscribed task before 1.3.2. Waits for the DERP write lock
+(`derp_wlock.h`, round 1.3.9) go in 1-s slices with a feed between them
+— `wg_tx` and the supervisor both write frames, and a waiting write on a
+stalled conn holds the lock up to 4 × 30 s — and the supervisor's close
+cuts a writer still inside a frame after 1 s (the socket's shutdown)
+instead of waiting it out unfed. The feeds stop after 240 s of waiting
+in total (one E line), so a lock never given back still ends in the
+WDT's reset. Budget: `CONFIG_ESP_TASK_WDT_TIMEOUT_S=60`, the Kconfig maximum
 (a larger value is silently dropped back to the 5-s default — that
 exact mistake tripped the long-poll on the first M15 flash, since its
 30-s poll cannot feed a 5-s budget). `CONFIG_ESP_TASK_WDT_PANIC=y`: a
