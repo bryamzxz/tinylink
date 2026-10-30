@@ -49,6 +49,25 @@ menu "tinylink core"
             64-byte packet 157 → 47 us (−70 %); hot-loop numbers do not
             move (385 us / 31.6 us). Off only if IRAM runs short.
 
+    config TINYLINK_POWER_DIAG
+        bool "Power diagnostic lines in the 60-s stack diag"
+        default n
+        depends on PM_ENABLE && FREERTOS_USE_TICKLESS_IDLE
+        select PM_LIGHT_SLEEP_CALLBACKS
+        select FREERTOS_GENERATE_RUN_TIME_STATS
+        help
+            Appends three "pwr diag:" lines to every 60-s stack diag:
+            light-sleep residency, sleeps per second split by what
+            ended them (an esp_timer alarm vs a FreeRTOS timeout),
+            sleep-length bins, RTOS-tick drift against esp_timer, and
+            run time per task (src/pwr_diag.h has the format). The
+            first dump only arms it. Cost (round 1.3.7): +2.6 KB
+            image, +72 B IRAM, +1.1 KB static DRAM; no extra wake, but
+            the run-time stats add an esp_timer read to every context
+            switch and the callbacks run in every idle-to-sleep
+            transition, so it is for diagnostic images only
+            (tools/power/sdkconfig.power-diag).
+
     config TINYLINK_BENCH_AEAD
         bool "Run ChaCha20-Poly1305 AEAD and X25519 micro-benchmarks on boot"
         default n

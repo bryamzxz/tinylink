@@ -41,6 +41,9 @@
 #endif
 #include "mapreq.h"
 #include "netmap.h"
+#if CONFIG_TINYLINK_POWER_DIAG
+#include "pwr_diag.h"
+#endif
 #include "register.h"
 #include "register_json.h"   /* register_retry_with_auth */
 #include "stun.h"
@@ -170,6 +173,9 @@ void tinylink_diag_dump_stacks(void)
                  snap[i].pcTaskName,
                  (unsigned)snap[i].usStackHighWaterMark);
     }
+#if CONFIG_TINYLINK_POWER_DIAG
+    tl_pwr_diag_dump(snap, (unsigned)n);   /* round 1.3.7, pwr_diag.h */
+#endif
 }
 
 static void reg_hint_load(void);

@@ -1,0 +1,7 @@
+# Power diagnostic image (round 1.3.7): "pwr diag:" lines in every 60-s
+# stack diag (components/tinylink/src/pwr_diag.h). Selects
+# CONFIG_PM_LIGHT_SLEEP_CALLBACKS and CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS.
+# Stack with an A/B fragment after it to measure the variant:
+#   idf.py -B <dir> -D SDKCONFIG=<dir>/sdkconfig \
+#     -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;tools/power/sdkconfig.power-diag" build
+CONFIG_TINYLINK_POWER_DIAG=y
