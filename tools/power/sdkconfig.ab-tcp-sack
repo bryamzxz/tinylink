@@ -1,0 +1,12 @@
+# A/B (round 1.3.9): lwIP sends SACK options (RFC 2018). Negotiated in the
+# SYN, so on every TCP conn (control and DERP). With lwIP's 4-segment
+# receive window a segment lost from a flight seldom draws the three
+# duplicate ACKs of a fast retransmit, and a server that is not told
+# SACK has neither the tail-loss probe nor RACK (Linux runs both only on
+# SACK conns): what is left is its RTO, srtt + ≥ 200 ms, doubling per
+# repeat — 1.3.8's 2.0–6.2-s netmap tails, if they are losses
+# (`map body:` stalls). With SACK the hole is resent after ~1 RTT. Costs
+# 32 B per TCP pcb (4 SACK ranges, LWIP_TCP_MAX_SACK_NUM) and lwIP's SACK
+# code (flash; LWIP_IRAM_OPTIMIZATION is off); no buffer — the blocks
+# describe the out-of-order segments lwIP keeps anyway (OOSEQ ≤ 4).
+CONFIG_LWIP_TCP_SACK_OUT=y

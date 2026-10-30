@@ -15,6 +15,9 @@
 #include "esp_err.h"
 
 #include "ts2021_client.h"
+#ifndef ESP_PLATFORM
+#include "tl_bodystat.h"   /* h2_client_bodystat */
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -118,9 +121,19 @@ esp_err_t h2_post_json_stream_side(ts2021_conn_t *conn,
                                    int *status_out,
                                    h2_data_callback cb, void *cb_ctx);
 
+/* The streaming request's first message is complete (the caller's
+ * framing; body_len its length), called from inside `cb`: one I line on
+ * how its body came since the response HEADERS (round 1.3.9,
+ * tl_bodystat.h: `map body: N B in M ms after HEADERS (first DATA +…)`).
+ * Only the first call per stream logs — later messages are no-ops; a
+ * stream that ends before it logs `map body: incomplete, …` instead. */
+void h2_map_body_done(size_t body_len);
+
 #ifndef ESP_PLATFORM
 /* Host tests: forget a one-stream server (h2_post_json_stream_side). */
 void h2_client_forget_limits(void);
+/* Host tests: the map body's timing state (h2_map_body_done). */
+const tl_bodystat_t *h2_client_bodystat(void);
 #endif
 
 /* The load-balancer hint every request carries from now on (round 1.3.8,

@@ -1306,6 +1306,11 @@ static int stream_frame(const mapresp_stream_t *ms, esp_err_t pe, void *ctx)
     const mapresp_json_t *j = &ms->json;
     const tl_netmap_t *nm = j->out;
 
+    /* The stream's first message: how its body came (round 1.3.9, one
+     * `map body:` line per stream; a no-op for every later frame). Before
+     * the handler — the first netmap's runs the data-plane start. */
+    h2_map_body_done(ms->body_size);
+
     /* Soak observability, per frame: its size, and the largest element
      * the splitter had to hold against the element buffer — grep
      * `stream peak:` over a multi-hour log and take the max of `elem` to

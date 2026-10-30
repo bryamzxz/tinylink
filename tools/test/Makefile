@@ -34,7 +34,7 @@ TARGETS := test_blake2s test_curve25519 test_x25519 test_mapresp \
            test_tai64n test_nacl_box test_tsmp test_tl_date test_stats test_noise_ik \
            test_http1 test_ctrl_json test_ts2021 test_hpack test_h2_core test_tls_resume \
            test_addr test_wifi_hint test_wifi_psk test_pwr_diag test_tlm_sched test_tls_offer \
-           test_tls_rtc test_ts2021_e2e test_derp_wlock
+           test_tls_rtc test_ts2021_e2e test_derp_wlock test_bodystat
 
 all: $(TARGETS) $(H2_INTEROP)
 
@@ -236,7 +236,7 @@ test_h2_core: test_h2_core.c $(H2_SRCS) $(TL_SRC)/h2_core.h $(TL_SRC)/hpack.h
 # stubs — h2_post_json_stream on conns ts2021_connect dials, through
 # ts2021_close's port and address rules.
 test_ts2021_e2e: test_ts2021.c $(TL_SRC)/ts2021_client.c $(TL_SRC)/ts2021_client.h \
-                 $(TL_SRC)/h2_client.c $(TL_SRC)/h2_client.h $(H2_SRCS) \
+                 $(TL_SRC)/h2_client.c $(TL_SRC)/h2_client.h $(TL_SRC)/tl_bodystat.h $(H2_SRCS) \
                  $(TL_SRC)/tls_io.c $(TL_SRC)/tls_offer.c $(TL_SRC)/tls_offer.h $(NOISE_SRCS) \
                  host_include/esp_tls.h host_include/esp_timer.h
 	$(CC) $(CFLAGS) $(TS2021_DEFS) -DTS2021_E2E -I$(TL_SRC) -I$(TL_INC) -I$(CRYPTO) -Ihost_include \
@@ -279,7 +279,8 @@ $(NG_LIB_DIR)/libnghttp2_host.a:
 
 H2_STACK := $(TL_SRC)/h2_client.c $(H2_SRCS) $(TL_SRC)/ts2021_client.c $(TL_SRC)/tls_io.c \
             $(TL_SRC)/tls_offer.c $(NOISE_SRCS)
-test_h2_interop: test_h2_interop.c $(H2_STACK) $(TL_SRC)/h2_client.h $(TL_SRC)/ts2021_client.h $(NG_DEP)
+test_h2_interop: test_h2_interop.c $(H2_STACK) $(TL_SRC)/h2_client.h $(TL_SRC)/tl_bodystat.h \
+                 $(TL_SRC)/ts2021_client.h $(NG_DEP)
 	$(CC) $(CFLAGS) $(TS2021_DEFS) $(NG_CFLAGS) -I$(TL_SRC) -I$(TL_INC) -I$(CRYPTO) -Ihost_include \
 	    -o $@ test_h2_interop.c $(H2_STACK) $(NG_LIBS)
 
@@ -323,6 +324,12 @@ test_pwr_diag: test_pwr_diag.c $(TL_SRC)/pwr_diag.h
 # housekeeping and STUN re-probe never late. Header-only.
 test_tlm_sched: test_tlm_sched.c $(TL_SRC)/tlm_sched.h
 	$(CC) $(CFLAGS) -I$(TL_SRC) -o $@ test_tlm_sched.c
+
+# The map stream's first body, timed (round 1.3.9): the `map body:` line
+# over a fake clock and three server timelines (window-limited, a loss, a
+# slow server). Header-only.
+test_bodystat: test_bodystat.c $(TL_SRC)/tl_bodystat.h
+	$(CC) $(CFLAGS) -I$(TL_SRC) -o $@ test_bodystat.c
 
 # wg_netif RX-task deadline helpers (B7/B21). Header-only.
 test_wg_timers: test_wg_timers.c $(TL_SRC)/wg_timers.h
@@ -505,7 +512,7 @@ test: test_blake2s.run test_curve25519.run test_x25519.run test_mapresp.run \
       test_http1.run test_ctrl_json.run test_ts2021.run test_hpack.run test_h2_core.run \
       test_tls_resume.run test_addr.run test_wifi_hint.run test_wifi_psk.run test_pwr_diag.run \
       test_tlm_sched.run test_tls_offer.run test_tls_rtc.run test_ts2021_e2e.run \
-      test_derp_wlock.run h2_interop.run
+      test_derp_wlock.run test_bodystat.run h2_interop.run
 
 test_tls_rtc.run: test_tls_rtc
 	$(RUNNER) ./test_tls_rtc
@@ -527,6 +534,9 @@ test_wifi_psk.run: test_wifi_psk
 
 test_pwr_diag.run: test_pwr_diag
 	$(RUNNER) ./test_pwr_diag
+
+test_bodystat.run: test_bodystat
+	$(RUNNER) ./test_bodystat
 
 test_tlm_sched.run: test_tlm_sched
 	$(RUNNER) ./test_tlm_sched

@@ -103,9 +103,9 @@ python tools/iram_access_check.py --objdump xtensa-esp32-elf-objdump --section .
 
 ## `power/`
 
-sdkconfig fragments for the steady-state power work (round 1.3.7). Each
-is stacked after `sdkconfig.defaults`; none is meant for production as
-is.
+sdkconfig fragments for the steady-state power work (round 1.3.7) and
+the boot path's TCP receive side (round 1.3.9). Each is stacked after
+`sdkconfig.defaults`; none is meant for production as is.
 
 | fragment | what |
 |---|---|
@@ -117,6 +117,9 @@ is.
 | `sdkconfig.ab-cpu160` | 160 MHz instead of 240 (boot and DFS max) |
 | `sdkconfig.ab-idle2` | light sleep from 2 idle ticks instead of 3 |
 | `sdkconfig.ab-txpower13` | Wi-Fi TX power cap 13 dBm instead of 20 |
+| `sdkconfig.ab-tcp-sack` | lwIP sends SACK (`LWIP_TCP_SACK_OUT`), window unchanged |
+| `sdkconfig.ab-tcp-wnd8` | TCP receive window 11 520 B (8 × MSS) instead of 5 760, mailbox 10, OOSEQ 5, SACK |
+| `sdkconfig.ab-tcp-wnd12` | window 17 280 B (12 × MSS), mailbox 14, OOSEQ 8, SACK, Wi-Fi dynamic RX buffers 24 instead of 16 |
 
 A measured variant is the diag fragment plus one A/B fragment, in a
 fresh build dir:
@@ -125,6 +128,12 @@ fresh build dir:
 idf.py -B work/artifacts/ab -D SDKCONFIG=work/artifacts/ab/sdkconfig \
     -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;tools/power/sdkconfig.power-diag;tools/power/sdkconfig.ab-wifi-active20" build
 ```
+
+The `ab-tcp-*` fragments are measured at boot, without the diag
+fragment: `sdkconfig.defaults;tools/power/sdkconfig.ab-tcp-wnd8`. Their
+figure is the `h2: map body:` line (`components/tinylink/src/tl_bodystat.h`)
+and the `map stream answered` → `netmap (initial)` gap, over a series of
+boots per image.
 
 ## `credentials.csv.example`
 

@@ -145,6 +145,86 @@ TSan-clean on 1, 2 and 16 CPUs. Static worst cases unchanged: `wg_tx`
   limit binds before the 5 760-B buffer at the sensor's frame sizes,
   which makes the partial send unlikely; not addressed here.
 
+#### Boot: the initial netmap's body, timed; TCP receive-side A/B (`feat/r139-boot`)
+
+Measured on 1.3.8 (sensor series): the map stream's HEADERS come one
+RTT after the request (`map stream answered: HTTP 200 in` ~180 ms), the
+~26 KB initial netmap (`stream peak: body=25962`) 720, 730, 790, 840,
+920, 980, 2 000, 2 500, 3 820, 5 120, 6 230 ms after them — on the path
+reset → WireGuard up, the WG handshake starts right after the netmap.
+Two readings fit and nothing logged told them apart. The transport:
+lwIP's receive window is 5 760 B (4 × MSS 1 440), so 26 KB takes 5
+flights, 4 RTTs = 720 ms behind the HEADERS — the floor; a segment lost
+from a flight of ≤ 4 seldom draws the 3 duplicate ACKs of a fast
+retransmit, and without SACK (`LWIP_TCP_SACK_OUT` is off) Linux has no
+tail-loss probe or RACK for the conn, so the server waits out its RTO
+(srtt + ≥ 200 ms, doubling) — the tail. Or the server: HEADERS at once,
+the body when the netmap is computed. (Our HTTP/2 windows, 64 KiB, are
+not in it.) Image 746 848 → **747 840 B (+992)**; static DRAM 58 684 →
+58 732 B (+48), IRAM ±0. Host suite 2 447 → **2 498 OK** (CI floor
+2 498), ASan + UBSan clean, 0 warnings. Static worst cases unchanged
+(`tinylink_lp` 5 232 / 7 168, `main` 5 440 / 8 192, the rest as
+before). Not yet on the sensor.
+
+- **One `map body:` line per map stream (always on).** When the stream's
+  first MapResponse is complete — mapreq's framing, before its handler
+  runs; at boot the initial netmap, on a reconnect the full one again:
+  `h2: map body: 25962 B in 2000 ms after HEADERS (first DATA +10 ms,
+  9 reads, waits 1890 ms, longest 1100 ms at 11 KB, stalls > 350 ms:
+  1 = 1100 ms, busy 100 ms)`. *first DATA*: HEADERS → the end of the read
+  that brought the first body byte (the server's share); *reads*: Noise
+  records from the HEADERS' one on; *waits*: time blocked in those reads
+  after the first DATA (the transport's share); *longest*, and the DATA
+  bytes in before it; *stalls*: waits over twice the request → HEADERS
+  time, clamped to 300–1 000 ms — past any window-limited wait (≤ 1 RTT)
+  and at an RTO's scale — their number and sum; *busy*: our own time
+  between reads (HTTP/2, the JSON split and parse). in = first DATA +
+  waits + busy, exactly. A stream that ends first logs `map body:
+  incomplete, N B in …` (N: DATA bytes; the end has its own line).
+  `h2_client.c` times each record read while armed (two esp_timer reads)
+  and the stream's DATA; the counters are `tl_bodystat.h` (48 B of BSS,
+  no heap, no per-read logging); armed by a 200 only — an error body is
+  no MapResponse. One log call for both variants (a call each was
+  432 B more).
+- **No lwIP counters.** lwIP 2.1's `tcp_pcb` keeps no receive-side loss
+  count. Its out-of-order queue is empty again the moment the
+  retransmission fills the hole, so sampling it between record reads
+  (safe under the core lock, `LWIP_TCPIP_CORE_LOCKING=y`) would see a
+  loss only by chance; the one drop counter (`TCP_STATS`, `tcp.drop`) is
+  global and needs `LWIP_STATS`; counting out-of-order and duplicate
+  segments per pcb takes a `LWIP_HOOK_TCP_INPACKET_PCB` on every segment
+  in tcpip_thread, through a hook header compiled into the lwip
+  component. The stall pattern and the A/B below answer the question
+  without them.
+- **A/B fragments (`tools/power/`, stacked after `sdkconfig.defaults`,
+  measured at boot).** `ab-tcp-sack`: SACK only — losses recovered in
+  ~1 RTT, the floor unchanged; +1 072 B flash, 32 B heap per TCP pcb.
+  `ab-tcp-wnd8`: window 11 520 B, RECVMBOX 10 (IDF's WND/MSS + 2; a full
+  mailbox makes lwIP drop the next data segment unACKed — a loss of its
+  own), OOSEQ 5 (IDF's DYNAMIC_RX / (TCP conns + 1)), SACK — 3 flights,
+  ~2 RTTs. `ab-tcp-wnd12`: 17 280 B, RECVMBOX 14, OOSEQ 8, SACK, Wi-Fi
+  dynamic RX buffers 16 → 24 — 2 flights, ~1 RTT (the first is the
+  server's initial cwnd, 10 segments; a bigger window gains nothing more
+  on this body). The window is credit, not memory, but it is every TCP
+  socket's (lwIP has no per-socket window), and each segment unread or
+  out of order holds a Wi-Fi dynamic RX buffer (~1.6 KB) until its task
+  reads it: worst case, control and DERP both full and unread, 12.8 KB
+  of heap today, 25.6 KB with wnd8, 38.4 KB with wnd12 (heap_free min
+  157 KB over the 1.3.6 soak); wnd12's one full window plus the 6-frame
+  AMPDU reorder window is 18 buffers, over the driver's 16, hence 24 (a
+  cap: buffers are allocated per received frame). Mailbox slots: 4 B
+  each per TCP socket. Images, all from `4918106`: default 747 840 B,
+  sack 748 912, wnd8 748 928, wnd12 748 944; each build's sdkconfig
+  checked for the values.
+- **Reading the boots.** Window-limited (the fast boots): first DATA
+  ≈ 0, ~8 reads, waits ≈ 4 RTTs, longest ≈ 1 RTT, no stall. Server:
+  first DATA ≈ in − the floor, no stall — no fragment changes first DATA.
+  Transport: first DATA ≈ 0, stalls ≥ 1, their sum ≈ in − the floor,
+  each ≥ 2 RTTs and roughly doubling when several (RTO backoff) — then
+  `ab-tcp-sack` shortens them. busy in the hundreds of ms would be our
+  own parse, neither. A bigger window shows as in falling to ~2 RTTs
+  (wnd8) / ~1 RTT (wnd12) on the stall-free boots.
+
 ### Optimization round 1.3.8 — TLS handshake, WireGuard silence, stalled polls, PSK (in progress, branch `feat/opt-1.3.8`)
 
 Four parallel tracks on top of 1.3.7 plus a register retry ladder;

@@ -1,0 +1,22 @@
+# A/B (round 1.3.9): lwIP's TCP receive window 12 segments (17 280 B)
+# instead of 4 (5 760), with SACK (sdkconfig.ab-tcp-sack). The ~26 KB
+# initial netmap in 2 flights, ~1 RTT behind its HEADERS: the first is
+# the server's initial cwnd (10 segments, 14 400 B), the second the rest
+# — a bigger window gains nothing more on it until the cwnd grows. Every
+# TCP socket gets it (lwIP has no per-socket window), and each unread or
+# out-of-order segment holds a Wi-Fi dynamic RX buffer (~1.6 KB): one
+# conn full is 12 buffers + the 6-frame AMPDU reorder window = 18, over
+# the 16 the driver allows — so the ceiling goes to 24 (IDF's
+# "high-performance" rank pairs 24 buffers with a 24-KB window; a cap,
+# not an allocation: buffers are allocated per received frame and freed
+# when lwIP lets go). Worst case, control and DERP both full and unread:
+# 2 × 12 × 1.6 = 38.4 KB of heap instead of 12.8 (+25.6 KB; heap_free
+# min was 157 KB over the 1.3.6 soak), and the driver's ceiling for all
+# held frames 38.4 KB instead of 25.6. RECVMBOX: IDF's WND/MSS + 2 (+8
+# slots × 4 B per TCP socket). OOSEQ_MAX_PBUFS: IDF's bound
+# DYNAMIC_RX / (TCP conns + 1) = 24 / 3.
+CONFIG_LWIP_TCP_WND_DEFAULT=17280
+CONFIG_LWIP_TCP_RECVMBOX_SIZE=14
+CONFIG_LWIP_TCP_OOSEQ_MAX_PBUFS=8
+CONFIG_LWIP_TCP_SACK_OUT=y
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=24
