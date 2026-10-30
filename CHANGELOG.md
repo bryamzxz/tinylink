@@ -16,11 +16,11 @@ got-ip → WG session up on the 1.3.6 boots: control conn up 0.42–0.66 s
 streaming MapRequest as two more serial round trips, netmap → first
 INIT 50 ms, with 14 X25519 (~12.5 ms each at 240 MHz, 1.3.3 bench) on
 that path and the DERP login (TLS full handshake 1.45–1.76 s, 3.3 and
-4.2 s outliers) running beside it. Image 725 536 → **729 728 B
-(+4 192)**; static DRAM 57 644 → 58 060 B (+416), IRAM ±0. Host suite
-1 791 → **1 899 OK** (CI floor 1 899), ASan + UBSan clean, 0 warnings.
+4.2 s outliers) running beside it. Image 725 536 → **730 128 B
+(+4 592)**; static DRAM 57 644 → 58 060 B (+416), IRAM ±0. Host suite
+1 791 → **1 912 OK** (CI floor 1 912), ASan + UBSan clean, 0 warnings.
 Static worst cases (`tools/stack_worst.py`, fixed below): `tinylink_lp`
-5 136 → 5 152 / 7 168, `main` 5 312 → 5 408 / 8 192, `tinylink_derp`
+5 136 → 5 168 / 7 168, `main` 5 312 → 5 424 / 8 192, `tinylink_derp`
 5 152 → 5 248 / 8 192, `wg_rx` 5 648 → 5 728 / 8 192, the rest
 unchanged. X25519 in a boot up to the first CallMeMaybe (4 peers, 3
 endpoints each, one CMM): 33 → **18**; on the got-ip → session-up
@@ -122,7 +122,15 @@ the sensor.
   own Retry-After, 30 s) per failure streak. The pair's rollback
   reported "session intact" after a failed send of its control frames.
   The review's demo is a host test; test_h2_core +16, test_h2_interop
-  +10. Image +1 488 B, static DRAM +16 B.
+  +10. Image +1 488 B, static DRAM +16 B. A second pass found the
+  cancel too eager: a push whose final 200 was in (body pending) was
+  cancelled and doubled the next deadline, and one whose answer already
+  sat received but unread behind a long stream callback was cancelled
+  as unanswered — a needless recycle and a second push; now only a push
+  without its final response, with nothing left to read
+  (`ts2021_rx_ready`), is cancelled, and a push refused by a GOAWAY
+  goes with the reconnect instead of after 30 s. Its tests (test_h2_core
+  +9, test_h2_interop +4) fail without the fixes; image +400 B.
 
 ### Optimization round 1.3.6 — data-plane path selection (in progress, branch `feat/opt-1.3.6`)
 
