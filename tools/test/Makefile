@@ -32,7 +32,7 @@ TARGETS := test_blake2s test_curve25519 test_x25519 test_mapresp \
            test_backoff test_keys_regen test_stun_boot test_skip_value test_jsmn_split \
            test_tai64n test_nacl_box test_tsmp test_tl_date test_stats test_noise_ik \
            test_http1 test_ctrl_json test_ts2021 test_hpack test_h2_core test_tls_resume \
-           test_addr test_pwr_diag
+           test_addr test_pwr_diag test_tlm_sched
 
 all: $(TARGETS) $(H2_INTEROP)
 
@@ -273,6 +273,12 @@ test_wg_demux: test_wg_demux.c $(TL_SRC)/wg_demux.c $(TL_SRC)/wg_demux.h
 test_pwr_diag: test_pwr_diag.c $(TL_SRC)/pwr_diag.h
 	$(CC) $(CFLAGS) -I$(TL_SRC) -o $@ test_pwr_diag.c
 
+# Telemetry task wake planning (round 1.3.7): the loop replayed over a
+# fake clock with the soaks' tick drift — one wake per sample, the
+# housekeeping and STUN re-probe never late. Header-only.
+test_tlm_sched: test_tlm_sched.c $(TL_SRC)/tlm_sched.h
+	$(CC) $(CFLAGS) -I$(TL_SRC) -o $@ test_tlm_sched.c
+
 # wg_netif RX-task deadline helpers (B7/B21). Header-only.
 test_wg_timers: test_wg_timers.c $(TL_SRC)/wg_timers.h
 	$(CC) $(CFLAGS) -I$(TL_SRC) -o $@ test_wg_timers.c
@@ -438,7 +444,8 @@ test: test_blake2s.run test_curve25519.run test_x25519.run test_mapresp.run \
       test_skip_value.run test_jsmn_split.run test_tai64n.run \
       test_nacl_box.run test_tsmp.run test_tl_date.run test_stats.run test_noise_ik.run \
       test_http1.run test_ctrl_json.run test_ts2021.run test_hpack.run test_h2_core.run \
-      test_tls_resume.run test_addr.run test_pwr_diag.run h2_interop.run
+      test_tls_resume.run test_addr.run test_pwr_diag.run test_tlm_sched.run \
+      h2_interop.run
 
 test_tls_resume.run: test_tls_resume
 	$(RUNNER) ./test_tls_resume
@@ -448,6 +455,9 @@ test_addr.run: test_addr
 
 test_pwr_diag.run: test_pwr_diag
 	$(RUNNER) ./test_pwr_diag
+
+test_tlm_sched.run: test_tlm_sched
+	$(RUNNER) ./test_tlm_sched
 
 test_hpack.run: test_hpack
 	$(RUNNER) ./test_hpack

@@ -827,7 +827,11 @@ path stands ≥ 176 B shallower than in 1.3.1 (one 688-B frame then), and
 the STUN path (~1.8 KB on its own task) ≈ 1.9 KB here, well under the
 `/stats`/sample paths (≈ 3.3 KB, ≤ 1.3.1's measured 3.5 KB peak). A
 GOT_IP wakes the loop at once, except while `select()` serves `/stats`:
-then the ≤ 5-s wait slice bounds the delay. The long-poll's stack is
+then the ≤ 5-s wait slice bounds the delay. Since 1.3.7 the samples run
+on a fixed grid, a wait the light-sleep tick drift ended a little early
+still counts as the sample's, and the housekeeping and the re-probe run
+at the last sample wake before they are due (`tlm_sched.h`): one
+light-sleep exit per sample instead of ~2.15. The long-poll's stack is
 the one to watch: its lifetime peak was 20 KiB in 2026-05, dominated by
 `ts2021_connect` (9 888 B frame) → the record decrypt (4 176 B) →
 mbedTLS handshake. Those buffers are gone (92c09dd; the record decrypt's

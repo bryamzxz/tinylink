@@ -24,6 +24,7 @@
 #include "lwip/netdb.h"
 
 #include "stats_json.h"
+#include "tlm_sched.h"
 #include "tmp117.h"
 #include "tl_wdt.h"
 #include "tl_time.h"
@@ -40,7 +41,9 @@ static const char *TAG = "telemetry";
 #define TLM_SLICE_STATS_US  (5LL * 1000LL * 1000LL)
 #define TLM_SLICE_IDLE_US   (30LL * 1000LL * 1000LL)
 /* Stack diag + NVS time-floor poll (every 12th sample ≈ 60 s until 1.3.2;
- * now its own deadline, so builds without telemetry persist the floor). */
+ * its own deadline since, so builds without telemetry persist the floor;
+ * since 1.3.7 it rides the last sample wake before it is due,
+ * tlm_sched.h). */
 #define TLM_HOUSEKEEP_US    (60LL * 1000LL * 1000LL)
 #define TLM_SPAWN_RETRY_US  (30LL * 1000LL * 1000LL)
 
@@ -280,17 +283,33 @@ static void telemetry_task(void *arg)
         int64_t now = esp_timer_get_time();
         int64_t deadline = now + (tlm_serves_stats(sock) ? TLM_SLICE_STATS_US
                                                          : TLM_SLICE_IDLE_US);
+        /* While sampling, the housekeeping and the STUN re-probe run at
+         * the last sample wake before they are due (tlm_sched.h): `early`
+         * is how far ahead, `anchor` the next sample. */
+        int64_t early  = tlm_early_us(false, 0);
+        int64_t anchor = INT64_MAX;
 #if CONFIG_TINYLINK_TELEMETRY_ENABLE
         if (s_tunnel_up && sensor_ok && sock >= 0) {
-            if (now >= next_sample) {
+            const int64_t period = (int64_t)CONFIG_TINYLINK_TELEMETRY_PERIOD_MS * 1000LL;
+            /* Within the slack: this wake is the sample's, though the
+             * tick-counted wait ended a little before its instant. */
+            if (tlm_due(now, next_sample, tlm_slack_us(period))) {
                 tlm_sample(sock, &dest, &seq);
+                /* On a grid since 1.3.7 (was one period after the
+                 * sample's end: 5.01–5.02 s apart on the sensor). */
+                next_sample = tlm_next_on_grid(next_sample, period, now);
                 now = esp_timer_get_time();
-                next_sample = now + (int64_t)CONFIG_TINYLINK_TELEMETRY_PERIOD_MS * 1000LL;
             }
-            if (next_sample < deadline) deadline = next_sample;
+            early  = tlm_early_us(true, period);
+            anchor = next_sample;
+            /* A sample due within the slack past the /stats slice takes
+             * its place: a slice cut short by the drift would otherwise
+             * end each wait earlier than the last, until one fell
+             * outside the slack and cost a wake of its own. */
+            if (next_sample < deadline + tlm_slack_us(period)) deadline = next_sample;
         }
 #endif
-        if (now >= next_housekeep) {
+        if (tlm_due(now, next_housekeep, early)) {
             /* Soak observability: tinylink_diag_dump_stacks() walks every
              * FreeRTOS task's stack high-water mark (data source for the
              * task-stack-trim audit item). */
@@ -298,13 +317,15 @@ static void telemetry_task(void *arg)
             tl_time_poll_persist();
             tinylink_addr_persist_poll();
             now = esp_timer_get_time();
-            next_housekeep = now + TLM_HOUSEKEEP_US;
+            next_housekeep = tlm_next_on_grid(next_housekeep, TLM_HOUSEKEEP_US, now);
         }
-        if (next_housekeep < deadline) deadline = next_housekeep;
+        const int64_t hk_at = tlm_wake_at(next_housekeep, anchor, early);
+        if (hk_at < deadline) deadline = hk_at;
         /* STUN re-probe when due (CONFIG_TINYLINK_STUN_REPROBE_MS) or
          * requested by GOT_IP; may block for one probe (it feeds). */
-        const int64_t stun_due = tinylink_stun_reprobe_poll(now);
-        if (stun_due < deadline) deadline = stun_due;
+        const int64_t stun_due = tinylink_stun_reprobe_poll(now, early);
+        const int64_t stun_at  = tlm_wake_at(stun_due, anchor, early);
+        if (stun_at < deadline) deadline = stun_at;
         tlm_wait(sock, deadline);
     }
 }
