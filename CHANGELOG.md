@@ -504,8 +504,10 @@ CRC OK; flashed `827c1b9` (reports `gf7d95e1`, the pre-rewrite hash).
   DERP; **1 endpoint roam** (the peer's restart; 149 in 6 h on 1.3.5).
   **3 RX-stale:** two with the direct path answering DISCO and nothing
   from the peer's WireGuard on either path (`seen direct=0 derp=0`),
-  fixed by the forced rekey in ~130 ms — the 1.3.5 soak's post-rekey
-  silences, which path selection cannot see; the third the peer's
+  over within ~130 ms of the forced rekey's INIT (in the second a packet
+  under the old keys arrived 30 ms after the INIT, before its response)
+  — the 1.3.5 soak's post-rekey silences, which path selection cannot
+  see; the third the peer's
   nightly restart at 02:00 (DERP `peer-gone`, the peer back with a new
   DiscoKey 48 s later, session up 6.3 s after that, on the 5-s INIT
   retry). One WAN event at 00:12: the DERP server's stream ended (TLS
