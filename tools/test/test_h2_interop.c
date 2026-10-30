@@ -902,6 +902,7 @@ static void sc_goaway_refuse_and_rst(void)
 /* Round 1.3.5: a one-shot request to a silent server fails after its
  * deadline's polls; each expiry doubles the next request's deadline up
  * to TS2021_REQ_TIMEOUT_MAX_MS, and an answered request resets it. */
+static bool s_last_post_io_failed;
 static int silent_post(void)
 {
     srv_new(0);
@@ -910,8 +911,9 @@ static int silent_post(void)
     s_silent_polls = 0;
     res_t r = post("/machine/map", kRegBody, sizeof(kRegBody) - 1, 256);
     s_silent = false;
-    const bool failed = r.err == ESP_FAIL && s_conn.req_expired && s_conn.io_failed &&
+    const bool failed = r.err == ESP_FAIL && s_conn.req_expired &&
                         s_conn.req_deadline_us == 0 && sock_poll_ms() == 30000;
+    s_last_post_io_failed = s_conn.io_failed;
     const int polls = s_silent_polls;
     conn_down();
     return failed ? polls : -1;
@@ -922,10 +924,12 @@ static void sc_deadline_backoff(void)
     const int base = (TS2021_REQ_TIMEOUT_MS + TS2021_REQ_POLL_MS - 1) / TS2021_REQ_POLL_MS;
     const int cap = (TS2021_REQ_TIMEOUT_MAX_MS + TS2021_REQ_POLL_MS - 1) / TS2021_REQ_POLL_MS;
     const int p1 = silent_post(), p2 = silent_post(), p3 = silent_post();
+    const bool io3 = s_last_post_io_failed;
     int pn = 0;
     for (int i = 0; i < 4; i++) pn = silent_post();
     check("deadline_backoff_doubles_to_the_cap",
-          p1 == base && p2 == 2 * base && p3 == 4 * base && pn == cap && cap < 255);
+          p1 == base && p2 == 2 * base && p3 == 4 * base && pn == cap && cap < 255 && io3 &&
+          s_last_post_io_failed);
     /* an answer resets it */
     srv_new(0);
     conn_up(true);
@@ -1046,6 +1050,7 @@ static bool disarmed(void)
     return sock_poll_ms() == 30000 && s_conn.req_idle == 0 && s_conn.req_deadline_us == 0;
 }
 
+static bool s_last_pair_io_failed;
 static int silent_pair(void)
 {
     srv_new(0);
@@ -1056,6 +1061,7 @@ static int silent_pair(void)
     s_silent = false;
     const bool failed = r.err == ESP_FAIL && s_conn.req_expired && s_side_calls == 0 &&
                         disarmed();
+    s_last_pair_io_failed = s_conn.io_failed;
     const int polls = s_silent_polls;
     conn_down();
     return failed ? polls : -1;
@@ -1592,11 +1598,12 @@ static void sc_resp_deadline(void)
     s_now_us = 0;
 }
 
-/* Round 1.3.8 review, F2: a poll after a clean server end (END_STREAM on
- * the last map stream) gets the stream budget for its answer, and its
- * expiries move nothing — not the ladder, not the streak, not the conn's
- * failure accounting — until a stream is answered; after a boot, a FIN
- * or a recycle the base deadline. */
+/* Round 1.3.8 review, F2: the first poll after a clean server end
+ * (END_STREAM on the last map stream) gets the stream budget for its
+ * answer, and its expiry moves nothing — not the ladder, not the streak,
+ * not the conn's failure accounting; the polls after it (second review)
+ * and those after a boot, a FIN or a recycle: the base deadline and the
+ * ladder. */
 static void sc_resp_after_clean_end(void)
 {
     const int base = (TS2021_RESP_TIMEOUT_MS + TS2021_REQ_POLL_MS - 1) / TS2021_REQ_POLL_MS;
@@ -1609,8 +1616,14 @@ static void sc_resp_after_clean_end(void)
     const uint32_t ms1 = s_last_req_ms;
     const int p2 = silent_stream();
     const bool io2 = s_last_io_failed;
-    check("resp_after_clean_end_patient", clean && p1 == cap && ms1 == TS2021_RESP_TIMEOUT_MAX_MS);
-    check("resp_after_clean_end_expiries_move_nothing", p2 == cap && !io1 && !io2);
+    const int p3x = silent_stream();
+    const bool io3x = s_last_io_failed;
+    check("resp_after_clean_end_patient", clean && p1 == cap && ms1 == TS2021_RESP_TIMEOUT_MAX_MS &&
+                                          !io1);
+    /* one poll only: the next two are the ladder's first and second
+     * expiry — the second escalates (a server that never answers) */
+    check("resp_after_clean_end_one_poll_then_the_ladder",
+          p2 == base && !io2 && p3x == 2 * base && io3x);
     /* answered (and recycled by us): back to the base, the streak at 0 */
     (void)answered_stream();
     const int p3 = silent_stream();
@@ -1644,6 +1657,40 @@ static void sc_resp_after_clean_end(void)
     check("resp_after_a_reset_base", r.err == ESP_OK && r.status == 200 && pr == base);
     (void)answered_stream();
 
+    /* a FIN during the patient poll: the next poll is not patient */
+    (void)answered_stream_how(true);
+    srv_new(0);
+    conn_up(true);
+    S.sc = SC_DEFER;
+    S.keep_deferred = true;
+    r = stream(kRegBody, sizeof(kRegBody) - 1);   /* nothing to send: EOF */
+    const bool fin_patient = r.err == ESP_FAIL && !s_conn.resp_expired &&
+                             s_conn.req_ms == TS2021_RESP_TIMEOUT_MAX_MS;
+    conn_down();
+    const int pafin = silent_stream();
+    check("resp_fin_in_the_patient_poll_ends_it", fin_patient && pafin == base);
+    (void)answered_stream();
+
+    /* the endpoint push ahead of the patient poll (push first, the
+     * default): its expiry is no transport failure, and takes the
+     * patience — the next poll has the base */
+    (void)answered_stream_how(true);
+    const int pp = silent_post();
+    const bool pp_io = s_last_post_io_failed;
+    const int pnext = silent_stream();
+    check("resp_push_expiry_before_the_patient_poll_not_a_failure",
+          pp == (TS2021_REQ_TIMEOUT_MS + TS2021_REQ_POLL_MS - 1) / TS2021_REQ_POLL_MS && !pp_io &&
+          pnext == base);
+    /* … and without a clean end before it, one still is (1.3.5) */
+    const int pp2 = silent_post();
+    check("resp_push_expiry_otherwise_a_failure", pp2 > 0 && s_last_post_io_failed);
+    (void)answered_stream();
+    srv_new(0);   /* the one-shot deadline reset */
+    conn_up(true);
+    S.sc = SC_HEADERS_ONLY;
+    (void)post("/machine/map", kRegBody, 10, 256);
+    conn_down();
+
     /* with the push riding along (B1): the stream's deadline after the
      * push closes is the patient one too */
     (void)answered_stream_how(true);
@@ -1662,6 +1709,21 @@ static void sc_resp_after_clean_end(void)
           !s_conn.io_failed && s_silent_polls == cap && s_conn.req_ms == TS2021_RESP_TIMEOUT_MAX_MS);
     conn_down();
     (void)answered_stream();
+
+    /* B1, nothing answered after a clean end (second review): the push's
+     * one-shot deadline governs the conn until the stream answers, as in
+     * 1.3.7 — cut at it, but not counted as a transport failure */
+    (void)answered_stream_how(true);
+    const int ps = silent_pair();
+    check("resp_side_push_cut_after_clean_end_not_a_failure",
+          ps == (TS2021_REQ_TIMEOUT_MS + TS2021_REQ_POLL_MS - 1) / TS2021_REQ_POLL_MS &&
+          !s_last_pair_io_failed);
+    (void)answered_stream();
+    srv_new(0);   /* the one-shot deadline reset */
+    conn_up(true);
+    S.sc = SC_HEADERS_ONLY;
+    (void)post("/machine/map", kRegBody, 10, 256);
+    conn_down();
 }
 
 /* Round 1.3.8 review, F1 (the reviewer's demo): with the push riding
