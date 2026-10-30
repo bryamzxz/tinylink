@@ -490,7 +490,10 @@ esp_err_t esp_tls_plain_tcp_connect(const char *h, int hl, int p, const esp_tls_
     (void)h; (void)hl; (void)p; (void)c; (void)e; *fd = -1;
     return ESP_FAIL;
 }
-int64_t esp_timer_get_time(void) { return 0; }
+/* A scripted clock: 0 unless a scenario moves it (the side request's
+ * own deadline, round 1.3.7 review). */
+static int64_t s_now_us;
+int64_t esp_timer_get_time(void) { return s_now_us; }
 
 /* Seal the server's plaintext into records of random sizes (empty ones
  * now and then). */
@@ -937,13 +940,15 @@ static void sc_sequence(void)
  * which, like Go's, answers each stream on its own. */
 static int    s_side_calls, s_side_status, s_side_err;
 static size_t s_side_at;   /* stream bytes delivered when the side closed */
+static h2_side_result_t s_side_res;
 
-static void side_cb(int status, int err, void *ctx)
+static void side_cb(const h2_side_result_t *res, void *ctx)
 {
     (void)ctx;
     s_side_calls++;
-    s_side_status = status;
-    s_side_err = err;
+    s_side_status = res->status;
+    s_side_err = res->stream_error;
+    s_side_res = *res;
     s_side_at = s_slen;
 }
 
@@ -1034,6 +1039,8 @@ static void sc_side(void)
     check("side_429_kept_apart", r.err == ESP_OK && r.status == 200 && s_side_calls == 1 &&
           s_side_status == 429 && s_conn.h2_status == 200 && !s_conn.h2_retry_after_present &&
           r.len == S.resp_len);
+    check("side_429_retry_after_its_own", s_side_res.retry_after_present &&
+          s_side_res.retry_after_s == 7 && !s_side_res.expired);
     conn_down();
 
     /* RST_STREAM instead of an answer: status 0 and the code. */
@@ -1110,6 +1117,156 @@ static void sc_side(void)
     check("side_window_too_small_nothing_sent", none && r2.err == ESP_OK && r2.status == 200 &&
           S.nreq == 1 && S.sid[0] == 1 && S.body_len[0] == sizeof(kPushBody) - 1 && S.bad == 0);
     conn_down();
+}
+#endif
+
+#ifndef H2_REF
+/* Round 1.3.7 review. A server that allows one stream at a time
+ * (SETTINGS_MAX_CONCURRENT_STREAMS 1): known before the burst, the pair
+ * sends nothing and the caller goes one request after the other on the
+ * same conn; learned after a pair went out (its map stream refused),
+ * remembered for the next conn. */
+static void sc_side_one_stream(void)
+{
+    nghttp2_settings_entry one[] = { { NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS, 1 } };
+
+    srv_new(0);
+    nghttp2_submit_settings(S.ng, NGHTTP2_FLAG_NONE, one, 1);
+    conn_up(true);
+    S.sc = SC_STREAM;
+    fill_mapresponses(1, 3000);
+    res_t r = stream_side();
+    check("one_stream_server_pair_not_sent",
+          r.err == ESP_ERR_INVALID_SIZE && S.nreq == 0 && s_side_calls == 0 && disarmed() &&
+          !s_conn.req_expired && S.bad == 0);
+    /* mapreq's fallback: the push alone, then the stream, same conn */
+    S.sc = SC_HEADERS_ONLY;
+    res_t rp = post("/machine/map", kPushBody, sizeof(kPushBody) - 1, 256);
+    S.sc = SC_STREAM;
+    res_t rs = stream(kRegBody, sizeof(kRegBody) - 1);
+    check("one_stream_server_push_then_stream",
+          rp.err == ESP_OK && rp.status == 200 && rs.err == ESP_OK && rs.status == 200 &&
+          rs.len == S.resp_len && memcmp(s_sbuf, S.resp, S.resp_len) == 0 &&
+          S.nreq == 2 && S.sid[0] == 1 && S.sid[1] == 3 && S.bad == 0);
+    conn_down();
+    /* remembered: the next conn's pair is not tried */
+    srv_new(0);
+    conn_up(true);
+    S.sc = SC_STREAM;
+    r = stream_side();
+    check("one_stream_server_remembered", r.err == ESP_ERR_INVALID_SIZE && S.nreq == 0);
+    conn_down();
+    h2_client_forget_limits();
+
+    /* The limit arrives after the burst: the server refuses the map
+     * stream, the side request is answered; the next pair is not tried. */
+    srv_new(0);
+    conn_up(true);   /* the default preface (250) left over … */
+    nghttp2_submit_settings(S.ng, NGHTTP2_FLAG_NONE, one, 1);   /* … then 1 */
+    S.sc = SC_STREAM;
+    S.sc_req[0] = SC_HEADERS_ONLY;
+    fill_mapresponses(1, 3000);
+    r = stream_side();
+    const bool refused = r.status != 200 && s_conn.h2.peer_max_streams == 1;
+    conn_down();
+    srv_new(0);
+    conn_up(true);
+    S.sc = SC_STREAM;
+    res_t r2 = stream_side();
+    check("one_stream_learned_late_then_alone",
+          refused && r2.err == ESP_ERR_INVALID_SIZE && S.nreq == 0);
+    conn_down();
+    h2_client_forget_limits();
+}
+
+/* Stream bytes at which the clock jumps past the side's deadline. */
+static size_t s_clock_jump_at;
+static int stream_cb_clock(const uint8_t *buf, size_t len, void *ctx)
+{
+    const int rc = stream_cb(buf, len, ctx);
+    if (s_clock_jump_at != 0 && s_slen >= s_clock_jump_at) {
+        s_now_us += (int64_t)TS2021_REQ_TIMEOUT_MS * 1000 + 1;
+        s_clock_jump_at = 0;
+    }
+    return rc;
+}
+
+static res_t stream_side_clock(void)
+{
+    res_t r;
+    memset(&r, 0, sizeof(r));
+    s_slen = 0;
+    s_scalls = 0;
+    s_side_calls = 0;
+    s_side_status = s_side_err = -1;
+    s_side_at = 0;
+    r.err = h2_post_json_stream_side(&s_conn, "/machine/map", AUTH,
+                                     (const uint8_t *)kPushBody, sizeof(kPushBody) - 1,
+                                     side_cb, NULL, (const uint8_t *)kRegBody,
+                                     sizeof(kRegBody) - 1, &r.status, stream_cb_clock, NULL);
+    r.len = s_slen;
+    return r;
+}
+
+/* A push answered late, once the map stream has answered: the conn
+ * stays, the push is cancelled at its deadline, the stream goes on. */
+static void sc_side_late_push(void)
+{
+    const int base = (TS2021_REQ_TIMEOUT_MS + TS2021_REQ_POLL_MS - 1) / TS2021_REQ_POLL_MS;
+
+    /* The deadline passes inside the stream callback on its first DATA
+     * (the first netmap's handler with the relay wait), before that
+     * feed's WINDOW_UPDATE flush: neither it nor any later read fails. */
+    s_now_us = 0;
+    srv_new(0);
+    conn_up(true);
+    S.sc = SC_STREAM;
+    S.sc_req[0] = SC_DEFER;   /* never answered */
+    fill_mapresponses(4, 9000);
+    S.chunk = 4000;
+    s_clock_jump_at = 1;
+    s_reads_short = s_reads_stream = s_reads_other = 0;
+    res_t r = stream_side_clock();
+    check("late_push_stream_survives",
+          r.err == ESP_OK && r.status == 200 && r.len == S.resp_len &&
+          memcmp(s_sbuf, S.resp, S.resp_len) == 0 && !s_conn.req_expired &&
+          !s_conn.io_failed && disarmed());
+    check("late_push_cancelled_expired",
+          s_side_calls == 1 && s_side_status == 0 && s_side_err == NGHTTP2_CANCEL &&
+          s_side_res.expired && s_side_at > 0 && s_side_at < S.resp_len && S.bad == 0);
+    check("late_push_stream_polls_after_its_answer", s_reads_stream > 0 && s_reads_other == 0);
+    conn_down();
+    /* An expiry all the same: the next one-shot gets twice the time. */
+    s_now_us = 0;
+    const int p = silent_post();
+    check("late_push_next_deadline_doubled", p == 2 * base);
+    srv_new(0);   /* leave it reset */
+    conn_up(true);
+    S.sc = SC_HEADERS_ONLY;
+    (void)post("/machine/map", kRegBody, 10, 256);
+    conn_down();
+
+    /* Answered after the stream's first bytes but within its deadline:
+     * an answer as before, the deadline not doubled. */
+    srv_new(0);
+    conn_up(true);
+    S.sc = SC_STREAM;
+    S.sc_req[0] = SC_DEFER;
+    fill_mapresponses(3, 9000);
+    S.chunk = 3000;
+    S.pause_at = 12000;
+    r = stream_side_clock();
+    conn_down();
+    const int p2 = silent_post();
+    check("late_push_in_time_answered", r.err == ESP_OK && r.status == 200 &&
+          s_side_calls == 1 && s_side_status == 200 && !s_side_res.expired && p2 == base);
+    srv_new(0);
+    conn_up(true);
+    S.sc = SC_HEADERS_ONLY;
+    (void)post("/machine/map", kRegBody, 10, 256);
+    conn_down();
+    /* No answer to either: the conn is cut at the deadline, as before
+     * (silent_pair in sc_side). */
 }
 #endif
 
@@ -1261,6 +1418,8 @@ int main(void)
 #ifndef H2_REF
     sc_deadline_backoff();
     sc_side();
+    sc_side_one_stream();
+    sc_side_late_push();
 #endif
     if (s_fails == 0) printf("\nALL OK\n");
     return s_fails ? 1 : 0;

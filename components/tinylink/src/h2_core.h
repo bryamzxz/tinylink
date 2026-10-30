@@ -93,6 +93,7 @@ enum {
     H2C_ERR_PROTO = -2,  /* connection error: GOAWAY sent, conn dead */
     H2C_ERR_STATE = -3,  /* not now: GOAWAY received, dead, busy     */
     H2C_ERR_SIZE  = -4,  /* request headers do not fit one frame     */
+    H2C_ERR_STREAMS = -5,  /* a pair over the server's stream limit  */
 };
 
 typedef struct {
@@ -138,6 +139,7 @@ typedef struct {
     uint32_t peer_initial_win;
     uint32_t peer_max_frame;
     uint32_t peer_enable_connect;
+    uint32_t peer_max_streams;  /* SETTINGS_MAX_CONCURRENT_STREAMS; ~0 = none yet */
 
     /* frame parser */
     uint8_t  fh[H2_FRAME_HDR_LEN];
@@ -189,6 +191,10 @@ int h2_io_tx_send(void *io, size_t len);
 void h2_io_on_status(void *io, int status);
 void h2_io_on_header(void *io, const hpack_field_t *f);   /* regular, validated */
 int  h2_io_on_data(void *io, const uint8_t *buf, size_t len);  /* < 0: stop */
+/* The same two for the side stream's header blocks (its DATA is
+ * dropped): the embedder reads a Retry-After off them. */
+void h2_io_on_side_status(void *io, int status);
+void h2_io_on_side_header(void *io, const hpack_field_t *f);
 void h2_io_on_goaway(void *io, uint32_t last_stream_id, uint32_t error_code);
 
 /* ---- engine ---- */
@@ -215,9 +221,16 @@ typedef struct {
  * The side request must go out whole now (windows, the lent buffer;
  * side->body need not outlive the call): if it cannot, nothing is sent
  * but the staged control frames and H2C_ERR_SIZE comes back with no ID
- * spent. side NULL = h2c_request. H2C_ERR_STATE also while the previous
- * side stream is still open. */
+ * spent. Nothing at all is sent, H2C_ERR_STREAMS, when the server's
+ * SETTINGS_MAX_CONCURRENT_STREAMS is known to be under 2 (RFC 9113
+ * §5.1.2). A failed send of the staged frames is H2C_ERR_IO, the
+ * session then dead. side NULL = h2c_request. H2C_ERR_STATE also while
+ * the previous side stream is still open. */
 int  h2c_request_pair(h2_core_t *h, const h2_req_t *side, const h2_req_t *req);
+/* Give up on the open side stream: RST_STREAM(CANCEL), sent now; it is
+ * then closed with close_err CANCEL and no final status. No-op without
+ * an open side stream. */
+int  h2c_cancel_side(h2_core_t *h);
 /* Parse received bytes (any split). Consumes all of them; returns
  * H2C_ERR_PROTO on a connection error (GOAWAY already sent). */
 int  h2c_feed(h2_core_t *h, const uint8_t *buf, size_t len);

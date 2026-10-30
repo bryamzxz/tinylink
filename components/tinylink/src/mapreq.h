@@ -47,8 +47,9 @@ extern "C" {
 #ifdef ESP_PLATFORM
 /* Lite endpoint update: POST /machine/map with `Stream:false` AND
  * `OmitPeers:true`. Since round 1.3.7 the long-poll sends it with the
- * stream request (mapreq_run_stream's push_status); this one-shot form
- * is the fallback for a server window it does not fit. Per upstream
+ * stream request (mapreq_run_stream's on_push); this one-shot form is
+ * the fallback for a server window it does not fit or a server that
+ * allows one stream at a time. Per upstream
  * tailscale/control/controlclient/auto.go:249-251, this is the only
  * MapRequest shape the modern (CapVer >= 68) control plane treats as
  * a writable Hostinfo / NetInfo / Endpoints push. The server is
@@ -77,17 +78,25 @@ esp_err_t mapreq_push_endpoints(ts2021_conn_t *conn,
 #define MAPREQ_STREAM_RECYCLE ((esp_err_t)0x7e01)
 typedef esp_err_t (*mapreq_handler_t)(const tl_netmap_t *nm, void *ctx);
 
-/* push_status non-NULL: the endpoint push (mapreq_push_endpoints' lite
+/* The endpoint push's outcome: its HTTP status (only 200 means pushed),
+ * or 0 — reset by the server, or cancelled unanswered at its deadline
+ * while the stream runs. wait_ms: the server's rate-limit wait for it
+ * (429, or 503 with a Retry-After: h2_rate_limit_wait_ms), else 0. */
+typedef void (*mapreq_push_fn)(int status, uint32_t wait_ms);
+
+/* on_push non-NULL: the endpoint push (mapreq_push_endpoints' lite
  * MapRequest) rides with the stream request as a second HTTP/2 stream,
  * in the same burst (round 1.3.7, B1) instead of a round trip of its
- * own before it. *push_status: 0 while unanswered, the push's HTTP
- * status once answered (logged then, mid-stream), -1 for a reset; only
- * 200 means pushed. The conn is under the one-shot request deadline
- * until the push is answered. */
+ * own before it — or, where the two cannot share a burst, goes just
+ * before the stream, on the same conn. on_push runs once, on the
+ * calling task, as soon as the push has its outcome (mid-stream: the
+ * push logs it then); not at all if the push is still unanswered when
+ * the stream ends or fails (h2_post_json_stream_side: the conn is under
+ * the push's deadline until the stream answers). */
 esp_err_t mapreq_run_stream(ts2021_conn_t *conn,
                             const tinylink_keys_t *keys,
                             mapreq_handler_t on_netmap, void *ctx,
-                            int *push_status);
+                            mapreq_push_fn on_push);
 #endif
 
 /* ---- Streaming MapResponse parser (round 1.3.4, D2) -------------------

@@ -1776,6 +1776,77 @@ void tinylink_control_mark_alive(void)
 static uint32_t s_stat_lp_reconnects;
 static uint32_t s_stat_ep_pushes;
 
+/* A push the server throttled (429 / 503), reset, or left unanswered
+ * while the map stream it rides with runs (round 1.3.7 review). Until
+ * 1.3.6 a failed push went again before the next stream, after the
+ * server's Retry-After; riding with the stream it would wait for the
+ * stream's end — hours on a healthy conn. So: one recycle of the stream
+ * after the server's wait (at least EP_PUSH_RETRY_MS), with the push held
+ * until then (a reconnect in between runs its stream without it). One
+ * per failure streak — a push the retry does not get through goes with
+ * the next stream, as does any other refusal (a server that rejects the
+ * lite update sees it once per reconnect); a 200 ends the streak. */
+#define EP_PUSH_RETRY_MS 30000u
+
+static esp_timer_handle_t s_ep_push_timer;   /* tinylink_long_poll_start */
+static volatile bool s_ep_push_waiting;      /* armed: the push is held */
+static bool s_ep_push_retried;               /* this streak had its recycle */
+static bool s_ep_push_resolved;              /* the stream's push has an outcome */
+
+static void ep_push_timer_cb(void *arg)
+{
+    (void)arg;
+    s_ep_push_waiting = false;
+    tinylink_endpoint_push_async();
+}
+
+/* mapreq_run_stream's on_push: long-poll task, mid-stream. */
+static void ep_push_done(int status, uint32_t wait_ms)
+{
+    s_ep_push_resolved = true;
+    if (status == 200) {
+        s_stat_ep_pushes++;
+        s_ep_push_retried = false;
+        uint8_t  ep_addr[4];
+        uint16_t ep_port = 0;
+        if (tinylink_get_public_endpoint(ep_addr, &ep_port)) {
+            ESP_LOGI(TAG, "endpoint push: pushed %u.%u.%u.%u:%u",
+                     ep_addr[0], ep_addr[1], ep_addr[2], ep_addr[3],
+                     (unsigned)ep_port);
+        }
+        return;
+    }
+    s_ep_push_pending = true;   /* owed — with the next stream at the latest */
+    const bool transient = status <= 0 || status == 429 || status == 503;
+    const char *what = status > 0 ? "refused" : "reset or unanswered";
+    const uint32_t ms = wait_ms > EP_PUSH_RETRY_MS ? wait_ms : EP_PUSH_RETRY_MS;
+    if (transient && !s_ep_push_retried && s_ep_push_timer != NULL) {
+        s_ep_push_waiting = true;
+        if (esp_timer_start_once(s_ep_push_timer, (uint64_t)ms * 1000u) == ESP_OK) {
+            s_ep_push_retried = true;
+            ESP_LOGW(TAG, "endpoint push %s (HTTP %d) — again in %u ms (one "
+                          "stream recycle)", what, status, (unsigned)ms);
+            return;
+        }
+        s_ep_push_waiting = false;
+    }
+    ESP_LOGW(TAG, "endpoint push %s (HTTP %d) — again with the next stream",
+             what, status);
+}
+
+/* noinline: tools/stack_worst.py takes every function whose address the
+ * caller of esp_timer_create takes for a timer callback — inlined into
+ * tinylink_long_poll_start, that would be long_poll_task too. */
+static __attribute__((noinline)) void ep_push_timer_init(void)
+{
+    if (s_ep_push_timer != NULL) return;
+    const esp_timer_create_args_t ta = { .callback = ep_push_timer_cb,
+                                         .name = "ep_push" };
+    if (esp_timer_create(&ta, &s_ep_push_timer) != ESP_OK) {
+        s_ep_push_timer = NULL;   /* failed pushes go with the next stream */
+    }
+}
+
 static void long_poll_task(void *arg)
 {
     (void)arg;
@@ -1805,13 +1876,14 @@ static void long_poll_task(void *arg)
              * this one too). This task has the stack the ts2021 path
              * needs; the old dedicated ep_up task did not (see the
              * "Endpoint push" section). Taken now: a request raised
-             * during the stream is a new one (and recycles it). */
-            const bool push = s_ep_push_pending;
-            s_ep_push_pending = false;
-            int push_status = 0;
+             * during the stream is a new one (and recycles it). Held
+             * while a refused push waits for its retry (ep_push_done). */
+            const bool push = s_ep_push_pending && !s_ep_push_waiting;
+            if (push) s_ep_push_pending = false;
+            s_ep_push_resolved = false;
             const int64_t t0 = esp_timer_get_time();
             err = mapreq_run_stream(&s_conn, &s_keys, long_poll_handler, NULL,
-                                    push ? &push_status : NULL);
+                                    push ? ep_push_done : NULL);
             /* Stream ended: either the server closed it (idle / ping
              * failure / restart), our side errored, the push went
              * unanswered within the one-shot deadline, or the handler
@@ -1820,28 +1892,19 @@ static void long_poll_task(void *arg)
             rate_limit_ms = control_rate_limit_ms();
             http_status   = s_conn.h2_status;
             const int64_t up_us = esp_timer_get_time() - t0;
-            if (push && push_status == 200) {
-                s_stat_ep_pushes++;
-                uint8_t  ep_addr[4];
-                uint16_t ep_port = 0;
-                if (tinylink_get_public_endpoint(ep_addr, &ep_port)) {
-                    ESP_LOGI(TAG, "endpoint push: pushed %u.%u.%u.%u:%u",
-                             ep_addr[0], ep_addr[1], ep_addr[2], ep_addr[3],
-                             (unsigned)ep_port);
-                }
-            }
-            if (s_ep_push_pending) {
+            if (s_ep_push_pending && s_conn.aborted) {
                 ESP_LOGI(TAG, "long-poll stream recycled for endpoint push "
                               "(0x%x) — reconnecting", err);
             } else {
                 ESP_LOGW(TAG, "long-poll stream ended: 0x%x — reconnecting", err);
             }
-            if (push && push_status != 200) {
-                /* Not pushed — unanswered (deadline, conn lost, reset) or
-                 * refused: again with the next connect's stream. A refusing
-                 * server sees one push per reconnect, as the stream does. */
-                ESP_LOGW(TAG, "endpoint push %s — retrying with the next "
-                              "stream", push_status > 0 ? "refused" : "unanswered");
+            if (push && !s_ep_push_resolved) {
+                /* Still unanswered when the stream ended or failed (its
+                 * deadline before the stream's answer, the conn lost):
+                 * again with the next connect's stream, as in 1.3.6. The
+                 * other outcomes are ep_push_done's. */
+                ESP_LOGW(TAG, "endpoint push unanswered — retrying with the "
+                              "next stream");
                 s_ep_push_pending = true;
             }
             drop_control_conn();
@@ -1981,6 +2044,7 @@ esp_err_t tinylink_long_poll_start(void)
      * once stay under it at their bounds (jsmn_skip_d's 65 levels:
      * 3 472 B; the ESP MPI multiply split, ≤ 2 levels deep: 4 832 B).
      * 7 KiB = 2.3 KB over the static worst case. */
+    ep_push_timer_init();
     BaseType_t ok = xTaskCreate(long_poll_task, "tinylink_lp",
                                 7168, NULL, tskIDLE_PRIORITY + 4, NULL);
     if (ok != pdPASS) {
@@ -2156,7 +2220,11 @@ esp_err_t tinylink_wg_socket_init(void)
 static void tinylink_endpoint_push_async(void)
 {
     s_ep_push_pending = true;
-    if (s_conn_open) {
+    if (s_ep_push_waiting) {
+        /* A throttled push's retry is armed (ep_push_done): it recycles
+         * the stream when the server's wait is over, this one with it. */
+        ESP_LOGI(TAG, "endpoint push: queued — after the server's wait");
+    } else if (s_conn_open) {
         ESP_LOGI(TAG, "endpoint push: queued — recycling the map stream");
         ts2021_abort_reads();
     } else {

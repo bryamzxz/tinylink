@@ -1389,6 +1389,11 @@ def project_config():
         # round 1.3.7 (B1): the endpoint push riding with the map stream
         R('h2_drive_request', r'side->cb', ['mapreq.c:push_side_done'],
           'h2_post_json_stream_side(.., push_side_done, ..): run_stream_in only'),
+        # (side_closed, inlined); round 1.3.7 review: the push's outcome
+        R('push_side_done', r'on_push', ['tinylink.c:ep_push_done'],
+          'mapreq_run_stream(.., ep_push_done): long_poll_task only'),
+        R('mapreq_run_stream', r'on_push', ['tinylink.c:ep_push_done'],
+          'the one-shot fallback (run_stream_in, inlined)'),
         # round 1.3.4 (D2): the streaming parser's framing calls the frame
         # handler back, which calls the netmap handler
         R('mapresp_stream_feed', r'on_frame', ['mapreq.c:stream_frame'],

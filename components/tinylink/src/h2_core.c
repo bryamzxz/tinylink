@@ -252,6 +252,7 @@ static int field_cb(void *ctx, const hpack_field_t *f)
         s->have_status = true;
         s->status = (int)st;
         if (is_main) h2_io_on_status(h->io, s->status);
+        else         h2_io_on_side_status(h->io, s->status);
         return 0;
     }
     s->pseudo_done = true;
@@ -272,7 +273,10 @@ static int field_cb(void *ctx, const hpack_field_t *f)
     } else if (name_is(f, "te", 2) && !value_ieq(f, "trailers", 8)) {
         goto bad;
     }
-    if (!h->blk_trailer && is_main) h2_io_on_header(h->io, f);
+    if (!h->blk_trailer) {
+        if (is_main) h2_io_on_header(h->io, f);
+        else         h2_io_on_side_header(h->io, f);
+    }
     return 0;
 bad:
     (void)stream_error(h, H2_PROTOCOL_ERROR);
@@ -346,12 +350,18 @@ static int setting(h2_core_t *h, uint16_t id, uint32_t v)
     case H2_SET_NO_RFC7540_PRIORITIES:
         if (v > 1) return conn_error(h, H2_PROTOCOL_ERROR);
         break;
+    case H2_SET_MAX_CONCURRENT_STREAMS:
+        /* One stream needs no check (a server allowing none refuses it
+         * whatever we do); a pair needs two (h2c_request_pair). A value
+         * that drops under the streams already open closes none
+         * (§5.1.2): the server refuses what is over it. */
+        h->peer_max_streams = v;
+        break;
     default:
         /* HEADER_TABLE_SIZE: our encoder never indexes, and the size
          * update in our first header block already took the server's
-         * decoder table to 0. MAX_CONCURRENT_STREAMS: we run one.
-         * MAX_HEADER_LIST_SIZE: our blocks are ~130 B. Unknown: ignored
-         * (§6.5.2). */
+         * decoder table to 0. MAX_HEADER_LIST_SIZE: our blocks are
+         * ~130 B. Unknown: ignored (§6.5.2). */
         break;
     }
     return H2C_OK;
@@ -784,6 +794,10 @@ int h2c_request_pair(h2_core_t *h, const h2_req_t *side, const h2_req_t *req)
         (side != NULL && h->side.open)) return H2C_ERR_STATE;
     /* IDs exhausted */
     if (h->next_id > (side != NULL ? 0x7ffffffdu : 0x7fffffffu)) return H2C_ERR_STATE;
+    /* Two streams at once only where the server allows two: one that
+     * advertised 1 refuses the second — the map stream (§5.1.2). The
+     * caller sends them one after the other instead. */
+    if (side != NULL && h->peer_max_streams < 2u) return H2C_ERR_STREAMS;
 
     size_t cap, off;
     uint8_t *b = tx_begin(h, &cap, &off);
@@ -807,12 +821,24 @@ int h2c_request_pair(h2_core_t *h, const h2_req_t *side, const h2_req_t *req)
         h->last_id = last_id;
         h->sent_size_update = sent_size_update;
         h->conn_send_win = conn_send_win;
-        (void)tx_end(h, ctl_at);                   /* keep the control frames */
-        return rc;
+        /* The control frames still go; if they cannot, the session is
+         * dead and that is the answer — not "nothing sent, intact". */
+        const int frc = tx_end(h, ctl_at);
+        return frc != H2C_OK ? frc : rc;
     }
     rc = tx_end(h, off);
     if (rc != H2C_OK) return rc;
     return h2c_pump(h);
+}
+
+int h2c_cancel_side(h2_core_t *h)
+{
+    if (!h->side.open) return H2C_OK;
+    if (h->dead) return H2C_ERR_STATE;
+    int rc = ctl_u32(h, H2_RST_STREAM, h->side.id, H2_CANCEL);
+    close_stream(&h->side, H2_CANCEL);
+    if (rc == H2C_OK) rc = ctl_flush(h);
+    return rc;
 }
 
 int h2c_request(h2_core_t *h, const h2_field_t *fields, size_t n_fields,
@@ -849,6 +875,7 @@ void h2c_init(h2_core_t *h, void *io)
     h->conn_recv_win = H2_DEFAULT_WINDOW;
     h->peer_initial_win = H2_DEFAULT_WINDOW;
     h->peer_max_frame = H2_MAX_FRAME;
+    h->peer_max_streams = 0xffffffffu;   /* unlimited until SETTINGS say (§6.5.2) */
     /* SETTINGS_HEADER_TABLE_SIZE 0 is what we advertise: the decoder's
      * table is bounded by it (no storage at all). */
     hpack_dec_init(&h->hpack, NULL, 0, 0);

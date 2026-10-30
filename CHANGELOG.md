@@ -285,11 +285,11 @@ got-ip → WG session up on the 1.3.6 boots: control conn up 0.42–0.66 s
 streaming MapRequest as two more serial round trips, netmap → first
 INIT 50 ms, with 14 X25519 (~12.5 ms each at 240 MHz, 1.3.3 bench) on
 that path and the DERP login (TLS full handshake 1.45–1.76 s, 3.3 and
-4.2 s outliers) running beside it. Image 725 536 → **728 240 B
-(+2 704)**; static DRAM 57 644 → 58 044 B (+400), IRAM ±0. Host suite
-1 791 → **1 873 OK** (CI floor 1 873), ASan + UBSan clean, 0 warnings.
+4.2 s outliers) running beside it. Image 725 536 → **729 728 B
+(+4 192)**; static DRAM 57 644 → 58 060 B (+416), IRAM ±0. Host suite
+1 791 → **1 899 OK** (CI floor 1 899), ASan + UBSan clean, 0 warnings.
 Static worst cases (`tools/stack_worst.py`, fixed below): `tinylink_lp`
-5 136 → 5 184 / 7 168, `main` 5 312 → 5 408 / 8 192, `tinylink_derp`
+5 136 → 5 152 / 7 168, `main` 5 312 → 5 408 / 8 192, `tinylink_derp`
 5 152 → 5 248 / 8 192, `wg_rx` 5 648 → 5 728 / 8 192, the rest
 unchanged. X25519 in a boot up to the first CallMeMaybe (4 peers, 3
 endpoints each, one CMM): 33 → **18**; on the got-ip → session-up
@@ -310,9 +310,10 @@ the sensor.
   checked like the main one (status, content-length, windows,
   RST_STREAM, GOAWAY) but kept off the `h2_io_on_*` hooks; it goes
   whole or not at all (a small window falls back to push-then-stream).
-  The side runs under the one-shot deadline; a push not answered 200
-  (refused, reset, conn lost) goes again with the next connect's
-  stream. `tinylink_dataplane_start` no longer touches the wire. Log:
+  The conn is under the push's one-shot deadline until the map stream
+  answers; a push unanswered when the stream ends goes again with the
+  next connect's stream (refusals and late answers: Review below).
+  `tinylink_dataplane_start` no longer touches the wire. Log:
   `endpoint push: HTTP 200 (with the map stream)`. Tests: `test_h2_core`
   +31, `test_h2_interop` +12 (nghttp2's server: answered first /
   mid-stream / never, RST, 429, the deadline and its doubling).
@@ -373,6 +374,24 @@ the sensor.
   the first's target: the long-poll's one-shot variant analysed only
   the push. 1.3.6's `tinylink_lp` worst case is 5 136 B (the register's
   reconnect), not 4 960. Rule for the push callback added.
+- **Review.** An independent review found one demonstrated defect and
+  three suspected ones in B1, all fixed. A server advertising
+  SETTINGS_MAX_CONCURRENT_STREAMS 1 got two streams and refused the map
+  stream on every reconnect, so it never ran; the engine now records
+  the limit and a pair under 2 sends nothing (`H2C_ERR_STREAMS`) and
+  takes the push-then-stream fallback on the same conn — a limit learned
+  after a burst is remembered until a reboot. The push's 10-s deadline
+  also covered the map stream, so a push answered late (52 s once on
+  the sensor) dropped a working conn after the netmap; from the
+  stream's final response on, the conn has the stream's budget and a
+  push past its deadline is cancelled (RST_STREAM CANCEL, the next
+  deadline doubled) while the stream goes on. A push throttled or reset
+  mid-stream waited for the stream's end, Retry-After ignored; it now
+  gets one stream recycle after max(the server's wait from the push's
+  own Retry-After, 30 s) per failure streak. The pair's rollback
+  reported "session intact" after a failed send of its control frames.
+  The review's demo is a host test; test_h2_core +16, test_h2_interop
+  +10. Image +1 488 B, static DRAM +16 B.
 
 ### Optimization round 1.3.6 — data-plane path selection (in progress, branch `feat/opt-1.3.6`)
 

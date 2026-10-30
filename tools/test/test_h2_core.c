@@ -49,6 +49,8 @@ typedef struct {
     int      stop_after;          /* on_data returns -1 at this call (1-based) */
     int      goaways;
     uint32_t goaway_last, goaway_err;
+    int      side_status, n_side_status;
+    char     side_hdrs[512];      /* from on_side_header */
 } io_t;
 
 static io_t s_io;
@@ -95,6 +97,22 @@ void h2_io_on_header(void *io, const hpack_field_t *f)
     (void)io;
     size_t l = strlen(s_io.hdrs);
     snprintf(s_io.hdrs + l, sizeof(s_io.hdrs) - l, "%.*s: %.*s\n",
+             (int)f->name_len, (const char *)f->name,
+             (int)f->value_len, (const char *)f->value);
+}
+
+void h2_io_on_side_status(void *io, int status)
+{
+    (void)io;
+    s_io.side_status = status;
+    s_io.n_side_status++;
+}
+
+void h2_io_on_side_header(void *io, const hpack_field_t *f)
+{
+    (void)io;
+    size_t l = strlen(s_io.side_hdrs);
+    snprintf(s_io.side_hdrs + l, sizeof(s_io.side_hdrs) - l, "%.*s: %.*s\n",
              (int)f->name_len, (const char *)f->name,
              (int)f->value_len, (const char *)f->value);
 }
@@ -1004,6 +1022,130 @@ static int client_with_pair(void)
     return h2c_request_pair(&s_h, &side, &req);
 }
 
+/* Round 1.3.7 review: SETTINGS_MAX_CONCURRENT_STREAMS, the rollback's
+ * own send failure, and cancelling the side stream. */
+static void test_side_limits_cancel(void)
+{
+    static const uint16_t mcs[] = { H2_SET_MAX_CONCURRENT_STREAMS };
+    const h2_req_t side = { kPushHdrs, 6, (const uint8_t *)"push", 4 };
+    const h2_req_t req = { kMapHdrs, 6, kHello, 5 };
+    frm_t f[8];
+
+    /* A server that allows one stream: the pair sends nothing at all,
+     * spends no ID; the plain request still goes on stream 1. */
+    io_reset();
+    h2c_init(&s_h, &s_io);
+    (void)h2c_start(&s_h);
+    check("max_streams_unknown_is_unlimited", s_h.peer_max_streams == 0xffffffffu);
+    srv_reset();
+    static const uint32_t one[] = { 1 };
+    settings(1, mcs, one);
+    int rc = feed(0);
+    s_io.out_len = 0;
+    s_io.sends = 0;
+    rc |= h2c_request_pair(&s_h, &side, &req);
+    check("max_streams_1_pair_refused_nothing_sent",
+          rc == H2C_ERR_STREAMS && s_h.peer_max_streams == 1 && s_io.sends == 0 &&
+          s_h.next_id == 1 && !s_h.side.open && !s_h.s.open && !s_h.dead);
+    rc = h2c_request(&s_h, kMapHdrs, 6, kHello, 5);
+    int n = out_frames(f, 8);
+    check("max_streams_1_single_request_stream1",
+          rc == H2C_OK && n == 2 && f[0].type == H2_HEADERS && f[0].sid == 1 && s_h.s.open);
+    /* … the limit staged with the request's ACK: the same. */
+    io_reset();
+    h2c_init(&s_h, &s_io);
+    (void)h2c_start(&s_h);
+    srv_reset();
+    settings(1, mcs, one);
+    s_io.in_feed = true;
+    rc = h2c_feed_staged(&s_h, s_srv, s_srv_len);
+    s_io.in_feed = false;
+    s_io.out_len = 0;
+    s_io.sends = 0;
+    rc |= h2c_request_pair(&s_h, &side, &req);
+    check("max_streams_1_staged_refused", rc == H2C_ERR_STREAMS && s_io.sends == 0 &&
+          s_h.ctl_len > 0 && s_h.next_id == 1);
+    /* Two (or none advertised) are enough; 0 refuses the pair as well. */
+    static const uint32_t two[] = { 2 }, zero[] = { 0 };
+    io_reset();
+    h2c_init(&s_h, &s_io);
+    (void)h2c_start(&s_h);
+    srv_reset();
+    settings(1, mcs, two);
+    rc = feed(0);
+    rc |= h2c_request_pair(&s_h, &side, &req);
+    check("max_streams_2_pair_goes", rc == H2C_OK && s_h.side.open && s_h.s.open &&
+          s_h.next_id == 5);
+    io_reset();
+    h2c_init(&s_h, &s_io);
+    (void)h2c_start(&s_h);
+    srv_reset();
+    settings(1, mcs, zero);
+    rc = feed(0);
+    check("max_streams_0_pair_refused",
+          h2c_request_pair(&s_h, &side, &req) == H2C_ERR_STREAMS && rc == H2C_OK);
+    /* Lowered under the open streams after the burst: recorded, nothing
+     * closed (§5.1.2 — the server refuses what is over it). */
+    (void)client_with_pair();
+    srv_reset();
+    settings(1, mcs, one);
+    rc = feed(0);
+    check("max_streams_lowered_after_burst", rc == H2C_OK && s_h.peer_max_streams == 1 &&
+          s_h.side.open && s_h.s.open);
+
+    /* The rollback's control frames cannot be sent: the session is dead
+     * and the caller hears H2C_ERR_IO, not "nothing sent, intact". */
+    io_reset();
+    h2c_init(&s_h, &s_io);
+    (void)h2c_start(&s_h);
+    srv_reset();
+    static const uint16_t iw[] = { H2_SET_INITIAL_WINDOW_SIZE };
+    static const uint32_t tiny[] = { 3 };
+    settings(1, iw, tiny);
+    s_io.in_feed = true;
+    rc = h2c_feed_staged(&s_h, s_srv, s_srv_len);   /* its ACK stays staged */
+    s_io.in_feed = false;
+    s_io.fail_send = s_io.sends + 1;
+    rc |= h2c_request_pair(&s_h, &side, &req);
+    check("rollback_flush_failure_reported", rc == H2C_ERR_IO && s_h.dead &&
+          s_h.next_id == 1 && !s_h.side.open && !s_h.s.open);
+
+    /* Cancel: RST_STREAM(CANCEL) on the side's ID, sent at once; closed
+     * without a status; the main stream untouched. */
+    (void)client_with_pair();
+    s_io.out_len = 0;
+    s_io.sends = 0;
+    rc = h2c_cancel_side(&s_h);
+    n = out_frames(f, 8);
+    check("cancel_side_rst_cancel_sent",
+          rc == H2C_OK && s_io.sends == 1 && n == 1 && f[0].type == H2_RST_STREAM &&
+          f[0].sid == 1 && f[0].len == 4 && f[0].p[3] == H2_CANCEL && f[0].p[0] == 0);
+    check("cancel_side_state", !s_h.side.open && s_h.side.closed && !s_h.side.final &&
+          s_h.side.close_err == H2_CANCEL && s_h.s.open && !s_h.s.closed);
+    /* Its late answer is dropped quietly; the stream goes on. */
+    srv_reset();
+    static const char *const ok[] = { ":status", "200" };
+    static const char *const s200[] = { ":status", "200", "retry-after", "9" };
+    headers(1, 0, s200, 2);
+    data(1, H2_F_END_STREAM, "late", 4);
+    headers(3, 0, ok, 1);
+    data(3, 0, "map", 3);
+    s_io.out_len = 0;
+    rc = feed(2);
+    n = out_frames(f, 8);
+    check("cancel_side_late_answer_ignored",
+          rc == H2C_OK && !s_h.dead && s_io.n_side_status == 0 && s_io.side_hdrs[0] == 0 &&
+          s_io.status == 200 && s_io.data_len == 3 && s_h.s.open && n == 0);
+    s_io.sends = 0;
+    check("cancel_side_none_open_noop", h2c_cancel_side(&s_h) == H2C_OK && s_io.sends == 0);
+    /* A dead session cancels nothing. */
+    (void)client_with_pair();
+    s_h.dead = true;
+    s_io.sends = 0;
+    check("cancel_side_dead_session", h2c_cancel_side(&s_h) == H2C_ERR_STATE &&
+          s_io.sends == 0 && s_h.side.open);
+}
+
 static void test_side_stream(void)
 {
     /* The burst: one send, side first on the lower ID, both bodies whole. */
@@ -1047,6 +1189,9 @@ static void test_side_stream(void)
         check(nm, s_h.side.closed && !s_h.side.open && s_h.side.final &&
                   s_h.side.status == 429 && s_h.side.close_err == 0 &&
                   s_h.side.recv_len == 11);
+        snprintf(nm, sizeof(nm), "side_hooks_side_only_mode%d", mode);
+        check(nm, s_io.n_side_status == 1 && s_io.side_status == 429 &&
+                  strcmp(s_io.side_hdrs, "retry-after: 60\ncontent-length: 11\n") == 0);
     }
 
     /* Interleaved: the stream's DATA before, around and after the side's
@@ -1371,6 +1516,7 @@ int main(void)
     test_response_checks();
     test_connection_errors();
     test_side_stream();
+    test_side_limits_cancel();
     test_structured_fuzz();
     test_garbage_fuzz();
     if (s_fails == 0) printf("\nALL OK\n");

@@ -465,7 +465,11 @@ anyone bisecting an unrelated regression to before the netstack switch.
    reconnect `long_poll_task` sends the push with the read-only
    Stream=true request, as a second HTTP/2 stream in the same burst
    (1.3.7; a round trip before the stream until then): the same path
-   the boot's push takes. The in-place re-register path (M13)
+   the boot's push takes — or alone, just before the stream, where the
+   server allows one stream at a time. Once the stream has answered, a
+   push past its deadline is cancelled, not the conn; a push throttled,
+   reset or cancelled gets one stream recycle after the server's wait
+   (≥ 30 s). The in-place re-register path (M13)
    sets the same flag. History: until 2026-09 this was a dedicated
    persistent task (`tinylink_ep_up`, 12 KiB static stack) that opened
    its own ts2021 conn from a stack-local `ts2021_conn_t` (8 648 B)
