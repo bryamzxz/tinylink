@@ -42,11 +42,12 @@ esp_err_t telemetry_start(void);
  * except ISRs; a no-op before the task exists. */
 void telemetry_kick(void);
 
-/* Provided by tinylink.c: run the STUN re-probe if it is due or was
+/* Provided by tinylink.c: run the STUN re-probe if it is due within
+ * early_us (it then shares a sample's wake, tlm_sched.h) or was
  * requested, and return when the next one is due (esp_timer µs;
  * INT64_MAX while tinylink_stun_reprobe_start hasn't armed it). Called
  * only from the telemetry task; may block for one probe. */
-int64_t tinylink_stun_reprobe_poll(int64_t now_us);
+int64_t tinylink_stun_reprobe_poll(int64_t now_us, int64_t early_us);
 
 /* Provided by tinylink.c: write the address-cache records (tl_addr.h)
  * whose bytes changed to NVS. Called only from the 60-s housekeeping,

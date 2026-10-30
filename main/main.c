@@ -59,8 +59,10 @@ static const char *reset_reason_name(esp_reset_reason_t r)
  * keeps RTC_PERIPH on in every light sleep (sleep_modes.c:2895). */
 static esp_err_t configure_pm(void)
 {
+    /* The max is the boot frequency, 240 MHz (sdkconfig.defaults.esp32):
+     * one knob for the 160-MHz A/B of round 1.3.7 (tools/power/). */
     esp_pm_config_t cfg = {
-        .max_freq_mhz       = 240,
+        .max_freq_mhz       = CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ,
         .min_freq_mhz       = 80,
         .light_sleep_enable = true,
     };
@@ -103,7 +105,8 @@ static esp_err_t bringup(void)
     if (pm_err != ESP_OK) {
         ESP_LOGW(TAG, "pm configure failed: 0x%x — continuing without light sleep", pm_err);
     } else {
-        ESP_LOGI(TAG, "pm: light-sleep enabled, DFS 240/80 MHz");
+        ESP_LOGI(TAG, "pm: light-sleep enabled, DFS %d/80 MHz",
+                 CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ);
     }
 
     /* Clock floor + SNTP before the first TLS handshake (tinylink_init

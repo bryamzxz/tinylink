@@ -41,6 +41,9 @@
 #endif
 #include "mapreq.h"
 #include "netmap.h"
+#if CONFIG_TINYLINK_POWER_DIAG
+#include "pwr_diag.h"
+#endif
 #include "register.h"
 #include "register_json.h"   /* register_retry_with_auth */
 #include "stun.h"
@@ -170,6 +173,9 @@ void tinylink_diag_dump_stacks(void)
                  snap[i].pcTaskName,
                  (unsigned)snap[i].usStackHighWaterMark);
     }
+#if CONFIG_TINYLINK_POWER_DIAG
+    tl_pwr_diag_dump(snap, (unsigned)n);   /* round 1.3.7, pwr_diag.h */
+#endif
 }
 
 static void reg_hint_load(void);
@@ -2314,7 +2320,7 @@ static void stun_reprobe_on_got_ip(void *arg, esp_event_base_t base,
      * immediate re-probe. The kick wakes the telemetry task right away
      * while it is not serving /stats (before the WG netif is up, or a
      * build without it); a /stats select() takes it within one ≤ 5-s
-     * wait slice. */
+     * wait slice (≤ 6 s when a sample stretches it, telemetry.c). */
     s_stun_reprobe_now = true;
     telemetry_kick();
     /* A new L3 identity (DHCP handed us a different address after a
@@ -2337,10 +2343,12 @@ static void stun_reprobe_on_got_ip(void *arg, esp_event_base_t base,
     }
 }
 
-int64_t tinylink_stun_reprobe_poll(int64_t now_us)
+int64_t tinylink_stun_reprobe_poll(int64_t now_us, int64_t early_us)
 {
     if (!s_stun_reprobe_armed) return INT64_MAX;
-    if (!s_stun_reprobe_now && now_us < s_stun_reprobe_due_us) {
+    /* Up to early_us ahead of time: the telemetry task is awake for a
+     * sample then (round 1.3.7, tlm_sched.h). */
+    if (!s_stun_reprobe_now && now_us + early_us < s_stun_reprobe_due_us) {
         return s_stun_reprobe_due_us;
     }
     /* A re-probe goes through wg_rx (tinylink_stun_probe), which the

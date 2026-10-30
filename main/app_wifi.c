@@ -73,6 +73,15 @@ static portMUX_TYPE    s_conn_mux = portMUX_INITIALIZER_UNLOCKED;
  * the session. */
 #define PS_POLL_MS       500u
 #define PS_AWAKE_CAP_MS  60000u
+/* The steady-state mode: MIN_MODEM; MAX_MODEM only as the round-1.3.7
+ * A/B knob (Kconfig help, tools/power/). */
+#if CONFIG_TINYLINK_WIFI_PS_MAX_MODEM
+#define PS_STEADY        WIFI_PS_MAX_MODEM
+#define PS_STEADY_NAME   "MAX_MODEM"
+#else
+#define PS_STEADY        WIFI_PS_MIN_MODEM
+#define PS_STEADY_NAME   "MIN_MODEM"
+#endif
 static esp_timer_handle_t s_ps_timer;
 static int64_t s_ps_armed_us;
 static bool s_ps_warned;
@@ -83,17 +92,17 @@ static void ps_timer_cb(void *arg)
     const bool up = tinylink_session_up();
     const int64_t awake_ms = (esp_timer_get_time() - s_ps_armed_us) / 1000;
     if (!up && awake_ms < (int64_t)PS_AWAKE_CAP_MS) return;
-    esp_err_t ps_err = esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+    esp_err_t ps_err = esp_wifi_set_ps(PS_STEADY);
     if (ps_err != ESP_OK) {
         /* Retried on the next poll; warn once. */
         if (!s_ps_warned) {
-            ESP_LOGW(TAG, "esp_wifi_set_ps(MIN_MODEM) failed: 0x%x — retrying", ps_err);
+            ESP_LOGW(TAG, "esp_wifi_set_ps(" PS_STEADY_NAME ") failed: 0x%x — retrying", ps_err);
             s_ps_warned = true;
         }
         return;
     }
     (void)esp_timer_stop(s_ps_timer);
-    ESP_LOGI(TAG, "modem sleep (MIN_MODEM) on after %u ms awake%s",
+    ESP_LOGI(TAG, "modem sleep (" PS_STEADY_NAME ") on after %u ms awake%s",
              (unsigned)awake_ms, up ? "" : " — WG session not up yet");
 }
 
@@ -329,6 +338,9 @@ esp_err_t app_wifi_start(void)
            strnlen(pass, sizeof(wifi_cfg.sta.password)));
     wifi_cfg.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
     wifi_cfg.sta.pmf_cfg.capable = true;
+#if CONFIG_TINYLINK_WIFI_PS_MAX_MODEM
+    wifi_cfg.sta.listen_interval = CONFIG_TINYLINK_WIFI_LISTEN_INTERVAL;
+#endif
 
     /* Round 1.3.7: scan the last AP's channel first (wifi_hint.h). */
     s_ssid_hash = tl_wifi_ssid_hash(wifi_cfg.sta.ssid, strnlen(ssid, sizeof(wifi_cfg.sta.ssid)));
@@ -378,10 +390,10 @@ esp_err_t app_wifi_start(void)
     bool ps_armed = esp_timer_create(&ps_args, &s_ps_timer) == ESP_OK &&
                     esp_timer_start_periodic(s_ps_timer,
                                              (uint64_t)PS_POLL_MS * 1000ULL) == ESP_OK;
-    esp_err_t ps_err = esp_wifi_set_ps(ps_armed ? WIFI_PS_NONE : WIFI_PS_MIN_MODEM);
+    esp_err_t ps_err = esp_wifi_set_ps(ps_armed ? WIFI_PS_NONE : PS_STEADY);
     if (ps_err != ESP_OK) {
         ESP_LOGW(TAG, "esp_wifi_set_ps(%s) failed: 0x%x",
-                 ps_armed ? "NONE" : "MIN_MODEM", ps_err);
+                 ps_armed ? "NONE" : PS_STEADY_NAME, ps_err);
     }
 
     return ESP_OK;

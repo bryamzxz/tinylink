@@ -32,6 +32,7 @@ idf_component_register(
         "src/wg_lwip.c"
         "src/tmp117.c"
         "src/telemetry.c"
+        "src/pwr_diag.c"
         "src/crypto/blake2s.c"
         "src/crypto/curve25519.c"
         "src/crypto/curve25519_fiat32.c"
@@ -60,6 +61,7 @@ idf_component_register(
         mbedtls
     PRIV_REQUIRES
         esp_timer
+        esp_pm
 )
 
 # -O2 islands inside tinylink (round 1.3.2, B6). The global level is -Os
