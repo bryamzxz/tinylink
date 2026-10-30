@@ -16,7 +16,13 @@
 //    handshake keeps going; a failed connect clears it; an expired one is
 //    cleared; a session that does not fit is not kept; two servers use
 //    two records; a third evicts the oldest; the restore happens once per
-//    record per boot; a session mbedTLS refuses to load is dropped.
+//    record per boot; a session mbedTLS refuses to load is dropped;
+//  - review 1.3.8: an RTC timer that restarted under the record (reads
+//    earlier than its last write) never restores it — the 23-h secret
+//    that looked 2 s old; only a warm reset restores, and the boot sweep
+//    zeroes everything else (cold boot, expired, garbage) at once; a
+//    master secret older than the RTC time is not saved; a seal zeroes the
+//    previous session's tail.
 
 #include "../../components/tinylink/src/tls_resume.c"
 
@@ -28,6 +34,9 @@ static int64_t s_now = 5000000;   /* esp_timer µs (since this boot) */
  * through a warm reset: RTC = base + esp_timer, base moved at each reset. */
 static uint64_t s_rtc_base = 5000000000ull;
 uint64_t rtc_now_us(void) { return s_rtc_base + (uint64_t)s_now; }
+/* The boot's reset reason, as tls_resume.c's ESP side classifies it. */
+static bool s_warm = true;
+bool rtc_warm_boot(void) { return s_warm; }
 
 struct esp_tls {
     mbedtls_ssl_session cur;
@@ -111,11 +120,18 @@ static void conn(esp_tls_t *t, uint8_t m, uint8_t *ticket, size_t tlen)
 
 /* A warm reset: RAM (slot, heap entry, the once-per-boot flags, esp_timer)
  * gone, RTC memory and the RTC timer kept (advanced by `gap_us`). */
-static void warm_reset(tls_resume_slot_t *slot, uint64_t gap_us)
+static void new_boot(tls_resume_slot_t *slot, bool warm)
 {
     entry_free(*slot);
     *slot = NULL;
     memset(s_rtc_tried, 0, sizeof(s_rtc_tried));
+    s_rtc_swept = false;
+    s_warm = warm;
+}
+
+static void warm_reset(tls_resume_slot_t *slot, uint64_t gap_us)
+{
+    new_boot(slot, true);
     s_rtc_base += (uint64_t)s_now + gap_us - 1000000;
     s_now = 1000000;
 }
@@ -133,7 +149,12 @@ int main(void)
     memset(&r, 0xa5, sizeof(r));   /* power-on garbage */
     check("rtc_garbage_invalid", !tls_rtc_valid(&r));
     memset(r.sess, 0x42, 100);
-    check("rtc_seal", tls_rtc_seal(&r, kDerp, 443, 1000, 100) && tls_rtc_valid(&r));
+    memset(r.sess + 100, 0x77, sizeof(r.sess) - 100);   /* a longer session's tail */
+    check("rtc_seal", tls_rtc_seal(&r, kDerp, 443, 1000, 1000, 100) && tls_rtc_valid(&r));
+    {
+        uint8_t z[TLS_RTC_SESS_MAX - 100] = { 0 };
+        check("rtc_seal_zeroes_tail", memcmp(r.sess + 100, z, sizeof(z)) == 0 && r.sess[99] == 0x42);
+    }
     uint64_t age = 0;
     check("rtc_usable", tls_rtc_usable(&r, kDerp, 443, 1000 + 5, 10, &age) && age == 5);
     check("rtc_other_port", !tls_rtc_usable(&r, kDerp, 8443, 1005, 10, NULL));
@@ -158,22 +179,46 @@ int main(void)
     check("rtc_unterminated_host", !tls_rtc_valid(&r));
     check("rtc_seal_rejects_long_host",
           !tls_rtc_seal(&r, "a-host-name-of-sixty-four-characters-is-one-too-many-for-the-rec",
-                        443, 1, 10) && r.magic == 0 && r.len == 0);
-    check("rtc_seal_rejects_len", !tls_rtc_seal(&r, kDerp, 443, 1, 0) &&
-                                  !tls_rtc_seal(&r, kDerp, 443, 1, TLS_RTC_SESS_MAX + 1));
+                        443, 1, 1, 10) && r.magic == 0 && r.len == 0);
+    check("rtc_seal_rejects_len", !tls_rtc_seal(&r, kDerp, 443, 1, 1, 0) &&
+                                  !tls_rtc_seal(&r, kDerp, 443, 1, 1, TLS_RTC_SESS_MAX + 1));
+    check("rtc_seal_rejects_future_birth", !tls_rtc_seal(&r, kDerp, 443, 2, 1, 10));
+    /* written at 5000 for a secret born at 1000: the RTC timer reading
+     * earlier than the write means it restarted, whatever the birth says */
+    tls_rtc_seal(&r, kDerp, 443, 1000, 5000, 10);
+    check("rtc_clock_behind_last_write", !tls_rtc_usable(&r, kDerp, 443, 4999, 100000, NULL) &&
+                                         tls_rtc_usable(&r, kDerp, 443, 5000, 100000, NULL));
+    r.saved_rtc_us++;
+    check("rtc_flipped_write_time", !tls_rtc_valid(&r));
     tls_rtc_rec_t recs[2];
     memset(recs, 0xa5, sizeof(recs));
     check("rtc_pick_unused_first", tls_rtc_pick(recs, 2, kDerp, 443) == 0);
-    tls_rtc_seal(&recs[1], kDerp, 443, 50, 10);
+    tls_rtc_seal(&recs[1], kDerp, 443, 50, 50, 10);
     check("rtc_pick_same_host", tls_rtc_pick(recs, 2, kDerp, 443) == 1 &&
                                 tls_rtc_find(recs, 2, kDerp, 443) == 1);
     check("rtc_pick_spare_for_other", tls_rtc_pick(recs, 2, kCtl, 443) == 0 &&
                                       tls_rtc_find(recs, 2, kCtl, 443) == 2);
-    tls_rtc_seal(&recs[0], kCtl, 443, 70, 10);
+    tls_rtc_seal(&recs[0], kCtl, 443, 70, 70, 10);
     check("rtc_pick_evicts_oldest", tls_rtc_pick(recs, 2, "derp1.tailscale.com", 443) == 1);
     tls_rtc_clear(&recs[0]);
     uint8_t zero[sizeof(recs[0])] = { 0 };
     check("rtc_clear_zeroes", memcmp(&recs[0], zero, sizeof(zero)) == 0);
+    /* sweep: keeps a fresh record on a warm boot, zeroes garbage, expired,
+     * clock-behind and — on a cold boot — everything */
+    memset(recs, 0xa5, sizeof(recs));
+    memset(recs[1].sess, 0x42, 10);
+    tls_rtc_seal(&recs[1], kDerp, 443, 100, 200, 10);
+    check("rtc_sweep_warm_keeps_fresh",
+          tls_rtc_sweep(recs, 2, true, 300, 1000) == 0 && tls_rtc_valid(&recs[1]) &&
+          memcmp(&recs[0], zero, sizeof(zero)) == 0);
+    check("rtc_sweep_expired", tls_rtc_sweep(recs, 2, true, 1101, 1000) == 1 &&
+                               memcmp(&recs[1], zero, sizeof(zero)) == 0);
+    tls_rtc_seal(&recs[1], kDerp, 443, 100, 200, 10);
+    check("rtc_sweep_clock_behind", tls_rtc_sweep(recs, 2, true, 150, 1000) == 1 &&
+                                    !tls_rtc_valid(&recs[1]));
+    tls_rtc_seal(&recs[1], kDerp, 443, 100, 200, 10);
+    check("rtc_sweep_cold_boot", tls_rtc_sweep(recs, 2, false, 300, 1000) == 1 &&
+                                 memcmp(&recs[1], zero, sizeof(zero)) == 0);
 
     /* --- the glue -------------------------------------------------------- */
     memset(s_rtc, 0xa5, sizeof(s_rtc));   /* power-on */
@@ -277,9 +322,75 @@ int main(void)
           s_free == frees + 1);
     s_load_fail = 0;
 
+    /* review 1.3.8: the RTC timer restarts from 0 while RTC slow memory
+     * keeps the record. A session made at RTC ~4 s and resumed for 23 h
+     * keeps born = 4 s; after the restart the RTC reads ~6 s. */
+    entry_free(other);
+    other = NULL;
+    memset(s_rtc, 0xa5, sizeof(s_rtc));
+    new_boot(&slot, false);
+    s_rtc_base = 0;
+    s_now = 4000000;
+    conn(&t, 0x11, s_ticket, sizeof(s_ticket));
+    tls_resume_keep(&slot, NULL, &t, kDerp, 443);
+    for (int h = 1; h <= 23; h++) {
+        s_now = 4000000 + (int64_t)h * 3600 * 1000000;
+        e = tls_resume_take(&slot, kDerp, 443);
+        conn(&t, 0x11, s_ticket, sizeof(s_ticket));
+        tls_resume_keep(&slot, e, &t, kDerp, 443);
+    }
+    new_boot(&slot, true);   /* even if it were classed a warm reset */
+    s_rtc_base = 0;
+    s_now = 6000000;
+    check("glue_rtc_restart_23h_secret_not_restored",
+          tls_resume_take(&slot, kDerp, 443) == NULL &&
+          tls_rtc_find(s_rtc, TLS_RTC_RECS, kDerp, 443) == TLS_RTC_RECS);
+
+    /* only after a warm reset: a power-on / EN / brown-out / RTC-WDT boot
+     * scrubs the record at the boot sweep, master secret included */
+    conn(&t, 0x12, s_ticket, sizeof(s_ticket));
+    tls_resume_keep(&slot, NULL, &t, kDerp, 443);
+    const unsigned ri = tls_rtc_find(s_rtc, TLS_RTC_RECS, kDerp, 443);
+    new_boot(&slot, false);
+    s_now += 2000000;
+    tls_resume_boot();
+    uint8_t zrec[sizeof(tls_rtc_rec_t)] = { 0 };
+    check("glue_cold_boot_swept", ri < TLS_RTC_RECS && memcmp(&s_rtc[ri], zrec, sizeof(zrec)) == 0 &&
+                                  tls_resume_take(&slot, kDerp, 443) == NULL);
+    /* the same record after a warm reset survives the sweep and restores */
+    conn(&t, 0x13, s_ticket, sizeof(s_ticket));
+    tls_resume_keep(&slot, NULL, &t, kDerp, 443);
+    warm_reset(&slot, 1000000);
+    tls_resume_boot();
+    e = tls_resume_take(&slot, kDerp, 443);
+    check("glue_warm_boot_restores", e != NULL && e->sess->saved_session.master[0] == 0x13);
+    entry_free(e);
+    /* an expired record is scrubbed at boot, not when looked up */
+    conn(&t, 0x14, s_ticket, sizeof(s_ticket));
+    tls_resume_keep(&slot, NULL, &t, kCtl, 443);
+    const unsigned ci = tls_rtc_find(s_rtc, TLS_RTC_RECS, kCtl, 443);
+    warm_reset(&slot, (uint64_t)TLS_RESUME_MAX_AGE_S * 1000000 + 1);
+    tls_resume_boot();
+    check("glue_expired_swept_at_boot", ci < TLS_RTC_RECS &&
+                                        memcmp(&s_rtc[ci], zrec, sizeof(zrec)) == 0);
+
+    /* a master secret older than the RTC time itself (the timer restarted
+     * during this boot): not saved, and the host's old record dropped */
+    conn(&t, 0x15, s_ticket, sizeof(s_ticket));
+    tls_resume_keep(&slot, NULL, &t, kDerp, 443);
+    check("glue_saved", tls_rtc_find(s_rtc, TLS_RTC_RECS, kDerp, 443) < TLS_RTC_RECS);
+    e = tls_resume_take(&slot, kDerp, 443);
+    s_now += 10LL * 1000000;
+    s_rtc_base = (uint64_t)0 - (uint64_t)s_now + 5000000;   /* RTC now reads 5 s */
+    conn(&t, 0x15, s_ticket, sizeof(s_ticket));
+    e->born_us = s_now - 6LL * 1000000;                      /* 6 s old > 5 s of RTC */
+    check("glue_age_beyond_rtc_not_saved",
+          tls_resume_keep(&slot, e, &t, kDerp, 443) == TLS_RESUME_RESUMED &&
+          tls_rtc_find(s_rtc, TLS_RTC_RECS, kDerp, 443) == TLS_RTC_RECS);
+    s_rtc_base = 5000000000ull;
+
     entry_free(slot);
     entry_free(ctl);
-    entry_free(other);
     check("glue_every_session_freed", s_free == s_alloc + s_load_calls);
 
     if (s_fails) {

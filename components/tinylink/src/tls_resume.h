@@ -116,6 +116,16 @@ static inline tls_resume_result_t tls_resume_keep(tls_resume_slot_t *slot,
 
 #endif
 
+/* Boot-time scrub of the warm-reset copies (round 1.3.8, tls_rtc.h):
+ * garbage, records a cold boot cannot use and expired ones are zeroed.
+ * Call once before the first TLS connect (tinylink_init); the first
+ * take / keep runs it too. A no-op without CONFIG_TINYLINK_TLS_RESUME_RTC. */
+#if CONFIG_ESP_TLS_CLIENT_SESSION_TICKETS && CONFIG_TINYLINK_TLS_RESUME_RTC
+void tls_resume_boot(void);
+#else
+static inline void tls_resume_boot(void) { }
+#endif
+
 /* "resumed" / "full" / "no ticket", for the one-line connect logs. */
 static inline const char *tls_resume_str(tls_resume_result_t r)
 {

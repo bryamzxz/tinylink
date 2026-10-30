@@ -19,6 +19,7 @@
 #include <sys/lock.h>
 #include "esp_attr.h"
 #include "esp_rtc_time.h"
+#include "esp_system.h"
 #endif
 #endif
 
@@ -40,28 +41,69 @@ static void entry_free(tls_resume_entry_t *e)
 /* The warm-reset copies (round 1.3.8, tls_rtc.h). s_rtc_lock serialises
  * the DERP supervisor's and the control conn's keeps (two records, one
  * pick); s_rtc_tried makes the restore a once-per-boot, per-record thing
- * — after it the RAM slot is the session, as without the option. */
+ * — after it the RAM slot is the session, as without the option;
+ * s_rtc_swept runs the boot sweep before the first use. */
 #ifdef ESP_PLATFORM
 static RTC_NOINIT_ATTR tls_rtc_rec_t s_rtc[TLS_RTC_RECS];
 static _lock_t s_rtc_lock;
 static uint64_t rtc_now_us(void) { return esp_rtc_get_time_us(); }
 static void rtc_lock(void)   { _lock_acquire(&s_rtc_lock); }
 static void rtc_unlock(void) { _lock_release(&s_rtc_lock); }
-#else   /* host test: storage, clock and lock come from the test */
+/* The resets that keep both RTC slow memory and the RTC timer: esp_restart
+ * (ESP_RST_SW), the panic handler's restart (PANIC, and the two WDTs that
+ * panic). Not power-on, EN, brown-out, deep sleep, or the RTC / timer-group
+ * WDTs (ESP_RST_WDT), which can reset the RTC domain — and with it the RTC
+ * timer the master secret's age is counted on. */
+static bool rtc_warm_boot(void)
+{
+    switch (esp_reset_reason()) {
+    case ESP_RST_SW:
+    case ESP_RST_PANIC:
+    case ESP_RST_INT_WDT:
+    case ESP_RST_TASK_WDT:
+        return true;
+    default:
+        return false;
+    }
+}
+#else   /* host test: storage, clock, reset kind and lock come from the test */
 extern tls_rtc_rec_t s_rtc[TLS_RTC_RECS];
 uint64_t rtc_now_us(void);
+bool rtc_warm_boot(void);
 static void rtc_lock(void)   { }
 static void rtc_unlock(void) { }
 #endif
 static bool s_rtc_tried[TLS_RTC_RECS];
+static bool s_rtc_swept;
 static const char *RTC_TAG = "tls_resume";
 
 #define MAX_AGE_US ((uint64_t)TLS_RESUME_MAX_AGE_S * 1000000u)
+
+/* Under rtc_lock: the boot's sweep, once. */
+static void rtc_sweep_locked(void)
+{
+    if (s_rtc_swept) return;
+    s_rtc_swept = true;
+    const bool warm = rtc_warm_boot();
+    const unsigned dropped = tls_rtc_sweep(s_rtc, TLS_RTC_RECS, warm, rtc_now_us(), MAX_AGE_US);
+    if (dropped > 0) {
+        ESP_LOGI(RTC_TAG, "%u RTC session record(s) scrubbed (%s)", dropped,
+                 warm ? "expired" : "not a warm reset");
+    }
+}
+
+void tls_resume_boot(void)
+{
+    rtc_lock();
+    rtc_sweep_locked();
+    rtc_unlock();
+}
 
 /* The record for host:port, if usable, as a slot entry (once per boot). */
 static tls_resume_entry_t *rtc_restore(const char *host, uint16_t port)
 {
     rtc_lock();
+    rtc_sweep_locked();
     const unsigned i = tls_rtc_find(s_rtc, TLS_RTC_RECS, host, port);
     uint64_t age = 0;
     tls_resume_entry_t *e = NULL;
@@ -100,19 +142,28 @@ out:
 }
 
 /* Write e's session into its record (or clear the record when it does
- * not serialize into one). */
+ * not serialize into one, or when its age does not fit the RTC timer —
+ * a master secret older than the RTC time itself means that timer
+ * restarted during this boot, and a birth can only be stored as a time). */
 static void rtc_save(const tls_resume_entry_t *e)
 {
     rtc_lock();
+    rtc_sweep_locked();
+    const uint64_t now = rtc_now_us();
+    (void)tls_rtc_sweep(s_rtc, TLS_RTC_RECS, true, now, MAX_AGE_US);   /* aged out since */
+    const int64_t age_us = esp_timer_get_time() - e->born_us;
+    if (age_us < 0 || (uint64_t)age_us > now) {
+        const unsigned j = tls_rtc_find(s_rtc, TLS_RTC_RECS, e->host, e->port);
+        if (j < TLS_RTC_RECS) tls_rtc_clear(&s_rtc[j]);
+        rtc_unlock();
+        return;
+    }
     const unsigned i = tls_rtc_pick(s_rtc, TLS_RTC_RECS, e->host, e->port);
     tls_rtc_rec_t *r = &s_rtc[i];
     size_t len = 0;
-    const int64_t age_us = esp_timer_get_time() - e->born_us;
-    const uint64_t now = rtc_now_us();
-    const uint64_t born = age_us > 0 && (uint64_t)age_us < now ? now - (uint64_t)age_us : now;
     r->magic = 0;   /* invalid while the bytes change under it */
     if (mbedtls_ssl_session_save(&e->sess->saved_session, r->sess, sizeof(r->sess), &len) != 0 ||
-        !tls_rtc_seal(r, e->host, e->port, born, len)) {
+        !tls_rtc_seal(r, e->host, e->port, now - (uint64_t)age_us, now, len)) {
         tls_rtc_clear(r);
     }
     rtc_unlock();
@@ -121,6 +172,7 @@ static void rtc_save(const tls_resume_entry_t *e)
 static void rtc_drop(const char *host, uint16_t port)
 {
     rtc_lock();
+    rtc_sweep_locked();
     const unsigned i = tls_rtc_find(s_rtc, TLS_RTC_RECS, host, port);
     if (i < TLS_RTC_RECS) tls_rtc_clear(&s_rtc[i]);
     rtc_unlock();

@@ -54,6 +54,7 @@
 #include "stun_probe.h"
 #include "telemetry.h"
 #include "tl_addr.h"
+#include "tls_resume.h"
 #include "tl_bootstat.h"
 #include "ts2021_client.h"
 #include "wg_dataplane.h"
@@ -210,6 +211,8 @@ esp_err_t tinylink_init(void)
 {
     /* Task-WDT feed for every blocking TLS poll (see tl_wdt.h). */
     tls_io_set_poll_hook(tl_wdt_feed);
+    /* Scrub unusable warm-reset TLS sessions before any TLS (round 1.3.8). */
+    tls_resume_boot();
     esp_err_t err = ESP_OK;
     if (!s_keys_loaded) {
         err = keys_load_or_generate(&s_keys);
