@@ -199,7 +199,8 @@ test_tls_resume: test_tls_resume.c $(TL_SRC)/tls_resume.c $(TL_SRC)/tls_resume.h
 # TLS ClientHello offer (round 1.3.8): ECDHE-RSA first, one full-offer
 # retry on a handshake failure, remembered per server for 6 h.
 test_tls_offer: test_tls_offer.c $(TL_SRC)/tls_offer.c $(TL_SRC)/tls_offer.h \
-                host_include/esp_tls.h host_include/mbedtls/ssl.h host_include/esp_timer.h
+                host_include/esp_tls.h host_include/mbedtls/ssl.h host_include/mbedtls/x509.h \
+                host_include/esp_timer.h
 	$(CC) $(CFLAGS) -DCONFIG_ESP_TLS_CLIENT_SESSION_TICKETS=1 -DCONFIG_TINYLINK_TLS_RSA_FIRST=1 \
 	    -I$(TL_SRC) -Ihost_include -o $@ test_tls_offer.c
 

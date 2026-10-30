@@ -98,8 +98,9 @@ menu "tinylink core"
             same X25519 ECDHE and AES-128-GCM records; the server is
             authenticated by RSA-2048 (about 112-bit) instead of P-256
             (about 128-bit). A server that refuses the offer is dialled
-            again at once with the full mbedTLS offer, and asked with it
-            directly for 6 h (src/tls_offer.h).
+            again at once with the full mbedTLS offer (not after a
+            certificate for another name), and asked with it directly
+            for 6 h (src/tls_offer.h).
 
     config TINYLINK_TLS_X25519_INTREE
         bool "TLS: X25519 ECDHE on the in-tree Curve25519"

@@ -34,7 +34,8 @@
 // chain the bundle does not anchor) fails the TLS handshake; the
 // connect then dials once more at once with the full mbedTLS offer and
 // no session, and remembers for TLS_OFFER_MEMO_S that this host:port
-// needs it. A connect that offers a saved session offers the suite
+// needs it — unless the failure was a certificate for another name,
+// which no offer fixes (tls_offer.c has the rule). A connect that offers a saved session offers the suite
 // family the session was negotiated under (a Go server only resumes a
 // session whose suite the ClientHello lists).
 
@@ -110,7 +111,8 @@ tls_offer_t tls_offer_apply(esp_tls_cfg_t *cfg, const tls_offer_memo_t *memo,
 /* After a connect with offer `o` failed: true when it was the RSA offer
  * and the TLS handshake itself failed (esp-tls's
  * ESP_ERR_MBEDTLS_SSL_HANDSHAKE_FAILED: an alert, no common suite, a
- * chain the bundle does not anchor — not a TCP failure or a timeout).
+ * chain the bundle does not anchor — not a TCP failure or a timeout, and
+ * not a verify result naming another host, MBEDTLS_X509_BADCERT_CN_MISMATCH).
  * Then *tls has been replaced by a fresh esp_tls (NULL if that failed:
  * false), cfg carries the full offer and no session, and the caller
  * dials again at once and reports the result to tls_offer_note. */

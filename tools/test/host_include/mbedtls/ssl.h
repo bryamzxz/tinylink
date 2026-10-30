@@ -26,6 +26,12 @@ typedef struct {
     size_t         ticket_len;
 } mbedtls_ssl_session;
 
+/* The verify result of a (failed) handshake, read by tls_offer.c (round
+ * 1.3.8); the host tests define it over their fake contexts. */
+#include <stdint.h>
+typedef struct mbedtls_ssl_context mbedtls_ssl_context;
+uint32_t mbedtls_ssl_get_verify_result(const mbedtls_ssl_context *ssl);
+
 /* Session (de)serialization (tls_resume.c's RTC copy, round 1.3.8): the
  * host test defines them over the fields above. */
 #define MBEDTLS_ERR_SSL_BUFFER_TOO_SMALL  -0x6A00

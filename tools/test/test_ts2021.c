@@ -202,6 +202,8 @@ esp_err_t esp_tls_get_error_handle(esp_tls_t *tls, esp_tls_error_handle_t *h)
     *h = NULL;
     return ESP_FAIL;
 }
+void *esp_tls_get_ssl_context(esp_tls_t *t) { (void)t; return NULL; }
+uint32_t mbedtls_ssl_get_verify_result(const mbedtls_ssl_context *ssl) { (void)ssl; return 0xFFFFFFFFu; }
 /* noise_ik_init's ephemeral key: fixed, so the connect tests can
  * precompute the client's msg1 and answer it. */
 void esp_fill_random(void *buf, size_t len) { memset(buf, 0x5a, len); }
