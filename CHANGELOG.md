@@ -22,28 +22,31 @@ s); 140–170 ms more to the auth frame; every association refused once
 0.40–0.63 s backoff, a 2.28–2.29-s rescan and a 10–40 ms handshake.
 got-ip 3.02–3.15 / 5.00–5.39 / 8.75–9.23 s after reset (medians 3.05 /
 5.05 / 8.88), DHCP 110–420 ms of it (median 130). Image 725 536 →
-**728 176 B (+2 640)**; static DRAM 57 644 → 57 700 B (+56), IRAM ±0,
-RTC slow +20 B; the diagnostic build (below) 731 504 B. Host suite 1 791
-→ **1 848 OK** (CI floor 1 848), ASan + UBSan clean, 0 warnings. Static
+**727 840 B (+2 304)**; static DRAM 57 644 → 57 700 B (+56), IRAM ±0,
+RTC slow +16 B; the diagnostic build (below) 731 152 B. Host suite 1 791
+→ **1 846 OK** (CI floor 1 846), ASan + UBSan clean, 0 warnings. Static
 worst cases: `esp_timer` 3 248 → 3 328 / 4 608 (the station config on the
 re-apply path), `tinylink_tlm` 3 712 / 4 608 unchanged (the NVS write
 from the hook is not its deepest path), the rest unchanged. Not yet on
 the sensor.
 
-- **W1 — the last AP's channel first (`main/wifi_hint.h`).** Channel +
-  BSSID of the last AP joined, bound to a hash of the SSID: an RTC no-init
-  copy written at every connect (software / panic / WDT resets) and NVS
-  `tl_state/wifi_ap` (12 B) written from the 60-s housekeeping only when
-  it differs (`tinylink_set_persist_hook`, new; a day of housekeeping or
-  100 reboots on the same AP: 0 flash writes in the tests). At start
+- **W1 — the last AP's channel first (`main/wifi_hint.h`).** The channel
+  of the last AP joined, bound to a hash of the SSID: an RTC no-init copy
+  written at every connect (software / panic / WDT resets) and NVS
+  `tl_state/wifi_ap` (6 B) written only when it differs — from the 60-s
+  housekeeping (`tinylink_set_persist_hook`, new) and, while the node is
+  not registered yet (no telemetry task), from main's register retry loop
+  after each wait; a day of housekeeping, 100 reboots, or 100 reconnects
+  across a mesh's nodes on one channel: 0 flash writes in the tests. At start
   `sta.channel` = the record: the driver scans that channel first, then
   1..N without it (IDF wifi.rst), and WIFI_FAST_SCAN ends at the first
   match — a moved AP costs one extra dwell (~110 ms), never a lock-out.
-  `bssid_set` stays off: no gain on the hinted channel, and a replaced AP
-  would turn every attempt into NO_AP_FOUND after a full scan;
+  `bssid_set` stays off — no gain on the hinted channel, and a replaced AP
+  would turn every attempt into NO_AP_FOUND after a full scan — so no
+  BSSID is kept at all;
   `failure_retry_cnt` / `sort_method` need WIFI_ALL_CHANNEL_SCAN (a full
   scan every time). Any failed attempt drops the hint (scan 1..N) until
-  the next connect, which rewrites the record whatever channel / BSSID it
+  the next connect, which rewrites the record whatever channel it
   landed on; a lost working link keeps it. Logs: `wifi hint: channel N
   first (RTC | NVS record)`, `wifi hint: AP on channel N — in RTC now…`,
   `wifi hint: channel N stored`. Expected −1.2 s on every cold boot (scan
@@ -63,14 +66,16 @@ the sensor.
   rescan saw the AP at once (its FT-PSK line came first), walked every
   channel for 2.29 s and only then took it anyway ("no ap found, connect
   to ap in blacklist") — and finished the handshake in 10–40 ms in 22 of
-  22 boots. Now the first 4-way timeout (15 / 204) after an association
-  with the recorded AP is retried at once, the config re-applied
+  22 boots. Now the first 4-way timeout (15 / 204) of a failure streak is
+  retried at once, record or not, the config re-applied
   (`wifi_set_config_process` calls `cnx_clear_blacklist` first thing; its
-  PMK cache, keyed by SSID + passphrase, should spare a second PBKDF2),
-  the hint kept: it found the right AP, the handshake is what failed. One
-  per failure streak; a second failure takes the old ladder without the
-  hint. `disconnected (reason 15), retry now — 4-way timeout after
-  association: config re-applied, channel 11 first`. Expected on the 32 %
+  PMK cache, keyed by SSID + passphrase, should spare a second PBKDF2; a
+  failed re-apply stays pending for the next attempt), the hint kept: the
+  scan found the AP, the handshake is what failed. One per streak; a
+  second failure takes the old ladder without the hint; a wrong
+  passphrase costs one extra attempt per streak. `disconnected (reason
+  15), retry now — 4-way timeout after association: config re-applied,
+  channel 11 first (0 = 1..N)`. Expected on the 32 %
   of hard resets that hit it: got-ip ~4.8 s (8.9 s); if the AP is still
   not ready ~3 s after the comeback, ~0.6 s worse than before.
 - **`CONFIG_TINYLINK_WIFI_DIAG` (default n, out of the default image).**
@@ -118,6 +123,20 @@ the sensor.
   from app start, in parallel with Wi-Fi init (~60 ms) and the hinted
   scan, and handing the driver the 64-hex PSK — ~−100 ms on every boot,
   at the cost of an IDF-internal `pbkdf2_sha1` call and the hex-PSK path.
+
+- **Review.** An independent review found four low items, two
+  demonstrated: with one SSID on one channel across several BSSIDs (a
+  mesh), every reconnect to another node was an NVS write (100 reconnects
+  → 100 writes for one hint change) — the record now holds the channel
+  only (blob v2, 6 B; the BSSID had no reader with `bssid_set` off); and
+  the immediate retry also fired with no record, against the header's
+  comment — kept (the blacklist and the backoff cost the same either way)
+  and documented. Also fixed: the hint reached NVS only from the telemetry
+  task, which starts once registered (now also from the register retry
+  loop), and a failed config re-apply dropped its blacklist clear. Each
+  is a suite test (`store/mesh-nodes-one-channel-one-write`,
+  `retry/no-record-immediate-too-1..N`,
+  `config/failed-reapply-stays-pending`).
 
 Expected on the hardware-reset series: got-ip ~1.8 / 3.8 / 4.8 s for the
 three handshake outcomes (3.05 / 5.05 / 8.88), mean ~3.6 s (5.8 s, −37 %);
