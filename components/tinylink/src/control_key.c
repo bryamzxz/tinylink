@@ -127,13 +127,15 @@ static esp_err_t https_get_key(uint8_t *buf, tl_http1_resp_t *resp)
         .crt_bundle_attach = tl_crt_bundle_attach,
         .timeout_ms        = KEY_TIMEOUT_MS,
     };
-    /* The full mbedTLS offer, ECDSA chain (round 1.3.8 review): this
-     * fetch is the one TLS connect whose server authentication is all
-     * that stands behind what gets trusted — the control key it returns
-     * is pinned, and the Noise IK of every later connect rests on it. It
-     * runs once per pin (a first boot), so its ~1.5 s of P-384 / P-256
-     * verifies buys P-256 server authentication instead of the RSA-2048
-     * the DERP and control :443 connects accept (tls_offer.h). */
+    /* The full mbedTLS offer, not the RSA-only one (round 1.3.8 review):
+     * this fetch is the one TLS connect whose server authentication is
+     * all that stands behind what gets trusted — the control key it
+     * returns is pinned, and the Noise IK of every later connect rests on
+     * it. It runs once per pin (a first boot), so it is not narrowed for
+     * speed: offered ECDSA, controlplane answers with its ECDSA chain
+     * (P-256 leaf, ~1.5 s of verifies). The RSA suites stay listed, so a
+     * server may still answer RSA — verified against the bundle the same
+     * way; this is "ECDSA-capable", not "P-256 enforced" (tls_offer.h). */
     esp_tls_t *tls = esp_tls_init();
     if (tls == NULL) return ESP_ERR_NO_MEM;
     esp_err_t err  = ESP_OK;
