@@ -27,12 +27,11 @@ mode at one frame per sample fills lwIP's send queue (16 segments,
 5 760 B) a minute or two after the stall, sooner behind a re-send — and
 the board resets (`PANIC=y`). The same wait sat in the supervisor's
 pongs (`derp_send_frame_locked`) and DISCO pongs behind wg_tx, and in
-wg_tx behind those. Image 745 840 →
-**746 560 B (+720)**; static DRAM 58 676 → 58 684 B (+8), IRAM ±0. Host
-suite 2 318 → **2 399 OK** (CI floor 2 399), ASan + UBSan clean, 0
-warnings; the new test TSan-clean on 1, 2 and 16 CPUs. Static worst
-cases unchanged: `wg_tx` 3 440 / 5 120, `tinylink_derp` 5 248 / 8 192.
-Not yet on the sensor.
+wg_tx behind those. Image 745 840 → **746 848 B (+1 008)**; static
+DRAM 58 676 → 58 684 B (+8), IRAM ±0. Host suite 2 318 → **2 447 OK**
+(CI floor 2 447), ASan + UBSan clean, 0 warnings; the new test
+TSan-clean on 1, 2 and 16 CPUs. Static worst cases unchanged: `wg_tx`
+3 440 / 5 120, `tinylink_derp` 5 248 / 8 192. Not yet on the sensor.
 
 - **Every wait for the lock feeds (`derp_wlock.h`).** Writers wait in
   1-s slices with a feed after each and leave without the lock, as
@@ -45,7 +44,10 @@ Not yet on the sensor.
   blocked send at once with `ERR_CLSD`; the fd stays allocated until the
   destroy, the TCP close is the one `close()` would do) and takes the
   lock in fed slices — always: the TLS context is still freed under it.
-  A refused shutdown leaves the writer to its next poll (≤ 30 s). A cut
+  A refused shutdown leaves the writer to its next poll (≤ 30 s). The
+  feeds stop after 240 s of waiting in total (`DERP_WL_FED_MAX_MS`, twice
+  a stalled write's hold) with one E line: a lock never given back — a
+  leak — ends in the task WDT's reset, not in a relay hung for good. A cut
   frame is a failed one, which its sender handles as before (kept for
   the re-send, a refused INIT copy, the direct send). `connect_login` no
   longer memsets the struct, which zeroed the lock handle for an instant
@@ -76,31 +78,53 @@ Not yet on the sensor.
   the re-send's relay site (`tx_rescue`, unresolved and costed 0 B
   before): the re-send's path 3 008 → 2 992 B, a relayed frame 2 912 →
   2 896, the pong 3 104 → 3 152, the DISCO pong 4 336 → 4 320, the close
-  3 696 → 3 712.
-- **Test (`test_derp_wlock`, +81):** the protocol over pthreads and the
-  real `tls_io_write_full`, with a fake conn that keeps mbedtls's write
-  semantics (a record copied once and flushed across calls, WANT_WRITE
-  after a poll, the tail-flush above); every thread counts its waits and
+  3 696 → 3 760.
+- **Test (`test_derp_wlock`, +129):** `derp_client.c` itself, built on
+  the host over fakes of esp_tls, FreeRTOS and `select()` with a
+  scripted DERP login (`derp_client_connect_login` for real), pthreads
+  for the lock primitives; the fake conn keeps mbedtls's write semantics
+  (a record copied once and flushed across calls, WANT_WRITE after a
+  poll, the tail-flush above), and every thread counts its waits and
   feeds. Forced: a close against a writer whose poll never ends here
   (cut after the grace, fed, done in ms), a refused shutdown (one poll,
   not four), no writer (one take), a writer done within the grace (not
   cut), a waiter behind a stalled holder (fed each slice, leaves
-  unwritten), a waiter parked while its conn is replaced (refused by
-  the count with the next conn up), a failed write (the next frame
-  refused; under 1.3.8's rule reported sent and absent from the wire).
-  Seeded stress, 60 rounds of closes, reconnects, stalls and refused
-  shutdowns at random instants: no use after free, no frame reported
-  sent that is not whole on its conn, none twice or elsewhere, per-writer
-  order, every lock wait fed and bounded. Mutants that fail it: no cut,
-  no count check, no feed in the wait, no abort flag, an unbounded close
-  wait, a failed write leaving the conn up.
+  unwritten), a waiter that leaves within a slice while the holder still
+  writes, one that wins the lock after the close began (refused though
+  the count matches), one parked while its conn is replaced (refused by
+  the count with the next conn up), a failed relayed write and a failed
+  pong (the next frame refused, the reader told; under 1.3.8's rule
+  reported sent and absent from the wire), a best-effort copy on a
+  socket that cannot take it, the cap (writer and close: one overdue,
+  no feeds after, done once the lock comes back). Seeded stress, 60
+  rounds of closes, reconnects, stalls and refused shutdowns at random
+  instants: no use after free, no frame reported sent that is not whole
+  on its conn, none twice or elsewhere, per-writer order, every lock
+  wait fed and bounded, none overdue. Mutants that fail it: 11 of the
+  protocol (no cut, no count check, HELD on the count alone, no feed in
+  either wait, no abort flag, no closed exit while waiting, no count
+  bump, no cap, an unbounded close wait, a failed write leaving the conn
+  up) and 8 of `derp_client.c` (no `frame_failed_locked` call, no
+  `abort_reads`, no writability check, no abort in the adapter, raw
+  writes, the old memset, a close that frees nothing or takes no lock).
 - On the sensor, a close that had to cut a writer logs `DERP close: a
   write still held the conn after 1000 ms — cut, the lock free after N
   ms` (N ≈ 1 000), usually with esp-tls's `write error :-0x004E:` from
   the cut write; a write that failed on its own `DERP write failed
   (-0x10000) — no more frames on this conn, reconnecting`, then
-  `derp supervisor: stream ended 0xffffffff` within 30 s and a reconnect.
-  Neither in a healthy run; no `task_wdt` reset after a DERP stall.
+  `derp supervisor: stream ended 0xffffffff` within 30 s and a reconnect;
+  a lock never given back `DERP write lock held over 240 s: no more WDT
+  feeds for it`, then a task-WDT reset. None in a healthy run; no
+  `task_wdt` reset after a DERP stall.
+- **Review.** An independent review found no high or medium item (lock
+  order, the shutdown on IDF 5.5.6, fd reuse, use after free, writes
+  after a close, the feeds and the ordering checked). Lows, fixed: no
+  test forced a waiter winning the lock between the close's first step
+  and its take (a mutant granting on the count alone passed); the test
+  re-implemented `derp_client.c`'s glue, so deleting the failure call,
+  the `abort_reads` set or the writability check failed nothing — it now
+  builds the real file; the fed waits had no total bound; two comments
+  still named `write_lock`.
 - **Residual (pre-existing, every TLS writer):** one `esp_tls_conn_write`
   can span two 30-s sends — a partial one, then one that moves nothing —
   so a holder's own feeds can be ~61 s apart. lwIP's 16-segment queue

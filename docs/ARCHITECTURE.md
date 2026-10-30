@@ -908,7 +908,9 @@ unsubscribed task before 1.3.2. Waits for the DERP write lock
 — `wg_tx` and the supervisor both write frames, and a waiting write on a
 stalled conn holds the lock up to 4 × 30 s — and the supervisor's close
 cuts a writer still inside a frame after 1 s (the socket's shutdown)
-instead of waiting it out unfed. Budget: `CONFIG_ESP_TASK_WDT_TIMEOUT_S=60`, the Kconfig maximum
+instead of waiting it out unfed. The feeds stop after 240 s of waiting
+in total (one E line), so a lock never given back still ends in the
+WDT's reset. Budget: `CONFIG_ESP_TASK_WDT_TIMEOUT_S=60`, the Kconfig maximum
 (a larger value is silently dropped back to the 5-s default — that
 exact mistake tripped the long-poll on the first M15 flash, since its
 30-s poll cannot feed a 5-s budget). `CONFIG_ESP_TASK_WDT_PANIC=y`: a
