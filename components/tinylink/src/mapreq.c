@@ -1365,10 +1365,27 @@ static int stream_chunk_cb(const uint8_t *data, size_t len, void *ctx)
     return mapresp_stream_feed(&s->ms, data, len);
 }
 
+/* The endpoint push riding with the stream answered (round 1.3.7, B1):
+ * the push's own log line, at the time it lands — the stream goes on. */
+static void push_side_done(int status, int stream_error, void *ctx)
+{
+    *(int *)ctx = status > 0 ? status : -1;
+    if (status == 200) {
+        ESP_LOGI(TAG, "endpoint push: HTTP 200 (with the map stream)");
+    } else if (status == 429 || status == 503) {
+        ESP_LOGW(TAG, "endpoint push throttled: HTTP %d", status);
+    } else if (status > 0) {
+        ESP_LOGE(TAG, "endpoint push HTTP %d (server rejected lite update)", status);
+    } else {
+        ESP_LOGW(TAG, "endpoint push: stream reset (HTTP/2 error 0x%x)",
+                 (unsigned)stream_error);
+    }
+}
+
 static esp_err_t run_stream_in(ts2021_conn_t *conn,
                                const tinylink_keys_t *keys,
                                mapreq_handler_t on_netmap, void *ctx,
-                               uint8_t *buf)
+                               uint8_t *buf, int *push_status)
 {
     /* MapRequest from the buffer's tail, MapResponse elements collected at
      * offset 0 — disjoint: nghttp2 (until 1.3.4) could still be reading
@@ -1389,17 +1406,50 @@ static esp_err_t run_stream_in(ts2021_conn_t *conn,
     s.handler_ctx = ctx;
 
     int status = 0;
-    esp_err_t err = h2_post_json_stream(conn, "/machine/map",
-                                        CONFIG_TINYLINK_CONTROL_HOST,
-                                        (const uint8_t *)body,
-                                        (size_t)body_len,
-                                        &status, stream_chunk_cb, &s);
+    esp_err_t err = ESP_ERR_INVALID_SIZE;
+    if (push_status != NULL) {
+        /* The endpoint push goes as a second HTTP/2 stream ahead of the
+         * map stream, in the same burst (round 1.3.7, B1) — upstream's
+         * updateRoutine runs its lite update alongside the poll the same
+         * way. Its body sits in the element area: h2_post_json_stream_side
+         * sends it whole before the first response byte can land there. */
+        *push_status = 0;
+        const int push_len = build_request_body(keys, /*stream=*/false,
+                                                /*omit_peers=*/true,
+                                                (char *)buf, TL_CTRL_REQ_CAP);
+        if (push_len < 0) return ESP_ERR_INVALID_SIZE;
+        err = h2_post_json_stream_side(conn, "/machine/map",
+                                       CONFIG_TINYLINK_CONTROL_HOST,
+                                       buf, (size_t)push_len,
+                                       push_side_done, push_status,
+                                       (const uint8_t *)body, (size_t)body_len,
+                                       &status, stream_chunk_cb, &s);
+        if (err == ESP_ERR_INVALID_SIZE) {
+            /* A server window under the push's size (never seen): push,
+             * then the stream, one after the other as before 1.3.7. The
+             * push's body went where the stream's was. */
+            err = push_endpoints_in(conn, keys, buf);
+            *push_status = err == ESP_OK ? 200 : conn->h2_status;
+            if (err != ESP_OK && conn->h2_status == 0) return err;   /* unanswered */
+            body_len = build_request_body(keys, true, false, body, TL_CTRL_REQ_CAP);
+            if (body_len < 0) return ESP_ERR_INVALID_SIZE;
+            err = ESP_ERR_INVALID_SIZE;
+        }
+    }
+    if (err == ESP_ERR_INVALID_SIZE) {
+        err = h2_post_json_stream(conn, "/machine/map",
+                                  CONFIG_TINYLINK_CONTROL_HOST,
+                                  (const uint8_t *)body,
+                                  (size_t)body_len,
+                                  &status, stream_chunk_cb, &s);
+    }
     if (err != ESP_OK) {
         /* A requested recycle (endpoint push, IP change) is no error: its
          * one line is ts2021's "control stream read aborted on request"
-         * (round 1.3.5; it logged two E lines here and in h2 before). */
-        if (conn->aborted) {
-            ESP_LOGD(TAG, "map stream left on request (recycle)");
+         * (round 1.3.5; it logged two E lines here and in h2 before) … */
+        if (conn->aborted || conn->req_expired) {
+            /* … nor is the push's deadline: ts2021 has its W line. */
+            ESP_LOGD(TAG, "map stream left: %s", conn->aborted ? "recycle" : "push deadline");
         } else {
             ESP_LOGE(TAG, "h2_post_json_stream failed: 0x%x", err);
         }
@@ -1422,14 +1472,15 @@ static esp_err_t run_stream_in(ts2021_conn_t *conn,
 
 esp_err_t mapreq_run_stream(ts2021_conn_t *conn,
                             const tinylink_keys_t *keys,
-                            mapreq_handler_t on_netmap, void *ctx)
+                            mapreq_handler_t on_netmap, void *ctx,
+                            int *push_status)
 {
     if (conn == NULL || keys == NULL || on_netmap == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
     uint8_t *buf = tl_ctrl_buf_claim("map stream");
     if (buf == NULL) return ESP_ERR_INVALID_STATE;
-    esp_err_t err = run_stream_in(conn, keys, on_netmap, ctx, buf);
+    esp_err_t err = run_stream_in(conn, keys, on_netmap, ctx, buf, push_status);
     tl_ctrl_buf_release();
     return err;
 }

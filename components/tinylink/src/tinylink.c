@@ -453,13 +453,17 @@ esp_err_t tinylink_dataplane_start(void)
      * `Addrs: null, Relay: ""` for sensor-cali after multiple
      * Stream=true cycles that included Endpoints + NetInfo.
      *
-     * Push the device's current endpoints + NetInfo via a one-shot
-     * Stream=false MapRequest before the long-poll grabs the conn.
-     * This is the "fresh state upload" that updates the server's
-     * cached Hostinfo/Endpoints record so peers see real dial
-     * candidates and a HomeDERP region in their MapResponse. The
-     * response (a full netmap) is parsed for status only — the
-     * long-poll will redeliver it as its first stream frame. */
+     * So the device's endpoints + NetInfo go up in a Stream=false,
+     * OmitPeers=true lite MapRequest — the "fresh state upload" that
+     * updates the server's cached Hostinfo/Endpoints record, so peers
+     * see real dial candidates and a HomeDERP region in their
+     * MapResponse. Until round 1.3.7 it ran here, a round trip on its
+     * own (~0.19 s on the sensor) between the register and the map
+     * stream. Now it is the long-poll's first push: a second HTTP/2
+     * stream in the same burst as the map stream (mapreq_run_stream),
+     * as upstream's updateRoutine sends its lite updates alongside the
+     * poll — the netmap no longer waits for it, and the endpoint is
+     * read when the burst is built, ~0.2 s later than here. */
     if (!s_initialized) return ESP_ERR_INVALID_STATE;
 
     /* The boot STUN probe ran alongside the register (round 1.3.5):
@@ -468,55 +472,26 @@ esp_err_t tinylink_dataplane_start(void)
      * socket (stun_boot.h). */
     stun_boot_join();
 
-    esp_err_t err = ensure_control_conn();
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "dataplane_start: ensure_conn failed: 0x%x — "
-                      "long-poll will retry the connect anyway", err);
-        return ESP_OK;  /* not fatal — long-poll task handles reconnect */
-    }
-
     /* Observability: was the STUN-discovered endpoint available when
-     * we built the MapRequest body? Log the actual state as a clear
-     * breadcrumb when an admin-panel "Endpoints" field comes up empty. */
+     * the boot handed over? The push body is built from the same
+     * accessor a moment later; an admin-panel "Endpoints" field that
+     * comes up empty starts here. */
     uint8_t  ep_addr[4];
     uint16_t ep_port;
-    bool stun_ready = tinylink_get_public_endpoint(ep_addr, &ep_port);
-    if (stun_ready) {
-        ESP_LOGI(TAG, "dataplane_start: pushing endpoint %u.%u.%u.%u:%u",
+    if (tinylink_get_public_endpoint(ep_addr, &ep_port)) {
+        ESP_LOGI(TAG, "dataplane_start: endpoint %u.%u.%u.%u:%u goes up "
+                      "with the map stream",
                  ep_addr[0], ep_addr[1], ep_addr[2], ep_addr[3],
                  (unsigned)ep_port);
     } else {
         ESP_LOGW(TAG, "dataplane_start: no STUN endpoint yet — the "
-                      "Stream=false MapRequest lands NetInfo only; the "
+                      "lite MapRequest lands NetInfo only; the "
                       "re-probe pushes the endpoint once the data plane "
                       "is up");
     }
-
-    err = mapreq_push_endpoints(&s_conn, &s_keys);
-    if (err != ESP_OK) {
-        /* Drop the conn so the long-poll's next ensure_control_conn
-         * gets a fresh one. Don't fail bringup — the long-poll path
-         * will keep trying and may eventually succeed (or surface a
-         * different error). Since round 1.3.5 a push that got no answer
-         * is retried there too, on the fresh conn before the stream:
-         * with the one-shot deadline a stalled push now fails after 10 s
-         * (it sat 52 s in one sensor boot), and nothing else would push
-         * an endpoint that does not change. A push the server answered
-         * with an error is not — as before, the stream runs without it,
-         * rather than wait for a push the server keeps refusing. */
-        const bool unanswered = s_conn.h2_status == 0;
-        ESP_LOGW(TAG, "dataplane_start: mapreq_push_endpoints: 0x%x — %s", err,
-                 unanswered ? "the long-poll pushes after its connect"
-                            : "the stream runs without it");
-        if (unanswered) s_ep_push_pending = true;
-        drop_control_conn();
-        return ESP_OK;
-    }
-    ESP_LOGI(TAG, "dataplane_start: pushed lite MapRequest "
-                  "(Stream=false, OmitPeers=true, stun=%s)",
-             stun_ready ? "ready" : "missing");
-    /* Keep s_conn open — the long-poll will reuse it for the
-     * Stream=true cycle. */
+    s_ep_push_pending = true;
+    /* s_conn stays open (the register's) — the long-poll's first cycle
+     * rides it. */
     return ESP_OK;
 }
 
@@ -1678,15 +1653,30 @@ static void long_poll_task(void *arg)
         uint32_t rate_limit_ms = 0;
         int      http_status   = 0;
         esp_err_t err = ensure_control_conn();
-        if (err == ESP_OK && s_ep_push_pending) {
+        if (err == ESP_OK) {
             /* Endpoint push (Stream=false lite MapRequest) on the freshly
-             * connected s_conn, BEFORE the read-only Stream=true cycle
-             * claims it — the same sequence bringup runs at boot. This
-             * task has the stack the ts2021 path needs; the old dedicated
-             * ep_up task did not (see the "Endpoint push" section). */
+             * connected s_conn — since round 1.3.7 as a second HTTP/2
+             * stream in the same burst as the read-only Stream=true
+             * request, not a round trip before it (the boot's push is
+             * this one too). This task has the stack the ts2021 path
+             * needs; the old dedicated ep_up task did not (see the
+             * "Endpoint push" section). Taken now: a request raised
+             * during the stream is a new one (and recycles it). */
+            const bool push = s_ep_push_pending;
             s_ep_push_pending = false;
-            esp_err_t perr = mapreq_push_endpoints(&s_conn, &s_keys);
-            if (perr == ESP_OK) {
+            int push_status = 0;
+            const int64_t t0 = esp_timer_get_time();
+            err = mapreq_run_stream(&s_conn, &s_keys, long_poll_handler, NULL,
+                                    push ? &push_status : NULL);
+            /* Stream ended: either the server closed it (idle / ping
+             * failure / restart), our side errored, the push went
+             * unanswered within the one-shot deadline, or the handler
+             * left an expired-node frame. Capture the rate-limit wait and
+             * the HTTP status before drop_control_conn clears the conn. */
+            rate_limit_ms = control_rate_limit_ms();
+            http_status   = s_conn.h2_status;
+            const int64_t up_us = esp_timer_get_time() - t0;
+            if (push && push_status == 200) {
                 s_stat_ep_pushes++;
                 uint8_t  ep_addr[4];
                 uint16_t ep_port = 0;
@@ -1695,34 +1685,20 @@ static void long_poll_task(void *arg)
                              ep_addr[0], ep_addr[1], ep_addr[2], ep_addr[3],
                              (unsigned)ep_port);
                 }
-            } else {
-                /* Retry on the next connect; the loop's backoff below
-                 * paces it and a server Retry-After is honored like any
-                 * other map failure. */
-                s_ep_push_pending = true;
-                rate_limit_ms = control_rate_limit_ms();
-                http_status   = s_conn.h2_status;
-                ESP_LOGW(TAG, "endpoint push failed: 0x%x — retrying after "
-                              "reconnect", perr);
-                drop_control_conn();
-                err = perr;
             }
-        }
-        if (err == ESP_OK) {
-            const int64_t t0 = esp_timer_get_time();
-            err = mapreq_run_stream(&s_conn, &s_keys, long_poll_handler, NULL);
-            /* Stream ended: either the server closed it (idle / ping
-             * failure / restart), our side errored, or the handler left
-             * an expired-node frame. Capture the rate-limit wait and the
-             * HTTP status before drop_control_conn clears the conn. */
-            rate_limit_ms = control_rate_limit_ms();
-            http_status   = s_conn.h2_status;
-            const int64_t up_us = esp_timer_get_time() - t0;
             if (s_ep_push_pending) {
                 ESP_LOGI(TAG, "long-poll stream recycled for endpoint push "
                               "(0x%x) — reconnecting", err);
             } else {
                 ESP_LOGW(TAG, "long-poll stream ended: 0x%x — reconnecting", err);
+            }
+            if (push && push_status != 200) {
+                /* Not pushed — unanswered (deadline, conn lost, reset) or
+                 * refused: again with the next connect's stream. A refusing
+                 * server sees one push per reconnect, as the stream does. */
+                ESP_LOGW(TAG, "endpoint push %s — retrying with the next "
+                              "stream", push_status > 0 ? "refused" : "unanswered");
+                s_ep_push_pending = true;
             }
             drop_control_conn();
             s_stat_lp_reconnects++;
@@ -2013,8 +1989,9 @@ esp_err_t tinylink_wg_socket_init(void)
  * (objdump of the release objects) and -fstack-usage.
  *
  * Now: the push runs on the long-poll task, on s_conn, right after the
- * (re)connect and before the stream starts — the exact sequence bringup
- * runs at boot (tinylink_dataplane_start). tinylink_endpoint_push_async()
+ * (re)connect — since round 1.3.7 as a second HTTP/2 stream in the same
+ * burst as the map stream (mapreq_run_stream; the boot's push is the
+ * first one). tinylink_endpoint_push_async()
  * records the request and kicks the long-poll out of its blocking
  * stream read (ts2021_abort_reads); the reconnect then follows the
  * normal healthy-stream backoff (~1 s), so a push lands within one 30 s
@@ -2025,8 +2002,10 @@ esp_err_t tinylink_wg_socket_init(void)
  * change (rare), in exchange for −12.6 KiB of BSS (stack + TCB), no
  * second Noise/TLS conn (−8.6 KiB peak stack, ~−12 KiB TLS heap
  * transient) and no overflow. Upstream sends its lite update over the
- * shared HTTP/2 client (controlclient.Auto.updateRoutine); tinylink's
- * h2_client is one stream per conn, so the recycle is the equivalent. */
+ * shared HTTP/2 client (controlclient.Auto.updateRoutine) while the
+ * poll runs; tinylink's opens its side stream only together with a map
+ * stream (the long-poll task sits in the stream's read loop), so a push
+ * after the boot still recycles the stream. */
 
 /* Signal that the public endpoint changed. Idempotent; callable from
  * any task (STUN re-probe on the telemetry task, event handlers). */

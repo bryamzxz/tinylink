@@ -197,7 +197,8 @@ static esp_err_t bringup(void)
      * our reflexive AddrPort to the control plane (which forwards it to
      * peers). Since round 1.3.5 it runs on its own task WHILE the
      * register runs — it cost the boot 0.04–7.1 s here before — and
-     * tinylink_dataplane_start's endpoint push waits ≤ 300 ms for it.
+     * tinylink_dataplane_start waits ≤ 300 ms for it; the endpoint push
+     * goes with the long-poll's first map stream (round 1.3.7).
      * Non-load-bearing: no result in time = the push goes without an
      * endpoint, and the re-probe pushes it once the data plane is up. */
     esp_err_t serr = tinylink_stun_probe_start();
@@ -242,8 +243,9 @@ static esp_err_t bringup(void)
     }
 #endif
 
-    /* The long-poll's first stream rides the register's control conn
-     * (kept open by tinylink_dataplane_start) — no handshake at boot.
+    /* The long-poll's first stream — with the endpoint push as a second
+     * HTTP/2 stream in the same burst (round 1.3.7) — rides the
+     * register's control conn — no handshake at boot.
      * The long-poll task runs at priority IDLE+4 (higher than this
      * bringup task) so it preempts here and sends its MapRequest
      * immediately. */
