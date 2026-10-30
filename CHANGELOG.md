@@ -7,7 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Optimization round 1.3.7 (in progress, branch `feat/opt-1.3.7`)
+### Optimization round 1.3.7 — Wi-Fi association, boot control path, steady-state power (branch `feat/opt-1.3.7`)
+
+Three parallel tracks on top of 1.3.6, reviewed independently twice
+(all findings low, all fixed), then measured on the sensor; two
+defaults changed after the hardware runs (steady-state power below, the
+endpoint-push pipelining under B1). Image 725 536 → **731 952 B
+(+6 416)**; host suite 1 791 → **2 092 OK** (CI floor 2 092), ASan +
+UBSan clean, 0 warnings. On the sensor (hardware section at the end of
+this entry): reset → WG session up median **7.1 s** over a 10-boot
+series of hardware resets (1.3.6: 9.3 s), 4.1 s with no stale
+association on the AP; light sleep 81.4 → 89.8 % of the time with the
+new modem-sleep default.
 
 #### Wi-Fi association (`feat/r137-wifi`)
 
@@ -411,6 +422,59 @@ the sensor.
   (`ts2021_rx_ready`), is cancelled, and a push refused by a GOAWAY
   goes with the reconnect instead of after 30 s. Its tests (test_h2_core
   +9, test_h2_interop +4) fail without the fixes; image +400 B.
+
+#### Hardware (deployed sensor, app partition only; the 1.3.6 `ota_0` + `otadata` read back to `~/tinylink-backups/` first)
+
+Backup valid (1.3.6 `gf7d95e1`, image checksum and hash OK; otadata seq
+1, CRC OK). Images: `078ebae` with `CONFIG_TINYLINK_WIFI_DIAG` (series),
+`078ebae` + `CONFIG_TINYLINK_POWER_DIAG` and the A/B fragments (power),
+`bef0eb5` and `694876a` (soaks).
+
+- **Smoke + 10 × 2 min, EAPOL diagnostic on (all hardware resets):**
+  register without Auth 10 / 10, 0 E lines, 0 crashes, heap ~157.1 KB.
+  `wifi hint: channel 11 first (NVS record)` from the second boot on:
+  `init -> auth` at 0.56–0.65 s (1.77 s). Every boot still had the PMF
+  comeback (+1.13 s), and the diagnostic showed what follows it: the AP
+  re-sends M1 at 1-s intervals and ignores our first M2s (each one
+  ACKed at the MAC layer), then sends M3 after the third M2 (5 boots,
+  got-ip 3.73–3.76 s) or a fourth M1 that makes the supplicant give up
+  (reason 15; 5 boots) — the immediate retry was associated and
+  through the 4-way handshake 30–60 ms later (got-ip 4.79–4.92 s, ~8.9
+  s on 1.3.6). AP behaviour, not ours; software restarts deauth first
+  and never see it. Got-ip → WG up 1.9–2.4 s (one boot 4.35 s: the peer
+  answered the second INIT). **Reset → WG up median 7.1 s (5.70–8.11),
+  1.3.6 9.3 s (7.3–11.1).**
+- **Power A/B** (`CONFIG_TINYLINK_POWER_DIAG`, 8 min per variant, first
+  interval dropped; light sleep % of the time): 1.3.7 as built 81.4 %
+  (10.5 light-sleep exits / s, CPU busy 1.8 %, of it the Wi-Fi task
+  1.45 %); **MAX_MODEM at listen interval 3: 89.8 %** (6.6 / s, Wi-Fi
+  task 0.59 %); **2 idle ticks before sleep: 84.7 %**; 20-ms Wi-Fi
+  minimum active time 83.7 %; 500-ms TCP timer 83.3 %; 160 MHz 83.0 %
+  (CPU busy up); PM_SLP_IRAM_OPT + RTOS_IDLE_OPT 81.3 % (+5 KB IRAM).
+  The first two became the defaults (`bef0eb5`), the rest were not
+  taken (within the run-to-run spread of ~1 %, or a cost).
+- **Endpoint-push pipelining (B1) on tailscale.com:** both boot
+  connections that carried the push beside the map stream (the A/B run
+  and the first soak, `bef0eb5`) had the map stream ended cleanly by the
+  server (229 s, 645 s); the next poll got no answer for 120 s and the
+  one after it its netmap 26–55 s late. A host probe of the reconnect
+  found no client fault; B1 went behind
+  `CONFIG_TINYLINK_CONTROL_PUSH_PIPELINE` (default n, `694876a`). Clean
+  ends with the push first are rare (once in ~30 boot connections of
+  1.3.5–1.3.6, twice mid-soak on 1.2.0), each followed by a slow poll
+  too — round 1.3.8 looks at that.
+- **Soak (`694876a`, 152 min, cut to flash 1.3.8):** 0 resets / panics
+  / WDT / brown-outs, 0 E lines, **0 long-poll stream ends**; first boot
+  got-ip 1.75 s and WG up 4.1 s after reset (no comeback: the previous
+  boot had ended cleanly); 80 rekeys (4 needed a retry); path selection
+  6 doubts, all settled by the peer's WireGuard, 0 undelivered / dead,
+  0 roams; one RX-stale with the direct path answering DISCO and the
+  peer's WireGuard silent on both paths (the 1.3.5–1.3.6 pattern; the
+  rekey ended it in ~60 ms — round 1.3.8's doubt handshake targets it).
+  heap_free min **157 412 B**, largest block 110 592 B; stack lows (B
+  free) `tinylink_lp` 4 308 of 7 168, `tinylink_derp` 4 592 of 8 192,
+  `wg_rx` 4 084 of 8 192, `wg_tx` 2 852 of 5 120, `tinylink_tlm` 2 620
+  of 4 608, `esp_timer` 3 032 of 4 608.
 
 ### Optimization round 1.3.6 — data-plane path selection (in progress, branch `feat/opt-1.3.6`)
 
