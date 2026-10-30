@@ -32,7 +32,7 @@ static const char *kStub =
 "{"
   "\"Node\":{"
     "\"ID\":42,"
-    "\"Name\":\"sensor-cali.tail-scale.ts.net.\","
+    "\"Name\":\"sensor-test.tail-scale.ts.net.\","
     "\"Addresses\":[\"100.64.0.7/32\",\"fd7a:115c:a1e0::7/128\"]"
   "},"
   "\"Peers\":["
@@ -642,16 +642,16 @@ static size_t put_self(sb_t *b, int ncap)
     const int nc = (int)(sizeof(caps) / sizeof(caps[0]));
     size_t s0 = b->n;
     sb_printf(b, "{\"ID\":8150413018412615,\"StableID\":\"nGq4pVdP9611CNTRL\","
-                 "\"Name\":\"sensor-cali.tail1234ab.ts.net.\",\"User\":5271734863091011,");
+                 "\"Name\":\"sensor-test.tail1234ab.ts.net.\",\"User\":123456789,");
     sb_key(b, "Key", "nodekey:", 1);
     sb_printf(b, ",\"KeyExpiry\":\"0001-01-01T00:00:00Z\",");
     sb_key(b, "Machine", "mkey:", 2); sb_printf(b, ",");
     sb_key(b, "DiscoKey", "discokey:", 3);
-    sb_printf(b, ",\"Addresses\":[\"100.67.60.92/32\",\"fd7a:115c:a1e0::8d01:3c5c/128\"],"
-                 "\"AllowedIPs\":[\"100.67.60.92/32\",\"fd7a:115c:a1e0::8d01:3c5c/128\"],"
+    sb_printf(b, ",\"Addresses\":[\"100.64.0.10/32\",\"fd7a:115c:a1e0::a/128\"],"
+                 "\"AllowedIPs\":[\"100.64.0.10/32\",\"fd7a:115c:a1e0::a/128\"],"
                  "\"Endpoints\":[\"203.0.113.157:56828\",\"192.168.1.50:41641\"],\"HomeDERP\":16,"
                  "\"Hostinfo\":{\"IPNVersion\":\"1.3.3-tinylink\",\"OS\":\"esp32\","
-                 "\"Hostname\":\"sensor-cali\",\"NetInfo\":{\"WorkingUDP\":true,\"PreferredDERP\":16}},"
+                 "\"Hostname\":\"sensor-test\",\"NetInfo\":{\"WorkingUDP\":true,\"PreferredDERP\":16}},"
                  "\"Created\":\"2026-05-02T14:21:07.123456789Z\",\"Cap\":131,\"Tags\":[\"tag:sensor\",\"tag:iot\"],"
                  "\"MachineAuthorized\":true,\"Capabilities\":[");
     for (int i = 0; i < 12; i++) sb_printf(b, "%s\"%s\"", i ? "," : "", caps[12 + i]);
@@ -663,7 +663,7 @@ static size_t put_self(sb_t *b, int ncap)
         else if (strcmp(k, "tailnet.display-name") == 0) sb_printf(b, ",\"%s\":[\"bryam's tailnet\"]", k);
         else sb_printf(b, "%s\"%s\":null", i ? "," : "", k);
     }
-    sb_printf(b, "},\"ComputedName\":\"sensor-cali\",\"ComputedNameWithHost\":\"sensor-cali\","
+    sb_printf(b, "},\"ComputedName\":\"sensor-test\",\"ComputedNameWithHost\":\"sensor-test\","
                  "\"StableTailnetID\":\"T1234CNTRL\"}");
     sb_elem(b, s0);
     return b->n - s0;
@@ -676,14 +676,14 @@ static void put_peer(sb_t *b, int i, int shape)
 {
     size_t s0 = b->n;
     sb_printf(b, "{\"ID\":%d%06d,\"StableID\":\"n%dCNTRL\",\"Name\":\"peer-%d.tail1234ab.ts.net.\","
-                 "\"User\":5271734863091011,", 7 + i, 4242 + i, i, i);
+                 "\"User\":123456789,", 7 + i, 4242 + i, i, i);
     if (shape == 5) sb_printf(b, "\"Sharer\":6271734863091099,");
     sb_key(b, "Key", "nodekey:", 100u + (unsigned)i);
     sb_printf(b, ",\"KeyExpiry\":\"2027-04-%02dT12:00:00Z\",", 10 + i);
     sb_key(b, "Machine", "mkey:", 200u + (unsigned)i); sb_printf(b, ",");
     sb_key(b, "DiscoKey", "discokey:", 300u + (unsigned)i);
-    sb_printf(b, ",\"Addresses\":[\"100.88.%d.%d/32\",\"fd7a:115c:a1e0::%x/128\"],"
-                 "\"AllowedIPs\":[\"100.88.%d.%d/32\",\"fd7a:115c:a1e0::%x/128\"%s],",
+    sb_printf(b, ",\"Addresses\":[\"100.64.%d.%d/32\",\"fd7a:115c:a1e0::%x/128\"],"
+                 "\"AllowedIPs\":[\"100.64.%d.%d/32\",\"fd7a:115c:a1e0::%x/128\"%s],",
               250 - i, 54 + i, 0x1000 + i, 250 - i, 54 + i, 0x1000 + i,
               shape == 3 ? ",\"192.168.10.0/24\",\"10.20.0.0/16\"" : "");
     if (shape != 4) {
@@ -742,15 +742,15 @@ static void put_misc(sb_t *b)
 {
     sb_printf(b, "\"DNSConfig\":{\"Resolvers\":[{\"Addr\":\"https://dns.nextdns.io/abc123\"}],"
                  "\"Routes\":{\"ts.net.\":null,\"tail1234ab.ts.net.\":[]},\"Domains\":[\"tail1234ab.ts.net\"],"
-                 "\"Proxied\":true,\"CertDomains\":[\"sensor-cali.tail1234ab.ts.net\"],"
-                 "\"ExtraRecords\":[{\"Name\":\"peer-0.tail1234ab.ts.net.\",\"Value\":\"100.88.250.54\"}],"
+                 "\"Proxied\":true,\"CertDomains\":[\"sensor-test.tail1234ab.ts.net\"],"
+                 "\"ExtraRecords\":[{\"Name\":\"peer-0.tail1234ab.ts.net.\",\"Value\":\"100.64.0.20\"}],"
                  "\"ExitNodeFilteredSet\":[\".ts.net\"],\"TempCorpIssue13969\":\"\"},"
                  "\"Domain\":\"bryam@example.com\",\"CollectServices\":true,"
                  "\"PacketFilter\":[");
     for (int r = 0; r < 18; r++) {
-        sb_printf(b, "%s{\"SrcIPs\":[\"100.64.0.0/10\",\"fd7a:115c:a1e0::/48\",\"100.88.250.%d\"],"
+        sb_printf(b, "%s{\"SrcIPs\":[\"100.64.0.0/10\",\"fd7a:115c:a1e0::/48\",\"100.64.1.%d\"],"
                      "\"DstPorts\":[{\"IP\":\"*\",\"Ports\":{\"First\":%d,\"Last\":%d}},"
-                     "{\"IP\":\"100.67.60.92\",\"Ports\":{\"First\":0,\"Last\":65535}}],"
+                     "{\"IP\":\"100.64.0.10\",\"Ports\":{\"First\":0,\"Last\":65535}}],"
                      "\"IPProto\":[6,17,1,58]}", r ? "," : "", 50 + r, 1000 * r, 1000 * r + 999);
     }
     sb_printf(b, "],\"UserProfiles\":[");

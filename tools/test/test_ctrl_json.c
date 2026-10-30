@@ -29,7 +29,7 @@ static const char *const k_golden[] = {
     "0000000000000000000000000000000000000000000000000000000\",\"NLKey\":\""
     "nlpub:0000000000000000000000000000000000000000000000000000000000000000"
     "\",\"Followup\":\"\",\"Expiry\":\"0001-01-01T00:00:00Z\",\"Hostinfo\":"
-    "{\"OS\":\"esp32\",\"Hostname\":\"sensor-cali\",\"IPNVersion\":\"1.3.2-"
+    "{\"OS\":\"esp32\",\"Hostname\":\"sensor-test\",\"IPNVersion\":\"1.3.2-"
     "tinylink\"},\"Auth\":{\"AuthKey\":\"tskey-auth-kAbCdEf1CNTRL-012345678"
     "9abcdefABCDEF\"}}",
     "{\"Version\":148,\"NodeKey\":\"nodekey:0000000000000000000000000000000"
@@ -63,7 +63,7 @@ int main(void)
         for (int i = 0; i < 32; i++) k[i] = (uint8_t)(i * 7 + 1);
         static char out[2048];
         size_t n = 0;
-        esp_err_t e = register_build_body(148, k, "sensor-cali", "1.3.2-tinylink",
+        esp_err_t e = register_build_body(148, k, "sensor-test", "1.3.2-tinylink",
                                           "tskey-auth-kAbCdEf1CNTRL-0123456789abcdefABCDEF",
                                           out, sizeof(out), &n);
         CHECK("register/golden-typical", e == ESP_OK && n == strlen(k_golden[0]) &&
@@ -84,12 +84,12 @@ int main(void)
 
         /* Exact fit vs one byte short (the NUL counts). */
         const size_t len0 = strlen(k_golden[0]);
-        e = register_build_body(148, k, "sensor-cali", "1.3.2-tinylink",
+        e = register_build_body(148, k, "sensor-test", "1.3.2-tinylink",
                                 "tskey-auth-kAbCdEf1CNTRL-0123456789abcdefABCDEF",
                                 out, len0 + 1, &n);
         CHECK("register/exact-fit", e == ESP_OK && n == len0);
         memset(out, 'X', sizeof(out));
-        e = register_build_body(148, k, "sensor-cali", "1.3.2-tinylink",
+        e = register_build_body(148, k, "sensor-test", "1.3.2-tinylink",
                                 "tskey-auth-kAbCdEf1CNTRL-0123456789abcdefABCDEF",
                                 out, len0, &n);
         CHECK("register/one-short", e == ESP_ERR_INVALID_SIZE && out[len0 - 1] == '\0'
@@ -105,16 +105,16 @@ int main(void)
         const size_t head = (size_t)(auth_at - k_golden[0]);
         memcpy(want, k_golden[0], head);
         memcpy(want + head, "}", 2);
-        e = register_build_body(148, k, "sensor-cali", "1.3.2-tinylink", NULL,
+        e = register_build_body(148, k, "sensor-test", "1.3.2-tinylink", NULL,
                                 out, sizeof(out), &n);
         CHECK("register/no-auth-omits-member", e == ESP_OK && n == strlen(want) &&
                                                strcmp(out, want) == 0 &&
                                                strstr(out, "Auth") == NULL);
         CHECK("register/no-auth-is-object", json_check_object(out, n) == ESP_OK);
-        e = register_build_body(148, k, "sensor-cali", "1.3.2-tinylink", NULL,
+        e = register_build_body(148, k, "sensor-test", "1.3.2-tinylink", NULL,
                                 out, n + 1, &n);
         CHECK("register/no-auth-exact-fit", e == ESP_OK && n == strlen(want));
-        e = register_build_body(148, k, "sensor-cali", "1.3.2-tinylink", NULL,
+        e = register_build_body(148, k, "sensor-test", "1.3.2-tinylink", NULL,
                                 out, strlen(want), &n);
         CHECK("register/no-auth-one-short", e == ESP_ERR_INVALID_SIZE);
         /* "" is still a key: the member stays (empty-strings golden). */
