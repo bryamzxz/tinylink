@@ -53,6 +53,13 @@ the sensor logs in CHANGELOG.md.
 
 - **In-tunnel TSMP probe.** Would bring WG-silent failover below the
   ~13 s of the doubt handshake (1.3.8).
+- **No 15-s "stopped hearing back" handshake on the DERP-only path.**
+  WireGuard initiates a new handshake when data sent got nothing back
+  for KEEPALIVE + REKEY_TIMEOUT (15 s). tinylink does it on the direct
+  path (the doubt handshake at 12 s, 1.3.8), but on DERP only it waits
+  for the 30-s RX-stale. Seen in the 1.4.0 soak after a ~70-s outage of
+  the collector: a rekey answered via DERP, then 45 s with nothing from
+  the peer, the RX-stale rekey at 30 s, answered on its 4th try.
 - **Warm start, second iteration.** On the sensor (1.4.0, 7 warm boots)
   got-ip → session up was median 1.55 s / mean 2.34 s, against
   2.17–2.20 / 2.49–2.74 s for 18 cold boots. In 4 of 7 the peer answered
