@@ -161,18 +161,30 @@ static int hint_nvs_write(const uint8_t *b, size_t n, void *ctx)
     return err == ESP_OK ? 0 : -1;
 }
 
-/* tinylink_set_persist_hook: the 60-s housekeeping on the telemetry task
- * writes the record when it differs from NVS — after a connect to a new
- * channel, never on the boot path. */
+/* The record → NVS when it differs (a connect on a new channel), never on
+ * the boot path. Two callers that never overlap in practice, guarded
+ * anyway: the 60-s housekeeping on the telemetry task
+ * (tinylink_set_persist_hook), and — the telemetry task only starts once
+ * the node is registered — main's register retry loop after each wait
+ * (app_wifi_persist_hint), so a boot with control down or the node not
+ * yet approved still keeps the channel for the next cold boot. */
 static void hint_persist(void)
 {
+    static uint32_t s_busy;
+    if (__atomic_exchange_n(&s_busy, 1u, __ATOMIC_ACQUIRE) != 0) return;   /* next call */
     portENTER_CRITICAL(&s_conn_mux);
     const tl_wifi_ap_t ap = s_conn.ap;
     portEXIT_CRITICAL(&s_conn_mux);
-    if (!tl_wifi_ap_ok(&ap, s_ssid_hash)) return;          /* nothing learned yet */
-    if (tl_wifi_blob_store(&s_hint_nvs, &ap, hint_nvs_write, NULL) == 1) {
+    if (tl_wifi_ap_ok(&ap, s_ssid_hash) &&                 /* else nothing learned yet */
+        tl_wifi_blob_store(&s_hint_nvs, &ap, hint_nvs_write, NULL) == 1) {
         ESP_LOGI(TAG, "wifi hint: channel %u stored", (unsigned)ap.channel);
     }
+    __atomic_store_n(&s_busy, 0u, __ATOMIC_RELEASE);
+}
+
+void app_wifi_persist_hint(void)
+{
+    hint_persist();
 }
 
 /* Boot: the RTC copy (a warm reset) or the NVS record (any reset) for
