@@ -122,7 +122,7 @@ What works today, verified on real hardware:
 | 22 | Optimization round 1.3.5 (2026-10-29) | done — 6-h soak clean; ts2021 over plain HTTP :80 (Noise IK authenticates), TLS session tickets, STUN off the boot path, DERP at boot, servers at their last-known address (no DNS), one-shot request deadlines |
 | 23 | Optimization round 1.3.6 (2026-10-29) | done — 3.5-h soak; data-plane path selection by proof (doubt / silent / undelivered), DERP re-send ring, no endpoint flapping (149 → 1 roam) |
 | 24 | Optimization round 1.3.7 (2026-10-30) | done — reset → WG up median 9.3 → 7.1 s: Wi-Fi channel hint, immediate retry after the AP's 4-way timeout, DHCP INIT-REBOOT, 18 instead of 33 X25519 per boot; MAX_MODEM at listen interval 3 (light sleep 81 → 90 % of the time) |
-| 25 | Optimization round 1.3.8 (2026-10-30) | soaking — TLS handshake CPU 1.18 s → 66 ms on the chip (RSA chains first, in-tree X25519), PMK on the second core, WG-silence recovery 30 → ~13 s (doubt handshake), stalled-poll deadline, `Ts-Lb` hint |
+| 25 | Optimization round 1.3.8 (2026-10-30) | 161-min soak clean (0 resets, 0 RX-stale) — TLS handshake CPU 1.18 s → 66 ms on the chip (RSA chains first, in-tree X25519), PMK on the second core, WG-silence recovery 30 → ~13 s (doubt handshake), stalled-poll deadline, `Ts-Lb` hint |
 
 Two further 2026-05-12 rounds — sdkconfig perf-trim (#76–#80) and DERP
 outbound (#82–#83: supervisor spawn + lossless relay fallback during
