@@ -964,7 +964,7 @@ static void test_rescue_ring(void)
 {
     static wg_rescue_ring_t r;
     memset(&r, 0, sizeof(r));
-    const int64_t age = MS(WG_PATH_RESCUE_MS);
+    const int64_t age = MS(WG_PATH_RESCUE_MAX_MS);
     uint8_t f[WG_RESCUE_MAX + 1];
     for (int i = 0; i < 3; i++) {
         memset(f, 0xA0 + i, sizeof(f));
@@ -972,20 +972,20 @@ static void test_rescue_ring(void)
     }
     rescue_sink_t k = { 0 };
     unsigned kept = 99;
-    ok("rescue/refused-kept", wg_rescue_flush(&r, T0 + S(12), age, rescue_sink, &k, &kept) == 0 &&
+    ok("rescue/refused-kept", wg_rescue_flush(&r, T0 + S(12), 0, age, rescue_sink, &k, &kept) == 0 &&
                               kept == 3 && k.calls == 0);
     k = (rescue_sink_t){ .accept = 1 };
-    ok("rescue/partial", wg_rescue_flush(&r, T0 + S(13), age, rescue_sink, &k, &kept) == 1 &&
+    ok("rescue/partial", wg_rescue_flush(&r, T0 + S(13), 0, age, rescue_sink, &k, &kept) == 1 &&
                          kept == 2 && k.order[0] == 0xA0);
     k = (rescue_sink_t){ .accept = -1 };
-    ok("rescue/relay-back", wg_rescue_flush(&r, T0 + S(20), age, rescue_sink, &k, &kept) == 2 &&
+    ok("rescue/relay-back", wg_rescue_flush(&r, T0 + S(20), 0, age, rescue_sink, &k, &kept) == 2 &&
                             kept == 0 && k.order[0] == 0xA1 && k.order[1] == 0xA2);
-    ok("rescue/once", wg_rescue_flush(&r, T0 + S(21), age, rescue_sink, &k, &kept) == 0 &&
+    ok("rescue/once", wg_rescue_flush(&r, T0 + S(21), 0, age, rescue_sink, &k, &kept) == 0 &&
                       k.calls == 2);
     /* Past the age bound: dropped, not sent late. */
     wg_rescue_keep(&r, f, 112, T0 + S(30));
     k = (rescue_sink_t){ .accept = -1 };
-    ok("rescue/age-bound", wg_rescue_flush(&r, T0 + S(30) + age + 1, age, rescue_sink, &k,
+    ok("rescue/age-bound", wg_rescue_flush(&r, T0 + S(30) + age + 1, 0, age, rescue_sink, &k,
                                            &kept) == 0 && kept == 0 && k.calls == 0);
     /* Full: the oldest goes; too big: not kept. */
     for (int i = 0; i < WG_RESCUE_SLOTS + 1; i++) {
@@ -995,8 +995,50 @@ static void test_rescue_ring(void)
     wg_rescue_keep(&r, f, WG_RESCUE_MAX + 1, T0 + S(110));
     k = (rescue_sink_t){ .accept = -1 };
     ok("rescue/ring-oldest-out",
-       wg_rescue_flush(&r, T0 + S(111), age, rescue_sink, &k, &kept) == WG_RESCUE_SLOTS &&
+       wg_rescue_flush(&r, T0 + S(111), 0, age, rescue_sink, &k, &kept) == WG_RESCUE_SLOTS &&
        k.order[0] == 1 && k.order[WG_RESCUE_SLOTS - 1] == WG_RESCUE_SLOTS);
+
+    /* Round 1.3.8: aged by the last proof of delivery, not 40 s. Frames
+     * sent before it are dropped unsent, those at or after it go — 60 s
+     * old too (the 1.3.6 known gap) — up to WG_PATH_RESCUE_MAX_MS. */
+    for (int i = 0; i < 4; i++) {
+        memset(f, 0xB0 + i, sizeof(f));
+        wg_rescue_keep(&r, f, 112, T0 + S(200 + 20 * i));      /* 200, 220, 240, 260 */
+    }
+    k = (rescue_sink_t){ .accept = -1 };
+    ok("rescue/from-proof",
+       wg_rescue_flush(&r, T0 + S(280), T0 + S(220), age, rescue_sink, &k, &kept) == 3 &&
+       kept == 0 && k.order[0] == 0xB1 && k.order[2] == 0xB3);
+    wg_rescue_keep(&r, f, 112, T0 + S(300));
+    k = (rescue_sink_t){ .accept = -1 };
+    ok("rescue/max-age", wg_rescue_flush(&r, T0 + S(300) + age + 1, 0, age, rescue_sink, &k,
+                                         &kept) == 0 && k.calls == 0);
+
+    /* The proof: a keepalive that proves the direct path — its frame went
+     * out KEEPALIVE_TIMEOUT before it. Not one within a window of a DERP
+     * copy (it may answer that), not one ending a doubt, not a pong. */
+    wg_path_t p;
+    wg_path_mode_t m;
+    wg_path_init(&p, T0, true);
+    ok("proof/none-at-start", wg_path_rescue_from(&p) == 0);
+    confirm_at(&p, T0, 50000);
+    ok("proof/not-a-pong", wg_path_rescue_from(&p) == 0);
+    (void)wg_path_on_send(&p, T0 + S(1), true, &m);
+    (void)wg_path_on_keepalive(&p, T0 + S(11));
+    ok("proof/direct-ka", wg_path_rescue_from(&p) == T0 + S(1));
+    wg_path_init(&p, T0, true);
+    (void)wg_path_on_send(&p, T0 + S(1), true, &m);          /* DUAL: via DERP too */
+    confirm_at(&p, T0 + S(2), 50000);
+    (void)wg_path_on_send(&p, T0 + S(3), true, &m);
+    (void)wg_path_on_keepalive(&p, T0 + S(13));               /* within a window of S(1) */
+    ok("proof/not-after-derp", p.mode == WG_PATH_DIRECT && wg_path_rescue_from(&p) == 0);
+    (void)wg_path_on_send(&p, T0 + S(14), true, &m);
+    (void)wg_path_on_keepalive(&p, T0 + S(24));
+    ok("proof/then-direct-ka", wg_path_rescue_from(&p) == T0 + S(14));
+    doubt_at(&p, T0 + S(1), T0 + S(1) + MS(WG_PATH_ANSWER_MS) + MS(81));
+    const int64_t before = wg_path_rescue_from(&p);
+    (void)wg_path_on_keepalive(&p, T0 + S(30));
+    ok("proof/not-a-doubt-ka", p.mode == WG_PATH_DIRECT && wg_path_rescue_from(&p) == before);
 }
 
 static void test_unmanaged(void)
@@ -1124,9 +1166,9 @@ typedef struct {
     bool     wg_fixed;                  /* runtime: the peer got an INIT since */
 } sim_t;
 
-/* Our direct-only frames of the last WG_PATH_RESCUE_MS (wg_netif keeps
- * the wire bytes; here only whether the frame got through). */
-#define RESCUE_N 8
+/* Our direct-only frames in the rescue ring (wg_netif keeps the wire
+ * bytes; here only whether the frame got through). */
+#define RESCUE_N WG_RESCUE_SLOTS
 typedef struct { int64_t t; bool lost; bool dead_keys; } sent_t;
 static sent_t s_sent[RESCUE_N];
 static int    s_sent_head;
@@ -1212,13 +1254,17 @@ static bool sim_init(const sim_t *s, wg_path_t *p, int64_t t)
     return true;
 }
 
-/* The lapse's re-send: every frame of the window goes via DERP; the
- * peer's replay window drops the ones it has, the lost ones arrive —
- * unless the peer lost the keys they are sealed with. */
-static void sim_rescue(sim_t *s, int64_t t, int64_t break_at)
+/* The lapse's re-send: every frame sent since the last proof of delivery
+ * goes via DERP; the peer's replay window drops the ones it has, the lost
+ * ones arrive — unless the peer lost the keys they are sealed with. */
+static void sim_rescue(sim_t *s, const wg_path_t *p, int64_t t, int64_t break_at)
 {
     for (int i = 0; i < RESCUE_N; i++) {
-        if (s_sent[i].t == 0 || wg_timer_due(t, s_sent[i].t, MS(WG_PATH_RESCUE_MS))) continue;
+        if (s_sent[i].t == 0 || s_sent[i].t < wg_path_rescue_from(p) ||
+            wg_timer_due(t, s_sent[i].t, MS(WG_PATH_RESCUE_MAX_MS))) {
+            s_sent[i].t = 0;
+            continue;
+        }
         s->rescue_copies++;
         if (s_sent[i].lost && !s_sent[i].dead_keys) {
             s->rescued++;
@@ -1425,7 +1471,7 @@ static void run_sim(sim_t *s)
             forced_init_at = t;
             (void)sim_init(s, &p, t);
         }
-        if (act & WG_PATH_ACT_RESCUE) sim_rescue(s, t, break_at);
+        if (act & WG_PATH_ACT_RESCUE) sim_rescue(s, &p, t, break_at);
         if (act & WG_PATH_ACT_PING) sim_ping(s, t, s_cur);
         if (act & WG_PATH_ACT_PROBE) {          /* every endpoint the netmap lists */
             s->probes++;
@@ -1443,7 +1489,8 @@ static void run_sim(sim_t *s)
     s->lost_open = 0;
     for (int i = 0; i < RESCUE_N; i++) {
         if (s_sent[i].t != 0 && s_sent[i].lost && !s_sent[i].dead_keys &&
-            !wg_timer_due(t, s_sent[i].t, MS(WG_PATH_RESCUE_MS))) {
+            s_sent[i].t >= wg_path_rescue_from(&p) &&
+            !wg_timer_due(t, s_sent[i].t, MS(WG_PATH_RESCUE_MAX_MS))) {
             s->lost_open++;
         }
     }

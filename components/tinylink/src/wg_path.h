@@ -52,7 +52,7 @@
 // none (the test simulates hours of it); a lapse costs one ping. The
 // price is detection latency — a keepalive answers a frame ~10 s old —
 // paid back by re-sending, once a lapse is confirmed, the direct-only
-// frames that may have been lost (WG_PATH_RESCUE_MS).
+// frames that may have been lost (WG_PATH_RESCUE_MAX_MS).
 //
 // Exceptions handled: the peer's handshake response and its first data
 // packet after a handshake (the capver-144 TSMP disco advert on every new
@@ -193,21 +193,33 @@ typedef enum {
 /* When a lapse is confirmed — its ping got no pong (DUAL → RELAY), the
  * doubt after its pong ended SILENT or UNDELIVERED, or the endpoint
  * moved elsewhere before the current one answered — the data frames sent
- * direct-only within this long are re-sent via DERP (WG_PATH_ACT_RESCUE),
- * and frames whose DERP copy was refused count as direct-only. Passive
- * evidence is late by construction: a keepalive answers the frame the
- * peer got KEEPALIVE_TIMEOUT before sending it, so one sent just before
- * the path died still arrives ~10 s after, restarts the window, and the
- * lapse comes up to ~27 s after the break (test_wg_path, 200 random
- * break instants: mean 20 s; without the re-send 3–5 frames lost per
- * break). The peer's replay window drops every frame it already got; the
- * lost ones arrive up to ~35 s late (the telemetry carries its sequence
- * number). The same ciphertexts: if the peer lost the session keys they
- * are lost again — the rekey only saves what follows. Not at the lapse
- * itself: a lapse whose ping is answered while the peer's packets keep
- * coming sends nothing twice — with a peer that streams data to us (no
- * keepalives) that is every lapse. */
-#define WG_PATH_RESCUE_MS 40000
+ * direct-only since the last proof of their delivery are re-sent via
+ * DERP (WG_PATH_ACT_RESCUE), and frames whose DERP copy was refused count
+ * as direct-only. Passive evidence is late by construction: a keepalive
+ * answers the frame the peer got KEEPALIVE_TIMEOUT before sending it, so
+ * one sent just before the path died still arrives ~10 s after, restarts
+ * the window, and the lapse comes up to ~27 s after the break
+ * (test_wg_path, 200 random break instants: mean 20 s; without the
+ * re-send 3–5 frames lost per break). The peer's replay window drops
+ * every frame it already got; the lost ones arrive late (the telemetry
+ * carries its sequence number). The same ciphertexts: if the peer lost
+ * the session keys they are lost again — the rekey only saves what
+ * follows. Not at the lapse itself: a lapse whose ping is answered while
+ * the peer's packets keep coming sends nothing twice — with a peer that
+ * streams data to us (no keepalives) that is every lapse.
+ *
+ * The proof (round 1.3.8, wg_path_rescue_from): a keepalive that proves
+ * the direct path (no frame via DERP within a window before it) answers
+ * a frame the peer received KEEPALIVE_TIMEOUT before sending it — frames
+ * sent before that instant got through the direct path, those after may
+ * not have. Until 1.3.7 the ring kept the last 40 s instead: with only
+ * our direct WireGuard toward the peer dropped, the first episode
+ * (direct → doubt → direct again → doubt → UNDELIVERED) outlasts 40 s and
+ * lost the 3–6 frames sent first (1.3.6 "Known gap"). The ring
+ * (WG_RESCUE_SLOTS) bounds how many; this bounds how old — the peer
+ * rejects anything sealed under a keypair older than REJECT_AFTER_TIME
+ * (whitepaper §6.2), so an older frame can never be accepted. */
+#define WG_PATH_RESCUE_MAX_MS 180000
 
 /* Actions for the caller (bitmask). */
 #define WG_PATH_ACT_PING   0x01u   /* DISCO ping to the current endpoint */
@@ -249,6 +261,8 @@ typedef struct {
     int64_t hs_us;              /* last completed handshake; 0 none */
     int64_t peer_wg_us;         /* last authenticated WG packet from the peer */
     int64_t lapse_from_us;      /* at a lapse: the unanswered frame / proof */
+    int64_t delivered_us;       /* direct-only data frames sent before this were
+                                   delivered (wg_path_rescue_from); 0 none */
     uint8_t doubts;             /* doubts since a keepalive that proved direct
                                    (any endpoint): the re-test back-off */
     uint8_t silent_streak;      /* silences since a transport packet from the peer */
@@ -406,7 +420,7 @@ static inline uint32_t wg_path_check_answer_(wg_path_t *p, int64_t now)
  * period would save those two packets per sample but deliver a sample
  * sent into a path that died during the pause only once a lapse is
  * confirmed (≥ 17 s late) — and never when the doubt needs a second
- * window the next sample opens minutes later, past WG_PATH_RESCUE_MS. */
+ * window the next sample opens minutes later, past WG_PATH_RESCUE_MAX_MS. */
 static inline uint32_t wg_path_on_send(wg_path_t *p, int64_t now, bool data,
                                        wg_path_mode_t *mode)
 {
@@ -614,8 +628,21 @@ static inline uint32_t wg_path_on_keepalive(wg_path_t *p, int64_t now)
         wg_timer_due(now, p->last_relay_data_us, (int64_t)WG_PATH_ANSWER_MS * 1000LL)) {
         p->proof_us = now;
         p->doubts   = 0;
+        /* The frame it answers was sent before now - KEEPALIVE_TIMEOUT
+         * (the peer's timer, plus the round trip): see
+         * WG_PATH_RESCUE_MAX_MS. */
+        const int64_t d = now - (int64_t)WG_PATH_KEEPALIVE_TIMEOUT_MS * 1000LL;
+        if (d > p->delivered_us) p->delivered_us = d;
     }
     return 0;
+}
+
+/* Data frames sent direct-only before this instant are proven delivered
+ * (0: none): a confirmed lapse re-sends via DERP the ones sent at or
+ * after it (wg_rescue_flush), WG_PATH_RESCUE_MAX_MS at most. */
+static inline int64_t wg_path_rescue_from(const wg_path_t *p)
+{
+    return p->delivered_us;
 }
 
 /* A transport packet with a payload from the peer, either path. Proves

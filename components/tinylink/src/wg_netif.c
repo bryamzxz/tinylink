@@ -319,6 +319,8 @@ typedef struct {
     uint8_t             buf[WG_RX_BUF_LEN];
     bool                relay_only;   /* B7 INIT copy: DERP relay, no sendto */
     bool                data;         /* carries a payload (not a keepalive) */
+    bool                rescue;       /* kept for a re-send when it goes direct only
+                                         (wg_rescue.h): not the TSMP advert (1.3.8) */
 } wg_tx_item_t;
 
 typedef enum {
@@ -856,6 +858,7 @@ static bool init_queue_relay(int64_t now)
     it->len        = sizeof(g.init_msg);
     it->relay_only = true;
     it->data       = false;
+    it->rescue     = false;
     (void)xQueueSend(g.tx_ready_q, &slot, 0);   /* never full */
     g.init_relay_us = now;
     return true;
@@ -1138,6 +1141,8 @@ static bool handle_handshake_response_locked(const uint8_t *buf, size_t len,
  * the next telemetry frame. Best effort like upstream: a full TX queue
  * drops it. Skipped when either tailnet address is unknown or the peer
  * has no DiscoKey (WireGuard-only peers never get one). */
+static esp_err_t send_plaintext(const uint8_t *pkt, size_t len, bool rescue);
+
 static void send_disco_advert(void)
 {
     if (!g.peer.has_peer_disco_pub ||
@@ -1149,7 +1154,7 @@ static void send_disco_advert(void)
                                              g.peer.self_tailnet_v4_be,
                                              g.peer.peer_tailnet_v4_be,
                                              g.local.disco_pub);
-    if (wg_netif_send_plaintext(pkt, n) == ESP_OK) {
+    if (send_plaintext(pkt, n, false) == ESP_OK) {
         g.stat_disco_adverts++;
     }
 }
@@ -2080,7 +2085,7 @@ retry_timer:;
     vTaskDelete(NULL);
 }
 
-/* Keep a copy of a data frame that went direct only (WG_PATH_RESCUE_MS). */
+/* Keep a copy of a data frame that went direct only (WG_PATH_RESCUE_MAX_MS). */
 static void rescue_keep(const wg_tx_item_t *it, int64_t now)
 {
     if (g.rescue != NULL) wg_rescue_keep(g.rescue, it->buf, it->len, now);
@@ -2095,7 +2100,8 @@ static bool rescue_relay(const uint8_t *buf, size_t len, void *user)
 
 /* A lapse of the direct path was confirmed (the WG_TX_SLOT_RESCUE
  * sentinel, queue_rescue): re-send via DERP, oldest first, the
- * direct-only frames of the last WG_PATH_RESCUE_MS. The peer's replay
+ * direct-only frames sent since the last proof of their delivery
+ * (wg_path_rescue_from; the last 40 s until 1.3.7). The peer's replay
  * window drops those it already has; the others are the telemetry the
  * dead path ate. Not best effort: these are the only copies. A relay that
  * refuses (DERP not connected) keeps the rest in the ring — the next
@@ -2107,16 +2113,26 @@ static __attribute__((noinline)) void tx_rescue(int64_t now)
     if (g.rescue == NULL || g.relay_cb == NULL) return;
     uint8_t dst_pub[WG_KEY_LEN];
     peer_static_snapshot(dst_pub);
+    xSemaphoreTake(g.lock, portMAX_DELAY);
+    const int64_t from = wg_path_rescue_from(&g.path);
+    xSemaphoreGive(g.lock);
     unsigned kept = 0;
-    const unsigned sent = wg_rescue_flush(g.rescue, now,
-                                          (int64_t)WG_PATH_RESCUE_MS * 1000LL,
+    const unsigned sent = wg_rescue_flush(g.rescue, now, from,
+                                          (int64_t)WG_PATH_RESCUE_MAX_MS * 1000LL,
                                           rescue_relay, dst_pub, &kept);
     g.rescue_owed = kept > 0;
     if (sent > 0) {
         g.stat_rescued += sent;
-        ESP_LOGI(TAG, "re-sent via DERP the %u direct-only frames of the last "
-                      "%d s (rescued: %u)", sent, WG_PATH_RESCUE_MS / 1000,
-                 (unsigned)g.stat_rescued);
+        /* `from`: when the last frame proven delivered went out. */
+        if (from > 0) {
+            ESP_LOGI(TAG, "re-sent via DERP the %u direct-only frames sent since the "
+                          "last one proven delivered, %u s ago (rescued: %u)", sent,
+                     (unsigned)((now - from) / 1000000LL), (unsigned)g.stat_rescued);
+        } else {
+            ESP_LOGI(TAG, "re-sent via DERP the %u direct-only frames sent since the "
+                          "session start, none proven delivered (rescued: %u)", sent,
+                     (unsigned)g.stat_rescued);
+        }
     }
     if (kept > 0) {
         g.relay_errors++;
@@ -2183,13 +2199,13 @@ static void tx_send_item(const wg_tx_item_t *it, int64_t now)
         if (g.relay_cb(dst_pub, it->buf, it->len, true,
                        g.relay_cb_user) != ESP_OK) {
             g.relay_errors++;
-            if (n >= 0 && it->data) rescue_keep(it, now);
+            if (n >= 0 && it->rescue) rescue_keep(it, now);
         }
         return;
     }
     if (n >= 0) {
         /* Direct only: DIRECT, or DERP only with the relay refusing. */
-        if (it->data && g.relay_cb != NULL && (mode == WG_PATH_DIRECT || relay_tried)) {
+        if (it->rescue && g.relay_cb != NULL && (mode == WG_PATH_DIRECT || relay_tried)) {
             rescue_keep(it, now);
         }
         return;
@@ -2548,7 +2564,7 @@ void wg_netif_handshake_kick(wg_netif_kick_t why)
          * have consumed it and answered into the relay that was down. */
         init_refresh_or_resend(false, true, true, "DERP relay up");
         /* A re-send the relay refused while it was down goes now (the
-         * frames younger than WG_PATH_RESCUE_MS). */
+         * frames not proven delivered, WG_PATH_RESCUE_MAX_MS at most). */
         if (g.rescue_owed) queue_rescue(WG_PATH_ACT_RESCUE);
         break;
     case WG_NETIF_KICK_CALL_ME_MAYBE:
@@ -2561,7 +2577,12 @@ void wg_netif_handshake_kick(wg_netif_kick_t why)
     xSemaphoreGive(g.hs_lock);
 }
 
-esp_err_t wg_netif_send_plaintext(const uint8_t *pkt, size_t len)
+/* `rescue`: a copy may be kept for a re-send via DERP (wg_rescue.h).
+ * The TSMP advert (send_disco_advert) is not: it is not application data
+ * (control gives the peer our DiscoKey too), and in the simulated worst
+ * episode with our direct WireGuard dropped its slot pushed out a lost
+ * sample. */
+static esp_err_t send_plaintext(const uint8_t *pkt, size_t len, bool rescue)
 {
     if (!g.initialized || g.state != WG_NETIF_UP) {
         return ESP_ERR_INVALID_STATE;
@@ -2621,10 +2642,16 @@ esp_err_t wg_netif_send_plaintext(const uint8_t *pkt, size_t len)
     it->len = (size_t)wlen;
     it->relay_only = false;
     it->data = len > 0;
+    it->rescue = rescue && len > 0;
     (void)xQueueSend(g.tx_ready_q, &slot, 0);   /* WG_TX_SLOTS + 2 deep: never full */
 
     g.last_tx_us = now_us();
     return ESP_OK;
+}
+
+esp_err_t wg_netif_send_plaintext(const uint8_t *pkt, size_t len)
+{
+    return send_plaintext(pkt, len, true);
 }
 
 void wg_netif_set_rx_callback(wg_netif_rx_cb_t cb, void *user)
