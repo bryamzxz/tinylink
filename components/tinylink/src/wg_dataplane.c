@@ -18,7 +18,7 @@
 #include "lwip/sockets.h"
 
 #include "tinylink.h"   /* tinylink_get_public_endpoint */
-#include "tl_warm.h"    /* tl_warm_target_index, tl_warm_addr_moved */
+#include "tl_warm.h"    /* tl_warm_target_index, tl_warm_addr_moved, tl_warm_disco_delta */
 #include "wg_lwip.h"
 #include "wg_netif.h"
 
@@ -512,12 +512,25 @@ esp_err_t wg_dataplane_update_peers(const tinylink_keys_t *keys,
     /* Same peer, new identity keys: a re-login (NodeKey) or a
      * tailscaled restart (DiscoKey, every start). Without this the
      * DISCO filters kept the boot-time DiscoKey forever and a
-     * re-logged peer left the session dead until our reboot. */
+     * re-logged peer left the session dead until our reboot. A peer
+     * entry without a DiscoKey clears the session's (round 1.3.9: a
+     * warm start's cached one must not outlive the netmap; a cold start
+     * from that netmap runs the peer without one). */
+    const int disco = tl_warm_disco_delta(peer->has_disco_pub, peer->disco_pub,
+                                          s_peer_has_disco, s_peer_disco_pub);
+    if (disco == TL_WARM_DISCO_GONE) {
+        ESP_LOGI(TAG, "peer DiscoKey gone from the netmap — DISCO off for the session");
+        esp_err_t derr = wg_netif_clear_peer_disco();
+        if (derr == ESP_OK) {
+            memset(s_peer_disco_pub, 0, sizeof(s_peer_disco_pub));
+            s_peer_has_disco = false;
+        } else {
+            err = derr;
+        }
+    }
     const bool static_changed =
         memcmp(peer->node_pub, s_peer_node_pub, sizeof(s_peer_node_pub)) != 0;
-    const bool disco_changed = peer->has_disco_pub &&
-        (!s_peer_has_disco ||
-         memcmp(peer->disco_pub, s_peer_disco_pub, sizeof(s_peer_disco_pub)) != 0);
+    const bool disco_changed = disco == TL_WARM_DISCO_NEW;
     if (static_changed || disco_changed) {
         ESP_LOGI(TAG, "peer identity changed (%s%s%s) — updating session",
                  static_changed ? "NodeKey" : "",

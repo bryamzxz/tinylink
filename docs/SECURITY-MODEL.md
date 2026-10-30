@@ -277,18 +277,24 @@ used:
 
 How long: until the netmap replaces the binding — normally seconds; at
 most `CONFIG_TINYLINK_WARM_START_MAX_S` (600 s) plus up to 60 s (the
-telemetry task's housekeeping checks the bound), after which the record
+telemetry task's 60-s housekeeping checks the bound; without a telemetry
+task the long-poll checks it at every reconnect, up to a reconnect
+backoff or a control `Retry-After` later), after which the record
 is erased and the device restarts into a cold boot. Also not used: a
 record no netmap stood behind for 30 days (`written` is refreshed at
 most daily while it is current; before SNTP the floor clock gives a
 lower bound of the age, and a pending session ends once SNTP shows the
 record too old), a record written under another NodeKey or control key,
 a boot whose register needed the auth key (a new or re-created node),
-and a boot after a reset during a warm start (the record is erased;
-after two, the warm start stays off until a power cycle). No warm start
+and a boot after a reset during a warm start before it settled (its
+netmap applied, the record for the next boot stored) or after one that
+hung (the record is erased; after two, the warm start stays off until a
+power cycle). No warm start
 without a register answered by the Noise-authenticated control plane.
 The netmap's own binding replaces the cached one in place (keys,
-endpoints, address) or the device restarts cold (another peer, another
+endpoints, address; a peer entry without a DiscoKey clears the cached
+one — DISCO then runs as for a cold start from that netmap, i.e.
+permissive) or the device restarts cold (another peer, another
 self address, no peers, an expired or deleted node). Nothing else is
 skipped: tinylink enforces no packet filter (above). The record is
 checked only against corruption (strict decode); like every NVS key it

@@ -1534,12 +1534,17 @@ static void handle_disco_direct(const uint8_t *buf, size_t len,
 {
     disco_peer_snap_t peer;
     xSemaphoreTake(g.lock, portMAX_DELAY);
+    /* IDLE with wg_rx running: a start that failed after spawning it
+     * (wg_netif_abort_start, round 1.3.9) — no peer until the netmap's
+     * start, so no DISCO either (permissive with the zeroed peer, it
+     * would answer anyone's ping sealed to our key). */
+    const bool idle = g.state == WG_NETIF_IDLE;
     peer.has_pub = g.peer.has_peer_disco_pub;
     peer.k_valid = g.peer_disco_shared_k_valid;
     memcpy(peer.pub, g.peer.peer_disco_pub, WG_KEY_LEN);
     memcpy(peer.k, g.peer_disco_shared_k, WG_KEY_LEN);
     xSemaphoreGive(g.lock);
-    handle_disco_direct_snap(buf, len, src, &peer);
+    if (!idle) handle_disco_direct_snap(buf, len, src, &peer);
     tl_secure_zero(peer.k, sizeof(peer.k));
 }
 
@@ -2601,6 +2606,19 @@ esp_err_t wg_netif_update_peer_endpoint(uint32_t v4_be, uint16_t port)
     /* Existing transport session keys remain valid — endpoint roaming
      * doesn't invalidate keys (per WG roaming spec). Subsequent
      * outgoing packets land at the new endpoint. */
+    return ESP_OK;
+}
+
+esp_err_t wg_netif_clear_peer_disco(void)
+{
+    if (!g.initialized) return ESP_ERR_INVALID_STATE;
+    xSemaphoreTake(g.lock, portMAX_DELAY);
+    memset(g.peer.peer_disco_pub, 0, WG_KEY_LEN);
+    g.peer.has_peer_disco_pub = false;
+    tl_secure_zero(g.peer_disco_shared_k, sizeof(g.peer_disco_shared_k));
+    g.peer_disco_shared_k_valid = false;
+    wg_path_set_managed(&g.path, now_us(), false);
+    xSemaphoreGive(g.lock);
     return ESP_OK;
 }
 
