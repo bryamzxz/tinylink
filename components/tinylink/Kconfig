@@ -101,6 +101,20 @@ menu "tinylink core"
             again at once with the full mbedTLS offer, and asked with it
             directly for 6 h (src/tls_offer.h).
 
+    config TINYLINK_TLS_X25519_INTREE
+        bool "TLS: X25519 ECDHE on the in-tree Curve25519"
+        default y
+        help
+            Round 1.3.8. Both X25519 scalar multiplications of a full TLS
+            handshake (the client's ephemeral key and the shared secret)
+            run on the constant-time Curve25519 the WireGuard data plane
+            uses (src/crypto/curve25519_fiat32.c) instead of mbedTLS's
+            Montgomery ladder over its generic bignum. The link wraps
+            mbedtls_ecp_mul_restartable (-Wl,--wrap) and diverts
+            Curve25519 only; same argument checks and results as mbedTLS
+            (src/tls_x25519.c). CONFIG_TINYLINK_BENCH_TLS cross-checks
+            the two on the device.
+
     config TINYLINK_BENCH_AEAD
         bool "Run ChaCha20-Poly1305 AEAD and X25519 micro-benchmarks on boot"
         default n
