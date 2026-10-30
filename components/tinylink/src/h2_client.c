@@ -99,6 +99,24 @@ typedef struct {
  * on the control conn (the long-poll task's). */
 static h2_side_t *s_side;
 
+/* The Ts-Lb value (h2_client_set_lb): "nodekey:" + 64 hex, or "". */
+static char s_lb[8 + 64 + 1];
+
+void h2_client_set_lb(const uint8_t node_pub[32])
+{
+    static const char hex[] = "0123456789abcdef";
+    if (node_pub == NULL) {
+        s_lb[0] = '\0';
+        return;
+    }
+    memcpy(s_lb, "nodekey:", 8);
+    for (size_t i = 0; i < 32; i++) {
+        s_lb[8 + 2 * i]     = hex[node_pub[i] >> 4];
+        s_lb[8 + 2 * i + 1] = hex[node_pub[i] & 0x0f];
+    }
+    s_lb[sizeof(s_lb) - 1] = '\0';
+}
+
 /* A server that allows one stream at a time (SETTINGS_MAX_CONCURRENT_
  * STREAMS < 2), seen on any conn: the side request then goes before its
  * stream, alone (ESP_ERR_INVALID_SIZE to the caller), on every later
@@ -378,7 +396,8 @@ static esp_err_t h2_drive_request(ts2021_conn_t *conn,
 
     char content_length[16];
     snprintf(content_length, sizeof(content_length), "%u", (unsigned)body_len);
-    /* Same fields, same order as the nghttp2 client sent. */
+    /* Same fields, same order as the nghttp2 client sent; the Ts-Lb
+     * hint after them once it is set (round 1.3.8). */
     const h2_field_t hdrs[] = {
         { ":method",        "POST" },
         { ":scheme",        "https" },
@@ -386,9 +405,10 @@ static esp_err_t h2_drive_request(ts2021_conn_t *conn,
         { ":authority",     authority },
         { "content-type",   "application/json" },
         { "content-length", content_length },
+        { "ts-lb",          s_lb },
     };
-    const h2_req_t req = { hdrs, sizeof(hdrs) / sizeof(hdrs[0]),
-                           conn->h2_req_body, body_len };
+    const size_t n_hdrs = sizeof(hdrs) / sizeof(hdrs[0]) - (s_lb[0] == '\0' ? 1 : 0);
+    const h2_req_t req = { hdrs, n_hdrs, conn->h2_req_body, body_len };
     /* The side request: the same path and fields, its own length. */
     char side_length[16];
     h2_field_t side_hdrs[sizeof(hdrs) / sizeof(hdrs[0])];
@@ -397,8 +417,7 @@ static esp_err_t h2_drive_request(ts2021_conn_t *conn,
         snprintf(side_length, sizeof(side_length), "%u", (unsigned)side->len);
         memcpy(side_hdrs, hdrs, sizeof(hdrs));
         side_hdrs[5].value = side_length;
-        side_req = (h2_req_t){ side_hdrs, sizeof(hdrs) / sizeof(hdrs[0]),
-                               side->body, side->len };
+        side_req = (h2_req_t){ side_hdrs, n_hdrs, side->body, side->len };
     }
     int rc = h2c_request_pair(h, side != NULL ? &side_req : NULL, &req);
     if ((rc == H2C_ERR_SIZE || rc == H2C_ERR_STREAMS) && side != NULL) {

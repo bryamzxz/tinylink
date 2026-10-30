@@ -120,6 +120,16 @@ esp_err_t h2_post_json_stream_side(ts2021_conn_t *conn,
 void h2_client_forget_limits(void);
 #endif
 
+/* The load-balancer hint every request carries from now on (round 1.3.8,
+ * C2): `ts-lb: nodekey:<hex>`, upstream's tailcfg.LBHeader — the
+ * official client adds it to register, map and every other Noise request
+ * (ts2021.AddLBHeader, since 2024-03), so that the control plane's
+ * reverse proxy can route a request to the node's backend without
+ * reading its body. "Not a security or authentication header; strictly
+ * denormalized redundant data as an optimization" (tailcfg.go); headscale
+ * ignores it. NULL: no hint. */
+void h2_client_set_lb(const uint8_t node_pub[32]);
+
 /* Start the persistent HTTP/2 session bound to `conn` (state embedded in
  * the conn, no heap). Called once at the end of ts2021_connect. Sends
  * the client preface + our SETTINGS and returns without waiting for the

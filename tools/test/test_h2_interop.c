@@ -1546,6 +1546,67 @@ static void sc_resp_deadline(void)
     conn_down();
     s_now_us = 0;
 }
+
+/* Round 1.3.8, C2: the Ts-Lb load-balancer hint (upstream's
+ * tailcfg.LBHeader) on every request once set — register, push, the
+ * map stream and the side stream — and none once cleared. */
+static void sc_lb_hint(void)
+{
+    uint8_t pub[32];
+    for (int i = 0; i < 32; i++) pub[i] = (uint8_t)(0xa0 + i);
+    const char *want_lb =
+        "ts-lb: nodekey:a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf\n";
+    h2_client_set_lb(pub);
+
+    srv_new(0);
+    conn_up(true);
+    S.sc = SC_OK;
+    memcpy(S.resp, kOkBody, sizeof(kOkBody) - 1);
+    S.resp_len = sizeof(kOkBody) - 1;
+    res_t r1 = post("/machine/register", kRegBody, sizeof(kRegBody) - 1, 4095);
+    S.sc = SC_HEADERS_ONLY;
+    res_t r2 = post("/machine/map", kRegBody, sizeof(kRegBody) - 1, 256);
+    S.sc = SC_STREAM;
+    fill_mapresponses(1, 3000);
+    res_t r3 = stream(kRegBody, sizeof(kRegBody) - 1);
+    char want[512];
+    snprintf(want, sizeof(want), ":method: POST\n:scheme: https\n:path: /machine/register\n"
+             ":authority: " AUTH "\ncontent-type: application/json\ncontent-length: %zu\n%s",
+             sizeof(kRegBody) - 1, want_lb);
+    const size_t lb_len = strlen(want_lb);
+    const size_t h1 = strlen(S.hdrs[1]), h2 = strlen(S.hdrs[2]);
+    check("lb_hint_on_register_push_stream",
+          r1.err == ESP_OK && r1.status == 200 && r2.err == ESP_OK && r2.status == 200 &&
+          r3.err == ESP_OK && r3.status == 200 && r3.len == S.resp_len && S.nreq == 3 &&
+          strcmp(S.hdrs[0], want) == 0 &&
+          h1 > lb_len && strcmp(S.hdrs[1] + h1 - lb_len, want_lb) == 0 &&
+          h2 > lb_len && strcmp(S.hdrs[2] + h2 - lb_len, want_lb) == 0 && S.bad == 0);
+    conn_down();
+
+    /* the pair (B1): both streams carry it */
+    srv_new(0);
+    conn_up(true);
+    S.sc = SC_STREAM;
+    S.sc_req[0] = SC_HEADERS_ONLY;
+    fill_mapresponses(1, 3000);
+    res_t r4 = stream_side();
+    const size_t s0 = strlen(S.hdrs[0]), s1 = strlen(S.hdrs[1]);
+    check("lb_hint_on_the_side_pair",
+          r4.err == ESP_OK && r4.status == 200 && s_side_status == 200 && S.nreq == 2 &&
+          s0 > lb_len && strcmp(S.hdrs[0] + s0 - lb_len, want_lb) == 0 &&
+          s1 > lb_len && strcmp(S.hdrs[1] + s1 - lb_len, want_lb) == 0 && S.bad == 0);
+    conn_down();
+
+    /* cleared: the six fields of before */
+    h2_client_set_lb(NULL);
+    srv_new(0);
+    conn_up(true);
+    S.sc = SC_HEADERS_ONLY;
+    (void)post("/machine/map", kRegBody, sizeof(kRegBody) - 1, 256);
+    check("lb_hint_cleared", S.nreq == 1 && strstr(S.hdrs[0], "ts-lb") == NULL &&
+          strstr(S.hdrs[0], "content-length: ") != NULL);
+    conn_down();
+}
 #endif
 
 static void sc_small_server_window(void)
@@ -1699,6 +1760,7 @@ int main(void)
     sc_side_one_stream();
     sc_side_late_push();
     sc_resp_deadline();
+    sc_lb_hint();
 #endif
     if (s_fails == 0) printf("\nALL OK\n");
     return s_fails ? 1 : 0;

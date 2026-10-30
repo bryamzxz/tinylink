@@ -25,6 +25,7 @@
 #include "sdkconfig.h"
 
 #include "backoff.h"
+#include "h2_client.h"        /* h2_client_set_lb */
 #include "h2_retry_after.h"
 #include "tl_wdt.h"
 #include "tl_time.h"
@@ -96,6 +97,9 @@ static esp_err_t ensure_control_conn(void)
                                    control_key_pinned());
     if (err == ESP_OK) {
         s_conn_open = true;
+        /* Every request on it names the node for control's load
+         * balancer, as upstream's (round 1.3.8, h2_client_set_lb). */
+        h2_client_set_lb(s_keys.node_pub);
         /* For the next boot (round 1.3.5): the telemetry housekeeping
          * stores it when it differs from NVS (tl_addr.h). An unknown peer
          * (0) leaves the record alone. */
