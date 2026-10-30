@@ -251,6 +251,50 @@ cheaper than dragging in another dependency.
   were never authenticated (the transaction ID is the check, as before).
   Host tests: `test_addr`, `test_ts2021` (`dns_*`).
 
+## Warm start (round 1.3.9)
+
+`CONFIG_TINYLINK_WARM_START` (default y) brings WireGuard up from the
+previous boot's netmap — our tailnet address and the target peer's
+NodeID, NodeKey, DiscoKey, endpoints and tailnet addresses, NVS
+`tl_state` / `warm_rec` (`src/tl_warm.h`) — once this boot's register
+has succeeded without the auth key, instead of after this boot's
+netmap. Until that netmap arrives the device trusts a binding — this
+NodeKey and this DiscoKey are the peer at that tailnet address — that
+an earlier, authenticated netmap gave it, possibly long ago. A peer key
+rotated or revoked since (the peer removed, its key leaked) is still
+used:
+
+- **NodeKey.** Whoever holds the old private key can answer the
+  handshake — via DERP, which routes by NodeKey — and then receives the
+  telemetry and can query `/stats` (`CONFIG_TINYLINK_STATS_PORT`, served
+  over the tunnel: counters, version, uptime).
+- **DiscoKey.** The relayed-DISCO gate and the direct path's admit the
+  cached DiscoKey: its holder gets pings answered, has the endpoints of
+  its CallMeMaybe punched (DISCO pings to addresses it names, at most
+  the endpoints one CMM carries) and can move our WireGuard endpoint
+  with a pong (traffic analysis or a dropped path; the frames stay
+  encrypted to the session, which needs the NodeKey).
+
+How long: until the netmap replaces the binding — normally seconds; at
+most `CONFIG_TINYLINK_WARM_START_MAX_S` (600 s) plus up to 60 s (the
+telemetry task's housekeeping checks the bound), after which the record
+is erased and the device restarts into a cold boot. Also not used: a
+record no netmap stood behind for 30 days (`written` is refreshed at
+most daily while it is current; before SNTP the floor clock gives a
+lower bound of the age, and a pending session ends once SNTP shows the
+record too old), a record written under another NodeKey or control key,
+a boot whose register needed the auth key (a new or re-created node),
+and a boot after a reset during a warm start (the record is erased;
+after two, the warm start stays off until a power cycle). No warm start
+without a register answered by the Noise-authenticated control plane.
+The netmap's own binding replaces the cached one in place (keys,
+endpoints, address) or the device restarts cold (another peer, another
+self address, no peers, an expired or deleted node). Nothing else is
+skipped: tinylink enforces no packet filter (above). The record is
+checked only against corruption (strict decode); like every NVS key it
+is not protected against a physical attacker (out of scope). Host test:
+`test_warm`.
+
 ## Audit + optimization round (2026-09) — memory safety + upstream drift
 
 Fourth audit round; details per item in `CHANGELOG.md`, threat-model

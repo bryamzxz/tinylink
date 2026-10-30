@@ -55,6 +55,7 @@
 #include "stun_probe.h"
 #include "telemetry.h"
 #include "tl_addr.h"
+#include "tl_warm.h"
 #include "tls_resume.h"
 #include "tl_bootstat.h"
 #include "ts2021_client.h"
@@ -189,6 +190,7 @@ void tinylink_diag_dump_stacks(void)
 
 static void reg_hint_load(void);
 static void addr_cache_load(void);
+static void warm_load(void);
 
 /* Round 1.3.7, B2: the boot's static key work while Wi-Fi associates
  * (main.c calls this between starting Wi-Fi and waiting for it; 3–9 s of
@@ -231,6 +233,7 @@ esp_err_t tinylink_init(void)
     }
     reg_hint_load();
     addr_cache_load();
+    warm_load();
     s_initialized = true;
     return ESP_OK;
 }
@@ -356,6 +359,10 @@ static esp_err_t read_auth_key(char *out, size_t out_size)
  * out of NVS. Written only when the verdict changes. */
 #define REG_NVS_KEY "reg_keys"
 static bool s_reg_known;   /* NVS reg_keys == this device's keys */
+/* The last successful register sent no auth key: control answered for
+ * the node it already knew with these keys (round 1.3.9: the warm start
+ * needs that — one that needed the key may be a new node). */
+static bool s_reg_no_auth;
 
 static void reg_hint_load(void)
 {
@@ -412,6 +419,7 @@ static esp_err_t register_node(bool force_auth)
     /* Read before connecting when it is going to be sent: a missing key
      * then fails without a TLS + Noise handshake per retry. */
     const bool known = s_reg_known && !force_auth;
+    bool retried = false;
     char auth_key[128];
     esp_err_t err;
     if (!known) {
@@ -433,6 +441,7 @@ static esp_err_t register_node(bool force_auth)
             ESP_LOGW(TAG, "register without auth refused (HTTP %d, 0x%x) — "
                           "retrying with the stored auth key", status, err);
             reg_hint_store(false);
+            retried = true;
             err = read_auth_key(auth_key, sizeof(auth_key));
             if (err == ESP_OK) {
                 err = register_emit(&s_conn, &s_keys, auth_key, &status);
@@ -457,6 +466,7 @@ static esp_err_t register_node(bool force_auth)
      * nothing either way). */
     if (err == ESP_OK) {
         reg_hint_store(true);
+        s_reg_no_auth = tl_warm_reg_reused(known, retried);
     } else if (register_retry_with_auth(status, err)) {
         reg_hint_store(false);
     }
@@ -1670,19 +1680,509 @@ static uint32_t cidr_host_v4(const tl_cidr_t *c)
     return inet_pton(AF_INET, host, &v4_be) == 1 ? v4_be : 0;
 }
 
+/* ---- Warm start (round 1.3.9, tl_warm.h) --------------------------------
+ *
+ * The data plane up from the previous boot's netmap, right after this
+ * boot's register, so the WireGuard handshake (direct to the cached
+ * endpoint, and via DERP) runs while the endpoint push and the map
+ * stream do. tl_warm.h has the record, why and when it is written, and
+ * every decision below (tl_warm_go, tl_warm_sm_*, tl_warm_rtc_*), which
+ * this file only drives, logs and acts on.
+ *
+ * Who runs what. The main task (tinylink_warm_start, after
+ * tinylink_long_poll_start, so the push is already out) brings the data
+ * plane up exactly as the first netmap would — relay_boot_join,
+ * wg_dataplane_start, telemetry_start, the prepunch — from s_self_addrs
+ * and s_last_peers seeded with the record (so the path-stale prepunch
+ * works too). The long-poll's first netmap shuts the gate first
+ * (warm_gate_shut): a warm start under way finishes before the handler
+ * touches anything, none starts after. From then on the long-poll task
+ * owns the tables, as in a cold boot.
+ *
+ * The first netmap replaces the seeded tables with its own and is held
+ * against the record (tl_warm_sm_netmap): what a cold start would run
+ * against — the peer the netmap's table gives tl_warm_target_index, our
+ * netmap address — must be what the session runs against. The same peer
+ * with another NodeKey, DiscoKey, endpoints or tailnet address is
+ * updated in place (wg_dataplane_update_peers). Another peer (or none),
+ * another self address, a netmap without peers or self address, a node
+ * control marks expired / deleted, the bound or a record SNTP shows too
+ * old: the record is erased and the device restarts into a cold boot
+ * (wg_dataplane_stop cannot be undone in place: the socket, and the STUN
+ * endpoint pushed for it, go with it — the self-address restart was
+ * already the way), with an RTC mark so that boot is cold even if the
+ * erase failed. A crash before the netmap confirmed is the RTC guard's
+ * (tl_warm_rtc_boot). One case stays apart: a target with no endpoint
+ * left keeps the warm session (via DERP), where a cold start would
+ * refuse to start — what a cold session does when its peer loses its
+ * endpoints. */
+
+/* Set once the long-poll has handled the first full netmap (cold start,
+ * or the warm start's confirmation): until then the modem stays awake
+ * (app_wifi.c) and no STUN re-probe recycles the map stream. Read from
+ * any task. */
+static volatile bool     s_netmap_seen;
+/* Uptime second of the last control byte (tinylink_control_mark_alive),
+ * for the record's refresh. */
+static volatile uint32_t s_control_rx_s;
+
+bool tinylink_netmap_seen(void)
+{
+    return s_netmap_seen;
+}
+
+#if CONFIG_TINYLINK_WARM_START
+
+/* NVS "warm_rec", mirrored: loaded by tinylink_init; on a warm boot also
+ * the record the session runs on until the first netmap. The main task
+ * (warm start) and the telemetry task (writes) use it under s_warm_mx;
+ * the long-poll task reads it only while the session is pending, when
+ * nothing writes it — no record is staged before the netmap confirms. */
+static tl_warm_nvs_t     s_warm_nvs;
+/* The warm start vs the first netmap (the gate), and an NVS write vs the
+ * erase before a restart. */
+static SemaphoreHandle_t s_warm_mx;
+static bool              s_warm_gate_shut;   /* under s_warm_mx: too late for a warm start */
+static bool              s_warm_nvs_shut;    /* under s_warm_mx: erased for a restart */
+static bool              s_warm_gate_lp;     /* long-poll task: it shut the gate */
+/* The state machine and the netmap's record for the next boot (long-poll
+ * → telemetry task): under s_warm_mux. */
+static portMUX_TYPE      s_warm_mux = portMUX_INITIALIZER_UNLOCKED;
+static tl_warm_sm_t      s_wsm;
+static tl_warm_rec_t     s_warm_stage;
+static bool              s_warm_staged;
+/* This boot's verdict from the RTC marks (tinylink_init). */
+static tl_warm_rtc_verdict_t s_warm_rtc_verdict;
+/* The crash guard and the restart mark (tl_warm.h). Written under
+ * s_warm_mux. */
+static RTC_NOINIT_ATTR tl_warm_rtc_t s_warm_rtc;
+
+_Static_assert(TL_WARM_RST_POWERON == ESP_RST_POWERON && TL_WARM_RST_SW == ESP_RST_SW,
+               "tl_warm.h reset-reason values drifted from esp_reset_reason_t");
+
+/* The long-poll waits at most this long for a warm start under way (the
+ * relay wait is ≤ RELAY_BOOT_WAIT_MS of it): the main task is not on the
+ * task WDT, and a warm start that hangs would hold the netmap forever. */
+#define WARM_GATE_MAX_MS 30000
+/* wg_rx's 8-KiB stack and the telemetry task's 4.5 KiB, contiguous, with
+ * room for a TLS handshake still under way; below it the netmap brings
+ * the data plane up, as before 1.3.9. */
+#define WARM_HEAP_FREE_MIN    32768u
+#define WARM_HEAP_LARGEST_MIN 16384u
+/* The netmap is current (the record's refresh): control heard this lately. */
+#define WARM_FRESH_S          600u
+
+static tl_warm_tables_t warm_tables(void)
+{
+    return (tl_warm_tables_t){ s_self_addrs, &s_self_addrs_count,
+                               s_last_peers, &s_last_peers_count };
+}
+
+static uint32_t uptime_s(void)
+{
+    return (uint32_t)(esp_timer_get_time() / 1000000LL);
+}
+
+static esp_err_t warm_nvs_erase(void)
+{
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(TAI64N_NVS_NS, NVS_READWRITE, &h);
+    if (err == ESP_OK) {
+        err = nvs_erase_key(h, TL_WARM_KEY);
+        if (err == ESP_OK) {
+            err = nvs_commit(h);
+        } else if (err == ESP_ERR_NVS_NOT_FOUND) {
+            err = ESP_OK;
+        }
+        nvs_close(h);
+    }
+    return err;
+}
+
+/* tinylink_init (main task, before any other task uses it). The RTC
+ * marks are consumed here on every boot, whatever follows. */
+static void warm_load(void)
+{
+    if (s_warm_mx == NULL) s_warm_mx = xSemaphoreCreateMutex();
+    bool erase = false;
+    const int rst = (int)esp_reset_reason();
+    s_warm_rtc_verdict = tl_warm_rtc_boot(&s_warm_rtc, rst, &erase);
+    if (erase) {
+        /* Rare (a reset before a warm start's netmap): an NVS erase on
+         * the boot path, before the register. */
+        const esp_err_t err = warm_nvs_erase();
+        ESP_LOGW(TAG, "warm start: the last one ended in a reset (reason %d) before "
+                      "its netmap — record %s%s", rst,
+                 err == ESP_OK ? "erased" : "erase failed",
+                 s_warm_rtc_verdict == TL_WARM_RTC_OFF
+                     ? "; warm start off until a power cycle" : "");
+        return;
+    }
+    nvs_handle_t h;
+    if (nvs_open(TAI64N_NVS_NS, NVS_READONLY, &h) != ESP_OK) return;
+    uint8_t b[TL_WARM_BLOB_MAX + 1];
+    size_t  n = sizeof(b);
+    const esp_err_t err = nvs_get_blob(h, TL_WARM_KEY, b, &n);
+    nvs_close(h);
+    if (err == ESP_OK && tl_warm_decode(b, n, &s_warm_nvs.rec)) {
+        s_warm_nvs.valid = true;
+    } else if (err == ESP_OK || err == ESP_ERR_NVS_INVALID_LENGTH) {
+        /* Another layout (or a damaged blob): no record; the first
+         * netmap's replaces it. */
+        ESP_LOGW(TAG, "warm start: the stored record is not one this firmware "
+                      "reads — ignored");
+    }
+}
+
+static int warm_nvs_write(const uint8_t *b, size_t n, const void *ctx)
+{
+    (void)ctx;
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(TAI64N_NVS_NS, NVS_READWRITE, &h);
+    if (err == ESP_OK) {
+        err = nvs_set_blob(h, TL_WARM_KEY, b, n);
+        if (err == ESP_OK) err = nvs_commit(h);
+        nvs_close(h);
+    }
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "warm start: record write failed: 0x%x", err);
+    }
+    return err == ESP_OK ? 0 : -1;
+}
+
+/* Erase the record and restart: the next boot is cold (the RTC mark
+ * holds even if the erase fails). The long-poll task (at its top level:
+ * NVS and esp_restart stay off the stream callback's stack) or the
+ * telemetry task (the bound). Does not return. */
+static __attribute__((noinline, noreturn)) void warm_restart_now(void)
+{
+    portENTER_CRITICAL(&s_warm_mux);
+    tl_warm_rtc_restart(&s_warm_rtc);
+    portEXIT_CRITICAL(&s_warm_mux);
+    /* The mutex keeps a housekeeping write from landing after the erase;
+     * not given back — the restart follows. */
+    if (s_warm_mx != NULL) (void)xSemaphoreTake(s_warm_mx, pdMS_TO_TICKS(5000));
+    s_warm_nvs_shut = true;
+    const esp_err_t err = warm_nvs_erase();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "warm start: record erase failed: 0x%x — the next boot "
+                      "starts cold all the same (RTC mark)", err);
+    }
+    esp_restart();
+}
+
+/* Long-poll task, every netmap frame: the first shuts the gate — no warm
+ * start begins after it, one under way finishes first (priority
+ * inheritance lifts the main task; the relay wait is ≤ 1 s of it). Fed
+ * 1-s slices, at most WARM_GATE_MAX_MS: then the warm start is taken for
+ * hung, and the device restarts into a cold boot. */
+static void warm_gate_shut(void)
+{
+    if (s_warm_gate_lp || s_warm_mx == NULL) return;
+    s_warm_gate_lp = true;
+    for (unsigned waited = 0; xSemaphoreTake(s_warm_mx, pdMS_TO_TICKS(1000)) != pdTRUE;) {
+        tl_wdt_feed();
+        waited += 1000;
+        if (waited >= WARM_GATE_MAX_MS) {
+            ESP_LOGE(TAG, "warm start: still running after %u ms — restarting into a "
+                          "cold start", waited);
+            warm_restart_now();
+        }
+    }
+    s_warm_gate_shut = true;
+    xSemaphoreGive(s_warm_mx);
+}
+
+/* The record the netmap would give the next boot — our addresses and the
+ * peer wg_dataplane_start would pick from the table now (the next boot's
+ * best guess at the cold choice) — handed to the telemetry task's write.
+ * Long-poll task, after the data plane runs on a netmap. Not inlined:
+ * its ~180-B frame stays off long_poll_handler's, above
+ * wg_dataplane_start. A table it cannot represent (no endpoint on the
+ * target) leaves the last one staged. */
+static __attribute__((noinline)) void warm_stage(void)
+{
+    if (s_self_addrs_count == 0 || s_last_peers_count == 0) return;
+    const size_t ti = wg_dataplane_target_index(s_last_peers, s_last_peers_count);
+    tl_warm_rec_t r;
+    tl_warm_rec_build(s_self_addrs, s_self_addrs_count, &s_last_peers[ti],
+                      s_keys.node_pub, s_control_pub, &r);
+    if (!tl_warm_rec_storable(&r)) return;
+    portENTER_CRITICAL(&s_warm_mux);
+    s_warm_stage  = r;
+    s_warm_staged = true;
+    portEXIT_CRITICAL(&s_warm_mux);
+}
+
+static const char *peer_ip_str(const tl_peer_t *p)
+{
+    return p->n_addresses > 0 ? p->addresses[0].str : "(no address)";
+}
+
+/* Under s_warm_mx, the gate still open (main task). */
+static void warm_start_locked(void)
+{
+    const tl_warm_rec_t *r = &s_warm_nvs.rec;
+    const unsigned free0    = (unsigned)esp_get_free_heap_size();
+    const unsigned largest0 = (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT);
+    const tl_warm_go_in_t in = {
+        .rtc        = s_warm_rtc_verdict,
+        .have_rec   = s_warm_nvs.valid,
+        .keys_ok    = s_warm_nvs.valid && tl_warm_rec_for(r, s_keys.node_pub, s_control_pub),
+        .reg_reused = s_reg_no_auth,
+        .heap_ok    = free0 >= WARM_HEAP_FREE_MIN && largest0 >= WARM_HEAP_LARGEST_MIN,
+        .now_unix   = (int64_t)time(NULL),
+        .written    = r->written,
+    };
+    switch (tl_warm_go(&in)) {
+    case TL_WARM_GO:
+        break;
+    case TL_WARM_NO_RECORD:
+        ESP_LOGI(TAG, "warm start: no cached netmap — WireGuard waits for the netmap");
+        return;
+    case TL_WARM_SKIP_CRASH:
+        ESP_LOGW(TAG, "warm start: skipped — the last one ended in a reset; "
+                      "WireGuard waits for the netmap");
+        return;
+    case TL_WARM_SKIP_OFF:
+        ESP_LOGW(TAG, "warm start: off after %u resets during one — until a power "
+                      "cycle; WireGuard waits for the netmap",
+                 (unsigned)TL_WARM_RTC_MAX_CRASHES);
+        return;
+    case TL_WARM_SKIP_RESTART:
+        ESP_LOGI(TAG, "warm start: skipped once after a restart for a netmap change — "
+                      "WireGuard waits for the netmap");
+        return;
+    case TL_WARM_OTHER_KEYS:
+        ESP_LOGI(TAG, "warm start: the cached netmap is for other keys or another "
+                      "control plane — ignored");
+        return;
+    case TL_WARM_STALE:
+        ESP_LOGI(TAG, "warm start: the cached netmap is over %u days old — "
+                      "WireGuard waits for the netmap",
+                 (unsigned)(TL_WARM_MAX_AGE_S / 86400u));
+        return;
+    case TL_WARM_NEEDED_AUTH:
+        ESP_LOGI(TAG, "warm start: skipped — the register needed the auth key "
+                      "(a new or re-created node)");
+        return;
+    case TL_WARM_LOW_HEAP:
+        ESP_LOGW(TAG, "warm start: skipped — heap free %u, largest %u; WireGuard "
+                      "waits for the netmap", free0, largest0);
+        return;
+    }
+    tl_warm_tables_t t = warm_tables();
+    portENTER_CRITICAL(&s_warm_mux);
+    tl_warm_sm_begin(&s_wsm, &s_warm_rtc, r, &t);
+    portEXIT_CRITICAL(&s_warm_mux);
+    /* The steps of the first netmap's bring-up (long_poll_handler), all
+     * of them: the first INIT waits for the relay as there. */
+    relay_boot_join();
+    esp_err_t err = wg_dataplane_start(&s_keys, s_self_addrs, s_self_addrs_count,
+                                       s_last_peers, s_last_peers_count);
+    portENTER_CRITICAL(&s_warm_mux);
+    tl_warm_sm_started(&s_wsm, &s_warm_rtc, &t, err == ESP_OK, uptime_s(), r->written);
+    portEXIT_CRITICAL(&s_warm_mux);
+    if (err != ESP_OK) {
+        /* wg_dataplane_start left wg_netif as after its init (socket,
+         * wg_tx, callbacks): the netmap's start is the first one. */
+        ESP_LOGW(TAG, "warm start: wg_dataplane_start failed: 0x%x (heap free %u, "
+                      "largest %u) — WireGuard waits for the netmap", err, free0, largest0);
+        return;
+    }
+    s_dataplane_started = true;
+    char age[64];
+    tl_warm_age_str(age, sizeof(age), (int64_t)time(NULL), tl_time_synced(), r->written);
+    ESP_LOGI(TAG, "warm start: WG up from the cached netmap (peer %s, %s; heap free "
+                  "%u→%u, largest %u→%u)",
+             peer_ip_str(&s_last_peers[0]), age, free0,
+             (unsigned)esp_get_free_heap_size(), largest0,
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
+    esp_err_t terr = telemetry_start();
+    if (terr != ESP_OK) {
+        ESP_LOGW(TAG, "telemetry_start failed: 0x%x — continuing", terr);
+    }
+    prepunch_pings_to_peers(s_last_peers, s_last_peers_count);
+}
+
+/* A netmap frame while the warm session waits (after the merge, or —
+ * expired / self address moved — before it): tl_warm_sm_netmap decides,
+ * this logs and acts. Not inlined: `now` and the log buffer stay off
+ * long_poll_handler's frame. */
+static __attribute__((noinline)) esp_err_t warm_netmap(const tl_netmap_t *nm, bool expired,
+                                                       bool self0_moved)
+{
+    tl_warm_rec_t now;
+    const tl_peer_t *t = NULL;
+    if (!expired && !self0_moved && s_self_addrs_count > 0 && s_last_peers_count > 0) {
+        t = &s_last_peers[wg_dataplane_target_index(s_last_peers, s_last_peers_count)];
+        tl_warm_rec_build(s_self_addrs, s_self_addrs_count, t, s_keys.node_pub,
+                          s_control_pub, &now);
+    }
+    const tl_warm_nm_t in = { .expired = expired, .have_self = nm->have_self,
+                              .self0_moved = self0_moved, .now = t != NULL ? &now : NULL };
+    unsigned why = 0;
+    portENTER_CRITICAL(&s_warm_mux);
+    const tl_warm_act_t act = tl_warm_sm_netmap(&s_wsm, &s_warm_rtc, &s_warm_nvs.rec, &in, &why);
+    portEXIT_CRITICAL(&s_warm_mux);
+    if (t != NULL) {
+        /* The cold path's line, for the boot timings. */
+        ESP_LOGI(TAG, "netmap (initial): self.id=0x%08lx%08lx peers=%u derp_regions=%u",
+                 (unsigned long)(nm->self_id >> 32),
+                 (unsigned long)(nm->self_id & 0xFFFFFFFFul),
+                 (unsigned)s_last_peers_count, (unsigned)nm->n_derp_regions);
+    }
+    char what[112];
+    switch (act) {
+    case TL_WARM_ACT_COLD:    /* not reached: the handler asks only while pending */
+    case TL_WARM_ACT_WAIT:
+    case TL_WARM_ACT_LATE:    /* the bound's restart is under way */
+        return ESP_OK;
+    case TL_WARM_ACT_RESTART:
+        if (why & TL_WARM_WHY_EXPIRED) {
+            ESP_LOGW(TAG, "control marks this node %s — the warm start goes: "
+                          "restarting into a cold start",
+                     nm->self_expired ? "expired/deleted" : "key-expired");
+        } else if (why & TL_WARM_WHY_EMPTY) {
+            ESP_LOGW(TAG, "netmap differs: %s — restarting into a cold start",
+                     s_self_addrs_count == 0 ? "no self address" : "no peers");
+        } else if (why & TL_WARM_D_PEER) {
+            const uint64_t id = s_warm_nvs.rec.peer.id;
+            bool listed = false;
+            for (size_t i = 0; i < s_last_peers_count && id != 0; i++) {
+                listed = listed || s_last_peers[i].id == id;
+            }
+            ESP_LOGW(TAG, "netmap differs: target peer %s (the cached one is %s) — "
+                          "restarting into a cold start",
+                     peer_ip_str(t), listed ? "not the pick" : "gone");
+        } else if (self0_moved) {
+            ESP_LOGW(TAG, "netmap differs: self address %s — restarting into a cold "
+                          "start", s_self_addrs[0].str);
+        } else {
+            ESP_LOGW(TAG, "netmap differs: %s — restarting into a cold start",
+                     tl_warm_diff_str(why & TL_WARM_RESTART, what, sizeof(what)));
+        }
+        return MAPREQ_STREAM_RECYCLE;
+    case TL_WARM_ACT_CONFIRM:
+        break;
+    }
+    s_netmap_seen = true;
+    if (why == 0) {
+        ESP_LOGI(TAG, "netmap confirms the warm start (peer %s)", peer_ip_str(t));
+    } else {
+        ESP_LOGI(TAG, "netmap differs: %s — updated (peer %s)",
+                 tl_warm_diff_str(why, what, sizeof(what)), peer_ip_str(t));
+    }
+    /* What the cold path's first netmap does after the start: the update
+     * applies keys, endpoints and the tailnet address; the prepunch goes
+     * to the whole table (the warm one had the cached peer only). */
+    esp_err_t err = wg_dataplane_update_peers(&s_keys, s_last_peers, s_last_peers_count);
+    prepunch_pings_to_peers(s_last_peers, s_last_peers_count);
+    warm_stage();
+    return err;
+}
+
+/* The pending session against the bound and the record's age (telemetry
+ * task). */
+static __attribute__((noinline)) void warm_bound_poll(void)
+{
+    const bool    synced   = tl_time_synced();
+    const int64_t now_unix = (int64_t)time(NULL);
+    portENTER_CRITICAL(&s_warm_mux);
+    const int why = tl_warm_sm_bound(&s_wsm, uptime_s(),
+                                     (uint32_t)CONFIG_TINYLINK_WARM_START_MAX_S,
+                                     synced, now_unix);
+    portEXIT_CRITICAL(&s_warm_mux);
+    if (why == 0) return;
+    if (why == TL_WARM_BOUND_TIME) {
+        ESP_LOGW(TAG, "warm start: no netmap within %d s — erasing the record, "
+                      "restarting into a cold start", CONFIG_TINYLINK_WARM_START_MAX_S);
+    } else {
+        ESP_LOGW(TAG, "warm start: the cached netmap is over %u days old (clock "
+                      "synced) and no netmap came — erasing the record, restarting into "
+                      "a cold start", (unsigned)(TL_WARM_MAX_AGE_S / 86400u));
+    }
+    warm_restart_now();
+}
+
+/* The staged record → NVS, when tl_warm_store says so (telemetry task). */
+static __attribute__((noinline)) void warm_persist(void)
+{
+    tl_warm_rec_t r;
+    portENTER_CRITICAL(&s_warm_mux);
+    const bool have  = s_warm_staged;
+    const bool ready = s_wsm.state == TL_WARM_ST_CONFIRMED;
+    if (have) r = s_warm_stage;
+    portEXIT_CRITICAL(&s_warm_mux);
+    if (!have || s_warm_mx == NULL) return;
+    if (xSemaphoreTake(s_warm_mx, pdMS_TO_TICKS(1000)) != pdTRUE) return;   /* next time */
+    if (!s_warm_nvs_shut) {
+        const bool synced = tl_time_synced();
+        const uint32_t now = synced ? (uint32_t)time(NULL) : 0;
+        const bool fresh = ready && s_netmap_seen &&
+                           uptime_s() - s_control_rx_s < WARM_FRESH_S;
+        if (tl_warm_store(&s_warm_nvs, &r, now, esp_timer_get_time(), fresh,
+                          warm_nvs_write, NULL) == 1) {
+            tl_cidr_t a = { "(no address)" };
+            if (r.peer.n_addr > 0) tl_warm_cidr_str(&r.peer.addr[0], &a);
+            ESP_LOGI(TAG, "warm start: record stored for the next boot (peer %s)", a.str);
+        }
+    }
+    xSemaphoreGive(s_warm_mx);
+}
+
+#else
+static void warm_load(void) {}
+#endif /* CONFIG_TINYLINK_WARM_START */
+
+void tinylink_warm_start(void)
+{
+#if CONFIG_TINYLINK_WARM_START
+    if (!s_initialized || s_warm_mx == NULL) return;
+    xSemaphoreTake(s_warm_mx, portMAX_DELAY);
+    if (!s_warm_gate_shut) {
+        s_warm_gate_shut = true;
+        warm_start_locked();
+    }
+    xSemaphoreGive(s_warm_mx);
+#endif
+}
+
+void tinylink_warm_persist_poll(void)
+{
+#if CONFIG_TINYLINK_WARM_START
+    warm_bound_poll();
+    warm_persist();
+#endif
+}
+
 static esp_err_t long_poll_handler(const tl_netmap_t *nm, void *ctx)
 {
     (void)ctx;
+#if CONFIG_TINYLINK_WARM_START
+    warm_gate_shut();
+    tl_warm_tables_t wt = warm_tables();
+    portENTER_CRITICAL(&s_warm_mux);
+    /* The first frame empties the tables a warm start seeded; true while
+     * that session waits for its netmap (tl_warm_sm_frame). */
+    const bool warm = tl_warm_sm_frame(&s_wsm, &wt);
+    portEXIT_CRITICAL(&s_warm_mux);
+#endif
     if (self_node_expired(nm)) {
         /* headscale ≥0.29.4 answers a deleted node's stream with HTTP
          * 200 + this frame and an expired node's with Expired set — no
          * 4xx ever reaches the re-register path, and the bytes keep the
          * wedge clock fed. Upstream clients go to NeedsLogin; we have the
-         * authkey, so long_poll_task re-registers. */
+         * authkey, so long_poll_task re-registers. A warm session, which
+         * no netmap of this boot confirmed, goes: a cold boot would have
+         * no data plane before the re-register (round 1.3.9). */
+        s_self_expired = true;
+#if CONFIG_TINYLINK_WARM_START
+        if (warm) return warm_netmap(nm, true, false);
+#endif
         ESP_LOGW(TAG, "control marks this node %s — leaving the stream to "
                       "re-register",
                  nm->self_expired ? "expired/deleted" : "key-expired");
-        s_self_expired = true;
         return MAPREQ_STREAM_RECYCLE;
     }
     if (nm->have_self) s_self_live = true;
@@ -1695,21 +2195,38 @@ static esp_err_t long_poll_handler(const tl_netmap_t *nm, void *ctx)
              * tailnet address; the lwIP tunnel netif, the TSMP advert
              * source and the peers' AllowedIPs for us would all disagree.
              * Rare (admin deleted the node) — restart into the boot path,
-             * which brings everything up against the new address. */
+             * which brings everything up against the new address. So does
+             * a warm start's cached address that is no longer ours. */
             const uint32_t now_v4 = cidr_host_v4(&s_self_addrs[0]);
             if (now_v4 != 0 && now_v4 != wg_dataplane_self_v4()) {
+#if CONFIG_TINYLINK_WARM_START
+                if (warm) return warm_netmap(nm, false, true);
+                ESP_LOGW(TAG, "self address changed to %s — restarting to "
+                              "re-attach the tunnel", s_self_addrs[0].str);
+                /* The record holds the old address: erased first, at the
+                 * long-poll's top level (warm_restart_now). */
+                portENTER_CRITICAL(&s_warm_mux);
+                s_wsm.restart = true;
+                portEXIT_CRITICAL(&s_warm_mux);
+                return MAPREQ_STREAM_RECYCLE;
+#else
                 ESP_LOGW(TAG, "self address changed to %s — restarting to "
                               "re-attach the tunnel", s_self_addrs[0].str);
                 esp_restart();
+#endif
             }
         }
     }
     const bool peers_changed = merge_peers(nm);
     update_derp_host_from_netmap(nm);   /* STUN uses it without the supervisor too */
+#if CONFIG_TINYLINK_WARM_START
+    if (warm) return warm_netmap(nm, false, false);
+#endif
     if (!s_dataplane_started) {
         if (s_self_addrs_count == 0 || s_last_peers_count == 0) {
             return ESP_OK;   /* wait for self + peers (first full map) */
         }
+        s_netmap_seen = true;
         /* Tailscale node ID is genuinely 64-bit (random server-assigned);
          * high/low hex split keeps it printable under NEWLIB_NANO_FORMAT
          * without dragging in full %llu. */
@@ -1739,6 +2256,12 @@ static esp_err_t long_poll_handler(const tl_netmap_t *nm, void *ctx)
          * cold-start `tailscale ping` from any peer has a fresh path
          * available without waiting for a DERP-relayed CMM round trip. */
         prepunch_pings_to_peers(s_last_peers, s_last_peers_count);
+#if CONFIG_TINYLINK_WARM_START
+        portENTER_CRITICAL(&s_warm_mux);
+        tl_warm_sm_cold(&s_wsm);
+        portEXIT_CRITICAL(&s_warm_mux);
+        warm_stage();   /* the next boot's warm start */
+#endif
         return ESP_OK;
     }
     ESP_LOGI(TAG, "netmap (update): peers=%u%s removed=%u patches=%u "
@@ -1746,15 +2269,24 @@ static esp_err_t long_poll_handler(const tl_netmap_t *nm, void *ctx)
              (unsigned)nm->n_peers, nm->peers_is_delta ? " (delta)" : "",
              (unsigned)nm->n_removed, (unsigned)nm->n_patches,
              (unsigned)nm->n_derp_regions, (unsigned)s_last_peers_count);
-    if (!peers_changed) return ESP_OK;
-    /* Apply the merged table to the data plane: endpoint roam and peer
-     * NodeKey/DiscoKey rotation of the WG peer (a removed WG peer leaves
-     * the live session alone). Then refresh NAT mappings towards the
-     * merged endpoints — idle ages them out (typical UDP timeout
-     * 30-120 s) and the peer's first packet after silence would find a
-     * closed path and fall back to DERP. ~50-200 bytes per endpoint. */
+    if (!peers_changed) {
+#if CONFIG_TINYLINK_WARM_START
+        if (nm->have_self) warm_stage();
+#endif
+        return ESP_OK;
+    }
+    /* Apply the merged table to the data plane: endpoint roam, peer
+     * NodeKey/DiscoKey rotation and tailnet address of the WG peer (a
+     * removed WG peer leaves the live session alone). Then refresh NAT
+     * mappings towards the merged endpoints — idle ages them out
+     * (typical UDP timeout 30-120 s) and the peer's first packet after
+     * silence would find a closed path and fall back to DERP. ~50-200
+     * bytes per endpoint. */
     esp_err_t err = wg_dataplane_update_peers(&s_keys, s_last_peers, s_last_peers_count);
     prepunch_pings_to_peers(s_last_peers, s_last_peers_count);
+#if CONFIG_TINYLINK_WARM_START
+    warm_stage();
+#endif
     return err;
 }
 
@@ -1792,6 +2324,7 @@ static int64_t s_control_last_rx_us;
 void tinylink_control_mark_alive(void)
 {
     s_control_last_rx_us = esp_timer_get_time();
+    s_control_rx_s = (uint32_t)(s_control_last_rx_us / 1000000LL);
 }
 
 /* Counters for the /stats snapshot. */
@@ -1913,6 +2446,12 @@ static void long_poll_task(void *arg)
             const int64_t t0 = esp_timer_get_time();
             err = mapreq_run_stream(&s_conn, &s_keys, long_poll_handler, NULL,
                                     push ? ep_push_done : NULL);
+#if CONFIG_TINYLINK_WARM_START
+            /* A netmap the warm session (or the tunnel's address) cannot
+             * follow in place (long_poll_handler logged what): erase the
+             * record, restart into a cold boot. */
+            if (s_wsm.restart) warm_restart_now();
+#endif
             /* Stream ended: either the server closed it (idle / ping
              * failure / restart), our side errored, the push went
              * unanswered within the one-shot deadline, or the handler
@@ -2587,8 +3126,11 @@ int64_t tinylink_stun_reprobe_poll(int64_t now_us, int64_t early_us)
      * first netmap starts. A request before that — the boot probe's
      * "push it later" (stun_boot_join), a GOT_IP — waits for it in 1-s
      * steps instead of being spent on a refused probe and pushed a whole
-     * period out. */
-    if (!wg_netif_rx_running()) return now_us + 1000000LL;
+     * period out. Since round 1.3.9 a warm start runs wg_rx before the
+     * netmap: the wait is for the first netmap too, as in a cold boot —
+     * the push a new endpoint queues recycles the map stream, which would
+     * cut the first netmap's body (a new connect before it). */
+    if (!wg_netif_rx_running() || !s_netmap_seen) return now_us + 1000000LL;
     s_stun_reprobe_now = false;
     /* Blocks for one STUN round trip normally; worst case ≈ 24 s (lwIP
      * DNS: 1+1+2+3 s × 3 servers, then the 3-s response wait) — inside

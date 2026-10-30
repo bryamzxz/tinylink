@@ -15,9 +15,11 @@
 #include "freertos/task.h"
 
 #include "esp_event.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_netif_types.h"
 #include "esp_random.h"
+#include "esp_system.h"
 #include "esp_timer.h"
 
 #include "lwip/inet.h"
@@ -2544,14 +2546,44 @@ esp_err_t wg_netif_start(const struct wg_netif_peer_config *peer)
         tl_secure_zero(k, sizeof(k));
     }
 
+    /* One wg_rx for the socket's life: a start after wg_netif_abort_start
+     * reuses the one already running. */
+    if (g.rx_task != NULL) return ESP_OK;
     BaseType_t ok = xTaskCreate(rx_task, "wg_rx",
                                 WG_RX_TASK_STACK_BYTES, NULL,
                                 WG_RX_TASK_PRIO, &g.rx_task);
     if (ok != pdPASS) {
-        ESP_LOGE(TAG, "xTaskCreate(wg_rx) failed");
+        g.rx_task = NULL;
+        ESP_LOGE(TAG, "xTaskCreate(wg_rx) failed (heap_free=%u largest=%u)",
+                 (unsigned)esp_get_free_heap_size(),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
         return ESP_ERR_NO_MEM;
     }
     return ESP_OK;
+}
+
+void wg_netif_abort_start(void)
+{
+    if (!g.initialized) return;
+    /* Lock order hs_lock → g.lock, as everywhere. The INIT may be out:
+     * its answer finds no handshake (scrubbed) and is dropped; relayed
+     * frames from the peer no longer match its (zeroed) key. */
+    xSemaphoreTake(g.hs_lock, portMAX_DELAY);
+    g.init_valid = false;
+    wg_handshake_scrub(&g.handshake);
+    g.state             = WG_NETIF_IDLE;
+    g.handshake_attempt = 0;
+    g.rekey_attempt     = 0;
+    g.rekey_in_flight   = false;
+    xSemaphoreTake(g.lock, portMAX_DELAY);
+    wg_transport_session_scrub(&g.transport);
+    memset(&g.peer, 0, sizeof(g.peer));
+    rebuild_peer_sockaddr();
+    tl_secure_zero(g.peer_disco_shared_k, sizeof(g.peer_disco_shared_k));
+    g.peer_disco_shared_k_valid = false;
+    wg_path_init(&g.path, now_us(), false);
+    xSemaphoreGive(g.lock);
+    xSemaphoreGive(g.hs_lock);
 }
 
 esp_err_t wg_netif_update_peer_endpoint(uint32_t v4_be, uint16_t port)
@@ -2569,6 +2601,18 @@ esp_err_t wg_netif_update_peer_endpoint(uint32_t v4_be, uint16_t port)
     /* Existing transport session keys remain valid — endpoint roaming
      * doesn't invalidate keys (per WG roaming spec). Subsequent
      * outgoing packets land at the new endpoint. */
+    return ESP_OK;
+}
+
+esp_err_t wg_netif_update_peer_tailnet(uint32_t v4_be)
+{
+    if (!g.initialized) return ESP_ERR_INVALID_STATE;
+    /* send_disco_advert reads it unlocked on wg_rx / the DERP task: an
+     * aligned 32-bit store, never torn. */
+    xSemaphoreTake(g.lock, portMAX_DELAY);
+    g.peer.peer_tailnet_v4_be = v4_be;
+    xSemaphoreGive(g.lock);
+    if (wg_netif_is_up()) send_disco_advert();
     return ESP_OK;
 }
 
@@ -2934,14 +2978,18 @@ bool wg_netif_get_peer_endpoint(uint32_t *v4_be, uint16_t *port)
     return *v4_be != 0;
 }
 
-bool wg_netif_path_alive(void)
+bool wg_netif_live_path_proven(void)
 {
     if (!g.initialized) return false;
+    const int64_t now = now_us();
     xSemaphoreTake(g.lock, portMAX_DELAY);
-    const int64_t last = g.last_transport_recv_us;
+    const bool    managed = g.path.managed;
+    const bool    valid   = wg_path_valid(&g.path, now);
+    const int64_t last    = g.last_transport_recv_us;
     xSemaphoreGive(g.lock);
+    if (managed) return valid;
     return g.state == WG_NETIF_UP && last > 0 &&
-           (now_us() - last) <= (int64_t)WG_RX_STALE_THRESHOLD_MS * 1000LL;
+           (now - last) <= (int64_t)WG_RX_STALE_THRESHOLD_MS * 1000LL;
 }
 
 bool wg_netif_get_peer_disco_k(uint8_t pub[WG_KEY_LEN], uint8_t k[WG_KEY_LEN],

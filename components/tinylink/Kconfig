@@ -52,6 +52,68 @@ menu "tinylink core"
             the earlier clean ends). Off, the push goes first and the
             stream after it on the same connection, as up to 1.3.6.
 
+    config TINYLINK_WARM_START
+        bool "WireGuard up from the previous boot's netmap (warm start)"
+        default y
+        help
+            Round 1.3.9. Once this boot's register has succeeded without
+            the auth key (control answered for the node it knows, with
+            these keys), the WireGuard data plane comes up from a record
+            of the previous boot's netmap — our tailnet address and the
+            target peer's NodeID, NodeKey, DiscoKey, endpoints and
+            tailnet addresses (NVS tl_state "warm_rec", src/tl_warm.h) —
+            instead of after this boot's netmap, so the handshake runs
+            while the endpoint push and the map stream do (on the 1.3.8
+            sensor the netmap was complete 1.4–5.5 s after the
+            register). The first netmap confirms it, updates the peer's
+            keys, endpoints or tailnet address in place, or — when the
+            session cannot follow: another target peer, another self
+            address, no peers, this node expired or deleted — erases the
+            record and restarts into a cold boot (the next boot is cold
+            even if the erase fails). Not used: a record no netmap stood
+            behind for 30 days (it is refreshed daily while current), and
+            after a reset (panic, WDT, brown-out) during a warm start
+            before its netmap — the record is erased; after two such
+            resets the warm start stays off until a power cycle.
+
+            Trade-off: until that netmap arrives the device trusts the
+            previous boot's peer binding — this NodeKey and this DiscoKey
+            are the peer at that tailnet address — which an authenticated
+            netmap gave it, possibly long ago. A peer key rotated or
+            revoked since then (the peer removed, its key leaked) is
+            still dialled: whoever holds the old NodeKey's private key
+            can answer the handshake (via DERP, which routes by NodeKey)
+            and receive telemetry and /stats replies; whoever holds the
+            old DiscoKey's can get its DISCO pings answered, have the
+            endpoints of its CallMeMaybe punched and move the WireGuard
+            endpoint with a pong (the frames stay encrypted to the
+            session). Until the netmap: normally seconds; at most
+            TINYLINK_WARM_START_MAX_S plus up to a minute (the 60-s
+            housekeeping checks it). Upstream tailscaled trusts its last
+            netmap the same way within a run (through a control outage),
+            as tinylink does after its first netmap. No packet filter is
+            skipped: tinylink enforces none (docs/SECURITY-MODEL.md).
+            Without a reachable control plane there is no warm start —
+            the register comes first. n: the data plane waits for the
+            netmap, as in 1.3.8.
+
+    config TINYLINK_WARM_START_MAX_S
+        int "Warm start: restart cold if no netmap confirms it within (s)"
+        depends on TINYLINK_WARM_START
+        default 600
+        range 60 86400
+        help
+            How long a warm-started session may run on the previous
+            boot's netmap alone, when control answered the register but
+            no netmap followed (a map stream that stalls or is refused,
+            an outage right after the register). Past it the record is
+            erased and the device restarts; that cold boot waits for the
+            netmap, as without the warm start. Checked by the telemetry
+            task's 60-s housekeeping, so up to a minute late. 600 s is
+            over three times the longest stretch without a netmap seen
+            on the sensor (181 s after a clean stream end, 1.3.7, before
+            1.3.8's first-response deadline).
+
     config TINYLINK_CRYPTO_IN_IRAM
         bool "Place the ChaCha20-Poly1305 hot path in IRAM"
         default y

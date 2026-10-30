@@ -104,6 +104,12 @@ esp_err_t wg_netif_update_peer_endpoint(uint32_t v4_be, uint16_t port);
 esp_err_t wg_netif_update_peer_keys(const uint8_t static_pub[WG_KEY_LEN],
                                     const uint8_t *disco_pub);
 
+/* The peer's tailnet IPv4 (network order) changed — the destination of
+ * the TSMP disco advert (round 1.3.9). With the session up the advert
+ * goes again at once: the one after the last handshake carried the old
+ * address, which the peer drops. Long-poll task. */
+esp_err_t wg_netif_update_peer_tailnet(uint32_t v4_be);
+
 /* Path events that can unblock a pending handshake (round 1.3.2, B7).
  * While an INIT is unanswered (cold handshake or rekey), the SAME INIT
  * is re-sent — not a new attempt, so REKEY_TIMEOUT pacing is untouched:
@@ -340,9 +346,20 @@ bool wg_netif_get_peer_disco_k(uint8_t pub[WG_KEY_LEN], uint8_t k[WG_KEY_LEN],
  * own (roam on authenticated packets, pong roam). False before start. */
 bool wg_netif_get_peer_endpoint(uint32_t *v4_be, uint16_t *port);
 
-/* True while the session is up and a transport packet authenticated
- * within the RX-stale window (WG_RX_STALE_THRESHOLD_MS). */
-bool wg_netif_path_alive(void);
+/* The live endpoint is proven, i.e. worth keeping over what control
+ * advertises (wg_dataplane apply_peer_endpoint; round 1.3.9): for a peer
+ * with a DiscoKey, a pong from it confirmed the direct path within
+ * WG_PATH_TRUST_MS (wg_path_valid); for one without (no pings, direct
+ * only), the session is up and a transport packet authenticated within
+ * the RX-stale window, as before. */
+bool wg_netif_live_path_proven(void);
+
+/* Undo a wg_netif_start that wg_dataplane_start could not finish (the RX
+ * task or the lwIP netif was not created; round 1.3.9): back to the
+ * state after wg_netif_init — socket, wg_tx and every callback kept, the
+ * peer and its handshake gone — so the next wg_netif_start is a first
+ * one. A wg_rx already spawned stays and is reused. */
+void wg_netif_abort_start(void);
 
 #ifdef __cplusplus
 }

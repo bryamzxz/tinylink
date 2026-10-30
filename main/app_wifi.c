@@ -69,9 +69,11 @@ static portMUX_TYPE    s_conn_mux = portMUX_INITIALIZER_UNLOCKED;
 
 /* Boot power-save switch (round 1.3.1). The station starts with
  * WIFI_PS_NONE so the boot exchange is not paced by DTIM beacons; this
- * periodic esp_timer turns modem sleep on once the WG session is up, or
- * PS_AWAKE_CAP_MS after Wi-Fi start whatever happened (register waiting
- * for approval, control down) — the modem never stays awake unbounded.
+ * periodic esp_timer turns modem sleep on once the WG session is up and
+ * the first netmap handled (round 1.3.9: a warm start has the session
+ * first), or PS_AWAKE_CAP_MS after Wi-Fi start whatever happened
+ * (register waiting for approval, control down) — the modem never stays
+ * awake unbounded.
  * A timer rather than a wait in bringup(): app_main returns as soon as
  * the long-poll runs, its stack back to the heap, without waiting for
  * the session. */
@@ -95,7 +97,12 @@ static bool s_ps_warned;
 static void ps_timer_cb(void *arg)
 {
     (void)arg;
-    const bool up = tinylink_session_up();
+    /* The session and the first netmap (round 1.3.9): a warm start has
+     * the session up while the netmap's ~26-KB body still arrives, which
+     * a 3-beacon listen interval (~307 ms a wake) would stretch — and
+     * with it the time the cached netmap is trusted. */
+    const bool session = tinylink_session_up();
+    const bool up = session && tinylink_netmap_seen();
     const int64_t awake_ms = (esp_timer_get_time() - s_ps_armed_us) / 1000;
     if (!up && awake_ms < (int64_t)PS_AWAKE_CAP_MS) return;
     esp_err_t ps_err = esp_wifi_set_ps(PS_STEADY);
@@ -109,7 +116,8 @@ static void ps_timer_cb(void *arg)
     }
     (void)esp_timer_stop(s_ps_timer);
     ESP_LOGI(TAG, "modem sleep (" PS_STEADY_NAME ") on after %u ms awake%s",
-             (unsigned)awake_ms, up ? "" : " — WG session not up yet");
+             (unsigned)awake_ms,
+             up ? "" : session ? " — no netmap yet" : " — WG session not up yet");
 }
 
 /* The station config again, with `channel` as the scan hint. It also
