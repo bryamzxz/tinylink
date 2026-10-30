@@ -7,7 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Optimization round 1.3.8 (in progress, branch `feat/opt-1.3.8`)
+### Optimization round 1.3.8 — TLS handshake, WireGuard silence, stalled polls, PSK (in progress, branch `feat/opt-1.3.8`)
+
+Four parallel tracks on top of 1.3.7 plus a register retry ladder;
+independent reviews: three passes on the data plane (a medium finding
+each time — wireguard-go's responder keypair rules, DERP down mid-
+rescue, DERP's non-blocking write — all fixed and re-checked), two on
+the control and TLS tracks (low findings, fixed), one on the PSK (none).
+Image 731 952 → **745 840 B (+13 888)**; host suite 2 092 → **2 318
+OK** (CI floor 2 318), ASan + UBSan clean, 0 warnings. Hardware section
+at the end of this entry.
+
+- **Register retries on a ladder** (`main.c`): a failed register was
+  retried after a fixed `CONFIG_TINYLINK_REGISTER_RETRY_MS` (30 s); one
+  series boot lost both TCP conns for ~20 s right after the association
+  and waited until 44 s for the retry. Now `tl_backoff_ms` from 2 s
+  (±25 %) up to that value; a rate-limit answer still waits what
+  control asks.
 
 #### Data plane (`feat/r138-dp`)
 
@@ -614,6 +630,41 @@ warnings. Static stack worst cases unchanged (`tinylink_derp` 5 248 /
 - Expected on the sensor: a full DERP handshake ≈ 3 round trips + ~0.1 s
   (was 1.45–4.19 s), the boot's DERP login at ≈ got-ip +0.5 s (ahead of
   the netmap), the same on every reconnect that cannot resume.
+
+#### Hardware (deployed sensor, app partition only)
+
+The 1.3.6 `ota_0` backup from round 1.3.7 stays the rollback image.
+
+- **TLS bench on the chip** (`CONFIG_TINYLINK_BENCH_TLS`, one image per
+  accelerator setting; µs): handshake CPU (chain parse + verify,
+  ServerKeyExchange verify, ECDHE) **ECDSA chain 976 265, RSA chain
+  65 948** with the 1.3.8 defaults (RSA exponentiation on the
+  accelerator, multiplication in software); multiplication on the
+  accelerator too (as up to 1.3.7): 1 063 998 / 143 402; no accelerator:
+  1 064 244 / 318 497. Per step (defaults): ECDSA P-384 verify 268 336,
+  P-256 125 853; RSA-2048 3 632, RSA-4096 15 191–16 683; X25519 in-tree
+  12 478 per operation against mbedTLS's 72 018–79 874 (16 / 16
+  results equal); P-256 ECDHE 30 541 + 82 327, P-384 59 734 + 180 357.
+  With 1.3.7's ECDSA chain and mbedTLS X25519 a full handshake cost
+  ~1.18 s of CPU; now 66 ms.
+- **Smoke (`9ba76cf`):** `wifi psk: derived on CPU 1 in 139 ms, waited 4
+  ms`, `init -> auth` at 0.44 s; `TLS up to derp16b.tailscale.com:443
+  … (full handshake, RSA offer, 391 ms)` (1.3.7: ~1.7 s), DERP login at
+  got-ip + 0.57 s — before the register; `h2: map stream answered:
+  HTTP 200 in 183 ms`. That boot's map stream then got no keep-alive
+  for 120 s after its netmap and was declared dead (reconnect answered
+  in 276 ms, keep-alives normal) — not seen again in the series.
+- **8 × 3 min (`9ba76cf`):** register without Auth 8 / 8, 0 crashes,
+  keep-alives on every stream, heap ~157 KB. `init -> auth` at 0.42 s
+  every boot (PSK derived in 117 ms, waited 17–25 ms); got-ip 1.63 s
+  (no comeback), 3.61–3.65 s (the AP's 2-s handshake) or 4.65–4.67 s
+  (its 4-way timeout + the immediate retry); DERP login at got-ip +
+  0.56–0.86 s (1.3.7: +1.8–2.2 s), so WG up now follows the netmap
+  (got-ip + 1.69–1.99 s, server side) at +1.90–2.18 s. Reset → WG up
+  median ~6.6 s (3.8–8.7). One boot lost both TCP conns for ~20 s right
+  after the association and came up at 52 s on the fixed 30-s register
+  retry — the ladder above.
+- **Soak (`24f1d14`):** running.
 
 ### Optimization round 1.3.7 — Wi-Fi association, boot control path, steady-state power (branch `feat/opt-1.3.7`)
 
