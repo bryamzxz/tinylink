@@ -46,6 +46,12 @@ static const char *TAG = "telemetry";
 
 static TaskHandle_t  s_task;
 static volatile bool s_tunnel_up;     /* telemetry_start(): WG netif up */
+static void (*s_persist_hook)(void);  /* tinylink_set_persist_hook */
+
+void tinylink_set_persist_hook(void (*fn)(void))
+{
+    __atomic_store_n(&s_persist_hook, fn, __ATOMIC_RELEASE);
+}
 
 #if CONFIG_TINYLINK_TELEMETRY_ENABLE
 
@@ -297,6 +303,8 @@ static void telemetry_task(void *arg)
             tinylink_diag_dump_stacks();
             tl_time_poll_persist();
             tinylink_addr_persist_poll();
+            void (*persist_hook)(void) = __atomic_load_n(&s_persist_hook, __ATOMIC_ACQUIRE);
+            if (persist_hook != NULL) persist_hook();
             now = esp_timer_get_time();
             next_housekeep = now + TLM_HOUSEKEEP_US;
         }

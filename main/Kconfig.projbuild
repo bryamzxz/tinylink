@@ -294,4 +294,35 @@ menu "tinylink application"
 
     endmenu
 
+    config TINYLINK_WIFI_DIAG
+        bool "Wi-Fi association diagnostics (EAPOL timeline)"
+        default n
+        help
+            Diagnostic build only (round 1.3.7). Wraps the supplicant's
+            EAPOL path at link time (-Wl,--wrap of wpa_sm_rx_eapol,
+            wpa_ether_send, eapol_txcb, esp_wifi_internal_issue_disconnect)
+            and records, with millisecond timestamps, every EAPOL-Key frame
+            handed to wpa.c (M1 / M3, replay counter, what wpa.c returned),
+            every M2 / M4 it sends and whether the AP acknowledged it, a
+            deauth raised by the supplicant itself (the 4th-M1 rule), and
+            the connect / disconnect (reason, RSSI) / got-ip events. The
+            records are printed as `wifi_diag:` lines from the event
+            handler at each disconnect and at got-ip, never from the Wi-Fi
+            task. Out of the default image.
+
+    config TINYLINK_WIFI_DIAG_SNIFF
+        bool "Also sniff frames addressed to the station during the boot association"
+        depends on TINYLINK_WIFI_DIAG
+        default n
+        help
+            Promiscuous mode from Wi-Fi start to the first got-ip: logs
+            the management frames addressed to the station (auth, assoc
+            response with its status, action — e.g. the AP's SA Query —,
+            deauth / disassoc with the reason), every unprotected EAPOL
+            frame on the air (MAC retries included, so a M1 the driver
+            drops still shows) and protected data frames sent to the
+            station before its keys exist (a M1 encrypted with a stale
+            key). Perturbs the timing more than the hooks alone; use for
+            a second series if the first one is ambiguous.
+
 endmenu

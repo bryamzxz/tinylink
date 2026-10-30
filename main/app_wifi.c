@@ -10,16 +10,20 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 
+#include "esp_attr.h"
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_random.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
+#include "nvs.h"
 
 #include "app_nvs.h"
 #include "backoff.h"
 #include "tinylink.h"
+#include "wifi_diag.h"
+#include "wifi_hint.h"
 
 static const char *TAG = "app_wifi";
 
@@ -44,6 +48,20 @@ static int s_retry_count;
 #define WIFI_RECONNECT_BASE_MS 500u
 #define WIFI_RECONNECT_CAP_MS  30000u
 static esp_timer_handle_t s_reconnect_timer;
+
+/* Association hint and retry policy (round 1.3.7, wifi_hint.h). s_conn is
+ * written by the event handler (sys_evt) and read by the persist hook
+ * (telemetry task), both under s_conn_mux; the event handler hands the
+ * next attempt (s_next) to reconnect_timer_cb (esp_timer task) the same
+ * way. s_cfg_channel — the channel the driver config holds — is written
+ * by app_wifi_start and then only on the reconnect path. */
+static RTC_NOINIT_ATTR tl_wifi_rtc_t s_hint_rtc;
+static tl_wifi_retry_t s_conn;
+static tl_wifi_next_t  s_next;
+static tl_wifi_blob_t  s_hint_nvs;        /* what NVS holds (telemetry task) */
+static uint32_t        s_ssid_hash;
+static uint8_t         s_cfg_channel;
+static portMUX_TYPE    s_conn_mux = portMUX_INITIALIZER_UNLOCKED;
 
 /* Boot power-save switch (round 1.3.1). The station starts with
  * WIFI_PS_NONE so the boot exchange is not paced by DTIM beacons; this
@@ -79,13 +97,97 @@ static void ps_timer_cb(void *arg)
              (unsigned)awake_ms, up ? "" : " — WG session not up yet");
 }
 
+/* The station config again, with `channel` as the scan hint. It also
+ * drops the driver's BSSID blacklist (wifi_set_config_process calls
+ * cnx_clear_blacklist first thing) — the point of the immediate retry
+ * after a 4-way timeout. The PMK should survive: the same routine keeps
+ * it on a hit in the driver's cache of SSID + passphrase entries, so no
+ * second PBKDF2 (≈ 33 M instructions, ~165 ms at 240 MHz). The ~180-B
+ * config is what the esp_timer task's static worst case grows by
+ * (tools/stack_worst.py: 3 248 → 3 328 of 4 608 B — esp_wifi_set_config's
+ * ioctl chain is as deep as esp_wifi_connect's); not inlined, so a plain
+ * reconnect does not carry it. */
+static __attribute__((noinline)) void apply_channel(uint8_t channel)
+{
+    wifi_config_t cfg;
+    esp_err_t err = esp_wifi_get_config(WIFI_IF_STA, &cfg);
+    if (err == ESP_OK) {
+        cfg.sta.channel = channel;
+        err = esp_wifi_set_config(WIFI_IF_STA, &cfg);
+    }
+    if (err == ESP_OK) {
+        s_cfg_channel = channel;
+    } else {
+        ESP_LOGW(TAG, "esp_wifi_set_config (channel %u) failed: 0x%x", (unsigned)channel, err);
+    }
+}
+
 static void reconnect_timer_cb(void *arg)
 {
     (void)arg;
+    portENTER_CRITICAL(&s_conn_mux);
+    const tl_wifi_next_t n = s_next;
+    s_next.reapply = false;
+    portEXIT_CRITICAL(&s_conn_mux);
+    if (tl_wifi_needs_config(&n, s_cfg_channel)) apply_channel(n.channel);
     esp_err_t cerr = esp_wifi_connect();
     if (cerr != ESP_OK) {
         ESP_LOGW(TAG, "esp_wifi_connect (reconnect) failed: 0x%x", cerr);
     }
+}
+
+static int hint_nvs_write(const uint8_t *b, size_t n, void *ctx)
+{
+    (void)ctx;
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(TL_WIFI_HINT_NS, NVS_READWRITE, &h);
+    if (err == ESP_OK) {
+        err = nvs_set_blob(h, TL_WIFI_HINT_KEY, b, n);
+        if (err == ESP_OK) err = nvs_commit(h);
+        nvs_close(h);
+    }
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "wifi hint: nvs write failed: 0x%x — a cold boot scans 1..N", err);
+    }
+    return err == ESP_OK ? 0 : -1;
+}
+
+/* tinylink_set_persist_hook: the 60-s housekeeping on the telemetry task
+ * writes the record when it differs from NVS — after a connect to a new
+ * channel / BSSID, never on the boot path. */
+static void hint_persist(void)
+{
+    portENTER_CRITICAL(&s_conn_mux);
+    const tl_wifi_ap_t ap = s_conn.ap;
+    portEXIT_CRITICAL(&s_conn_mux);
+    if (!tl_wifi_ap_ok(&ap, s_ssid_hash)) return;          /* nothing learned yet */
+    if (tl_wifi_blob_store(&s_hint_nvs, &ap, hint_nvs_write, NULL) == 1) {
+        ESP_LOGI(TAG, "wifi hint: channel %u stored", (unsigned)ap.channel);
+    }
+}
+
+/* Boot: the RTC copy (a warm reset) or the NVS record (any reset) for
+ * this SSID, else none. Read-only. */
+static uint8_t hint_load(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(TL_WIFI_HINT_NS, NVS_READONLY, &h) == ESP_OK) {
+        size_t n = sizeof(s_hint_nvs.b);
+        s_hint_nvs.len = (nvs_get_blob(h, TL_WIFI_HINT_KEY, s_hint_nvs.b, &n) == ESP_OK &&
+                          n <= sizeof(s_hint_nvs.b)) ? (uint8_t)n : 0;
+        nvs_close(h);
+    }
+    tl_wifi_ap_t ap;
+    const tl_wifi_hint_src_t src = tl_wifi_ap_boot(&s_hint_rtc, s_hint_nvs.b, s_hint_nvs.len,
+                                                   s_ssid_hash, &ap);
+    tl_wifi_retry_init(&s_conn, &ap, s_ssid_hash);
+    if (src == TL_WIFI_HINT_NONE) {
+        ESP_LOGI(TAG, "wifi hint: none stored — scanning channels 1..N");
+    } else {
+        ESP_LOGI(TAG, "wifi hint: channel %u first (%s record)", (unsigned)ap.channel,
+                 src == TL_WIFI_HINT_RTC ? "RTC" : "NVS");
+    }
+    return tl_wifi_channel(&s_conn);
 }
 
 static void wifi_event_handler(void *arg, esp_event_base_t base,
@@ -96,6 +198,9 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
 
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
         ESP_LOGI(TAG, "STA start, connecting");
+#if CONFIG_TINYLINK_WIFI_DIAG
+        wifi_diag_start();
+#endif
         esp_err_t cerr = esp_wifi_connect();
         if (cerr != ESP_OK) {
             /* A synchronous error queues no DISCONNECTED event, so the
@@ -103,15 +208,52 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
              * silently going offline. */
             ESP_LOGW(TAG, "esp_wifi_connect (STA start) failed: 0x%x", cerr);
         }
+    } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_CONNECTED) {
+        const wifi_event_sta_connected_t *c = (const wifi_event_sta_connected_t *)data;
+        if (c == NULL) return;
+        portENTER_CRITICAL(&s_conn_mux);
+        const bool changed = tl_wifi_on_connected(&s_conn, c->channel, c->bssid, s_ssid_hash);
+        const tl_wifi_ap_t ap = s_conn.ap;
+        portEXIT_CRITICAL(&s_conn_mux);
+#if CONFIG_TINYLINK_WIFI_DIAG
+        wifi_diag_note(WIFI_DIAG_CONNECTED, c->channel, 0);
+#endif
+        if (ap.channel != 0) tl_wifi_rtc_put(&s_hint_rtc, &ap);     /* free: every connect */
+        if (changed) {
+            ESP_LOGI(TAG, "wifi hint: AP on channel %u — in RTC now, NVS at the next housekeeping",
+                     (unsigned)ap.channel);
+        }
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
         const wifi_event_sta_disconnected_t *d = (const wifi_event_sta_disconnected_t *)data;
-        const uint32_t delay_ms = tl_backoff_ms((uint32_t)s_retry_count,
-                                                WIFI_RECONNECT_BASE_MS,
-                                                WIFI_RECONNECT_CAP_MS,
-                                                esp_random());
-        if (s_retry_count < 1000) s_retry_count++;
-        ESP_LOGW(TAG, "disconnected (reason %u), retry %d in %u ms",
-                 d ? (unsigned)d->reason : 0u, s_retry_count, (unsigned)delay_ms);
+        const unsigned reason = d ? (unsigned)d->reason : 0u;
+        portENTER_CRITICAL(&s_conn_mux);
+        const tl_wifi_next_t n = tl_wifi_on_disconnected(&s_conn, (uint16_t)reason,
+                                                         d ? d->bssid : NULL);
+        s_next.reapply = s_next.reapply || n.reapply;      /* until an attempt applies it */
+        s_next.channel = n.channel;
+        portEXIT_CRITICAL(&s_conn_mux);
+        uint32_t delay_ms = 0;
+        if (n.now) {
+            ESP_LOGW(TAG, "disconnected (reason %u), retry now — 4-way timeout after "
+                          "association: config re-applied, channel %u first",
+                     reason, (unsigned)n.channel);
+        } else {
+            delay_ms = tl_backoff_ms((uint32_t)s_retry_count, WIFI_RECONNECT_BASE_MS,
+                                     WIFI_RECONNECT_CAP_MS, esp_random());
+            if (s_retry_count < 1000) s_retry_count++;
+            if (n.channel != 0) {
+                ESP_LOGW(TAG, "disconnected (reason %u), retry %d in %u ms, channel %u first",
+                         reason, s_retry_count, (unsigned)delay_ms, (unsigned)n.channel);
+            } else {
+                ESP_LOGW(TAG, "disconnected (reason %u), retry %d in %u ms, channels 1..N",
+                         reason, s_retry_count, (unsigned)delay_ms);
+            }
+        }
+#if CONFIG_TINYLINK_WIFI_DIAG
+        wifi_diag_note(WIFI_DIAG_DISCONNECTED, (uint16_t)reason, d ? d->rssi : 0);
+        wifi_diag_note(WIFI_DIAG_RETRY, n.channel, (int16_t)(delay_ms < 32767u ? delay_ms : 32767u));
+        wifi_diag_flush();
+#endif
         xEventGroupClearBits(s_wifi_events, WIFI_CONNECTED_BIT);
         if (s_reconnect_timer != NULL) {
             (void)esp_timer_stop(s_reconnect_timer);   /* coalesce bursts */
@@ -128,6 +270,10 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)data;
         ESP_LOGI(TAG, "got ip " IPSTR, IP2STR(&event->ip_info.ip));
         s_retry_count = 0;
+#if CONFIG_TINYLINK_WIFI_DIAG
+        wifi_diag_note(WIFI_DIAG_GOT_IP, 0, 0);
+        wifi_diag_flush();
+#endif
         xEventGroupSetBits(s_wifi_events, WIFI_CONNECTED_BIT);
     }
 }
@@ -183,6 +329,12 @@ esp_err_t app_wifi_start(void)
            strnlen(pass, sizeof(wifi_cfg.sta.password)));
     wifi_cfg.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
     wifi_cfg.sta.pmf_cfg.capable = true;
+
+    /* Round 1.3.7: scan the last AP's channel first (wifi_hint.h). */
+    s_ssid_hash = tl_wifi_ssid_hash(wifi_cfg.sta.ssid, strnlen(ssid, sizeof(wifi_cfg.sta.ssid)));
+    wifi_cfg.sta.channel = hint_load();
+    s_cfg_channel = wifi_cfg.sta.channel;
+    tinylink_set_persist_hook(hint_persist);
 
     const esp_timer_create_args_t targs = {
         .callback = reconnect_timer_cb,

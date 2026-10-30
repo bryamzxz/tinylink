@@ -392,6 +392,14 @@ const char *tinylink_version_string(void);
  * the diag dump can be Kconfig-gated off for production. */
 void tinylink_diag_dump_stacks(void);
 
+/* An application record to persist from the 60-s housekeeping (round
+ * 1.3.7: the Wi-Fi association hint, app_wifi.c), after the address
+ * cache: the place where NVS writes may stall both CPUs without landing
+ * on the boot path. `fn` runs on the telemetry task (≈ 2.5 KB of its
+ * 4.5 KiB stack free there) and must write only what changed. One hook;
+ * NULL clears it. Any task, any time. */
+void tinylink_set_persist_hook(void (*fn)(void));
+
 #ifdef __cplusplus
 }
 #endif
