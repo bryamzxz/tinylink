@@ -11,6 +11,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 The last round of the 1.3.x line: the firmware reports **1.4.0**, the
 last release of this work line. What is left is in `docs/BACKLOG.md`.
+Image 745 840 (1.3.8) → **758 336 B**; host suite 2 318 → **2 733 OK**
+(CI floor 2 733, `make -O`), ASan + UBSan clean, 0 warnings. Two
+independent reviews of the warm start (no high; one medium each, fixed).
+
+#### Hardware (1.4.0 candidate `a030d5c`)
+
+- **TCP receive A/B** (36 boots, before the warm start): in the boot
+  section below — SACK adopted, the window kept.
+- **Interim `d953f55`** (no warm start, 45 min): 0 resets, 0 E lines,
+  0 RX-stale, 24 rekeys; `tx seq=0` 10 ms after `session up`, no boot
+  `sendto failed` (the telemetry hold).
+- **First boot after the flash** (cold): `warm start: no cached netmap`,
+  netmap at 3.80 s (body 968 ms, no stall), session up 3.99 s, `tx
+  seq=0` 90 ms later; `warm start: record stored for the next boot` at
+  60 s.
+- **Warm boots** (7): the warm start fired 50–220 ms after the register
+  every time and the netmap confirmed it every time (no `netmap
+  differs`, no restart). got-ip → session up median **1.55 s**, mean
+  2.34 s (cold, 18 boots of the A/B: median 2.17–2.20 s, mean
+  2.49–2.74 s). In 4 of 7 the peer answered the early INIT in
+  100–590 ms (session up 0.96–1.55 s after got-ip); in 3 of 7 only
+  3.4–4.4 s after our endpoint push, together with its call-me-maybe —
+  the peer's side, the window a cold INIT (after the netmap) hits in
+  2 of 36 boots; there the held first sample timed out (`sendto failed`
+  after 2 s). The fixed local UDP port in `docs/BACKLOG.md` targets it.
+  Heap at the warm start 160 416 → 149 944 B free, largest block
+  110 592 B unchanged.
+- **Soak (`a030d5c`):** running.
 
 #### Warm start: WireGuard up before the netmap (`feat/r139-warm`)
 

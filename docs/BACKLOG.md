@@ -53,10 +53,16 @@ the sensor logs in CHANGELOG.md.
 
 - **In-tunnel TSMP probe.** Would bring WG-silent failover below the
   ~13 s of the doubt handshake (1.3.8).
-- **Warm start, second iteration.** Measure on the sensor how often the
-  netmap corrects the warm start, and whether the 600-s bound
-  (`CONFIG_TINYLINK_WARM_START_MAX_S`) and the 30-day record age are
-  right.
+- **Warm start, second iteration.** On the sensor (1.4.0, 7 warm boots)
+  got-ip → session up was median 1.55 s / mean 2.34 s, against
+  2.17–2.20 / 2.49–2.74 s for 18 cold boots. In 4 of 7 the peer answered
+  the early INIT in 100–590 ms. In 3 of 7 it answered only 3.4–4.4 s
+  after our endpoint push, together with its call-me-maybe; the INIT
+  before the netmap lands in that window more often than a cold boot's
+  (2 of 36). The fixed local UDP port above should remove the window.
+  Also measure how often the netmap corrects the warm start, and
+  whether the 600-s bound (`CONFIG_TINYLINK_WARM_START_MAX_S`) and the
+  30-day record age are right.
 
 ## Wi-Fi
 
