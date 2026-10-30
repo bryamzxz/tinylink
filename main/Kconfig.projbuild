@@ -246,9 +246,12 @@ menu "tinylink application"
 
         config TINYLINK_WIFI_PS_MAX_MODEM
             bool "Steady-state modem sleep: MAX_MODEM (listen interval) instead of MIN_MODEM"
-            default n
+            default y
             help
-                A/B knob, off in production (tools/power/). The station
+                On since round 1.3.7 after an on-device A/B (tools/power/,
+                CONFIG_TINYLINK_POWER_DIAG): light sleep 81.4 → 89.8 % of
+                the time, light-sleep exits 10.5 → 6.6 /s, Wi-Fi task CPU
+                1.45 → 0.59 %. The station
                 switches from WIFI_PS_NONE to modem sleep once the WG
                 session is up (app_wifi.c). MIN_MODEM wakes for every DTIM
                 beacon; MAX_MODEM wakes every TINYLINK_WIFI_LISTEN_INTERVAL

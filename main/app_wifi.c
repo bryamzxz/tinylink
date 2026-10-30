@@ -73,8 +73,10 @@ static portMUX_TYPE    s_conn_mux = portMUX_INITIALIZER_UNLOCKED;
  * the session. */
 #define PS_POLL_MS       500u
 #define PS_AWAKE_CAP_MS  60000u
-/* The steady-state mode: MIN_MODEM; MAX_MODEM only as the round-1.3.7
- * A/B knob (Kconfig help, tools/power/). */
+/* The steady-state mode: MAX_MODEM at a 3-beacon listen interval since
+ * round 1.3.7 (on the sensor: light sleep 81.4 → 89.8 % of the time,
+ * Wi-Fi task CPU 1.45 → 0.59 % — Kconfig help, tools/power/); MIN_MODEM with
+ * the option off. */
 #if CONFIG_TINYLINK_WIFI_PS_MAX_MODEM
 #define PS_STEADY        WIFI_PS_MAX_MODEM
 #define PS_STEADY_NAME   "MAX_MODEM"
@@ -396,12 +398,14 @@ esp_err_t app_wifi_start(void)
      * its APB_FREQ_MAX PM lock, so light sleep stays off until then.
      *
      * WIFI_PS_MIN_MODEM wakes on every DTIM beacon (does not skip
-     * beacons). Together with esp_pm_configure(light_sleep_enable=true)
-     * in main.c, this lets the modem sleep between beacons without
-     * losing inbound packets. WIFI_PS_MAX_MODEM (DTIM-skipping) is
-     * unsafe for tinylink because the sensor must receive WG/DISCO
-     * traffic reliably. If the timer cannot be armed, modem sleep goes
-     * on immediately (the pre-1.3.1 behaviour). */
+     * beacons); WIFI_PS_MAX_MODEM (the default since 1.3.7) every
+     * listen interval: unicast frames for the station wait at the AP
+     * (≤ ~307 ms at 3 beacons — WG / DISCO / TCP timers are seconds),
+     * broadcasts sent at a skipped DTIM are lost (the router's ARP
+     * requests; the 60-s gratuitous ARP covers them). Together with
+     * esp_pm_configure(light_sleep_enable=true) in main.c the modem
+     * sleeps between wakes. If the timer cannot be armed, modem sleep
+     * goes on immediately (the pre-1.3.1 behaviour). */
     const esp_timer_create_args_t ps_args = {
         .callback = ps_timer_cb,
         .name     = "wifi_ps",
