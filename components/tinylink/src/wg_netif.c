@@ -494,13 +494,11 @@ static struct {
      * transport and responses) and the long-poll task (endpoint / key
      * updates) all drive it. */
     wg_path_t                path;
-    /* Rescue ring (wg_tx only) and its sentinel: set by the task that
-     * queues one (queue_rescue), cleared by wg_tx when it ran (keeps
-     * tx_ready_q's spare entries for at most one rescue + the stop
-     * sentinel). */
-    /* Rescue ring (wg_rescue.h; heap, like the TX slots). Owned by
-     * wg_tx alone: tx_send_item writes it, the WG_TX_SLOT_RESCUE
-     * sentinel reads it. */
+    /* Rescue ring (wg_rescue.h; heap, like the TX slots), owned by wg_tx
+     * alone: tx_send_item writes it, the WG_TX_SLOT_RESCUE sentinel reads
+     * it. rescue_queued: set by the task that queues the sentinel
+     * (queue_rescue), cleared by wg_tx when it ran — keeps tx_ready_q's
+     * spare entries for at most one rescue + the stop sentinel. */
     wg_rescue_ring_t        *rescue;
     volatile bool            rescue_queued;
     /* A re-send found the relay down and kept the frames: the next DERP

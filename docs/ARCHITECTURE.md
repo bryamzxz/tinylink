@@ -230,7 +230,7 @@ the direct-only frames of the last 40 s (and those whose DERP copy was
 refused) are re-sent via DERP (`wg_tx`'s rescue ring, kept while the
 relay is down; the peer's replay window drops those it has). Steady
 state costs no packet (upstream heartbeats a ping every 3 s); 0.5 / 1 /
-2 % random loss costs ~8 / 22 / 59 one-ping lapses per 6 h and no
+2 % random loss costs ~11 / 22 / 62 one-ping lapses per 6 h and no
 rekey (test_wg_path). A pong from another endpoint
 moves a valid current one only if clearly better (upstream `betterAddr`
 points, +20 private, > 15 points and > 25 ms, compared within one ping

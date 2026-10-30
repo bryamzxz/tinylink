@@ -399,15 +399,14 @@ static inline uint32_t wg_path_check_answer_(wg_path_t *p, int64_t now)
  * keepalive answering a sample comes 10 s after it; Kconfig allows up
  * to 600 s, the default is 5 s) that is every sample: one DERP copy and
  * one ping / pong each (the ping is sealed with the cached key, no
- * X25519). Kept on purpose: the proof
- * is a keepalive ~10 s old by construction, and after minutes nothing
- * says the path still works — magicsock does the same (any send after
- * trustBestAddrUntil, 6.5 s past the last pong, goes to both and pings).
- * Scaling the trust with the period would save those two packets per
- * sample but deliver a sample sent into a path that died during the
- * pause only once a lapse is confirmed (≥ 17 s late) — and never when
- * the doubt needs a second window the next sample opens minutes later,
- * past WG_PATH_RESCUE_MS. */
+ * X25519). Kept on purpose: the proof is a keepalive ~10 s old by
+ * construction, and after minutes nothing says the path still works —
+ * magicsock does the same (any send after trustBestAddrUntil, 6.5 s past
+ * the last pong, goes to both and pings). Scaling the trust with the
+ * period would save those two packets per sample but deliver a sample
+ * sent into a path that died during the pause only once a lapse is
+ * confirmed (≥ 17 s late) — and never when the doubt needs a second
+ * window the next sample opens minutes later, past WG_PATH_RESCUE_MS. */
 static inline uint32_t wg_path_on_send(wg_path_t *p, int64_t now, bool data,
                                        wg_path_mode_t *mode)
 {
@@ -428,7 +427,7 @@ static inline uint32_t wg_path_on_send(wg_path_t *p, int64_t now, bool data,
         if (p->mode == WG_PATH_DIRECT &&
             (p->last_data_us == 0 || wg_timer_due(now, p->last_data_us, win)) &&
             wg_timer_due(now, seen, win)) {
-            act |= wg_path_lapse_(p, now, WG_PATH_WHY_IDLE, p->proof_us);
+            act |= wg_path_lapse_(p, now, WG_PATH_WHY_IDLE, seen);
         }
         if ((p->mode == WG_PATH_DIRECT || WG_PATH_IN_DOUBT(p)) && p->await_us == 0) {
             p->await_us = now;
