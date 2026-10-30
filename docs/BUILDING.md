@@ -64,6 +64,15 @@ diagnostic history (esp-protocols#800, commit `c8c10214f8`, and the
 
 ## Build / flash / monitor
 
+A deployment's own values — the device hostname and the telemetry
+destination — go in `sdkconfig.local` next to `sdkconfig.defaults`
+(git-ignored; copy `sdkconfig.local.example`). The build applies it
+last, after `sdkconfig.defaults` and any `-D SDKCONFIG_DEFAULTS` list.
+Without it the hostname is `tinylink` and no telemetry is sent (the
+device still joins the tailnet). An existing `sdkconfig` wins over every
+defaults file: after changing `sdkconfig.local`, delete `sdkconfig` or
+build in a fresh directory.
+
 ```bash
 idf.py build
 idf.py -p /dev/ttyUSB0 flash

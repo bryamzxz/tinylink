@@ -244,6 +244,19 @@ in docs/ARCHITECTURE.md). Not yet on the sensor.
   erased`, then a cold boot; after two failures `warm start: off after
   2 failed attempts (a reset or a hang) — until a power cycle; …`.
 
+#### Neutral defaults, a deployment's values in `sdkconfig.local`
+
+`CONFIG_TINYLINK_DEVICE_HOSTNAME` defaulted to the production sensor's
+hostname and `CONFIG_TINYLINK_TELEMETRY_DEST` to its collector's tailnet
+address. They now default to `tinylink` and empty (no samples, no
+/stats, a W line saying so; the device still joins the tailnet), and a
+git-ignored `sdkconfig.local` next to `sdkconfig.defaults`
+(`sdkconfig.local.example`) carries a deployment's values. The root
+`CMakeLists.txt` appends it last, after `sdkconfig.defaults` and any
+`-D SDKCONFIG_DEFAULTS` list. With the sensor's `sdkconfig.local` the
+generated `sdkconfig` is identical to the one before the change, and
+the image the same size (758 336 B). The neutral build is 755 056 B.
+
 #### The first telemetry sample of a boot
 
 Every 1.3.x boot log has `telemetry: sendto failed: errno=-1` right

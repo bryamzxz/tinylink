@@ -5,10 +5,12 @@ menu "tinylink application"
 
     config TINYLINK_DEVICE_HOSTNAME
         string "Device hostname"
-        default "sensor-cali"
+        default "tinylink"
         help
             Hostname advertised to DHCP, used as the Tailscale node hostname
-            (Hostinfo.Hostname) and surfaced in the admin panel.
+            (Hostinfo.Hostname) and surfaced in the admin panel. A
+            deployment's own value goes in a git-ignored sdkconfig.local
+            next to sdkconfig.defaults (sdkconfig.local.example).
 
     config TINYLINK_CONTROL_HOST
         string "Control plane host"
@@ -320,11 +322,13 @@ menu "tinylink application"
         config TINYLINK_TELEMETRY_DEST
             string "Telemetry UDP destination (host:port)"
             depends on TINYLINK_TELEMETRY_ENABLE
-            default "100.88.250.54:27821"
+            default ""
             help
                 IP:port to send JSON samples to. The IP must be reachable
                 through the WireGuard netif — typically the home peer's
-                tailnet 100.x address. Override per deployment.
+                tailnet 100.x address. Empty (the default): no samples and
+                no /stats responder. Set per deployment, in a git-ignored
+                sdkconfig.local (sdkconfig.local.example).
 
     endmenu
 

@@ -142,6 +142,11 @@ int tlm_open(struct sockaddr_in *dest, bool *sensor_ok)
 
     char     host[40];
     uint16_t port = 0;
+    if (CONFIG_TINYLINK_TELEMETRY_DEST[0] == '\0') {
+        ESP_LOGW(TAG, "no telemetry destination set (CONFIG_TINYLINK_TELEMETRY_DEST, "
+                      "sdkconfig.local) — samples and /stats off");
+        return -1;
+    }
     if (parse_dest(CONFIG_TINYLINK_TELEMETRY_DEST,
                    host, sizeof(host), &port) != 0) {
         ESP_LOGE(TAG, "telemetry dest malformed: %s",

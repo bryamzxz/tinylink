@@ -1,0 +1,6 @@
+# Copy to sdkconfig.local (git-ignored) and set this deployment's values;
+# the build applies it after sdkconfig.defaults (CMakeLists.txt).
+# Use a clean build directory (or delete sdkconfig) after changing it:
+# an existing sdkconfig wins over every defaults file.
+CONFIG_TINYLINK_DEVICE_HOSTNAME="my-sensor"
+CONFIG_TINYLINK_TELEMETRY_DEST="100.64.0.10:27821"

@@ -104,6 +104,19 @@ set(EXCLUDE_COMPONENTS
     ulp
 )
 
+# A deployment's own values (round 1.3.9): the device hostname and the
+# telemetry destination default to neutral ones (main/Kconfig.projbuild);
+# a git-ignored sdkconfig.local next to this file carries the real ones
+# and is applied last, after sdkconfig.defaults and any -D
+# SDKCONFIG_DEFAULTS list (the tools/power A/B fragments).
+# sdkconfig.local.example shows the shape.
+if(EXISTS "${CMAKE_CURRENT_LIST_DIR}/sdkconfig.local")
+    if(NOT DEFINED SDKCONFIG_DEFAULTS)
+        set(SDKCONFIG_DEFAULTS "sdkconfig.defaults")
+    endif()
+    list(APPEND SDKCONFIG_DEFAULTS "sdkconfig.local")
+endif()
+
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 
 # mbedTLS user config (round 1.3.2): mbedtls_user_config.h #undefs what
