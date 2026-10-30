@@ -32,6 +32,14 @@ extern "C" {
 #define WG_RESCUE_SLOTS 10
 #define WG_RESCUE_MAX   224
 
+/* How long a frame handed to the relay counts as still on its way: the
+ * DERP stream is TCP, and a segment the Wi-Fi lost waits for its
+ * retransmission (lwIP: 1 s and more); a direct INIT sent meanwhile
+ * could reach the peer first (review of 1.3.8, second pass). One
+ * REKEY_TIMEOUT. A guard: no simulated scenario changes with it at 0
+ * (an INIT seldom follows a re-send within a DERP transit). */
+#define WG_RESCUE_TRANSIT_MS 5000
+
 typedef struct {
     int64_t  at_us;                   /* sent at; 0 = empty */
     uint32_t gen;                     /* keypair generation that sealed it */
@@ -44,6 +52,9 @@ typedef struct {
 typedef struct {
     wg_rescue_t slot[WG_RESCUE_SLOTS];
     uint8_t     head;                 /* next to write = the oldest */
+    uint32_t    sent_gen[2];          /* the two newest keypairs a re-send handed
+                                         to the relay ([0] newest; 0 = none)... */
+    int64_t     sent_us[2];           /* ...and when */
 } wg_rescue_ring_t;
 
 /* Keep a copy of a frame sent direct only (or whose DERP copy was
@@ -97,6 +108,12 @@ static inline unsigned wg_rescue_flush(wg_rescue_ring_t *r, int64_t now, int64_t
         if (left == 0 && send(s->buf, s->len, user)) {
             sent++;
             s->at_us = 0;
+            if (s->gen != r->sent_gen[0]) {   /* oldest first: gens only grow */
+                r->sent_gen[1] = r->sent_gen[0];
+                r->sent_us[1]  = r->sent_us[0];
+                r->sent_gen[0] = s->gen;
+            }
+            r->sent_us[0] = now;
         } else {
             left++;
             s->owed = true;
@@ -110,16 +127,23 @@ static inline unsigned wg_rescue_flush(wg_rescue_ring_t *r, int64_t now, int64_t
  * (wg_tx owns the ring; wg_rx decides on a handshake): the two newest
  * keypairs with frames in it, and for each the newest frame and the
  * newest owed one (0: none). Frames are kept in send order, so "a frame
- * of keypair g still pending" is a test on these two instants. */
+ * of keypair g still pending" is a test on these two instants. Also the
+ * two newest keypairs the last re-sends handed to the relay, and when. */
 typedef struct {
     uint32_t gen[2];                  /* [0] the newest; 0 = no frame */
     int64_t  newest_us[2];
     int64_t  owed_us[2];
+    uint32_t sent_gen[2];
+    int64_t  sent_us[2];
 } wg_rescue_sum_t;
 
 static inline void wg_rescue_summarize(const wg_rescue_ring_t *r, wg_rescue_sum_t *out)
 {
     memset(out, 0, sizeof(*out));
+    for (unsigned i = 0; i < 2; i++) {
+        out->sent_gen[i] = r->sent_gen[i];
+        out->sent_us[i]  = r->sent_us[i];
+    }
     for (unsigned i = 0; i < WG_RESCUE_SLOTS; i++) {
         const wg_rescue_t *s = &r->slot[(r->head + i) % WG_RESCUE_SLOTS];   /* oldest first */
         if (s->at_us == 0) continue;
@@ -145,18 +169,30 @@ static inline void wg_rescue_summarize(const wg_rescue_ring_t *r, wg_rescue_sum_
  * `current` — the INIT deletes cur_gen - 1. Unconfirmed, the peer holds
  * cur_gen - 1 as current and cur_gen as next (the INIT deletes cur_gen),
  * or has promoted it unseen (the INIT deletes cur_gen - 1). Older
- * keypairs are gone already. A re-sent frame sealed under a deleted
+ * keypairs are gone already. A frame of such a keypair re-sent less than
+ * WG_RESCUE_TRANSIT_MS ago counts too: it may still be on the DERP
+ * stream, behind which only a DERP copy of the INIT is sure to stay. A
+ * re-sent frame sealed under a deleted
  * keypair is dropped by the peer: the review of 1.3.8 measured 3.1 lost
  * frames per episode with only our direct WireGuard dropped, two doubts'
  * handshakes in a row (2 000 random instants; 1.3.7, 8 slots and a fixed
  * 40 s: 2.3). */
+static inline bool wg_rescue_gen_at_risk_(uint32_t g, uint32_t cur_gen, bool confirmed)
+{
+    return g != 0 && (g == cur_gen - 1u || (!confirmed && g == cur_gen));
+}
+
 static inline bool wg_rescue_init_risk(const wg_rescue_sum_t *sum, int64_t now,
                                        int64_t from_us, int64_t max_age_us,
                                        uint32_t cur_gen, bool confirmed)
 {
     for (unsigned i = 0; i < 2; i++) {
+        if (wg_rescue_gen_at_risk_(sum->sent_gen[i], cur_gen, confirmed) &&
+            !wg_timer_due(now, sum->sent_us[i], (int64_t)WG_RESCUE_TRANSIT_MS * 1000LL)) {
+            return true;
+        }
         const uint32_t g = sum->gen[i];
-        if (g == 0 || !(g == cur_gen - 1u || (!confirmed && g == cur_gen))) continue;
+        if (!wg_rescue_gen_at_risk_(g, cur_gen, confirmed)) continue;
         const int64_t last = sum->owed_us[i] != 0 && sum->newest_us[i] < from_us
                                  ? sum->owed_us[i] : sum->newest_us[i];
         if ((sum->owed_us[i] != 0 || sum->newest_us[i] >= from_us) &&

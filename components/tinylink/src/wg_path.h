@@ -120,9 +120,9 @@
 // during one (DERP copies 21 / 44 / 90 → 1.6 / 3.1 / 17 per 6 h, frames
 // lost to the random loss 21.7 / 41.6 / 80.3 → 21.4 / 41.2 / 78.5), and
 // the RX-stale rekeys the loss caused (0.25 / 0.65 / 1.85 per 6 h, each
-// after 30 s of silence) are gone. A test that would make the peer delete
+// after 30 s of silence) are gone. An INIT that would make the peer delete
 // the keypair of frames still to re-send goes via DERP behind their
-// re-send (wg_path_rekey_gate): 2.3 / 4.5 / 11 of the 13 / 26 / 54 tests.
+// re-send (wg_path_init_route): 2.3 / 4.5 / 11 of the 13 / 26 / 54 tests.
 // Only one INIT in flight: wg_path_rekey_gate starts one only when no
 // handshake is pending, REKEY_TIMEOUT after the last INIT (whitepaper
 // §6.1, wireguard-go SendHandshakeInitiation), else the pending one's
@@ -157,6 +157,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "wg_rescue.h"
 #include "wg_timers.h"
 
 #ifdef __cplusplus
@@ -722,45 +723,67 @@ static inline bool wg_path_keys_confirmed(const wg_path_t *p)
  * WG_INIT_FRESH_AFTER_MS), and the pending one's answer does the same
  * job; a new one only REKEY_TIMEOUT after the last (whitepaper §6.1,
  * wireguard-go SendHandshakeInitiation); none without a session (a cold
- * handshake has its own retries).
- *
- * A doubt's test that would make the peer delete a keypair sealing
- * frames still to re-send (`ring_risk`, wg_rescue_init_risk; the review
- * of 1.3.8: 3.1 frames lost per episode with only our direct WireGuard
- * dropped, 2 000 random instants; 0 with this gate) goes after them: the pending frames are
- * re-sent via DERP first and the INIT goes via DERP only, behind them on
- * the same stream — the peer looks a transport packet's keypair up as it
- * arrives, before its handshake queue gets the INIT (GO_AFTER_RESCUE).
- * Withholding the test instead left a third of the simulated WG-silent
- * failures to the RX-stale rekey (a proactive rekey leaves frames of the
- * previous keypair pending for ~20 s): back up to 27.8 s after the first
- * unanswered frame, against 13.0 s. Without a relay: no test (RING);
- * the doubt ends as in 1.3.7, by WireGuard or SILENT. Pure, so the host
- * tests drive the same decision wg_netif makes. */
+ * handshake has its own retries). Which way the INIT goes is
+ * wg_path_init_route's. Pure, so the host tests drive the same decision
+ * wg_netif makes. */
 typedef enum {
     WG_REKEY_GO = 0,
-    WG_REKEY_GO_AFTER_RESCUE,
     WG_REKEY_NO_SESSION,
     WG_REKEY_IN_FLIGHT,
     WG_REKEY_TOO_SOON,
-    WG_REKEY_RING,
 } wg_rekey_gate_t;
 
 #define WG_PATH_REKEY_TIMEOUT_MS 5000   /* = wg_netif's WG_REKEY_TIMEOUT_MS */
 
-static inline wg_rekey_gate_t wg_path_rekey_gate(uint32_t act, bool up, bool in_flight,
-                                                 int64_t now, int64_t last_init_us,
-                                                 bool ring_risk, bool relay)
+static inline wg_rekey_gate_t wg_path_rekey_gate(bool up, bool in_flight, int64_t now,
+                                                 int64_t last_init_us)
 {
     if (!up) return WG_REKEY_NO_SESSION;
     if (in_flight) return WG_REKEY_IN_FLIGHT;
     if (!wg_timer_due(now, last_init_us, (int64_t)WG_PATH_REKEY_TIMEOUT_MS * 1000LL)) {
         return WG_REKEY_TOO_SOON;
     }
-    if (!(act & WG_PATH_ACT_REKEY) && ring_risk) {
-        return relay ? WG_REKEY_GO_AFTER_RESCUE : WG_REKEY_RING;
-    }
     return WG_REKEY_GO;
+}
+
+/* Which way an INIT may leave — any INIT, new or re-sent, whatever
+ * started it (a doubt's test, SILENT, the proactive or RX-stale rekey, a
+ * retry, a fresh one at a path event, the re-sends at a DERP login, a
+ * CallMeMaybe, link-up or a pong). An INIT the peer consumes deletes a
+ * keypair (wg_rescue_init_risk): while one still seals a frame to
+ * re-send, or one just re-sent, the INIT goes via DERP only, behind the
+ * re-send on the same stream — the peer looks a transport packet's
+ * keypair up as it arrives, before its handshake queue gets the INIT —
+ * and wg_netif queues the re-send first. With DERP down both wait: the
+ * re-send is kept owed, the INIT copy dropped, and the login sends them
+ * in that order. Review of 1.3.8: the doubt's test sent as it comes lost
+ * 3.1 frames per episode with only our direct WireGuard dropped (2 000
+ * random instants); with only the test held (81134de), our DERP down 3 /
+ * 8 / 20 s within the episode lost 194 / 642 / 1 597 (the login kick's
+ * fresh INIT or its DERP copy ahead of the re-send, the 5-s retry, a
+ * pong's re-send went direct); now 0 / 2 / 60, those 62 pushed out of the
+ * full ring by the outage, none to a deleted keypair. Withholding the test instead left a third of the
+ * simulated WG-silent failures to the RX-stale rekey (a proactive rekey
+ * leaves frames of the previous keypair pending for ~20 s): back up to
+ * 27.8 s after the first unanswered frame, against 13.0 s. A cold
+ * handshake (`rekey` false: none yet, or the rekey gave up after 60 s)
+ * goes as before: no session carries data, the tunnel is down. The ring
+ * keeps frames only with a relay registered (on the device always, with
+ * the DERP supervisor built in), so a held INIT always has a way. */
+typedef enum {
+    WG_INIT_ANY_PATH = 0,
+    WG_INIT_DERP_BEHIND_RESEND,
+} wg_init_route_t;
+
+static inline wg_init_route_t wg_path_init_route(const wg_path_t *p, const wg_rescue_sum_t *ring,
+                                                 bool rekey, int64_t now, uint32_t cur_gen)
+{
+    if (rekey && wg_rescue_init_risk(ring, now, wg_path_rescue_from(p),
+                                     (int64_t)WG_PATH_RESCUE_MAX_MS * 1000LL, cur_gen,
+                                     wg_path_keys_confirmed(p))) {
+        return WG_INIT_DERP_BEHIND_RESEND;
+    }
+    return WG_INIT_ANY_PATH;
 }
 
 /* A transport packet with a payload from the peer, either path. Proves

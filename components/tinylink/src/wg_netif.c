@@ -506,8 +506,8 @@ static struct {
      * spare entries for at most one rescue + the stop sentinel. */
     wg_rescue_ring_t        *rescue;
     /* What the ring holds per keypair (wg_rescue_summarize), published by
-     * wg_tx under g.lock after every change: wg_rx asks it before a
-     * doubt's handshake (wg_rescue_init_risk). */
+     * wg_tx under g.lock after every change: every INIT asks it
+     * (init_derp_only). */
     wg_rescue_sum_t          rescue_sum;
     volatile bool            rescue_queued;
     /* A re-send found the relay down and kept the frames: the next DERP
@@ -880,6 +880,27 @@ static bool init_queue_relay(int64_t now)
     return true;
 }
 
+/* Every INIT leaves through build_and_send_init or init_resend, and both
+ * ask this first (wg_path_init_route): via DERP only, behind a re-send?
+ * Caller holds hs_lock (order hs_lock -> g.lock). */
+static bool init_derp_only(int64_t now)
+{
+    xSemaphoreTake(g.lock, portMAX_DELAY);
+    const bool d = wg_path_init_route(&g.path, &g.rescue_sum, g.state == WG_NETIF_UP, now,
+                                      g.transport.gen) == WG_INIT_DERP_BEHIND_RESEND;
+    xSemaphoreGive(g.lock);
+    return d;
+}
+
+/* The INIT's DERP copy behind a re-send of the ring's pending frames: the
+ * sentinel enters tx_ready_q first (or is queued already), and wg_tx
+ * relays in queue order. Caller holds hs_lock. */
+static bool init_queue_relay_behind_resend(int64_t now)
+{
+    queue_rescue(WG_PATH_ACT_RESCUE);
+    return init_queue_relay(now);
+}
+
 /* Build a fresh INIT for a NEW attempt, keep it in g.init_msg and send
  * it: direct, plus a DERP copy while no direct path is confirmed.
  * Mutates g.handshake (new ephemeral + chain key) and g.local_index;
@@ -893,12 +914,12 @@ static bool init_queue_relay(int64_t now)
  * before the stamp and the retry fired on the next 1-s tick; with the
  * deadline-based RX wait that would spin. A failed direct send is not a
  * failed attempt: the DERP copy may still deliver it. Returns -1 only if
- * the INIT could not be built. `relay_only`: via DERP only, behind frames
- * just queued for a re-send (WG_REKEY_GO_AFTER_RESCUE) — a direct copy
- * could overtake them and make the peer drop their keypair; with no free
- * TX slot nothing goes and the REKEY_TIMEOUT retry sends it, the re-send
- * long done. Caller holds hs_lock. */
-static int build_and_send_init(bool relay_only)
+ * the INIT could not be built, 1 if it went via DERP only, behind a
+ * re-send (init_derp_only) — a direct copy could overtake the re-sent
+ * frames and make the peer drop their keypair; with DERP down or no free
+ * TX slot nothing goes, and the login kick or the REKEY_TIMEOUT retry
+ * sends it. Caller holds hs_lock. */
+static int build_and_send_init(void)
 {
     const int64_t now = now_us();
     g.last_handshake_us = now;
@@ -926,13 +947,13 @@ static int build_and_send_init(bool relay_only)
     }
     g.init_valid    = true;
     g.init_relay_us = 0;
-    if (relay_only) {
-        /* Stamped as sent direct: a path event re-sends it there only
-         * WG_INIT_RESEND_MIN_MS later, the re-sent frames arrived. */
+    if (init_derp_only(now)) {
+        /* Stamped as sent direct: once the risk is over, a path event
+         * re-sends it there only WG_INIT_RESEND_MIN_MS later. */
         g.init_direct_us  = now;
         g.init_direct_dst = peer_addr_snapshot();
-        (void)init_queue_relay(now);
-        return 0;
+        (void)init_queue_relay_behind_resend(now);
+        return 1;
     }
     init_send_direct(now);
     if (path_init_wants_relay(now)) {
@@ -943,14 +964,20 @@ static int build_and_send_init(bool relay_only)
 
 /* Re-send the INIT of the attempt in flight (B7) — the same bytes, see
  * WG_INIT_RESEND_MIN_MS. `force_relay`: the relay just came up, so an
- * earlier copy queued while it was down was dropped. Caller holds
- * hs_lock. */
+ * earlier copy queued while it was down was dropped. Via DERP only,
+ * behind a re-send, while init_derp_only says so — whatever the caller
+ * asked for. Caller holds hs_lock. */
 static void init_resend(bool direct, bool relay, bool force_relay,
                         const char *why)
 {
     if (!g.init_valid || !handshake_pending()) return;
     const int64_t now = now_us();
     const int64_t min_us = (int64_t)WG_INIT_RESEND_MIN_MS * 1000LL;
+    const bool derp_only = init_derp_only(now);
+    if (derp_only) {
+        direct = false;
+        relay  = true;
+    }
     bool sent_direct = false, sent_relay = false;
     if (direct) {
         const struct sockaddr_in dst = peer_addr_snapshot();
@@ -967,13 +994,14 @@ static void init_resend(bool direct, bool relay, bool force_relay,
     }
     if (relay && (force_relay || g.init_relay_us == 0 ||
                   wg_timer_due(now, g.init_relay_us, min_us))) {
-        sent_relay = init_queue_relay(now);
+        sent_relay = derp_only ? init_queue_relay_behind_resend(now) : init_queue_relay(now);
     }
     if (sent_direct || sent_relay) {
         ESP_LOGI(TAG, "handshake init re-sent via %s%s%s (%s, idx=0x%08x)",
                  sent_direct ? "direct" : "",
                  sent_direct && sent_relay ? " + " : "",
-                 sent_relay ? "DERP" : "", why, (unsigned)g.local_index);
+                 derp_only ? "DERP only, behind a re-send" : sent_relay ? "DERP" : "",
+                 why, (unsigned)g.local_index);
     }
 }
 
@@ -985,10 +1013,12 @@ static void init_resend(bool direct, bool relay, bool force_relay,
  * looping. */
 static int kick_off_handshake(void)
 {
-    const int rc = build_and_send_init(false);
-    g.handshake_attempt++;
+    /* PENDING first: a cold INIT is never held for a re-send
+     * (init_derp_only; a peer re-login comes here from UP). */
     g.state = WG_NETIF_HANDSHAKE_PENDING;
-    if (rc == 0) {
+    const int rc = build_and_send_init();
+    g.handshake_attempt++;
+    if (rc >= 0) {
         ESP_LOGI(TAG, "handshake init sent (attempt %d, idx=0x%08x)",
                  g.handshake_attempt, (unsigned)g.local_index);
     }
@@ -1008,13 +1038,14 @@ static void init_refresh_or_resend(bool direct, bool relay, bool force_relay,
         return;
     }
     const bool rekey = (g.state == WG_NETIF_UP);
-    const int rc = build_and_send_init(false);
+    const int rc = build_and_send_init();
     if (rekey) g.rekey_attempt++; else g.handshake_attempt++;
-    if (rc == 0) {
-        ESP_LOGI(TAG, "%s init sent (attempt %d, idx=0x%08x, fresh: %s)",
+    if (rc >= 0) {
+        ESP_LOGI(TAG, "%s init sent (attempt %d, idx=0x%08x, fresh: %s%s)",
                  rekey ? "rekey" : "handshake",
                  rekey ? g.rekey_attempt : g.handshake_attempt,
-                 (unsigned)g.local_index, why);
+                 (unsigned)g.local_index, why,
+                 rc == 1 ? ", via DERP behind a re-send" : "");
     }
 }
 
@@ -1026,18 +1057,18 @@ static void init_refresh_or_resend(bool direct, bool relay, bool force_relay,
  * the responder still accepts up to its REJECT_AFTER_TIME = 180 s).
  * Sets rekey_in_flight whatever the outcome, so the rekey-retry timer
  * (REKEY_TIMEOUT) owns the next try. `why` (may be NULL) ends the log
- * line: what the path selection asked it for; `relay_only`: see
- * build_and_send_init. */
-static void start_rekey(const char *why, bool relay_only)
+ * line: what the path selection asked it for. */
+static void start_rekey(const char *why)
 {
-    const int rc = build_and_send_init(relay_only);
+    const int rc = build_and_send_init();
     g.rekey_attempt++;
     g.rekey_in_flight = true;
-    if (rc == 0) {
-        ESP_LOGI(TAG, "rekey init sent (attempt %d, idx=0x%08x, age=%lds%s%s)",
+    if (rc >= 0) {
+        ESP_LOGI(TAG, "rekey init sent (attempt %d, idx=0x%08x, age=%lds%s%s%s)",
                  g.rekey_attempt, (unsigned)g.local_index,
                  (long)((now_us() - g.last_handshake_completed_us) / 1000000LL),
-                 why != NULL ? ", " : "", why != NULL ? why : "");
+                 why != NULL ? ", " : "", why != NULL ? why : "",
+                 rc == 1 ? ", via DERP behind a re-send" : "");
     }
 }
 
@@ -1761,42 +1792,20 @@ static __attribute__((noinline)) void rx_path_tick(int64_t now)
          * window, still nothing — usually the doubt's test or the RX-stale
          * rekey is in flight by then and does it. Make-before-break either
          * way; wg_path_rekey_gate decides (one INIT in flight, REKEY_TIMEOUT
-         * apart, and a test never makes the peer drop the keypair of a
-         * frame still to re-send). The ring summary is read under g.lock
-         * first: the lock order is hs_lock -> g.lock. */
-        bool risk = false;
-        if (act & WG_PATH_ACT_TEST) {
-            xSemaphoreTake(g.lock, portMAX_DELAY);
-            risk = wg_rescue_init_risk(&g.rescue_sum, now, wg_path_rescue_from(&g.path),
-                                       (int64_t)WG_PATH_RESCUE_MAX_MS * 1000LL,
-                                       g.transport.gen, wg_path_keys_confirmed(&g.path));
-            xSemaphoreGive(g.lock);
-        }
+         * apart), and build_and_send_init the way (wg_path_init_route: an
+         * INIT never makes the peer drop the keypair of a frame still to
+         * re-send). */
         xSemaphoreTake(g.hs_lock, portMAX_DELAY);
         const wg_rekey_gate_t gate = wg_path_rekey_gate(
-            act, g.state == WG_NETIF_UP, g.rekey_in_flight, now, g.last_handshake_us, risk,
-            g.relay_cb != NULL);
-        if (gate == WG_REKEY_GO_AFTER_RESCUE) {
-            /* The re-send's sentinel enters tx_ready_q before the INIT's
-             * DERP copy (or is queued already): wg_tx relays them in that
-             * order. */
-            queue_rescue(WG_PATH_ACT_RESCUE);
-        }
-        if (gate == WG_REKEY_GO || gate == WG_REKEY_GO_AFTER_RESCUE) {
+            g.state == WG_NETIF_UP, g.rekey_in_flight, now, g.last_handshake_us);
+        if (gate == WG_REKEY_GO) {
             g.rekey_attempt = 0;
             if (act & WG_PATH_ACT_REKEY) g.stat_silent_rekeys++;
             else g.stat_doubt_rekeys++;
-            start_rekey(act & WG_PATH_ACT_REKEY ? "silent"
-                        : gate == WG_REKEY_GO ? "doubt test"
-                        : "doubt test, via DERP after a re-send",
-                        gate == WG_REKEY_GO_AFTER_RESCUE);
+            start_rekey(act & WG_PATH_ACT_REKEY ? "silent" : "doubt test");
         }
         xSemaphoreGive(g.hs_lock);
-        if (gate == WG_REKEY_RING) {
-            ESP_LOGI(TAG, "doubt: no handshake test — the peer would drop the keypair of "
-                          "frames still to re-send, and no relay to send them first");
-        } else if (gate != WG_REKEY_GO && gate != WG_REKEY_GO_AFTER_RESCUE &&
-                   (act & WG_PATH_ACT_TEST)) {
+        if (gate != WG_REKEY_GO && (act & WG_PATH_ACT_TEST)) {
             ESP_LOGD(TAG, "doubt: a handshake is in flight — its answer settles it");
         }
     }
@@ -1981,7 +1990,7 @@ retry_timer:;
             ESP_LOGI(TAG, "session age >%ds — triggering proactive rekey",
                      WG_REKEY_AFTER_MS / 1000);
             g.rekey_attempt = 0;
-            start_rekey(NULL, false);
+            start_rekey(NULL);
         }
 
         /* Active DISCO probe of alternate peer endpoints. Fires when
@@ -2068,7 +2077,7 @@ retry_timer:;
              * from it backdates the clock again (send_to_peer) so the
              * path probe still fires at the next wake. */
             g.last_transport_recv_us = now;
-            start_rekey(NULL, false);
+            start_rekey(NULL);
         }
 
         /* Rekey retry timer. Mirrors the cold-path retry but does NOT
@@ -2091,7 +2100,7 @@ retry_timer:;
                 kick_off_handshake();
             } else {
                 ESP_LOGW(TAG, "rekey retry %d", g.rekey_attempt + 1);
-                start_rekey(NULL, false);
+                start_rekey(NULL);
             }
         }
         xSemaphoreGive(g.hs_lock);
@@ -2371,8 +2380,8 @@ static void tx_ring_destroy(void)
         free(g.rescue);
         g.rescue = NULL;
     }
-    /* Start failure or teardown: a racing wg_rx would only misjudge one
-     * doubt test (wg_rescue_init_risk) on a session that is going away. */
+    /* Start failure or teardown: a racing INIT would only misjudge its
+     * way (init_derp_only) on a session that is going away. */
     memset(&g.rescue_sum, 0, sizeof(g.rescue_sum));
 }
 
@@ -2638,14 +2647,18 @@ void wg_netif_handshake_kick(wg_netif_kick_t why)
     xSemaphoreTake(g.hs_lock, portMAX_DELAY);
     switch (why) {
     case WG_NETIF_KICK_RELAY_UP:
+        /* A re-send the relay refused while it was down goes now (the
+         * frames not proven delivered, WG_PATH_RESCUE_MAX_MS at most) —
+         * first: an INIT queued ahead of it could make the peer drop
+         * their keypair (review of 1.3.8, second pass). */
+        if (g.rescue_owed) queue_rescue(WG_PATH_ACT_RESCUE);
         /* The INIT's own DERP copy (if any) was declined while the relay
          * was down: re-queue it now, past the per-path gate — or, if it
          * is older than WG_INIT_FRESH_AFTER_MS, replace it: the peer may
-         * have consumed it and answered into the relay that was down. */
+         * have consumed it and answered into the relay that was down.
+         * Either goes via DERP only while the re-send is at risk
+         * (init_derp_only). */
         init_refresh_or_resend(false, true, true, "DERP relay up");
-        /* A re-send the relay refused while it was down goes now (the
-         * frames not proven delivered, WG_PATH_RESCUE_MAX_MS at most). */
-        if (g.rescue_owed) queue_rescue(WG_PATH_ACT_RESCUE);
         break;
     case WG_NETIF_KICK_CALL_ME_MAYBE:
         /* The peer is punching towards our endpoints right now: its NAT
