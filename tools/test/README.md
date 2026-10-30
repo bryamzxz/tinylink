@@ -68,6 +68,7 @@ test` prints a skip notice and runs everything else (53 fewer OK lines).
 | `test_tai64n`            | `wg_proto.c` TAI64N floor / reservation / persist     | synthetic |
 | `test_stats`             | `tl_bootstat.h` RTC boot counters, `stats_json.h` /stats worst case vs buffer | synthetic + jsmn validity |
 | `test_nacl_box`          | `nacl_box.c` seal/open/precomputed-shared/tamper      | **libsodium** vectors (PyNaCl, `gen_nacl_vectors.py`) |
+| `test_wifi_psk`          | `main/wifi_psk.h` early WPA2 PSK (1.3.8): both SHA-1 compressions, PBKDF2-HMAC-SHA1 (4096, 32 B), input bounds, hex digits, scrub, task hand-off | FIPS 180 digests, IEEE 802.11-2020 J.4.1, RFC 6070, OpenSSL edge vectors, a plain byte-oriented reference on 30 random length pairs, hostap `hexstr2bin` round trip; on the target also vs the IDF's `pbkdf2_sha1` |
 
 ## On the target: `tools/qemu_crypto` (Espressif QEMU, esp32 machine)
 
@@ -77,12 +78,14 @@ The host binaries above only ever run the C fallbacks. The Xtensa paths
 SAR, which GCC cannot be told about, so only running the compiled LX6
 code checks them. `tools/qemu_crypto/run.sh` builds the crypto suites
 (`test_chacha20`, `test_chacha20poly1305`, `test_poly1305`,
-`test_blake2s`, `test_hkdf_noise`, `test_nacl_box`) for the ESP32 with
-the firmware's -O2 islands, plus `x25519_qemu.c`: the field operations,
-asm vs the C fallback compiled for the same target, bit for bit on
-200 000 inputs at the loose bounds; X25519 asm vs C vs donna on 3 000
-pairs (u ≥ p, u = p, small u, all-ones scalars); RFC 7748 iterated
-1 / 1 000. It runs them on `qemu-system-xtensa -machine esp32` — an ISA
+`test_blake2s`, `test_hkdf_noise`, `test_nacl_box`, `test_wifi_psk`)
+for the ESP32 with the firmware's -O2 islands, plus `x25519_qemu.c`: the
+field operations, asm vs the C fallback compiled for the same target,
+bit for bit on 200 000 inputs at the loose bounds; X25519 asm vs C vs
+donna on 3 000 pairs (u ≥ p, u = p, small u, all-ones scalars); RFC 7748
+iterated 1 / 1 000; and `psk_qemu.c`: the early Wi-Fi PSK against the
+IDF's own `pbkdf2_sha1` (what wpa.c runs on a passphrase) on 36 random
+passphrase / SSID pairs. It runs them on `qemu-system-xtensa -machine esp32` — an ISA
 implementation nobody on this project wrote — and exits non-zero on any
 failure (~2 min in QEMU). Needs an exported ESP-IDF and
 `python $IDF_PATH/tools/idf_tools.py install qemu-xtensa`; CI runs it

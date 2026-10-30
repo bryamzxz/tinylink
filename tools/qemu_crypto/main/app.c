@@ -16,6 +16,8 @@ int m_blake2s(void);
 int m_hkdf(void);
 int m_nacl(void);
 int m_xq(void);
+int m_psk(void);
+int m_psk_idf(void);
 
 void app_main(void)
 {
@@ -27,6 +29,8 @@ void app_main(void)
         { "hkdf_noise",       m_hkdf },
         { "nacl_box",         m_nacl },
         { "x25519",           m_xq },
+        { "wifi_psk",         m_psk },
+        { "wifi_psk_idf",     m_psk_idf },
     };
     int failed = 0;
     for (size_t i = 0; i < sizeof(suites) / sizeof(suites[0]); i++) {
