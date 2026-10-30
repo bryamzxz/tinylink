@@ -18,6 +18,7 @@
 #include "h2_client.h"
 #include "tl_addr.h"
 #include "tls_io.h"
+#include "tls_offer.h"
 #include "tls_resume.h"
 #include "crypto/secure_zero.h"
 
@@ -156,6 +157,10 @@ void ts2021_set_addr(const uint8_t ip_v4[4])
 
 /* TLS session of the last :443 conn, for the next :443 connect (D9). */
 static tls_resume_slot_t s_resume;
+
+/* Set when the control host refused the ECDHE-RSA offer (round 1.3.8,
+ * tls_offer.h). */
+static tls_offer_memo_t s_offer;
 
 /* The DH work of msg1 kept out of the connect (round 1.3.7, B2): ss =
  * DH(machine key, pinned control key), the same for every connect — one
@@ -625,6 +630,20 @@ static bool set_socket_timeouts(int fd, uint32_t ms)
  * the certificate proved; controlplane's ticket keys are per address,
  * so a conn to the address that issued it resumes more often, and
  * another address answers with a full, verified handshake. */
+static int dial_tls(esp_tls_t *tls, const esp_tls_cfg_t *cfg, const uint8_t *ip)
+{
+    if (ip != NULL) {
+        char a[TL_IPV4_STRLEN];
+        tl_ipv4_str(ip, a);
+        return esp_tls_conn_new_sync(a, (int)strlen(a), CONFIG_TINYLINK_CONTROL_PORT,
+                                     cfg, tls);
+    }
+    char url[160];
+    snprintf(url, sizeof(url), "https://%s:%d",
+             CONFIG_TINYLINK_CONTROL_HOST, CONFIG_TINYLINK_CONTROL_PORT);
+    return esp_tls_conn_http_new_sync(url, cfg, tls);
+}
+
 static esp_err_t open_tls(ts2021_conn_t *c, const uint8_t *ip, tls_resume_result_t *res)
 {
     esp_tls_cfg_t tls_cfg = {
@@ -635,19 +654,22 @@ static esp_err_t open_tls(ts2021_conn_t *c, const uint8_t *ip, tls_resume_result
     tls_resume_entry_t *offered = tls_resume_take(&s_resume, CONFIG_TINYLINK_CONTROL_HOST,
                                                   CONFIG_TINYLINK_CONTROL_PORT);
     tls_resume_offer(&tls_cfg, offered);
+    /* ECDHE-RSA first, the full offer once if refused (round 1.3.8,
+     * tls_offer.h). */
+    const tls_offer_t offer = tls_offer_apply(&tls_cfg, &s_offer, CONFIG_TINYLINK_CONTROL_HOST,
+                                              CONFIG_TINYLINK_CONTROL_PORT);
 
     c->tls = esp_tls_init();
     int rc = -1;
-    if (c->tls != NULL && ip != NULL) {
-        char a[TL_IPV4_STRLEN];
-        tl_ipv4_str(ip, a);
-        rc = esp_tls_conn_new_sync(a, (int)strlen(a), CONFIG_TINYLINK_CONTROL_PORT,
-                                   &tls_cfg, c->tls);
-    } else if (c->tls != NULL) {
-        char url[160];
-        snprintf(url, sizeof(url), "https://%s:%d",
-                 CONFIG_TINYLINK_CONTROL_HOST, CONFIG_TINYLINK_CONTROL_PORT);
-        rc = esp_tls_conn_http_new_sync(url, &tls_cfg, c->tls);
+    if (c->tls != NULL) {
+        rc = dial_tls(c->tls, &tls_cfg, ip);
+        if (rc != 1 && tls_offer_fallback(offer, &c->tls, &tls_cfg,
+                                          CONFIG_TINYLINK_CONTROL_HOST,
+                                          CONFIG_TINYLINK_CONTROL_PORT)) {
+            rc = dial_tls(c->tls, &tls_cfg, ip);
+            tls_offer_note(&s_offer, CONFIG_TINYLINK_CONTROL_HOST,
+                           CONFIG_TINYLINK_CONTROL_PORT, rc == 1);
+        }
     }
     *res = tls_resume_keep(&s_resume, offered, rc == 1 ? c->tls : NULL,
                            CONFIG_TINYLINK_CONTROL_HOST, CONFIG_TINYLINK_CONTROL_PORT);

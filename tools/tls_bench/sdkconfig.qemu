@@ -1,0 +1,3 @@
+# QEMU only (sdkconfig.bench): Espressif QEMU fails the QIO flash
+# init (startup_funcs.c init_flash); DIO changes no crypto code path.
+CONFIG_ESPTOOLPY_FLASHMODE_DIO=y

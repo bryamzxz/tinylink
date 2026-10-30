@@ -194,6 +194,14 @@ esp_err_t esp_tls_get_conn_sockfd(esp_tls_t *tls, int *sockfd)
     return s_tls.has_fd ? ESP_OK : ESP_FAIL;
 }
 esp_err_t tl_crt_bundle_attach(void *conf) { (void)conf; return ESP_OK; }
+/* tls_offer.c (round 1.3.8) asks after a failed TLS dial; with
+ * CONFIG_TINYLINK_TLS_RSA_FIRST unset here it never does (full offer). */
+esp_err_t esp_tls_get_error_handle(esp_tls_t *tls, esp_tls_error_handle_t *h)
+{
+    (void)tls;
+    *h = NULL;
+    return ESP_FAIL;
+}
 /* noise_ik_init's ephemeral key: fixed, so the connect tests can
  * precompute the client's msg1 and answer it. */
 void esp_fill_random(void *buf, size_t len) { memset(buf, 0x5a, len); }

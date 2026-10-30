@@ -18,6 +18,7 @@
 #include "esp_timer.h"
 #include "tl_addr.h"
 #include "tls_io.h"
+#include "tls_offer.h"
 #include "tls_resume.h"
 
 static const char *TAG = "derp_client";
@@ -28,6 +29,10 @@ static const char *TAG = "derp_client";
  * different host (home region change) is a full handshake. derp16b
  * resumed 5/5 from the host (one address, TTL 600 s). */
 static tls_resume_slot_t s_resume;
+
+/* The relay that refused the ECDHE-RSA offer (round 1.3.8, tls_offer.h);
+ * same single-client rule as s_resume. */
+static tls_offer_memo_t s_offer;
 
 /* The login's NaCl box key for the last server key (round 1.3.7, B2;
  * derp.h): one X25519 for the first login to a server key — ClientInfo
@@ -152,8 +157,21 @@ static bool set_stream_timeouts(esp_tls_t *tls)
  * certificate proved, and a server at another address that does not
  * hold its ticket key answers with a full, verified handshake. On false
  * the caller closes `out`. */
+static int dial_tls(esp_tls_t *tls, const esp_tls_cfg_t *cfg, const char *host,
+                    uint16_t port, const uint8_t *ip)
+{
+    if (ip != NULL) {
+        char a[TL_IPV4_STRLEN];
+        tl_ipv4_str(ip, a);
+        return esp_tls_conn_new_sync(a, (int)strlen(a), port, cfg, tls);
+    }
+    char url[160];
+    snprintf(url, sizeof(url), "https://%s:%u", host, (unsigned)port);
+    return esp_tls_conn_http_new_sync(url, cfg, tls);
+}
+
 static bool open_tls(derp_client_t *out, const char *host, uint16_t port,
-                     const uint8_t *ip, tls_resume_result_t *res)
+                     const uint8_t *ip, tls_resume_result_t *res, tls_offer_t *offer)
 {
     esp_tls_cfg_t cfg = {
         .crt_bundle_attach = tl_crt_bundle_attach,
@@ -162,19 +180,19 @@ static bool open_tls(derp_client_t *out, const char *host, uint16_t port,
     };
     tls_resume_entry_t *offered = tls_resume_take(&s_resume, host, port);
     tls_resume_offer(&cfg, offered);
+    *offer = tls_offer_apply(&cfg, &s_offer, host, port);
 
     out->tls = esp_tls_init();
     int rc = -1;
     if (out->tls == NULL) {
         ESP_LOGE(TAG, "esp_tls_init failed");
-    } else if (ip != NULL) {
-        char a[TL_IPV4_STRLEN];
-        tl_ipv4_str(ip, a);
-        rc = esp_tls_conn_new_sync(a, (int)strlen(a), port, &cfg, out->tls);
     } else {
-        char url[160];
-        snprintf(url, sizeof(url), "https://%s:%u", host, (unsigned)port);
-        rc = esp_tls_conn_http_new_sync(url, &cfg, out->tls);
+        rc = dial_tls(out->tls, &cfg, host, port, ip);
+        if (rc != 1 && tls_offer_fallback(*offer, &out->tls, &cfg, host, port)) {
+            *offer = TLS_OFFER_FULL;
+            rc = dial_tls(out->tls, &cfg, host, port, ip);
+            tls_offer_note(&s_offer, host, port, rc == 1);
+        }
     }
     *res = tls_resume_keep(&s_resume, offered, rc == 1 ? out->tls : NULL, host, port);
     return rc == 1;
@@ -350,13 +368,14 @@ static esp_err_t connect_on(derp_client_t *out, const char *server_host, uint16_
                             const uint8_t client_pub[DERP_KEY_LEN])
 {
     tls_resume_result_t res = TLS_RESUME_NONE;
+    tls_offer_t offer = TLS_OFFER_FULL;
     char via[TL_IPV4_STRLEN + 3] = "by name";
     if (ip != NULL) {
         char a[TL_IPV4_STRLEN];
         tl_ipv4_str(ip, a);
         snprintf(via, sizeof(via), "at %s", a);
     }
-    if (!open_tls(out, server_host, port, ip, &res)) {
+    if (!open_tls(out, server_host, port, ip, &res, &offer)) {
         if (ip == NULL) {
             ESP_LOGE(TAG, "TLS connect to %s:%u failed", server_host, (unsigned)port);
         }
@@ -364,9 +383,9 @@ static esp_err_t connect_on(derp_client_t *out, const char *server_host, uint16_
         return ESP_FAIL;
     }
     set_tcp_nodelay(out->tls);
-    ESP_LOGI(TAG, "TLS up to %s:%u %s (%s handshake, %u ms), sending HTTP upgrade",
+    ESP_LOGI(TAG, "TLS up to %s:%u %s (%s handshake, %s offer, %u ms), sending HTTP upgrade",
              server_host, (unsigned)port, via,
-             res == TLS_RESUME_RESUMED ? "resumed" : "full",
+             res == TLS_RESUME_RESUMED ? "resumed" : "full", tls_offer_str(offer),
              (unsigned)((esp_timer_get_time() - t0) / 1000));
     esp_err_t err = login(out, server_host, ip != NULL ? 1 : DERP_MAX_IDLE_POLLS,
                           client_priv, client_pub);

@@ -453,6 +453,14 @@ static void transport_reset(void) { s_out_len = s_out_off = 0; }
 
 void esp_fill_random(void *buf, size_t len) { memset(buf, 0x5a, len); }
 esp_err_t tl_crt_bundle_attach(void *conf) { (void)conf; return ESP_OK; }
+/* tls_offer.c (round 1.3.8): never asked here (CONFIG_TINYLINK_TLS_RSA_FIRST
+ * unset = the full offer, no fallback). */
+esp_err_t esp_tls_get_error_handle(esp_tls_t *t, esp_tls_error_handle_t *h)
+{
+    (void)t;
+    *h = NULL;
+    return ESP_FAIL;
+}
 
 struct esp_tls {
     uint8_t c2s[64 * 1024];      /* client bytes not yet cut into records */

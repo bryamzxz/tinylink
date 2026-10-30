@@ -18,6 +18,7 @@
 #include "tl_http1.h"
 #include "tl_time.h"
 #include "tls_io.h"
+#include "tls_offer.h"
 
 static const char *TAG = "ctrl_key";
 
@@ -127,6 +128,10 @@ static esp_err_t https_get_key(uint8_t *buf, tl_http1_resp_t *resp)
         .crt_bundle_attach = tl_crt_bundle_attach,
         .timeout_ms        = KEY_TIMEOUT_MS,
     };
+    /* ECDHE-RSA first, the full offer once if refused (round 1.3.8,
+     * tls_offer.h); a one-shot, so nothing to remember. */
+    const tls_offer_t offer = tls_offer_apply(&cfg, NULL, CONFIG_TINYLINK_CONTROL_HOST,
+                                              (uint16_t)port);
     esp_tls_t *tls = esp_tls_init();
     if (tls == NULL) return ESP_ERR_NO_MEM;
     esp_err_t err  = ESP_OK;
@@ -134,9 +139,17 @@ static esp_err_t https_get_key(uint8_t *buf, tl_http1_resp_t *resp)
     size_t    len  = 0;
     bool      eof  = false;
     uint32_t  idle = 0;
-    if (esp_tls_conn_new_sync(CONFIG_TINYLINK_CONTROL_HOST,
-                              (int)strlen(CONFIG_TINYLINK_CONTROL_HOST),
-                              port, &cfg, tls) != 1) {
+    int       dial = esp_tls_conn_new_sync(CONFIG_TINYLINK_CONTROL_HOST,
+                                           (int)strlen(CONFIG_TINYLINK_CONTROL_HOST),
+                                           port, &cfg, tls);
+    if (dial != 1 && tls_offer_fallback(offer, &tls, &cfg, CONFIG_TINYLINK_CONTROL_HOST,
+                                        (uint16_t)port)) {
+        dial = esp_tls_conn_new_sync(CONFIG_TINYLINK_CONTROL_HOST,
+                                     (int)strlen(CONFIG_TINYLINK_CONTROL_HOST),
+                                     port, &cfg, tls);
+    }
+    if (tls == NULL) return ESP_ERR_NO_MEM;
+    if (dial != 1) {
         ESP_LOGE(TAG, "TLS connect to %s:%d failed",
                  CONFIG_TINYLINK_CONTROL_HOST, port);
         err = ESP_FAIL;

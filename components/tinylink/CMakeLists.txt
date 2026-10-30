@@ -10,6 +10,8 @@ idf_component_register(
         "src/noise_ik.c"
         "src/tls_io.c"
         "src/tls_resume.c"
+        "src/tls_offer.c"
+        "src/tls_x25519.c"
         "src/ts2021_client.c"
         "src/h2_client.c"
         "src/h2_core.c"
@@ -44,6 +46,7 @@ idf_component_register(
         "src/crypto/chacha20poly1305.c"
         "src/crypto/secure_zero.c"
         "src/tinylink_bench.c"
+        "src/tinylink_bench_tls.c"
         "src/tl_time.c"
         "src/tl_libc_stubs.c"
     INCLUDE_DIRS
@@ -125,6 +128,16 @@ set_property(SOURCE
 # link. A duplicate-definition link error would mean something now pulls
 # that libc object in for another symbol: re-audit before removing this.
 target_link_libraries(${COMPONENT_LIB} INTERFACE "-u _printf_float" "-u _scanf_float")
+
+# The TLS ECDHE's X25519 on the in-tree Curve25519 (round 1.3.8,
+# src/tls_x25519.c): ecdh.c's calls into mbedtls_ecp_mul_restartable go to
+# __wrap_mbedtls_ecp_mul_restartable (a --wrap only redirects references
+# from other objects; ecp.c's own calls keep the original). `-u` pulls the
+# wrapper's object out of this archive before mbedcrypto asks for it.
+if(CONFIG_TINYLINK_TLS_X25519_INTREE)
+    target_link_libraries(${COMPONENT_LIB} INTERFACE
+        "-Wl,--wrap=mbedtls_ecp_mul_restartable" "-u __wrap_mbedtls_ecp_mul_restartable")
+endif()
 
 # Build epoch for tl_time.c's clock floor (see tl_time.h). Evaluated at
 # configure time, so a reconfigure moves it; that is the intent — the

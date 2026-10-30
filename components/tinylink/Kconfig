@@ -84,6 +84,108 @@ menu "tinylink core"
             transition, so it is for diagnostic images only
             (tools/power/sdkconfig.power-diag).
 
+    config TINYLINK_TLS_RSA_FIRST
+        bool "TLS: offer the ECDHE-RSA suites first (RSA certificate chain)"
+        default y
+        help
+            Round 1.3.8. The Tailscale servers (DERP, controlplane on
+            :443, the first-boot /key fetch) serve an ECDSA chain to a
+            ClientHello that lists an ECDHE-ECDSA suite and an RSA chain
+            to one that does not: leaf RSA-2048 <- YR2 <- Root YR <- ISRG
+            Root X1 instead of leaf P-256 <- YE2 <- Root YE <- ISRG Root
+            X2 <- X1. Verifying the RSA chain and its ServerKeyExchange is
+            four RSA public-key operations (exponent 65537, on the RSA
+            accelerator) instead of three P-384 and one P-256 ECDSA
+            verifies in software. Same bundle, same chain validation,
+            same X25519 ECDHE and AES-128-GCM records; the server is
+            authenticated by RSA-2048 (about 112-bit) instead of P-256
+            (about 128-bit). A server that refuses the offer is dialled
+            again at once with the full mbedTLS offer, and asked with it
+            directly for 6 h (src/tls_offer.h).
+
+    config TINYLINK_TLS_X25519_INTREE
+        bool "TLS: X25519 ECDHE on the in-tree Curve25519"
+        default y
+        help
+            Round 1.3.8. Both X25519 scalar multiplications of a full TLS
+            handshake (the client's ephemeral key and the shared secret)
+            run on the constant-time Curve25519 the WireGuard data plane
+            uses (src/crypto/curve25519_fiat32.c) instead of mbedTLS's
+            Montgomery ladder over its generic bignum. The link wraps
+            mbedtls_ecp_mul_restartable (-Wl,--wrap) and diverts
+            Curve25519 only; same argument checks and results as mbedTLS
+            (src/tls_x25519.c). CONFIG_TINYLINK_BENCH_TLS cross-checks
+            the two on the device.
+
+    config TINYLINK_TLS_RESUME_RTC
+        bool "TLS: keep the resumption session across warm resets (RTC memory)"
+        depends on ESP_TLS_CLIENT_SESSION_TICKETS
+        default y
+        help
+            Round 1.3.8. Every TLS connect that keeps a session (the DERP
+            client, the control conn on :443) also writes it, serialized
+            by mbedTLS, into one of two records in RTC slow memory (1.1
+            KB), which survives a software, panic or watchdog reset but
+            not a power-on: the first connect to that server after such a
+            reset resumes (one round trip, no chain verify, no ECDHE)
+            instead of a full handshake. Same bounds as the RAM copy
+            (host:port, 24 h of master-secret age on the RTC timer, a
+            failed connect clears it), plus a checksum against the
+            garbage RTC memory holds after a power-on. Never written to
+            flash: src/tls_rtc.h has why.
+
+    config TINYLINK_TLS_MPI_MUL_SW
+        bool "TLS: bignum multiplication in software (RSA exponentiation stays on the accelerator)"
+        depends on MBEDTLS_HARDWARE_MPI
+        default y
+        help
+            Round 1.3.8. With CONFIG_MBEDTLS_HARDWARE_MPI alone every
+            mbedtls_mpi_mul_mpi / mbedtls_mpi_mul_int goes to the RSA
+            accelerator, operands padded to at least 512 bits, with a
+            lock, a peripheral clock enable + reset and the operand
+            copies per call. The worst case is on the RSA path: the R^2
+            mod N of every RSA public key (a software long division)
+            multiplies the 4096-bit modulus by one 32-bit limb per step,
+            which the accelerator does as two padded 2048-bit
+            multiplications. y undefines MBEDTLS_MPI_MUL_MPI_ALT
+            (mbedtls_user_config.h): the multiplications run in mbedTLS's
+            software bignum, while mbedtls_mpi_exp_mod (the RSA
+            exponentiation itself) keeps the accelerator. QEMU
+            instruction counts (the accelerator's own latency not
+            modelled): RSA chain verify 9.7 M -> 6.2 M; an ECDSA P-384
+            verify 38 M -> 47 M, the ECDSA fallback path's A/B is the
+            on-chip CONFIG_TINYLINK_BENCH_TLS (tools/tls_bench/).
+
+    config TINYLINK_TLS_ECP_WINDOW
+        int "TLS: mbedTLS ECP window size (MBEDTLS_ECP_WINDOW_SIZE)"
+        range 2 7
+        default 4
+        help
+            Round 1.3.8 A/B knob, mbedTLS's default 4. The comb window
+            of a scalar multiplication by a point other than the curve's
+            generator: the u2*Q half of every ECDSA verify and the P-256
+            / P-384 ECDHE. Larger windows take fewer point additions and
+            a 2^(w-1)-point heap table. Measured (QEMU instruction
+            counts, P-384 verify): w=2 +11 %, w=3 +3 %, w=5..7 -0.3 % for
+            +3.5 KB of transient heap (P-256 does not go past 4). 4
+            stays. The generator's fixed-point tables
+            (CONFIG_MBEDTLS_ECP_FIXED_POINT_OPTIM) do not depend on it.
+
+    config TINYLINK_BENCH_TLS
+        bool "Run the TLS handshake crypto benchmark on boot"
+        default n
+        help
+            Round 1.3.8. When y, bringup() calls tinylink_bench_tls()
+            first thing, before NVS and Wi-Fi: the signature verifies of
+            the two chains the Tailscale servers serve (ECDSA P-384 /
+            P-256, RSA-2048 / RSA-4096, from the certificates themselves),
+            the full chain verify of each through the certificate bundle,
+            and the ECDHE (keygen + shared secret) for X25519 (in-tree
+            and mbedTLS), P-256 and P-384, each timed on the chip with
+            the image's mbedTLS configuration, plus heap and stack use.
+            Build one image per configuration under test
+            (tools/tls_bench/). Off by default; opt-in for perf work.
+
     config TINYLINK_BENCH_AEAD
         bool "Run ChaCha20-Poly1305 AEAD and X25519 micro-benchmarks on boot"
         default n
