@@ -66,6 +66,12 @@ the sensor logs in CHANGELOG.md.
 
 ## Cryptography (post-quantum, before 2031)
 
+- **WireGuard cookie replies.** tinylink is initiator-only and drops
+  MessageCookieReply (`wg_netif.c`, mac2 always zero): a peer under
+  load, which answers INITs with a cookie until mac2 carries it, would
+  keep ignoring ours. Rare for a home peer; handling it needs
+  XChaCha20-Poly1305 (`hchacha20` is already in `crypto/chacha20.c`).
+
 - **What RSA-first changes, and what it does not.** Since 1.3.8 the TLS
   client offers the ECDHE-RSA suites first (TLS 1.2), so the DERP and
   control :443 servers present their RSA chains. That choice only
