@@ -196,7 +196,10 @@ and on a solicited pong (direct). The re-sends are the same 148 bytes,
 not new attempts — the responder takes the first copy and drops the rest
 as a TAI64N replay — so new INITs stay one per `REKEY_TIMEOUT`
 (wireguard-go / kernel rule; magicsock queues the INIT on DERP and sends
-to both paths while `bestAddr` is untrusted). Until 1.3.5 a session
+to both paths while `bestAddr` is untrusted). Because a re-send cannot
+recover an answer lost to a relay that was still logging in, the first
+netmap holds the first INIT (since 1.3.7, at most 1 s) while the DERP
+supervisor's first connect attempt runs. Until 1.3.5 a session
 that came up on a DERP-relayed response sent every frame on both paths
 until something authenticated on the UDP socket ("direct path
 confirmed"); since 1.3.6 the path selection below decides. Wake cadence

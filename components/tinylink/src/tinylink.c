@@ -9,6 +9,7 @@
 #include <time.h>
 
 #include "freertos/FreeRTOS.h"
+#include "freertos/event_groups.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 
@@ -712,6 +713,67 @@ esp_err_t tinylink_derp_smoke(void)
     return err;
 }
 
+/* ---- The first INIT waits for the relay (round 1.3.7) -------------------
+ *
+ * At boot the first INIT reaches the peer directly, and the peer, with
+ * no validated direct path to our new NAT mapping yet, answers via DERP.
+ * If our DERP login is still under way that answer is lost, and the copy
+ * re-queued at the login (WG_NETIF_KICK_RELAY_UP) is the same INIT — a
+ * TAI64N replay to the peer: the session waits for the new INIT of
+ * WG_FIRST_RETRY_MS. In the 1.3.5 reboot series the 8 boots whose login
+ * came 0.21 s or more after the first INIT had the session up 1.2-2.2 s
+ * after the netmap (two far later); all others but one, 0.16-0.54 s.
+ * 1.3.6 had the login first in all six boots, by 40-390 ms: a margin
+ * the ~0.28 s earlier netmap of 1.3.7 (the push rides with the map
+ * stream, Noise DH ahead) eats in two of them. So the first netmap waits
+ * for the outcome of the supervisor's first connect attempt, at most
+ * RELAY_BOOT_WAIT_MS — in those boots the login was 0.3 s away or less.
+ * A stalled attempt (TCP to a dead cached address took 4.6 s in one
+ * 1.3.5 boot) costs the cap, then the 1.3.6 order applies. One-shot: a
+ * failed first attempt, later netmaps and reconnects never wait. */
+#define RELAY_BOOT_WAIT_MS   1000
+#define RELAY_BOOT_LOGIN_OK  BIT0
+#define RELAY_BOOT_FAILED    BIT1
+
+static volatile bool s_relay_boot_pending;   /* the first attempt is running */
+static EventGroupHandle_t s_relay_boot;
+
+#if CONFIG_TINYLINK_DERP_SUPERVISED
+static StaticEventGroup_t s_relay_boot_buf;
+
+/* Supervisor, after its first connect attempt. The kick that precedes
+ * it is a no-op before the dataplane exists, so the INIT this releases
+ * carries its own DERP copy — no second one from the kick. */
+static void relay_boot_done(bool login_ok)
+{
+    if (!s_relay_boot_pending) return;
+    s_relay_boot_pending = false;
+    xEventGroupSetBits(s_relay_boot, login_ok ? RELAY_BOOT_LOGIN_OK
+                                              : RELAY_BOOT_FAILED);
+}
+#endif
+
+/* long_poll_handler, before the first INIT (wg_dataplane_start). */
+static void relay_boot_join(void)
+{
+    if (!s_relay_boot_pending) return;   /* no supervisor, or it is done */
+    const int64_t t0 = esp_timer_get_time();
+    /* The bits stay set: an outcome that lands between the check above
+     * and this wait returns at once. */
+    const EventBits_t got = xEventGroupWaitBits(
+        s_relay_boot, RELAY_BOOT_LOGIN_OK | RELAY_BOOT_FAILED, pdFALSE,
+        pdFALSE, pdMS_TO_TICKS(RELAY_BOOT_WAIT_MS));
+    const unsigned waited_ms = (unsigned)((esp_timer_get_time() - t0) / 1000);
+    if (got & RELAY_BOOT_LOGIN_OK) {
+        ESP_LOGI(TAG, "first INIT waited %u ms for the DERP login", waited_ms);
+    } else if (got & RELAY_BOOT_FAILED) {
+        ESP_LOGI(TAG, "first INIT waited %u ms: DERP connect failed", waited_ms);
+    } else {
+        ESP_LOGW(TAG, "DERP login still pending after %u ms — first INIT "
+                      "goes ahead", waited_ms);
+    }
+}
+
 /* ---- DERP supervised recv-loop task (M5 step 2b) -----------------------
  *
  * Long-running task: connect+login → run recv loop → close → backoff →
@@ -1272,10 +1334,14 @@ static void derp_supervised_task(void *arg)
                  * + netmap (1.3.4: every boot, the INIT went out ~2 s
                  * before this login) — gets its INIT relayed now instead
                  * of after REKEY_TIMEOUT (B7). Before the first netmap
-                 * there is none: a no-op. */
+                 * there is none: a no-op — and since 1.3.7 a first netmap
+                 * that lands during this attempt holds its INIT until
+                 * here (relay_boot_join). */
                 wg_netif_handshake_kick(WG_NETIF_KICK_RELAY_UP);
+                relay_boot_done(true);
                 break;
             }
+            relay_boot_done(false);
             const uint32_t delay_ms = tl_backoff_ms(fail, base_ms, cap_ms,
                                                     esp_random());
             if (fail < 1000u) fail++;              /* saturate the counter */
@@ -1394,9 +1460,14 @@ esp_err_t tinylink_derp_supervised_start(void)
      * a pristine heap: in the 2026-05 tree, spawned after the
      * long-poll, xTaskCreate failed with ESP_ERR_NO_MEM in 3 soaks and
      * every DERP-dependent feature stayed dead. */
+    /* Armed before the spawn: a netmap can only come later (the
+     * register follows this call), but the flag must not trail it. */
+    s_relay_boot = xEventGroupCreateStatic(&s_relay_boot_buf);
+    s_relay_boot_pending = true;
     BaseType_t ok = xTaskCreate(derp_supervised_task, "tinylink_derp",
                                 8192, NULL, tskIDLE_PRIORITY + 3, NULL);
     if (ok != pdPASS) {
+        s_relay_boot_pending = false;
         ESP_LOGE(TAG, "xTaskCreate(derp supervisor) failed — "
                       "heap_free=%u largest=%u (need 8 KiB contiguous)",
                  (unsigned)esp_get_free_heap_size(),
@@ -1626,6 +1697,7 @@ static esp_err_t long_poll_handler(const tl_netmap_t *nm, void *ctx)
                  (unsigned long)(nm->self_id & 0xFFFFFFFFul),
                  (unsigned)s_last_peers_count,
                  (unsigned)nm->n_derp_regions);
+        relay_boot_join();
         esp_err_t err = wg_dataplane_start(&s_keys, s_self_addrs, s_self_addrs_count,
                                            s_last_peers, s_last_peers_count);
         if (err != ESP_OK) {
