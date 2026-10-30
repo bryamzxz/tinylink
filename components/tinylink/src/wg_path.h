@@ -109,20 +109,24 @@
 // the doubt like a keepalive does (wg_path_resolve_ — the INIT went both
 // ways, so it proves the session, not our direct path), and a broken
 // session is replaced by the response. Recovery from
-// that failure (test_wg_path, 100 random instants): the session is back
-// 12.3–13.0 s after the first unanswered frame, 16.6 s on average after
-// the peer's last packet — 1.3.7: 25.1–27.8 s and 30.0 s (the RX-stale
-// rekey). The price: a handshake per doubt, +6 / +12 / +26 handshakes
-// per 6 h on 195 at 0.5 / 1 / 2 % loss (20 runs each; a doubt's
-// handshake also moves the next proactive one 110 s on). A doubt now
-// ends within a round trip, so fewer frames go both ways during one (DERP
-// copies 20 / 41 / 91 → 1 / 4 / 15 per 6 h, frames lost to the random
-// loss within ±2.3), and the RX-stale rekeys the loss caused (0.25 / 0.45
-// / 1.9 per 6 h, each after 30 s of silence) are gone. Only one INIT in
-// flight: the caller starts it only when no handshake is pending,
-// REKEY_TIMEOUT after the last INIT (whitepaper §6.1, wireguard-go
-// SendHandshakeInitiation), else the pending one's response does the
-// same. Once per silent streak: after a silence (the test's own session
+// that failure (test_wg_path, 100 random instants, the peer's keypair
+// slots modelled): the session is back 12.3–13.0 s after the first
+// unanswered frame, 16.6 s on average (max 17.9) after the peer's last
+// packet — 1.3.7: 25.1–28.0 s and 29.8 s (the RX-stale rekey). The
+// price: a handshake per doubt, +6 / +12.5 / +27 handshakes per 6 h on
+// 195 at 0.5 / 1 / 2 % loss (20 runs each, against the same rules without
+// the test; a doubt's handshake also moves the next proactive one 110 s
+// on). A doubt now ends within a round trip, so fewer frames go both ways
+// during one (DERP copies 21 / 44 / 90 → 1.6 / 3.1 / 17 per 6 h, frames
+// lost to the random loss 21.7 / 41.6 / 80.3 → 21.4 / 41.2 / 78.5), and
+// the RX-stale rekeys the loss caused (0.25 / 0.65 / 1.85 per 6 h, each
+// after 30 s of silence) are gone. A test that would make the peer delete
+// the keypair of frames still to re-send goes via DERP behind their
+// re-send (wg_path_rekey_gate): 2.3 / 4.5 / 11 of the 13 / 26 / 54 tests.
+// Only one INIT in flight: wg_path_rekey_gate starts one only when no
+// handshake is pending, REKEY_TIMEOUT after the last INIT (whitepaper
+// §6.1, wireguard-go SendHandshakeInitiation), else the pending one's
+// response does the same. Once per silent streak: after a silence (the test's own session
 // silent too) a doubt is not tested again until a transport packet from
 // the peer arrives.
 //
@@ -301,6 +305,8 @@ typedef struct {
     int64_t last_relay_data_us; /* last data frame that also went via DERP */
     int64_t hs_us;              /* last completed handshake; 0 none */
     int64_t peer_wg_us;         /* last authenticated WG packet from the peer */
+    int64_t peer_tr_us;         /* ...transport (keepalive / data): under our current
+                                   keypair, the only one wg_netif receives on */
     int64_t lapse_from_us;      /* at a lapse: the unanswered frame / proof */
     int64_t test_at_us;         /* DOUBT: a handshake test is owed from then; 0 none */
     int64_t delivered_us;       /* direct-only data frames sent before this were
@@ -670,6 +676,7 @@ static inline int64_t wg_path_next_deadline(const wg_path_t *p)
 static inline uint32_t wg_path_on_keepalive(wg_path_t *p, int64_t now)
 {
     p->peer_wg_us    = now;
+    p->peer_tr_us    = now;
     p->silent_streak = 0;                    /* the session works */
     if (WG_PATH_IN_DOUBT(p)) return wg_path_resolve_(p, now);
     if (p->mode != WG_PATH_DIRECT) return 0;   /* our frames went via DERP too */
@@ -679,10 +686,14 @@ static inline uint32_t wg_path_on_keepalive(wg_path_t *p, int64_t now)
         wg_timer_due(now, p->last_relay_data_us, (int64_t)WG_PATH_ANSWER_MS * 1000LL)) {
         p->proof_us = now;
         p->doubts   = 0;
-        /* The frame it answers was sent before now - KEEPALIVE_TIMEOUT
-         * (the peer's timer, plus the round trip): see
-         * WG_PATH_RESCUE_MAX_MS. */
-        const int64_t d = now - (int64_t)WG_PATH_KEEPALIVE_TIMEOUT_MS * 1000LL;
+        /* The frame it answers armed the peer's timer KEEPALIVE_TIMEOUT
+         * plus a round trip and a wake before now; frames sent after that
+         * one are proven by nothing (review of 1.3.8: one sent 150 ms
+         * after it, lost, was never re-sent). The answer window's slack
+         * covers the round trip and the wake (MAX_MODEM at a 3-beacon
+         * listen interval: up to ~307 ms), so frames sent before now -
+         * WG_PATH_ANSWER_MS went out before it. See WG_PATH_RESCUE_MAX_MS. */
+        const int64_t d = now - (int64_t)WG_PATH_ANSWER_MS * 1000LL;
         if (d > p->delivered_us) p->delivered_us = d;
     }
     return 0;
@@ -696,12 +707,69 @@ static inline int64_t wg_path_rescue_from(const wg_path_t *p)
     return p->delivered_us;
 }
 
+/* Has the peer confirmed the keypair of our last handshake — sent us a
+ * transport packet under it (its `current`; wg_netif receives on that
+ * keypair only)? Until then it may still hold it as `next`
+ * (wg_rescue_init_risk). */
+static inline bool wg_path_keys_confirmed(const wg_path_t *p)
+{
+    return p->peer_tr_us > p->hs_us;
+}
+
+/* Whether wg_netif starts a rekey the path selection asks for (SILENT's
+ * WG_PATH_ACT_REKEY, a doubt's WG_PATH_ACT_TEST). One INIT in flight: a
+ * responder that gets a second keeps only the second session (see
+ * WG_INIT_FRESH_AFTER_MS), and the pending one's answer does the same
+ * job; a new one only REKEY_TIMEOUT after the last (whitepaper §6.1,
+ * wireguard-go SendHandshakeInitiation); none without a session (a cold
+ * handshake has its own retries).
+ *
+ * A doubt's test that would make the peer delete a keypair sealing
+ * frames still to re-send (`ring_risk`, wg_rescue_init_risk; the review
+ * of 1.3.8: 3.1 frames lost per episode with only our direct WireGuard
+ * dropped, 2 000 random instants; 0 with this gate) goes after them: the pending frames are
+ * re-sent via DERP first and the INIT goes via DERP only, behind them on
+ * the same stream — the peer looks a transport packet's keypair up as it
+ * arrives, before its handshake queue gets the INIT (GO_AFTER_RESCUE).
+ * Withholding the test instead left a third of the simulated WG-silent
+ * failures to the RX-stale rekey (a proactive rekey leaves frames of the
+ * previous keypair pending for ~20 s): back up to 27.8 s after the first
+ * unanswered frame, against 13.0 s. Without a relay: no test (RING);
+ * the doubt ends as in 1.3.7, by WireGuard or SILENT. Pure, so the host
+ * tests drive the same decision wg_netif makes. */
+typedef enum {
+    WG_REKEY_GO = 0,
+    WG_REKEY_GO_AFTER_RESCUE,
+    WG_REKEY_NO_SESSION,
+    WG_REKEY_IN_FLIGHT,
+    WG_REKEY_TOO_SOON,
+    WG_REKEY_RING,
+} wg_rekey_gate_t;
+
+#define WG_PATH_REKEY_TIMEOUT_MS 5000   /* = wg_netif's WG_REKEY_TIMEOUT_MS */
+
+static inline wg_rekey_gate_t wg_path_rekey_gate(uint32_t act, bool up, bool in_flight,
+                                                 int64_t now, int64_t last_init_us,
+                                                 bool ring_risk, bool relay)
+{
+    if (!up) return WG_REKEY_NO_SESSION;
+    if (in_flight) return WG_REKEY_IN_FLIGHT;
+    if (!wg_timer_due(now, last_init_us, (int64_t)WG_PATH_REKEY_TIMEOUT_MS * 1000LL)) {
+        return WG_REKEY_TOO_SOON;
+    }
+    if (!(act & WG_PATH_ACT_REKEY) && ring_risk) {
+        return relay ? WG_REKEY_GO_AFTER_RESCUE : WG_REKEY_RING;
+    }
+    return WG_REKEY_GO;
+}
+
 /* A transport packet with a payload from the peer, either path. Proves
  * nothing about our sends; only the first after a handshake restarts the
  * window. Ends a doubt (the session lives): see wg_path_resolve_. */
 static inline uint32_t wg_path_on_peer_data(wg_path_t *p, int64_t now)
 {
     p->peer_wg_us    = now;
+    p->peer_tr_us    = now;
     p->silent_streak = 0;
     if (WG_PATH_IN_DOUBT(p)) return wg_path_resolve_(p, now);
     if (p->mode == WG_PATH_DIRECT && p->hs_us != 0 && !p->grace_used &&

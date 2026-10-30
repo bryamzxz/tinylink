@@ -11,9 +11,9 @@
 // new keypair (not application data). 10 slots (8 until 1.3.7): the
 // first episode with only our direct WireGuard toward the peer dropped
 // (direct → doubt → direct → lapse → doubt → UNDELIVERED) can leave 9
-// direct-only samples since the last proof — test_wg_path, 2 000 random
-// block instants: 8 slots lose up to 3, 9 up to 1, 10 none. 240 B each,
-// on the heap. Header-only and platform-free: wg_netif.c owns one (wg_tx
+// direct-only samples since the last proof — test_wg_path's keypair-aware
+// sim, 2 000 random block instants: 8 slots lose 59 frames, 9 lose 19,
+// 10 none. 240 B each, on the heap. Header-only and platform-free: wg_netif.c owns one (wg_tx
 // alone writes and reads it), tools/test/test_wg_path.c drives it.
 
 #pragma once
@@ -34,7 +34,10 @@ extern "C" {
 
 typedef struct {
     int64_t  at_us;                   /* sent at; 0 = empty */
+    uint32_t gen;                     /* keypair generation that sealed it */
     uint16_t len;
+    bool     owed;                    /* a re-send was refused: not proven by a
+                                         later proof of delivery (1.3.8 review) */
     uint8_t  buf[WG_RESCUE_MAX];
 } wg_rescue_t;
 
@@ -44,25 +47,40 @@ typedef struct {
 } wg_rescue_ring_t;
 
 /* Keep a copy of a frame sent direct only (or whose DERP copy was
- * refused); the oldest goes when the ring is full. */
+ * refused), sealed under keypair `gen`; the oldest goes when the ring is
+ * full. */
 static inline void wg_rescue_keep(wg_rescue_ring_t *r, const uint8_t *buf, size_t len,
-                                  int64_t now)
+                                  int64_t now, uint32_t gen)
 {
     if (len > WG_RESCUE_MAX) return;
     wg_rescue_t *s = &r->slot[r->head];
     memcpy(s->buf, buf, len);
     s->len   = (uint16_t)len;
     s->at_us = now;
+    s->gen   = gen;
+    s->owed  = false;
     r->head  = (uint8_t)((r->head + 1) % WG_RESCUE_SLOTS);
 }
 
-/* Re-send, oldest first, the frames sent at or after from_us (frames
- * before it are proven delivered: wg_path_rescue_from) and younger than
- * max_age_us through `send` (true: the relay took it); the others are
- * dropped. The first refusal (DERP not connected) stops the pass and
- * keeps it and the rest for the next one — until 1.3.6's review the ring
- * was emptied either way, losing what the relay refused. Returns the
- * frames sent; *kept (may be NULL) gets those left for later. */
+/* A frame still to re-send at a confirmed lapse: owed, or sent at or
+ * after from_us (before it: proven delivered, wg_path_rescue_from), and
+ * younger than max_age_us. */
+static inline bool wg_rescue_pending_(const wg_rescue_t *s, int64_t now, int64_t from_us,
+                                      int64_t max_age_us)
+{
+    return s->at_us != 0 && (s->owed || s->at_us >= from_us) &&
+           !wg_timer_due(now, s->at_us, max_age_us);
+}
+
+/* Re-send, oldest first, the pending frames (wg_rescue_pending_) through
+ * `send` (true: the relay took it); the others are dropped. The first
+ * refusal (DERP not connected) stops the pass and keeps it and the rest
+ * for the next one, owed — until 1.3.6's review the ring was emptied
+ * either way, losing what the relay refused; until 1.3.8's review a
+ * direct proof arriving before the relay came back marked them delivered
+ * (it proves the path works again, not that frames the dead path ate got
+ * through). Returns the frames sent; *kept (may be NULL) gets those left
+ * for later. */
 static inline unsigned wg_rescue_flush(wg_rescue_ring_t *r, int64_t now, int64_t from_us,
                                        int64_t max_age_us,
                                        bool (*send)(const uint8_t *buf, size_t len, void *user),
@@ -72,7 +90,7 @@ static inline unsigned wg_rescue_flush(wg_rescue_ring_t *r, int64_t now, int64_t
     for (unsigned i = 0; i < WG_RESCUE_SLOTS; i++) {
         wg_rescue_t *s = &r->slot[(r->head + i) % WG_RESCUE_SLOTS];
         if (s->at_us == 0) continue;
-        if (s->at_us < from_us || wg_timer_due(now, s->at_us, max_age_us)) {
+        if (!wg_rescue_pending_(s, now, from_us, max_age_us)) {
             s->at_us = 0;                     /* delivered, or too old to matter */
             continue;
         }
@@ -81,10 +99,72 @@ static inline unsigned wg_rescue_flush(wg_rescue_ring_t *r, int64_t now, int64_t
             s->at_us = 0;
         } else {
             left++;
+            s->owed = true;
         }
     }
     if (kept != NULL) *kept = left;
     return sent;
+}
+
+/* What the ring holds, per keypair, for a task that does not own it
+ * (wg_tx owns the ring; wg_rx decides on a handshake): the two newest
+ * keypairs with frames in it, and for each the newest frame and the
+ * newest owed one (0: none). Frames are kept in send order, so "a frame
+ * of keypair g still pending" is a test on these two instants. */
+typedef struct {
+    uint32_t gen[2];                  /* [0] the newest; 0 = no frame */
+    int64_t  newest_us[2];
+    int64_t  owed_us[2];
+} wg_rescue_sum_t;
+
+static inline void wg_rescue_summarize(const wg_rescue_ring_t *r, wg_rescue_sum_t *out)
+{
+    memset(out, 0, sizeof(*out));
+    for (unsigned i = 0; i < WG_RESCUE_SLOTS; i++) {
+        const wg_rescue_t *s = &r->slot[(r->head + i) % WG_RESCUE_SLOTS];   /* oldest first */
+        if (s->at_us == 0) continue;
+        if (s->gen != out->gen[0]) {          /* a newer keypair starts */
+            out->gen[1] = out->gen[0];
+            out->newest_us[1] = out->newest_us[0];
+            out->owed_us[1] = out->owed_us[0];
+            out->gen[0] = s->gen;
+            out->newest_us[0] = 0;
+            out->owed_us[0] = 0;
+        }
+        out->newest_us[0] = s->at_us;
+        if (s->owed) out->owed_us[0] = s->at_us;
+    }
+}
+
+/* Would a new INIT, once the peer consumes it, delete a keypair that
+ * still seals a pending frame? wireguard-go as responder
+ * (noise-protocol.go BeginSymmetricSession) parks the new keypair as
+ * `next` and deletes the old `next` and `previous`; the first packet
+ * under `next` promotes it (previous = current). With our keypair
+ * `cur_gen` confirmed — a packet of the peer under it, sealed with its
+ * `current` — the INIT deletes cur_gen - 1. Unconfirmed, the peer holds
+ * cur_gen - 1 as current and cur_gen as next (the INIT deletes cur_gen),
+ * or has promoted it unseen (the INIT deletes cur_gen - 1). Older
+ * keypairs are gone already. A re-sent frame sealed under a deleted
+ * keypair is dropped by the peer: the review of 1.3.8 measured 3.1 lost
+ * frames per episode with only our direct WireGuard dropped, two doubts'
+ * handshakes in a row (2 000 random instants; 1.3.7, 8 slots and a fixed
+ * 40 s: 2.3). */
+static inline bool wg_rescue_init_risk(const wg_rescue_sum_t *sum, int64_t now,
+                                       int64_t from_us, int64_t max_age_us,
+                                       uint32_t cur_gen, bool confirmed)
+{
+    for (unsigned i = 0; i < 2; i++) {
+        const uint32_t g = sum->gen[i];
+        if (g == 0 || !(g == cur_gen - 1u || (!confirmed && g == cur_gen))) continue;
+        const int64_t last = sum->owed_us[i] != 0 && sum->newest_us[i] < from_us
+                                 ? sum->owed_us[i] : sum->newest_us[i];
+        if ((sum->owed_us[i] != 0 || sum->newest_us[i] >= from_us) &&
+            !wg_timer_due(now, last, max_age_us)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 #ifdef __cplusplus

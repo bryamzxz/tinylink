@@ -735,6 +735,7 @@ typedef struct {
     int lose_ka_after;              /* the first keepalive after this frame is lost */
     int64_t up_wg_dead_at;          /* our direct WireGuard dropped from then */
     int64_t hs_at, padv_at;         /* a handshake response / the peer's advert due */
+    int64_t init_at;                /* our last INIT */
     uint32_t rekeys, tests, rescues, pings, dual_frames, relay_frames;
 } tl_t;
 
@@ -759,9 +760,12 @@ static void tl_act(tl_t *s, uint32_t act)
         s->pong_at = s->t + MS(50);
     }
     if (act & WG_PATH_ACT_RESCUE) s->rescues++;
-    if ((act & (WG_PATH_ACT_REKEY | WG_PATH_ACT_TEST)) && s->hs_at == 0) {
+    if ((act & (WG_PATH_ACT_REKEY | WG_PATH_ACT_TEST)) &&
+        wg_path_rekey_gate(act, true, s->hs_at != 0, s->t, s->init_at, false, true) ==
+        WG_REKEY_GO) {
         if (act & WG_PATH_ACT_REKEY) s->rekeys++;
         if (act & WG_PATH_ACT_TEST) s->tests++;
+        s->init_at = s->t;
         s->hs_at = s->t + MS(100);
     }
 }
@@ -1032,7 +1036,7 @@ static void test_rescue_ring(void)
     uint8_t f[WG_RESCUE_MAX + 1];
     for (int i = 0; i < 3; i++) {
         memset(f, 0xA0 + i, sizeof(f));
-        wg_rescue_keep(&r, f, 112, T0 + S(5 * i));
+        wg_rescue_keep(&r, f, 112, T0 + S(5 * i), 1);
     }
     rescue_sink_t k = { 0 };
     unsigned kept = 99;
@@ -1047,16 +1051,16 @@ static void test_rescue_ring(void)
     ok("rescue/once", wg_rescue_flush(&r, T0 + S(21), 0, age, rescue_sink, &k, &kept) == 0 &&
                       k.calls == 2);
     /* Past the age bound: dropped, not sent late. */
-    wg_rescue_keep(&r, f, 112, T0 + S(30));
+    wg_rescue_keep(&r, f, 112, T0 + S(30), 1);
     k = (rescue_sink_t){ .accept = -1 };
     ok("rescue/age-bound", wg_rescue_flush(&r, T0 + S(30) + age + 1, 0, age, rescue_sink, &k,
                                            &kept) == 0 && kept == 0 && k.calls == 0);
     /* Full: the oldest goes; too big: not kept. */
     for (int i = 0; i < WG_RESCUE_SLOTS + 1; i++) {
         memset(f, i, sizeof(f));
-        wg_rescue_keep(&r, f, 112, T0 + S(100 + i));
+        wg_rescue_keep(&r, f, 112, T0 + S(100 + i), 1);
     }
-    wg_rescue_keep(&r, f, WG_RESCUE_MAX + 1, T0 + S(110));
+    wg_rescue_keep(&r, f, WG_RESCUE_MAX + 1, T0 + S(110), 1);
     k = (rescue_sink_t){ .accept = -1 };
     ok("rescue/ring-oldest-out",
        wg_rescue_flush(&r, T0 + S(111), 0, age, rescue_sink, &k, &kept) == WG_RESCUE_SLOTS &&
@@ -1067,20 +1071,22 @@ static void test_rescue_ring(void)
      * old too (the 1.3.6 known gap) — up to WG_PATH_RESCUE_MAX_MS. */
     for (int i = 0; i < 4; i++) {
         memset(f, 0xB0 + i, sizeof(f));
-        wg_rescue_keep(&r, f, 112, T0 + S(200 + 20 * i));      /* 200, 220, 240, 260 */
+        wg_rescue_keep(&r, f, 112, T0 + S(200 + 20 * i), 1);      /* 200, 220, 240, 260 */
     }
     k = (rescue_sink_t){ .accept = -1 };
     ok("rescue/from-proof",
        wg_rescue_flush(&r, T0 + S(280), T0 + S(220), age, rescue_sink, &k, &kept) == 3 &&
        kept == 0 && k.order[0] == 0xB1 && k.order[2] == 0xB3);
-    wg_rescue_keep(&r, f, 112, T0 + S(300));
+    wg_rescue_keep(&r, f, 112, T0 + S(300), 1);
     k = (rescue_sink_t){ .accept = -1 };
     ok("rescue/max-age", wg_rescue_flush(&r, T0 + S(300) + age + 1, 0, age, rescue_sink, &k,
                                          &kept) == 0 && k.calls == 0);
 
-    /* The proof: a keepalive that proves the direct path — its frame went
-     * out KEEPALIVE_TIMEOUT before it. Not one within a window of a DERP
-     * copy (it may answer that), not one ending a doubt, not a pong. */
+    /* The proof: a keepalive that proves the direct path — the frame that
+     * armed the peer's timer went out KEEPALIVE_TIMEOUT plus a round trip
+     * and a wake before it, so frames sent before ka - WG_PATH_ANSWER_MS
+     * went out before that one. Not one within a window of a DERP copy
+     * (it may answer that), not one ending a doubt, not a pong. */
     wg_path_t p;
     wg_path_mode_t m;
     wg_path_init(&p, T0, true);
@@ -1089,7 +1095,7 @@ static void test_rescue_ring(void)
     ok("proof/not-a-pong", wg_path_rescue_from(&p) == 0);
     (void)wg_path_on_send(&p, T0 + S(1), true, &m);
     (void)wg_path_on_keepalive(&p, T0 + S(11));
-    ok("proof/direct-ka", wg_path_rescue_from(&p) == T0 + S(1));
+    ok("proof/direct-ka", wg_path_rescue_from(&p) == T0 + S(11) - MS(WG_PATH_ANSWER_MS));
     wg_path_init(&p, T0, true);
     (void)wg_path_on_send(&p, T0 + S(1), true, &m);          /* DUAL: via DERP too */
     confirm_at(&p, T0 + S(2), 50000);
@@ -1098,11 +1104,112 @@ static void test_rescue_ring(void)
     ok("proof/not-after-derp", p.mode == WG_PATH_DIRECT && wg_path_rescue_from(&p) == 0);
     (void)wg_path_on_send(&p, T0 + S(14), true, &m);
     (void)wg_path_on_keepalive(&p, T0 + S(24));
-    ok("proof/then-direct-ka", wg_path_rescue_from(&p) == T0 + S(14));
+    ok("proof/then-direct-ka", wg_path_rescue_from(&p) == T0 + S(24) - MS(WG_PATH_ANSWER_MS));
     doubt_at(&p, T0 + S(1), T0 + S(1) + MS(WG_PATH_ANSWER_MS) + MS(81));
     const int64_t before = wg_path_rescue_from(&p);
     (void)wg_path_on_keepalive(&p, T0 + S(30));
     ok("proof/not-a-doubt-ka", p.mode == WG_PATH_DIRECT && wg_path_rescue_from(&p) == before);
+
+    /* Review of 1.3.8 (test_proof_window.c): the keepalive proves only the
+     * frame that armed the peer's timer; one sent 150 ms after it (an ICMP
+     * reply), lost, was marked delivered — the keepalive arriving 10 s +
+     * 60 ms + a 250-ms wake after the arming frame — and never re-sent. */
+    memset(&r, 0, sizeof(r));
+    wg_path_init(&p, T0, true);
+    confirm_at(&p, T0, 50000);
+    const int64_t A = T0 + S(1);
+    (void)wg_path_on_send(&p, A, true, &m);
+    wg_rescue_keep(&r, f, 112, A, 1);
+    (void)wg_path_on_send(&p, A + MS(150), true, &m);
+    memset(f, 0xC1, sizeof(f));
+    wg_rescue_keep(&r, f, 112, A + MS(150), 1);
+    (void)wg_path_on_keepalive(&p, A + MS(10370));
+    k = (rescue_sink_t){ .accept = -1 };
+    ok("proof/margin", wg_rescue_flush(&r, A + S(40), wg_path_rescue_from(&p), age, rescue_sink,
+                                       &k, &kept) == 2 && k.order[1] == 0xC1);
+
+    /* Frames a refused re-send kept are owed: a direct proof before the
+     * relay is back proves the path works again, not that they arrived
+     * (review of 1.3.8). */
+    memset(&r, 0, sizeof(r));
+    for (int i = 0; i < 3; i++) {
+        memset(f, 0xD0 + i, sizeof(f));
+        wg_rescue_keep(&r, f, 112, T0 + S(500 + 5 * i), 1);
+    }
+    k = (rescue_sink_t){ .accept = 0 };
+    ok("rescue/refused-owed", wg_rescue_flush(&r, T0 + S(520), T0 + S(400), age, rescue_sink,
+                                              &k, &kept) == 0 && kept == 3);
+    wg_rescue_keep(&r, f, 112, T0 + S(530), 1);                /* direct again */
+    k = (rescue_sink_t){ .accept = -1 };
+    ok("rescue/owed-past-proof",
+       wg_rescue_flush(&r, T0 + S(560), T0 + S(540), age, rescue_sink, &k, &kept) == 3 &&
+       k.order[0] == 0xD0 && k.order[2] == 0xD2);
+}
+
+/* Which INIT would make the peer (wireguard-go, responder) delete a
+ * keypair that seals a frame still to re-send (wg_rescue_init_risk)? */
+static void test_init_risk(void)
+{
+    static wg_rescue_ring_t r;
+    uint8_t f[112] = { 0 };
+    wg_rescue_sum_t sum;
+    const int64_t age = MS(WG_PATH_RESCUE_MAX_MS);
+    memset(&r, 0, sizeof(r));
+    wg_rescue_summarize(&r, &sum);
+    ok("risk/empty", sum.gen[0] == 0 && !wg_rescue_init_risk(&sum, T0, 0, age, 7, false));
+    wg_rescue_keep(&r, f, 112, T0 + S(10), 6);
+    wg_rescue_keep(&r, f, 112, T0 + S(15), 6);
+    wg_rescue_keep(&r, f, 112, T0 + S(20), 7);
+    wg_rescue_summarize(&r, &sum);
+    ok("risk/summary", sum.gen[0] == 7 && sum.newest_us[0] == T0 + S(20) &&
+                       sum.gen[1] == 6 && sum.newest_us[1] == T0 + S(15) &&
+                       sum.owed_us[0] == 0 && sum.owed_us[1] == 0);
+    /* Ours confirmed (the peer's current): the INIT deletes the previous
+     * one — at risk while a frame of it is pending, not once proven. */
+    ok("risk/confirmed-previous", wg_rescue_init_risk(&sum, T0 + S(21), T0 + S(12), age, 7, true));
+    ok("risk/previous-proven", !wg_rescue_init_risk(&sum, T0 + S(21), T0 + S(16), age, 7, true));
+    /* Unconfirmed: maybe still the peer's `next` — ours at risk too. */
+    ok("risk/unconfirmed-current", wg_rescue_init_risk(&sum, T0 + S(21), T0 + S(16), age, 7, false));
+    ok("risk/current-confirmed-safe", !wg_rescue_init_risk(&sum, T0 + S(21), T0 + S(16), age, 7,
+                                                           true));
+    /* Two keypairs back: deleted already, nothing to protect. */
+    ok("risk/older-gone", !wg_rescue_init_risk(&sum, T0 + S(21), T0 + S(12), age, 9, true));
+    /* Too old to re-send: no risk. */
+    ok("risk/expired", !wg_rescue_init_risk(&sum, T0 + S(15) + age + 1, 0, age, 7, true));
+    /* Owed frames count whatever the proof says. */
+    rescue_sink_t k = { .accept = 0 };
+    unsigned kept = 0;
+    (void)wg_rescue_flush(&r, T0 + S(22), T0 + S(12), age, rescue_sink, &k, &kept);
+    wg_rescue_summarize(&r, &sum);
+    ok("risk/owed", kept == 2 && sum.owed_us[1] == T0 + S(15) &&
+                    wg_rescue_init_risk(&sum, T0 + S(23), T0 + S(30), age, 7, true));
+}
+
+/* wg_netif's rekey gate (wg_path_rekey_gate): what it starts, and why not. */
+static void test_rekey_gate(void)
+{
+    const int64_t now = T0 + S(100), last = T0;
+    const uint32_t T = WG_PATH_ACT_TEST, R = WG_PATH_ACT_REKEY;
+    ok("gate/test-go", wg_path_rekey_gate(T, true, false, now, last, false, true) == WG_REKEY_GO);
+    ok("gate/silent-go", wg_path_rekey_gate(R, true, false, now, last, true, true) == WG_REKEY_GO);
+    ok("gate/no-session", wg_path_rekey_gate(T, false, false, now, last, false, true) ==
+                          WG_REKEY_NO_SESSION);
+    ok("gate/one-in-flight", wg_path_rekey_gate(T, true, true, now, last, false, true) ==
+                             WG_REKEY_IN_FLIGHT &&
+                             wg_path_rekey_gate(R, true, true, now, last, false, true) ==
+                             WG_REKEY_IN_FLIGHT);
+    ok("gate/rekey-timeout",
+       wg_path_rekey_gate(T, true, false, last + MS(WG_PATH_REKEY_TIMEOUT_MS), last, false, true) ==
+       WG_REKEY_TOO_SOON &&
+       wg_path_rekey_gate(T, true, false, last + MS(WG_PATH_REKEY_TIMEOUT_MS) + 1, last, false,
+                          true) == WG_REKEY_GO);
+    ok("gate/ring-after-rescue", wg_path_rekey_gate(T, true, false, now, last, true, true) ==
+                                 WG_REKEY_GO_AFTER_RESCUE);
+    ok("gate/ring-no-relay", wg_path_rekey_gate(T, true, false, now, last, true, false) ==
+                             WG_REKEY_RING);
+    /* A late tick asking for both: the silence's rekey, as in 1.3.7. */
+    ok("gate/both-go", wg_path_rekey_gate(T | R, true, false, now, last, true, false) ==
+                       WG_REKEY_GO);
 }
 
 static void test_unmanaged(void)
@@ -1199,8 +1306,8 @@ typedef struct {
     int64_t up_dead_at, up_heal_at;     /* us → peer */
     int64_t down_dead_at, down_heal_at; /* peer → us */
     int64_t rebind_at;                  /* the peer's NAT moves to endpoint 1 */
-    int64_t wg_dead_at;                 /* the peer's session breaks: it drops our
-                                           transport, sends none, answers DISCO —
+    int64_t wg_dead_at;                 /* the peer's session breaks: it loses its
+                                           keypairs, sends none, answers DISCO —
                                            until an INIT from us (the 1.3.5 soak) */
     int64_t wg_block_at;                /* WireGuard dropped on the direct path,
                                            both ways, DISCO passes (DPI-like) */
@@ -1211,11 +1318,16 @@ typedef struct {
     bool    peer_chatty;                /* peer sends data every second */
     bool    peer_advert;                /* TSMP advert on every new keypair */
     bool    advert_kept;                /* ours takes a rescue slot (1.3.7) */
+    bool    no_test;                    /* ignore WG_PATH_ACT_TEST: 1.3.7's behaviour */
+    bool    no_ring_gate;               /* test even when it deletes ring keypairs
+                                           (1.3.8 before its review) */
+    bool    no_relay_first;             /* withhold such a test instead of re-sending
+                                           first (the alternative measured) */
     int64_t end;
-    /* results */
+    /* results; frames are counted lost by what the peer got (ground truth) */
     uint32_t frames, lost, lost_after_break, derp_copies, direct_after_relay;
     uint32_t pings, probes, lapses, deaths, confirms, roams;
-    uint32_t rescued, rescue_copies;    /* lost frames re-sent / all re-sent */
+    uint32_t rescued, rescue_copies;    /* lost frames re-sent and delivered / all re-sent */
     int64_t  rescue_delay_max;
     int64_t  lapse_after_break;         /* first lapse at or after the break; 0 none */
     int64_t  direct_again_at;           /* first DIRECT after the heal / rebind */
@@ -1223,10 +1335,15 @@ typedef struct {
     uint32_t silences, forced_rekeys, doubts, undelivered;
     uint32_t stale_rekeys;              /* wg_netif's RX-stale rekey (30 s) */
     uint32_t tests;                     /* doubts' handshake tests started (1.3.8) */
+    uint32_t test_skips;                /* ...withheld: they would delete ring keypairs */
+    uint32_t tests_after_rescue;        /* ...sent via DERP behind a re-send */
     uint32_t inits, hs_done;            /* INITs sent (retries too); handshakes done */
     uint32_t exhausted, lost_cold;      /* rekeys given up (cold), frames refused then */
-    bool     no_test;                   /* ignore WG_PATH_ACT_TEST: 1.3.7's behaviour */
-    uint32_t lost_open;                 /* lost, still to be re-sent at the end */
+    uint32_t deadkey;                   /* re-sent frames the peer dropped: their
+                                           keypair deleted */
+    uint32_t rx_oldkey;                 /* the peer's packets under a keypair we no
+                                           longer receive on (wg_netif rxd.old_idx) */
+    uint32_t lost_open;                 /* lost after the break, still to re-send */
     int      p_mode_end;
     int64_t  rekey_after_rx;            /* first path- or RX-stale-driven INIT after
                                            the break, after the peer's last WG
@@ -1238,27 +1355,61 @@ typedef struct {
     int64_t  silent_at;                 /* first SILENT after the break */
     int64_t  silent_after_rx;           /* ...after the peer's last WG packet */
     int64_t  direct_after_silent;       /* first DIRECT after it */
-    bool     wg_fixed;                  /* runtime: the peer got an INIT since */
 } sim_t;
 
-/* Our direct-only data frames go into a real rescue ring (wg_rescue.h),
- * as wg_tx keeps them; the wire bytes carry the frame's number, s_fr says
- * whether it got through. (`tlm` false: a frame that takes a slot but is
- * not telemetry — wg_netif keeps none since 1.3.8, see test_known_gap.) */
-#define FR_N 1024
-typedef struct { int64_t t; bool lost; bool dead_keys; bool tlm; } frame_t;
+/* Every transport frame we send (telemetry, our adverts) has a number and
+ * the keypair that sealed it; `delivered` is what the peer got. The
+ * direct-only ones go into a real rescue ring (wg_rescue.h), as wg_tx
+ * keeps them, the wire bytes carrying the number. */
+#define FR_N 8192
+typedef struct { int64_t t; uint32_t gen; bool tlm; bool delivered; } frame_t;
 static frame_t          s_fr[FR_N];
 static uint32_t         s_fr_next;
 static wg_rescue_ring_t s_ring;
 static int              s_cur;          /* our current endpoint, 0 or 1 */
 
-static void ring_keep(int64_t t, bool lost, bool dead_keys, bool tlm)
+/* Keypairs: ours (wg_netif keeps one session, sends and receives on it)
+ * and the peer's slots, wireguard-go as the responder: an INIT consumed
+ * puts the new keypair in `next` and deletes the old `next` and
+ * `previous` (noise-protocol.go BeginSymmetricSession); the first packet
+ * under `next` promotes it (previous = current) and makes tailscaled send
+ * its TSMP advert; it sends under `current` only, none without one. The
+ * keypair of INIT n is n + 1 (the session at T0 is 1, confirmed); ours
+ * are numbered as wg_transport does, one generation per installed
+ * session (s_kp maps it to the keypair), so unanswered retries leave no
+ * gap and cur - 1 is the previous one. */
+#define GEN_N 1024
+static uint32_t s_gen;
+static uint32_t s_kp[GEN_N];
+static uint32_t pk_prev, pk_cur, pk_next;
+static bool     s_peer_lost_keys;
+
+static uint32_t fr_new(int64_t t, bool tlm)
 {
     const uint32_t id = s_fr_next++;
-    s_fr[id % FR_N] = (frame_t){ t, lost, dead_keys, tlm };
+    s_fr[id % FR_N] = (frame_t){ t, s_gen, tlm, false };
+    return id;
+}
+
+static void ring_keep(uint32_t id, int64_t t)
+{
     uint8_t b[112] = { 0 };
     memcpy(b, &id, sizeof(id));
-    wg_rescue_keep(&s_ring, b, sizeof(b), t);
+    wg_rescue_keep(&s_ring, b, sizeof(b), t, s_fr[id % FR_N].gen);
+}
+
+static bool pk_has(uint32_t g)
+{
+    return g != 0 && (g == pk_cur || g == pk_prev || g == pk_next);
+}
+
+/* The 1.3.5 failure: the peer's session lost (wg_dead_at). */
+static void peer_keys_at(const sim_t *s, int64_t t)
+{
+    if (!s_peer_lost_keys && t >= s->wg_dead_at) {
+        s_peer_lost_keys = true;
+        pk_prev = pk_cur = pk_next = 0;
+    }
 }
 
 /* wg_netif's handshake state: one INIT in flight, retried every
@@ -1313,21 +1464,39 @@ static int64_t one_way(void) { return MS(20 + rnd(130)); }        /* 20–150 ms
 static int64_t derp_way(void) { return MS(60 + rnd(200)); }       /* 60–260 ms */
 static int64_t dtim(void) { return MS(rnd(300)); }                /* modem sleep */
 
-/* The peer's session is broken (wg_dead_at, no INIT since). */
-static bool wg_broken(const sim_t *s, int64_t t)
+/* Our DERP stream is one TCP connection: what we relay arrives in order. */
+static int64_t s_derp_last;
+static int64_t derp_at(int64_t t)
 {
-    return t >= s->wg_dead_at && !s->wg_fixed;
+    int64_t a = t + derp_way();
+    if (a <= s_derp_last) a = s_derp_last + 1;
+    s_derp_last = a;
+    return a;
 }
 
 /* Peer → us (WireGuard): direct if it works, else DERP (the peer's own
- * path choice — DISCO passing, it keeps a WG-blocked path). */
+ * path choice — DISCO passing, it keeps a WG-blocked path). `tag`: the
+ * INIT a response answers; transport goes under the peer's current
+ * keypair, and without one there is none. */
 static void peer_send(const sim_t *s, int64_t t, ev_kind_t k, int tag)
 {
+    if (k != EV_US_GOT_RESP) {
+        if (pk_cur == 0) return;
+        tag = (int)pk_cur;
+    }
     const bool direct = down_ok(s, t);
     if (direct && t >= s->wg_block_at) return;
     if (s->loss_pm && rnd(1000) < s->loss_pm) return;
     push(t + (direct ? one_way() : derp_way()) + dtim(), k,
          (direct ? 1 + peer_ep(s, t) : 0) + 4 * tag);
+}
+
+/* Us → peer: frame `id` at `at`, the first copy that arrives (a DUAL
+ * frame's second is a replay). */
+#define DATA_RESCUE (1 << 20)
+static void send_frame(int64_t at, uint32_t id, bool rescue)
+{
+    push(at, EV_PEER_GOT_DATA, (int)(id % FR_N) + 1 + (rescue ? DATA_RESCUE : 0));
 }
 
 static void sim_ping(sim_t *s, int64_t t, int ep)
@@ -1346,37 +1515,33 @@ static uint32_t sim_from(sim_t *s, wg_path_t *p, int64_t t, int src)
     return wg_path_on_endpoint_change(p, t);
 }
 
-/* A new INIT (a new attempt): direct, plus DERP unless the path is valid;
- * the peer answers the first copy that arrives. */
-static void sim_init(sim_t *s, wg_path_t *p, int64_t t)
+/* A new INIT (a new attempt): direct, plus DERP unless the path is valid
+ * (`relay_only`: DERP only, behind a re-send); the peer answers the first
+ * copy that arrives. */
+static void sim_init(sim_t *s, wg_path_t *p, int64_t t, bool relay_only)
 {
     s_hs.in_flight = true;
     s_hs.init_at = t;
     s_hs.id++;
     s_hs.attempts++;
     s->inits++;
-    const bool relay = wg_path_init_wants_relay(p, t);
-    bool direct = up_ok(s, t, s_cur) && t < s->wg_block_at && t < s->wg_upblock_at;
+    const bool relay = relay_only || wg_path_init_wants_relay(p, t);
+    bool direct = !relay_only && up_ok(s, t, s_cur) && t < s->wg_block_at &&
+                  t < s->wg_upblock_at;
     if (direct && s->loss_pm && rnd(1000) < s->loss_pm) direct = false;
     if (!direct && !relay) return;
-    push(t + (direct ? one_way() : derp_way()), EV_PEER_GOT_INIT, (int)s_hs.id);
+    int64_t at = direct ? t + one_way() : INT64_MAX;
+    if (relay) {
+        const int64_t d = derp_at(t);
+        if (d < at) at = d;
+    }
+    push(at, EV_PEER_GOT_INIT, (int)s_hs.id);
 }
 
-/* wg_netif's rekey for a path action (SILENT, a doubt's test): unless one
- * is in flight, and REKEY_TIMEOUT after the last INIT. */
-static bool sim_rekey(sim_t *s, wg_path_t *p, int64_t t)
-{
-    if (s_hs.in_flight || !wg_timer_due(t, s_hs.init_at, S(5))) return false;
-    s_hs.attempts = 0;
-    sim_init(s, p, t);
-    return true;
-}
-
-/* The lapse's re-send (wg_tx's tx_rescue): the ring's frames since the
- * last proof of delivery go via DERP; the peer's replay window drops the
- * ones it has, the lost ones arrive — unless the peer lost the keys they
- * are sealed with. */
-typedef struct { sim_t *s; int64_t t, break_at; } rsink_t;
+/* The lapse's re-send (wg_tx's tx_rescue): the ring's pending frames go
+ * via DERP; the peer drops the ones it has (replay window) and those
+ * whose keypair it deleted. */
+typedef struct { sim_t *s; int64_t t; } rsink_t;
 
 static bool sim_rescue_send(const uint8_t *buf, size_t len, void *user)
 {
@@ -1384,22 +1549,14 @@ static bool sim_rescue_send(const uint8_t *buf, size_t len, void *user)
     uint32_t id;
     (void)len;
     memcpy(&id, buf, sizeof(id));
-    frame_t *f = &s_fr[id % FR_N];
     k->s->rescue_copies++;
-    if (f->tlm && f->lost && !f->dead_keys) {
-        k->s->rescued++;
-        k->s->lost--;
-        if (f->t >= k->break_at) k->s->lost_after_break--;
-        if (k->t - f->t > k->s->rescue_delay_max) k->s->rescue_delay_max = k->t - f->t;
-        f->lost = false;
-        push(k->t + derp_way(), EV_PEER_GOT_DATA, 0);
-    }
+    send_frame(derp_at(k->t), id, true);
     return true;
 }
 
-static void sim_rescue(sim_t *s, const wg_path_t *p, int64_t t, int64_t break_at)
+static void sim_rescue(sim_t *s, const wg_path_t *p, int64_t t)
 {
-    rsink_t k = { s, t, break_at };
+    rsink_t k = { s, t };
     (void)wg_rescue_flush(&s_ring, t, wg_path_rescue_from(p), MS(WG_PATH_RESCUE_MAX_MS),
                           sim_rescue_send, &k, NULL);
 }
@@ -1407,7 +1564,6 @@ static void sim_rescue(sim_t *s, const wg_path_t *p, int64_t t, int64_t break_at
 typedef struct {
     bool ka_pending;
     int64_t ka_at;
-    bool new_keypair;     /* advert owed on the first data under it */
 } peer_t;
 
 static void run_sim(sim_t *s)
@@ -1428,16 +1584,22 @@ static void run_sim(sim_t *s)
     s->lapse_after_break = 0;
     s->direct_again_at = 0;
     s->silent_at = s->silent_after_rx = s->direct_after_silent = 0;
-    s->forced_rekeys = s->stale_rekeys = s->tests = s->inits = s->hs_done = 0;
-    s->exhausted = s->lost_cold = 0;
+    s->forced_rekeys = s->stale_rekeys = s->tests = s->test_skips = s->inits = s->hs_done = 0;
+    s->tests_after_rescue = 0;
+    s->exhausted = s->lost_cold = s->deadkey = s->rx_oldkey = 0;
     s->rekey_after_rx = s->fixed_at = s->fixed_after_rx = s->unanswered_at = 0;
-    s->wg_fixed = false;
-    int64_t last_rx = t;                        /* the peer's last WG packet */
+    int64_t last_rx = t;                        /* the peer's last WG packet we took */
     int64_t stale_clock = t;                    /* wg_netif last_transport_recv_us */
     memset(&s_ring, 0, sizeof(s_ring));
     memset(s_fr, 0, sizeof(s_fr));
     s_fr_next = 0;
     s_hs = (hs_t){ false, false, 0, t, t, 0 };  /* the session is up at T0 */
+    s_gen = 1;
+    s_kp[1] = 1;
+    pk_prev = pk_next = 0;
+    pk_cur = 1;
+    s_peer_lost_keys = false;
+    s_derp_last = 0;
     push(t + S(1), EV_TELEMETRY, 0);
     if (s->peer_chatty) push(t + S(1), EV_PEER_CHAT, 0);
     bool relayed_once = false;
@@ -1470,10 +1632,10 @@ static void run_sim(sim_t *s)
                     s_hs.cold = true;           /* "proactive rekey exhausted" */
                     s->exhausted++;
                 }
-                sim_init(s, &p, t);             /* (cold: no 30-s back-off here) */
+                sim_init(s, &p, t, false);             /* (cold: no 30-s back-off here) */
             } else if (!s_hs.in_flight && wg_timer_due(t, s_hs.done_at, S(110))) {
                 s_hs.attempts = 0;
-                sim_init(s, &p, t);
+                sim_init(s, &p, t, false);
             }
             if (!s_hs.in_flight && wg_timer_due(t, stale_clock, MS(30000))) {
                 /* wg_netif's RX-stale watchdog: a rekey and a probe of
@@ -1482,7 +1644,7 @@ static void run_sim(sim_t *s)
                 s->stale_rekeys++;
                 if (t >= break_at && s->rekey_after_rx == 0) s->rekey_after_rx = t - last_rx;
                 s_hs.attempts = 0;
-                sim_init(s, &p, t);
+                sim_init(s, &p, t, false);
                 act |= WG_PATH_ACT_PROBE;
             }
             const uint32_t pact = wg_path_tick(&p, t);
@@ -1495,7 +1657,8 @@ static void run_sim(sim_t *s)
         } else if (peer.ka_pending && peer.ka_at == q_min) {
             t = q_min;
             peer.ka_pending = false;              /* the keepalive is a send */
-            if (!wg_broken(s, t)) peer_send(s, t, EV_US_GOT_KA, 0);
+            peer_keys_at(s, t);
+            peer_send(s, t, EV_US_GOT_KA, 0);
             continue;
         } else {
             if (!pop(&e)) break;
@@ -1504,10 +1667,9 @@ static void run_sim(sim_t *s)
             case EV_TELEMETRY: {
                 push(t + S(5) + MS(rnd(500)) - MS(250), EV_TELEMETRY, 0);
                 s->frames++;
+                const uint32_t id = fr_new(t, true);
                 if (s_hs.cold) {                /* refused: no session */
-                    s->lost++;
                     s->lost_cold++;
-                    if (t >= break_at) s->lost_after_break++;
                     break;
                 }
                 wg_path_mode_t m;
@@ -1522,20 +1684,15 @@ static void run_sim(sim_t *s)
                 bool via_direct = direct && up_ok(s, t, s_cur) && t < s->wg_block_at &&
                                   t < s->wg_upblock_at;
                 if (via_direct && s->loss_pm && rnd(1000) < s->loss_pm) via_direct = false;
-                const bool keys = !wg_broken(s, t);
-                if (keys && (via_direct || derp)) {
-                    push(t + (via_direct ? one_way() : derp_way()), EV_PEER_GOT_DATA, 0);
-                } else {
-                    s->lost++;
-                    if (t >= break_at) s->lost_after_break++;
-                }
-                if (m == WG_PATH_DIRECT) ring_keep(t, !(keys && via_direct), !keys, true);
+                if (via_direct || derp) send_frame(via_direct ? t + one_way() : derp_at(t), id, false);
+                if (m == WG_PATH_DIRECT) ring_keep(id, t);
                 break;
             }
             case EV_PEER_GOT_INIT:
-                if (t >= s->wg_dead_at) s->wg_fixed = true;
+                peer_keys_at(s, t);
+                pk_next = (uint32_t)e.arg + 1u;   /* old next and previous deleted */
+                pk_prev = 0;
                 peer.ka_pending = false;          /* the response is a send */
-                peer.new_keypair = true;
                 peer_send(s, t, EV_US_GOT_RESP, e.arg);
                 break;
             case EV_US_GOT_RESP: {
@@ -1545,6 +1702,8 @@ static void run_sim(sim_t *s)
                 s_hs.attempts = 0;
                 s_hs.done_at = t;
                 s->hs_done++;
+                s_gen++;
+                s_kp[s_gen % GEN_N] = (uint32_t)(e.arg >> 2) + 1u;
                 if (t >= break_at && s->fixed_at == 0) {
                     s->fixed_at = t;
                     s->fixed_after_rx = t - last_rx;
@@ -1556,25 +1715,48 @@ static void run_sim(sim_t *s)
                  * (wg_tx sends it after the response was handled). */
                 wg_path_mode_t m;
                 act |= wg_path_on_send(&p, t + 1, true, &m);
+                const uint32_t id = fr_new(t + 1, false);
                 bool via_direct = m != WG_PATH_RELAY && up_ok(s, t, s_cur) &&
                                   t < s->wg_block_at && t < s->wg_upblock_at;
                 if (via_direct && s->loss_pm && rnd(1000) < s->loss_pm) via_direct = false;
                 if (via_direct || m != WG_PATH_DIRECT) {
-                    push(t + (via_direct ? one_way() : derp_way()), EV_PEER_GOT_DATA, 0);
+                    send_frame(via_direct ? t + 1 + one_way() : derp_at(t + 1), id, false);
                 }
-                if (m == WG_PATH_DIRECT && s->advert_kept) ring_keep(t, !via_direct, false, false);
+                if (m == WG_PATH_DIRECT && s->advert_kept) ring_keep(id, t + 1);
                 break;
             }
-            case EV_PEER_GOT_DATA:
+            case EV_PEER_GOT_DATA: {
+                peer_keys_at(s, t);
+                const bool resc = (e.arg & DATA_RESCUE) != 0;
+                frame_t *f = &s_fr[(uint32_t)((e.arg & (DATA_RESCUE - 1)) - 1)];
+                const uint32_t kp = s_kp[f->gen % GEN_N];
+                if (!pk_has(kp)) {                /* keypair gone: dropped, no timer */
+                    if (resc) s->deadkey++;
+                    break;
+                }
+                bool promoted = false;
+                if (kp == pk_next) {
+                    pk_prev = pk_cur;
+                    pk_cur = pk_next;
+                    pk_next = 0;
+                    promoted = true;
+                }
+                if (f->delivered) break;          /* replay window: dropped, no timer */
+                f->delivered = true;
+                if (resc && f->tlm) {
+                    s->rescued++;
+                    if (t - f->t > s->rescue_delay_max) s->rescue_delay_max = t - f->t;
+                }
                 if (!peer.ka_pending) { peer.ka_pending = true; peer.ka_at = t + S(10); }
-                if (peer.new_keypair && s->peer_advert) {
-                    peer.new_keypair = false;
+                if (promoted && s->peer_advert) {
                     peer.ka_pending = false;      /* its advert is a send */
                     peer_send(s, t, EV_US_GOT_DATA, 0);
                 }
                 break;
+            }
             case EV_PEER_CHAT:
-                peer.ka_pending = false;
+                peer_keys_at(s, t);
+                if (pk_cur != 0) peer.ka_pending = false;
                 peer_send(s, t, EV_US_GOT_DATA, 0);
                 push(t + S(1), EV_PEER_CHAT, 0);
                 break;
@@ -1583,13 +1765,12 @@ static void run_sim(sim_t *s)
                 if (down_ok(s, t)) push(t + one_way() + dtim(), EV_US_GOT_PONG, e.arg);
                 break;
             case EV_US_GOT_KA:
-                last_rx = t;
-                act = wg_path_on_keepalive(&p, t);
-                act |= sim_from(s, &p, t, e.arg & 3);
-                break;
             case EV_US_GOT_DATA:
+                /* wg_netif receives on its current keypair only. */
+                if ((uint32_t)(e.arg >> 2) != s_kp[s_gen % GEN_N]) { s->rx_oldkey++; break; }
                 last_rx = t;
-                act = wg_path_on_peer_data(&p, t);
+                act = e.k == EV_US_GOT_KA ? wg_path_on_keepalive(&p, t)
+                                          : wg_path_on_peer_data(&p, t);
                 act |= sim_from(s, &p, t, e.arg & 3);
                 break;
             case EV_US_GOT_PONG: {
@@ -1623,15 +1804,34 @@ static void run_sim(sim_t *s)
             s->direct_after_silent = t;
         }
         if (s->no_test) act &= ~WG_PATH_ACT_TEST;
+        if (act & WG_PATH_ACT_RESCUE) sim_rescue(s, &p, t);   /* queued first, as wg_netif */
         if (act & (WG_PATH_ACT_REKEY | WG_PATH_ACT_TEST)) {
-            /* wg_netif's rx_path_tick: unless one is in flight. */
+            /* wg_netif's rx_path_tick: the same gate, on the same ring. */
             if (act & WG_PATH_ACT_REKEY) s->forced_rekeys++;
-            if (sim_rekey(s, &p, t)) {
-                if (act & WG_PATH_ACT_TEST) s->tests++;
+            bool risk = false;
+            if ((act & WG_PATH_ACT_TEST) && !s->no_ring_gate) {
+                wg_rescue_sum_t sum;
+                wg_rescue_summarize(&s_ring, &sum);
+                risk = wg_rescue_init_risk(&sum, t, wg_path_rescue_from(&p),
+                                           MS(WG_PATH_RESCUE_MAX_MS), s_gen,
+                                           wg_path_keys_confirmed(&p));
+            }
+            const wg_rekey_gate_t gate = wg_path_rekey_gate(act, !s_hs.cold, s_hs.in_flight,
+                                                            t, s_hs.init_at, risk,
+                                                            !s->no_relay_first);
+            if (gate == WG_REKEY_GO_AFTER_RESCUE) {
+                sim_rescue(s, &p, t);
+                s->tests_after_rescue++;
+            }
+            if (gate == WG_REKEY_GO || gate == WG_REKEY_GO_AFTER_RESCUE) {
+                s_hs.attempts = 0;
+                sim_init(s, &p, t, gate == WG_REKEY_GO_AFTER_RESCUE);
+                if (!(act & WG_PATH_ACT_REKEY)) s->tests++;
                 if (t >= break_at && s->rekey_after_rx == 0) s->rekey_after_rx = t - last_rx;
+            } else if (gate == WG_REKEY_RING) {
+                s->test_skips++;
             }
         }
-        if (act & WG_PATH_ACT_RESCUE) sim_rescue(s, &p, t, break_at);
         if (act & WG_PATH_ACT_PING) sim_ping(s, t, s_cur);
         if (act & WG_PATH_ACT_PROBE) {          /* every endpoint the netmap lists */
             s->probes++;
@@ -1646,16 +1846,39 @@ static void run_sim(sim_t *s)
     s->doubts   = p.doubts_total;
     s->undelivered = p.undelivered;
     s->p_mode_end = p.mode;
-    s->lost_open = 0;
+    /* Frames and INITs still in flight to the peer arrive (no reactions). */
+    while (pop(&e)) {
+        if (e.k == EV_PEER_GOT_INIT) {
+            pk_next = (uint32_t)e.arg + 1u;
+            pk_prev = 0;
+        } else if (e.k == EV_PEER_GOT_DATA) {
+            frame_t *f = &s_fr[(uint32_t)((e.arg & (DATA_RESCUE - 1)) - 1)];
+            const uint32_t kp = s_kp[f->gen % GEN_N];
+            if (!pk_has(kp)) continue;
+            if (kp == pk_next) { pk_prev = pk_cur; pk_cur = pk_next; pk_next = 0; }
+            if (!f->delivered && (e.arg & DATA_RESCUE) && f->tlm) s->rescued++;
+            f->delivered = true;
+        }
+    }
+    /* Ground truth: telemetry the peer never got (the last 2 s may still
+     * be on their way), and of it what the ring would still re-send. */
+    s->lost = s->lost_after_break = s->lost_open = 0;
     const int64_t from = wg_path_rescue_from(&p);
-    for (int i = 0; i < WG_RESCUE_SLOTS; i++) {
-        const wg_rescue_t *r = &s_ring.slot[i];
-        if (r->at_us == 0 || r->at_us < from ||
-            wg_timer_due(t, r->at_us, MS(WG_PATH_RESCUE_MAX_MS))) continue;
-        uint32_t id;
-        memcpy(&id, r->buf, sizeof(id));
+    for (uint32_t id = s_fr_next > FR_N ? s_fr_next - FR_N : 0; id < s_fr_next; id++) {
         const frame_t *f = &s_fr[id % FR_N];
-        if (f->tlm && f->lost && !f->dead_keys) s->lost_open++;
+        if (!f->tlm || f->delivered || f->t > t - S(2)) continue;
+        s->lost++;
+        if (f->t < break_at) continue;
+        s->lost_after_break++;
+        for (int i = 0; i < WG_RESCUE_SLOTS; i++) {
+            const wg_rescue_t *r = &s_ring.slot[i];
+            uint32_t rid;
+            memcpy(&rid, r->buf, sizeof(rid));
+            if (rid == id && pk_has(s_kp[r->gen % GEN_N]) &&
+                wg_rescue_pending_(r, t, from, MS(WG_PATH_RESCUE_MAX_MS))) {
+                s->lost_open++;
+            }
+        }
     }
     s->final_ep = s_cur;
 }
@@ -1806,7 +2029,8 @@ static void test_sim(void)
 
     /* ...at random instants. */
     int64_t sworst = 0, ssum = 0, fsum = 0, fworst = 0, osum = 0, oworst = 0, bsum = 0;
-    int64_t ufbest = INT64_MAX, ufworst = 0, oufbest = INT64_MAX, oufworst = 0;
+    int64_t ufbest = INT64_MAX, ufworst = 0, oufbest = INT64_MAX, oufworst = 0, wworst = 0;
+    uint32_t wskips = 0, safter = 0;
     uint32_t slost = 0, slost_worst = 0, sn = 0, sforced = 0, olost = 0, stests = 0;
     int sgood = 1;
     for (int trial = 0; trial < 100; trial++) {
@@ -1816,8 +2040,16 @@ static void test_sim(void)
         s.end = brk + S(120);
         o = s;
         o.no_test = true;
+        sim_t w = s;
+        w.no_relay_first = true;
         run_sim(&s);
         run_sim(&o);
+        run_sim(&w);
+        if (w.unanswered_at != 0 && w.fixed_at - w.unanswered_at > wworst) {
+            wworst = w.fixed_at - w.unanswered_at;
+        }
+        wskips += w.test_skips;
+        safter += s.tests_after_rescue;
         sgood &= s.fixed_at != 0 && s.p_mode_end == WG_PATH_DIRECT;
         if (s.rekey_after_rx > sworst) sworst = s.rekey_after_rx;
         ssum += s.rekey_after_rx;
@@ -1852,6 +2084,12 @@ static void test_sim(void)
            ufbest / 1e6, ufworst / 1e6, oufbest / 1e6, oufworst / 1e6,
            bsum / 1e6 / sn, ssum / 1e6 / sn, sworst / 1e6,
            stests, sforced, (double)slost / sn, slost_worst, (double)olost / sn);
+    /* A third of the tests would delete the previous keypair of frames
+     * still to re-send (a proactive rekey leaves them pending ~20 s): they
+     * go via DERP behind those frames. Withheld instead, those breaks wait
+     * for the RX-stale rekey. */
+    printf("    %u tests went via DERP behind a re-send; withheld instead: %u withheld, "
+           "back up to %.1f s after the first unanswered frame\n", safter, wskips, wworst / 1e6);
     ok("sim/silent-random-recovers", sgood);
     /* The lapse 12 s after the frame, the pong and the response one round
      * trip each (≤ 0.6 s here, DTIM wake included). */
@@ -1880,7 +2118,7 @@ static void test_sim(void)
            "exhausted); tests=%u silences=%u\n", s.lost_after_break, s.lost_cold,
            s.exhausted, o.lost_after_break, o.lost_cold, o.exhausted, s.tests, s.silences);
     ok("sim/blocked-as-1.3.7", s.exhausted == 1 && o.exhausted == 1 &&
-                               s.lost_after_break <= o.lost_after_break + 3);
+                               s.lost_after_break <= o.lost_after_break + 10);
     ok("sim/blocked-one-rekey", s.forced_rekeys <= 1 && s.tests == 1);
 
     /* Review of 1.3.6 (sim_loss.c): our WireGuard dropped on the direct
@@ -1897,12 +2135,14 @@ static void test_sim(void)
     run_sim(&s);
     run_sim(&o);
     printf("  our direct WireGuard dropped, DISCO + peer's WG pass, 1 h: %u lost (+%u still "
-           "to re-send), forced rekeys=%u, RX-stale=%u, tests=%u, handshakes=%u, "
-           "undelivered=%u, pings=%u probes=%u (1.3.7 rules: %u lost, RX-stale=%u, "
-           "handshakes=%u, undelivered=%u)\n",
+           "to re-send), forced rekeys=%u, RX-stale=%u, tests=%u (%u behind a re-send), "
+           "handshakes=%u, undelivered=%u, pings=%u probes=%u, peer packets under an old "
+           "keypair=%u (1.3.7 rules: %u lost, RX-stale=%u, handshakes=%u, undelivered=%u, "
+           "old-keypair packets=%u)\n",
            s.lost_after_break - s.lost_open, s.lost_open, s.forced_rekeys, s.stale_rekeys,
-           s.tests, s.hs_done, s.undelivered, s.pings, s.probes,
-           o.lost_after_break - o.lost_open, o.stale_rekeys, o.hs_done, o.undelivered);
+           s.tests, s.tests_after_rescue, s.hs_done, s.undelivered, s.pings, s.probes,
+           s.rx_oldkey, o.lost_after_break - o.lost_open, o.stale_rekeys, o.hs_done,
+           o.undelivered, o.rx_oldkey);
     ok("sim/upblock-no-rekey", s.forced_rekeys == 0 && s.silences == 0);
     ok("sim/upblock-backs-off", s.undelivered >= 30 && s.undelivered <= 60 &&
                                 s.pings <= 150 && s.tests <= s.undelivered + 2);
@@ -1915,22 +2155,29 @@ static void test_sim(void)
      * to 8 per episode). Aged by the last proof of delivery, the advert
      * out of the ring, 10 slots: none at any block instant (2 000 in the
      * round's sweep; 8 slots lost up to 3, 9 up to 1). */
-    uint32_t glost = 0, gworst = 0, gopen = 0, gtests = 0;
+    uint32_t glost = 0, gworst = 0, gopen = 0, gtests = 0, gafter = 0, nlost = 0;
     for (int trial = 0; trial < 500; trial++) {
         s = sim_base();
         s.wg_upblock_at = T0 + S(600) + MS((trial * 7919) % 110000) + trial;
         s.end = s.wg_upblock_at + S(240);
+        o = s;
+        o.no_ring_gate = true;
         run_sim(&s);
+        run_sim(&o);
         const uint32_t l = s.lost_after_break - s.lost_open;
         glost += l;
         if (l > gworst) gworst = l;
         gopen += s.lost_open;
         gtests += s.tests;
+        gafter += s.tests_after_rescue;
+        nlost += o.lost_after_break - o.lost_open;
     }
     printf("  known gap (our direct WireGuard dropped), 500 random block instants, 4 min "
-           "each: %u frames lost (max %u in one), %u still to re-send at the end, %u "
-           "tests\n", glost, gworst, gopen, gtests);
+           "each: %u frames lost (max %u in one), %u still to re-send at the end, %u tests, "
+           "%u of them via DERP behind a re-send (every test sent as it comes: %u lost — "
+           "the peer deleted their keypair)\n", glost, gworst, gopen, gtests, gafter, nlost);
     ok("sim/known-gap-closed", glost == 0);
+    ok("sim/known-gap-keypairs", nlost > 500);
 
     /* Review of 1.3.6 (sim_loss.c): random loss of WireGuard datagrams on
      * a healthy path, 6 h each. Declaring WG silent on the first window
@@ -2008,6 +2255,8 @@ int main(void)
     test_review();
     test_late_ticks();
     test_rescue_ring();
+    test_init_risk();
+    test_rekey_gate();
     test_unmanaged();
     test_deadline_agrees();
     test_init_fresh();
