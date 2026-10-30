@@ -33,7 +33,7 @@ TARGETS := test_blake2s test_curve25519 test_x25519 test_mapresp \
            test_backoff test_keys_regen test_stun_boot test_skip_value test_jsmn_split \
            test_tai64n test_nacl_box test_tsmp test_tl_date test_stats test_noise_ik \
            test_http1 test_ctrl_json test_ts2021 test_hpack test_h2_core test_tls_resume \
-           test_addr test_wifi_hint test_pwr_diag test_tlm_sched
+           test_addr test_wifi_hint test_pwr_diag test_tlm_sched test_ts2021_e2e
 
 all: $(TARGETS) $(H2_INTEROP)
 
@@ -208,6 +208,16 @@ test_hpack: test_hpack.c $(TL_SRC)/hpack.c $(TL_SRC)/hpack.h
 
 test_h2_core: test_h2_core.c $(H2_SRCS) $(TL_SRC)/h2_core.h $(TL_SRC)/hpack.h
 	$(CC) $(CFLAGS) -I$(TL_SRC) -o $@ test_h2_core.c $(H2_SRCS)
+
+# The map stream's first-response deadline end to end (round 1.3.8
+# review): test_ts2021.c again, with the real HTTP/2 client instead of its
+# stubs — h2_post_json_stream on conns ts2021_connect dials, through
+# ts2021_close's port and address rules.
+test_ts2021_e2e: test_ts2021.c $(TL_SRC)/ts2021_client.c $(TL_SRC)/ts2021_client.h \
+                 $(TL_SRC)/h2_client.c $(TL_SRC)/h2_client.h $(H2_SRCS) \
+                 $(TL_SRC)/tls_io.c $(NOISE_SRCS) host_include/esp_tls.h host_include/esp_timer.h
+	$(CC) $(CFLAGS) $(TS2021_DEFS) -DTS2021_E2E -I$(TL_SRC) -I$(TL_INC) -I$(CRYPTO) -Ihost_include \
+	    -o $@ test_ts2021.c $(TL_SRC)/tls_io.c $(TL_SRC)/h2_client.c $(H2_SRCS) $(NOISE_SRCS)
 
 # HTTP/2 interop against nghttp2's server side, in memory: the firmware
 # stack (h2_client.c → h2_core → ts2021_client.c, Noise records over a
@@ -455,7 +465,7 @@ test: test_blake2s.run test_curve25519.run test_x25519.run test_mapresp.run \
       test_nacl_box.run test_tsmp.run test_tl_date.run test_stats.run test_noise_ik.run \
       test_http1.run test_ctrl_json.run test_ts2021.run test_hpack.run test_h2_core.run \
       test_tls_resume.run test_addr.run test_wifi_hint.run test_pwr_diag.run \
-      test_tlm_sched.run h2_interop.run
+      test_tlm_sched.run test_ts2021_e2e.run h2_interop.run
 
 test_tls_resume.run: test_tls_resume
 	$(RUNNER) ./test_tls_resume
@@ -489,6 +499,9 @@ endif
 
 test_ts2021.run: test_ts2021
 	$(RUNNER) ./test_ts2021
+
+test_ts2021_e2e.run: test_ts2021_e2e
+	$(RUNNER) ./test_ts2021_e2e
 
 test_http1.run: test_http1
 	$(RUNNER) ./test_http1

@@ -268,9 +268,15 @@ esp_err_t esp_tls_plain_tcp_connect(const char *host, int hostlen, int port,
 }
 
 /* ts2021_connect / ts2021_close call into the HTTP/2 layer; not under
- * test here. */
+ * test here — except in test_ts2021_e2e (TS2021_E2E), which links the
+ * real one (h2_client.c, h2_core.c, hpack.c). */
+#ifndef TS2021_E2E
 esp_err_t h2_session_init(ts2021_conn_t *conn) { (void)conn; return ESP_OK; }
 void h2_session_destroy(ts2021_conn_t *conn) { (void)conn; }
+#else
+#include "h2_client.h"
+bool tl_time_synced(void) { return false; }
+#endif
 
 /* ---- helpers -------------------------------------------------------- */
 
@@ -1647,6 +1653,31 @@ static void test_response_deadline(void)
           rr != ESP_OK && s_conn.resp_expired && wall_ms_since(&w0) < TS2021_REQ_POLL_MS);
     ts2021_close(&s_conn);
 
+    /* Past, but a record waits received: it is read first (review); the
+     * read after it, with nothing waiting, expires. The one-shot deadline
+     * has no such grace (deadline_trickle_is_absolute). */
+    boot_reset();
+    script(ESP_OK, RP_OK, false, 1, RP_OK);
+    rc = dial(true);
+    s_conn.h2_rx_off = s_conn.h2_rx_len;
+    {
+        uint8_t rb[64];
+        size_t rbn = 0;
+        put_record(rb, &rbn, "200!", 4);
+        const bool w = write(s_srv_fd, rb, rbn) == (ssize_t)rbn;
+        ts2021_response_deadline(&s_conn, TS2021_RESP_TIMEOUT_MS,
+                                 esp_timer_get_time() - (int64_t)TS2021_RESP_TIMEOUT_MS * 1000 - 1);
+        const esp_err_t r1 = ts2021_recv_record(&s_conn, &got);
+        const bool read_first = w && r1 == ESP_OK && got == 4 &&
+                                memcmp(s_conn.h2_rx, "200!", 4) == 0 && !s_conn.resp_expired;
+        clock_gettime(CLOCK_MONOTONIC, &w0);
+        const esp_err_t r2 = ts2021_recv_record(&s_conn, &got);
+        check("resp_deadline_past_reads_received_bytes_first",
+              rc == ESP_OK && read_first && r2 != ESP_OK && s_conn.resp_expired &&
+              !s_conn.io_failed && wall_ms_since(&w0) < TS2021_REQ_POLL_MS);
+    }
+    ts2021_close(&s_conn);
+
     /* An answer in time is read; disarming (ts2021_request_deadline 0)
      * ends it too, back on the stream's 30-s polls. */
     boot_reset();
@@ -1796,9 +1827,116 @@ static void test_precompute(void)
     check("pre_low_order_nothing_kept", !s_pre.keyed && !s_pre.pre.have_ss && !s_pre.pre.have_e);
 }
 
+#ifdef TS2021_E2E
+/* ---- Round 1.3.8 review: the map stream's deadline end to end --------
+ *
+ * h2_post_json_stream on conns ts2021_connect dials (the :80 socketpair,
+ * the :443 fake), closed with ts2021_close, as the long-poll does: a
+ * boot poll the server never answers is recycled and the next dial stays
+ * on :80; the second in a row marks its conn failed and the next dial
+ * goes to :443 by name; a poll after a clean server end (END_STREAM after
+ * the 200) gets the stream budget and its expiries leave the port and
+ * the address alone. */
+static int e2e_cb(const uint8_t *b, size_t n, void *ctx)
+{
+    (void)b; (void)n; (void)ctx;
+    return 0;
+}
+
+static esp_err_t e2e_stream(int *status)
+{
+    /* the connect left the server's SETTINGS (kH2) in the h2_rx window */
+    return h2_post_json_stream(&s_conn, "/machine/map", CONFIG_TINYLINK_CONTROL_HOST,
+                               (const uint8_t *)"{\"Stream\":true}", 15, status, e2e_cb, NULL);
+}
+
+/* The server answers stream 1: the rest of the SETTINGS ACK whose first
+ * byte ends kH2, then HEADERS — the table size update to 0 our SETTINGS
+ * asked for, 200 (HPACK static index 8) — with END_STREAM. */
+static bool e2e_answer_and_end(void)
+{
+    static const uint8_t hdrs[] = { 0x00, 0x00, 0x04, 0x01, 0x00, 0x00, 0x00, 0x00,
+                                    0x00, 0x00, 0x02, 0x01, 0x05, 0x00, 0x00, 0x00, 0x01,
+                                    0x20, 0x88 };
+    uint8_t in[128];
+    size_t inn = 0;
+    put_record(in, &inn, hdrs, sizeof(hdrs));
+    return write(s_srv_fd, in, inn) == (ssize_t)inn;
+}
+
+static void test_e2e_resp_deadline(void)
+{
+    int st = 0;
+    boot_reset();
+    script(ESP_OK, RP_OK, false, 1, RP_OK);
+    esp_err_t rc = dial(true);
+    struct timespec w0;
+    clock_gettime(CLOCK_MONOTONIC, &w0);
+    esp_err_t err = e2e_stream(&st);
+    const long ms = wall_ms_since(&w0);
+    check("e2e_unanswered_poll_recycled_at_the_base",
+          rc == ESP_OK && s_conn.plain && err == ESP_FAIL && st == 0 && s_conn.resp_expired &&
+          !s_conn.io_failed && s_conn.req_ms == TS2021_RESP_TIMEOUT_MS &&
+          ms >= TS2021_RESP_TIMEOUT_MS - 50 && ms < TS2021_RESP_TIMEOUT_MS + 2 * TS2021_REQ_POLL_MS);
+    ts2021_close(&s_conn);
+    script(ESP_OK, RP_OK, false, 1, RP_OK);
+    rc = dial(true);
+    check("e2e_after_one_expiry_next_dial_80", rc == ESP_OK && s_conn.plain &&
+                                               strcmp(s_dials, "N80") == 0);
+    err = e2e_stream(&st);
+    check("e2e_second_expiry_in_a_row_marks_the_conn_failed",
+          err == ESP_FAIL && s_conn.resp_expired && s_conn.io_failed &&
+          s_conn.req_ms == 2 * TS2021_RESP_TIMEOUT_MS);
+    ts2021_close(&s_conn);
+    const bool next_tls = s_tls_next;
+    script(ESP_OK, RP_OK, false, 1, RP_OK);
+    rc = dial(true);
+    check("e2e_second_expiry_next_dial_443", next_tls && rc == ESP_OK && !s_conn.plain &&
+                                             strcmp(s_dials, "N443") == 0);
+    ts2021_close(&s_conn);
+
+    /* answered and ended by the server: the poll after it is patient */
+    script(ESP_OK, RP_OK, false, 1, RP_OK);
+    rc = dial(true);
+    const bool wrote = e2e_answer_and_end();
+    err = e2e_stream(&st);
+    check("e2e_answered_clean_end", rc == ESP_OK && s_conn.plain && wrote && err == ESP_OK &&
+                                    st == 200 && s_conn.h2_stream_error == 0);
+    ts2021_close(&s_conn);
+    for (int i = 0; i < 2; i++) {
+        script(ESP_OK, RP_OK, false, 1, RP_OK);
+        rc = dial(true);
+        /* the clock past any deadline at once: which one was armed is
+         * req_ms; nothing buffered, so the first read expires it */
+        s_clock_step = (int64_t)TS2021_RESP_TIMEOUT_MAX_MS * 1000 * 2;
+        err = e2e_stream(&st);
+        s_clock_step = 0;
+        const bool patient = err == ESP_FAIL && s_conn.resp_expired && !s_conn.io_failed &&
+                             s_conn.req_ms == TS2021_RESP_TIMEOUT_MAX_MS;
+        ts2021_close(&s_conn);
+        const bool tls_next = s_tls_next;
+        script(ESP_OK, RP_OK, false, 1, RP_OK);
+        rc = dial(true);
+        char nm[80];
+        snprintf(nm, sizeof(nm), "e2e_after_clean_end_patient_no_escalation_%d", i + 1);
+        check(nm, rc == ESP_OK && patient && !tls_next && s_conn.plain &&
+                  strcmp(s_dials, "N80") == 0);
+        ts2021_close(&s_conn);
+    }
+}
+#endif
+
 int main(void)
 {
     s_build_reply = build_reply_int;
+#ifdef TS2021_E2E
+    curve25519_derive_pub(s_machine_pub, kMachinePriv);
+    curve25519_derive_pub(s_control_pub, kControlPriv);
+    test_e2e_resp_deadline();
+    if (s_srv_fd >= 0) close(s_srv_fd);
+    if (s_fails == 0) printf("\nALL OK\n");
+    return s_fails ? 1 : 0;
+#endif
     curve25519_derive_pub(s_machine_pub, kMachinePriv);
     curve25519_derive_pub(s_control_pub, kControlPriv);
     test_no_early_payload();
