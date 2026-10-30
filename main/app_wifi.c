@@ -24,6 +24,10 @@
 #include "tinylink.h"
 #include "wifi_diag.h"
 #include "wifi_hint.h"
+#include "wifi_psk.h"
+#if CONFIG_TINYLINK_WIFI_EARLY_PSK
+#include "freertos/task.h"
+#endif
 
 static const char *TAG = "app_wifi";
 
@@ -222,6 +226,122 @@ static uint8_t hint_load(void)
     return tl_wifi_channel(&s_conn);
 }
 
+#if CONFIG_TINYLINK_WIFI_EARLY_PSK
+/* Early PSK (round 1.3.8, wifi_psk.h). app_wifi_start copies the
+ * credentials into s_psk and starts psk_task on CPU 1, which derives the
+ * PMK while CPU 0 runs esp_wifi_init, PHY calibration and STA start; the
+ * STA_START handler waits for it — bounded — and hands the driver the 64
+ * hex digits, so the association no longer runs PBKDF2 on the Wi-Fi
+ * task between the scan and the auth frame (170 ms on the 1.3.7 sensor).
+ * Late or failed, the passphrase config stays and the driver derives as
+ * before. tl_psk_publish / tl_psk_claim decide which side owns — and
+ * scrubs — the result. */
+#define WIFI_PSK_BIT    BIT2
+#define PSK_WAIT_MS     200u    /* more than the whole derivation (~120 ms) */
+#define PSK_TASK_STACK  2048u   /* tools/stack_worst.py: wifi_psk */
+#define PSK_TASK_PRIO   5       /* alone on CPU 1 at that point of the boot */
+static struct {
+    uint8_t  pass[TL_PSK_PASS_MAX];
+    uint8_t  ssid[TL_PSK_SSID_MAX];
+    uint8_t  pass_len;
+    uint8_t  ssid_len;
+    char     hex[TL_PSK_HEX_LEN];
+    uint32_t derive_ms;
+    uint32_t state;                     /* TL_PSK_* */
+} s_psk;
+
+/* What the derivation leaves in its stack frames (the last schedule
+ * words, spilled registers) would go back to the heap with the task
+ * stack: overwritten first. Deeper than tl_psk_derive's frames. */
+static __attribute__((noinline)) void psk_burn_stack(void)
+{
+    uint8_t burn[768];
+    tl_psk_scrub(burn, sizeof(burn));
+}
+
+static void psk_task(void *arg)
+{
+    (void)arg;
+    const int64_t t0 = esp_timer_get_time();
+    uint8_t pmk[TL_PSK_LEN];
+    const bool ok = tl_psk_derive(s_psk.pass, s_psk.pass_len, s_psk.ssid, s_psk.ssid_len, pmk);
+    tl_psk_scrub(s_psk.pass, sizeof(s_psk.pass));
+    if (ok) tl_psk_hex(pmk, s_psk.hex);
+    tl_psk_scrub(pmk, sizeof(pmk));
+    s_psk.derive_ms = (uint32_t)((esp_timer_get_time() - t0) / 1000);
+    if (!(ok && tl_psk_publish(&s_psk.state))) {
+        /* The connect went ahead without it (or the inputs were refused,
+         * which app_wifi_start already ruled out). */
+        tl_psk_scrub(s_psk.hex, sizeof(s_psk.hex));
+    }
+    xEventGroupSetBits(s_wifi_events, WIFI_PSK_BIT);   /* the claim decides */
+    psk_burn_stack();
+    vTaskDelete(NULL);
+}
+
+/* Boot, credentials just read: start the derivation on CPU 1 unless the
+ * driver would not run PBKDF2 on them (a 64-character password is a PSK
+ * already; lengths it refuses stay its business). */
+static void psk_start(const char *ssid, size_t ssid_len, const char *pass, size_t pass_len)
+{
+    if (!tl_psk_inputs_ok(pass_len, ssid_len)) return;
+    memcpy(s_psk.pass, pass, pass_len);
+    s_psk.pass_len = (uint8_t)pass_len;
+    memcpy(s_psk.ssid, ssid, ssid_len);
+    s_psk.ssid_len = (uint8_t)ssid_len;
+    __atomic_store_n(&s_psk.state, TL_PSK_RUNNING, __ATOMIC_RELEASE);
+    if (xTaskCreatePinnedToCore(psk_task, "wifi_psk", PSK_TASK_STACK, NULL, PSK_TASK_PRIO,
+                                NULL, 1) != pdPASS) {
+        __atomic_store_n(&s_psk.state, TL_PSK_IDLE, __ATOMIC_RELEASE);
+        tl_psk_scrub(s_psk.pass, sizeof(s_psk.pass));
+        ESP_LOGW(TAG, "wifi psk: task not created — the driver derives it from the passphrase");
+    }
+}
+
+/* The 64 hex digits into the driver's station config. A frame of its
+ * own: the ~180-B config is on the sys_evt stack (2 304 B) only during
+ * this call, not under psk_apply's log line (esp_log's chain is the
+ * deepest thing that task runs: 1 280 B, tools/stack_worst.py). */
+static __attribute__((noinline)) esp_err_t psk_set_config(void)
+{
+    wifi_config_t cfg;
+    _Static_assert(sizeof(cfg.sta.password) == TL_PSK_HEX_LEN, "64 hex digits, no terminator");
+    esp_err_t err = esp_wifi_get_config(WIFI_IF_STA, &cfg);
+    if (err == ESP_OK) {
+        memcpy(cfg.sta.password, s_psk.hex, sizeof(cfg.sta.password));
+        err = esp_wifi_set_config(WIFI_IF_STA, &cfg);
+    }
+    tl_psk_scrub(&cfg, sizeof(cfg));
+    return err;
+}
+
+/* STA_START, before the connect: the PSK in place of the passphrase if
+ * the derivation is done within PSK_WAIT_MS. */
+static __attribute__((noinline)) void psk_apply(void)
+{
+    const uint32_t st = __atomic_load_n(&s_psk.state, __ATOMIC_ACQUIRE);
+    if (st != TL_PSK_RUNNING && st != TL_PSK_READY) return;         /* not started, or done */
+    const int64_t t0 = esp_timer_get_time();
+    (void)xEventGroupWaitBits(s_wifi_events, WIFI_PSK_BIT, pdTRUE, pdTRUE,
+                              pdMS_TO_TICKS(PSK_WAIT_MS));
+    const unsigned waited_ms = (unsigned)((esp_timer_get_time() - t0) / 1000);
+    if (!tl_psk_claim(&s_psk.state)) {
+        ESP_LOGW(TAG, "wifi psk: not derived after %u ms — the driver derives it from the "
+                      "passphrase", waited_ms);
+        return;
+    }
+    const esp_err_t err = psk_set_config();
+    tl_psk_scrub(s_psk.hex, sizeof(s_psk.hex));
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "wifi psk: derived on CPU 1 in %u ms, waited %u ms — PSK to the driver, "
+                      "no PBKDF2 at the auth", (unsigned)s_psk.derive_ms, waited_ms);
+    } else {
+        ESP_LOGW(TAG, "wifi psk: esp_wifi_set_config failed: 0x%x — the driver derives it "
+                      "from the passphrase", err);
+    }
+}
+#endif
+
 static void wifi_event_handler(void *arg, esp_event_base_t base,
                                int32_t id, void *data)
 {
@@ -230,6 +350,9 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
 
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
         ESP_LOGI(TAG, "STA start, connecting");
+#if CONFIG_TINYLINK_WIFI_EARLY_PSK
+        psk_apply();
+#endif
 #if CONFIG_TINYLINK_WIFI_DIAG
         wifi_diag_start();
 #endif
@@ -316,6 +439,37 @@ esp_err_t app_wifi_start(void)
         return ESP_ERR_NO_MEM;
     }
 
+    /* The credentials first (round 1.3.8): the early PSK derivation
+     * starts from them and runs while the rest of this function does. */
+    char ssid[WIFI_SSID_MAX + 1] = {0};
+    char pass[WIFI_PASS_MAX + 1] = {0};
+    esp_err_t err = app_nvs_read_str(WIFI_SSID_KEY, ssid, sizeof(ssid));
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "missing nvs key %s", WIFI_SSID_KEY);
+        return err;
+    }
+    err = app_nvs_read_str(WIFI_PASS_KEY, pass, sizeof(pass));
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "missing nvs key %s", WIFI_PASS_KEY);
+        tl_psk_scrub(pass, sizeof(pass));
+        return err;
+    }
+
+    wifi_config_t wifi_cfg = {0};
+    /* memcpy + strnlen instead of strncpy(dst, src, sizeof(dst)) — the
+     * classic form trips -Wstringop-truncation at -O2 because gcc can't
+     * prove src is NUL-terminated even when app_nvs_read_str() guarantees
+     * it. The struct is zero-init'd above, so a shorter copy leaves the
+     * tail at 0 which is what the WiFi driver expects. */
+    const size_t ssid_len = strnlen(ssid, sizeof(wifi_cfg.sta.ssid));
+    const size_t pass_len = strnlen(pass, sizeof(wifi_cfg.sta.password));
+    memcpy(wifi_cfg.sta.ssid, ssid, ssid_len);
+    memcpy(wifi_cfg.sta.password, pass, pass_len);
+#if CONFIG_TINYLINK_WIFI_EARLY_PSK
+    psk_start(ssid, ssid_len, pass, pass_len);
+#endif
+    tl_psk_scrub(pass, sizeof(pass));
+
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
@@ -335,29 +489,6 @@ esp_err_t app_wifi_start(void)
     ESP_ERROR_CHECK(esp_event_handler_instance_register(
         IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, NULL));
 
-    char ssid[WIFI_SSID_MAX + 1] = {0};
-    char pass[WIFI_PASS_MAX + 1] = {0};
-    esp_err_t err = app_nvs_read_str(WIFI_SSID_KEY, ssid, sizeof(ssid));
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "missing nvs key %s", WIFI_SSID_KEY);
-        return err;
-    }
-    err = app_nvs_read_str(WIFI_PASS_KEY, pass, sizeof(pass));
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "missing nvs key %s", WIFI_PASS_KEY);
-        return err;
-    }
-
-    wifi_config_t wifi_cfg = {0};
-    /* memcpy + strnlen instead of strncpy(dst, src, sizeof(dst)) — the
-     * classic form trips -Wstringop-truncation at -O2 because gcc can't
-     * prove src is NUL-terminated even when app_nvs_read_str() guarantees
-     * it. The struct is zero-init'd above, so a shorter copy leaves the
-     * tail at 0 which is what the WiFi driver expects. */
-    memcpy(wifi_cfg.sta.ssid, ssid,
-           strnlen(ssid, sizeof(wifi_cfg.sta.ssid)));
-    memcpy(wifi_cfg.sta.password, pass,
-           strnlen(pass, sizeof(wifi_cfg.sta.password)));
     wifi_cfg.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
     wifi_cfg.sta.pmf_cfg.capable = true;
 #if CONFIG_TINYLINK_WIFI_PS_MAX_MODEM
@@ -365,7 +496,7 @@ esp_err_t app_wifi_start(void)
 #endif
 
     /* Round 1.3.7: scan the last AP's channel first (wifi_hint.h). */
-    s_ssid_hash = tl_wifi_ssid_hash(wifi_cfg.sta.ssid, strnlen(ssid, sizeof(wifi_cfg.sta.ssid)));
+    s_ssid_hash = tl_wifi_ssid_hash(wifi_cfg.sta.ssid, ssid_len);
     wifi_cfg.sta.channel = hint_load();
     s_cfg_channel = wifi_cfg.sta.channel;
     tinylink_set_persist_hook(hint_persist);
@@ -388,6 +519,7 @@ esp_err_t app_wifi_start(void)
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg));
+    tl_psk_scrub(&wifi_cfg, sizeof(wifi_cfg));       /* the driver has its copy */
     ESP_ERROR_CHECK(esp_wifi_start());
 
     /* Modem awake for the boot exchange (round 1.3.1): under modem

@@ -1420,6 +1420,8 @@ def project_config():
         R('wg_tai64n_now', r's_persist_fn', ['tai64n_persist_cb'], 'tinylink.c:194'),
         R('telemetry_task', r'persist_hook\(\)', ['app_wifi.c:hint_persist'],
           'tinylink_set_persist_hook(hint_persist), app_wifi.c (round 1.3.7)'),
+        R(None, r'tl_psk_memset\(', ['memset'],
+          'wifi_psk.h scrub: a volatile pointer to memset (round 1.3.8)'),
         R('_printf_float', r'pfunc', ['__ssputs_r', '__sfputs_r'],
           'tl_libc_stubs.c float stub'),
         # ---- log / ROM console ----------------------------------------------
@@ -1789,6 +1791,12 @@ def project_config():
             {'name': TIT, 'alloc': 4608, 'entry': ['tcpip_thread']},
             # CONFIG_ESP_TIMER_TASK_STACK_SIZE (round 1.3.3, B18)
             {'name': TMR, 'alloc': 4608, 'entry': ['timer_task']},
+            # early Wi-Fi PSK (round 1.3.8): PBKDF2 on CPU 1 while the
+            # driver starts (app_wifi.c PSK_TASK_STACK); exits.
+            # Its vTaskDelete(NULL) is a self-delete: prvDeleteTCB runs on
+            # the idle task (tasks.c vTaskDelete, xIsCurRunning).
+            {'name': 'wifi_psk', 'alloc': 2048, 'entry': ['psk_task'],
+             'cut': [('vTaskDelete', 'prvDeleteTCB')]},
             # bringup (app_main): register, dataplane start, spawns; exits.
             # CONFIG_ESP_MAIN_TASK_STACK_SIZE (round 1.3.4, D4)
             {'name': 'main', 'alloc': 8192, 'entry': ['main_task']},
