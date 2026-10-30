@@ -34,7 +34,7 @@ TARGETS := test_blake2s test_curve25519 test_x25519 test_mapresp \
            test_tai64n test_nacl_box test_tsmp test_tl_date test_stats test_noise_ik \
            test_http1 test_ctrl_json test_ts2021 test_hpack test_h2_core test_tls_resume \
            test_addr test_wifi_hint test_wifi_psk test_pwr_diag test_tlm_sched test_tls_offer \
-           test_tls_rtc test_ts2021_e2e test_derp_wlock
+           test_tls_rtc test_ts2021_e2e test_derp_wlock test_warm
 
 all: $(TARGETS) $(H2_INTEROP)
 
@@ -79,6 +79,13 @@ test_stun_boot: test_stun_boot.c $(TL_SRC)/stun_boot.h
 # records, write-only-on-change over a fake NVS. Header-only.
 test_addr: test_addr.c $(TL_SRC)/tl_addr.h $(TL_SRC)/netmap.h
 	$(CC) $(CFLAGS) -I$(TL_SRC) -o $@ test_addr.c
+
+# Warm-start record (round 1.3.9): text forms, the record a netmap gives
+# and what it hands back to wg_dataplane_start, the strict decode
+# (truncations, counts, mutations), the diff and its restart verdict, the
+# write-on-change policy over a fake NVS across reboots. Header-only.
+test_warm: test_warm.c $(TL_SRC)/tl_warm.h $(TL_SRC)/tl_addr.h $(TL_SRC)/netmap.h
+	$(CC) $(CFLAGS) -I$(TL_SRC) -o $@ test_warm.c
 
 # Wi-Fi association hint + retry policy (round 1.3.7, main/wifi_hint.h):
 # the record, write-only-on-change over a fake NVS, the retry decisions
@@ -505,7 +512,7 @@ test: test_blake2s.run test_curve25519.run test_x25519.run test_mapresp.run \
       test_http1.run test_ctrl_json.run test_ts2021.run test_hpack.run test_h2_core.run \
       test_tls_resume.run test_addr.run test_wifi_hint.run test_wifi_psk.run test_pwr_diag.run \
       test_tlm_sched.run test_tls_offer.run test_tls_rtc.run test_ts2021_e2e.run \
-      test_derp_wlock.run h2_interop.run
+      test_derp_wlock.run test_warm.run h2_interop.run
 
 test_tls_rtc.run: test_tls_rtc
 	$(RUNNER) ./test_tls_rtc
@@ -518,6 +525,9 @@ test_tls_resume.run: test_tls_resume
 
 test_addr.run: test_addr
 	$(RUNNER) ./test_addr
+
+test_warm.run: test_warm
+	$(RUNNER) ./test_warm
 
 test_wifi_hint.run: test_wifi_hint
 	$(RUNNER) ./test_wifi_hint

@@ -104,6 +104,12 @@ esp_err_t wg_netif_update_peer_endpoint(uint32_t v4_be, uint16_t port);
 esp_err_t wg_netif_update_peer_keys(const uint8_t static_pub[WG_KEY_LEN],
                                     const uint8_t *disco_pub);
 
+/* The peer's tailnet IPv4 (network order) changed — the destination of
+ * the TSMP disco advert (round 1.3.9). With the session up the advert
+ * goes again at once: the one after the last handshake carried the old
+ * address, which the peer drops. Long-poll task. */
+esp_err_t wg_netif_update_peer_tailnet(uint32_t v4_be);
+
 /* Path events that can unblock a pending handshake (round 1.3.2, B7).
  * While an INIT is unanswered (cold handshake or rekey), the SAME INIT
  * is re-sent — not a new attempt, so REKEY_TIMEOUT pacing is untouched:

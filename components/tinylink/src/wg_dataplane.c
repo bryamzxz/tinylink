@@ -36,6 +36,7 @@ static uint64_t s_peer_id;
 static uint8_t  s_peer_node_pub[32];
 static uint8_t  s_peer_disco_pub[32];
 static bool     s_peer_has_disco;
+static uint32_t s_peer_tailnet_v4_be;   /* its first /32: the TSMP advert's destination */
 static uint32_t s_self_v4_be;           /* tunnel-side IPv4 the netif was attached with */
 
 /* Parse "1.2.3.4/32" → host out + numeric prefix length. Tailscale
@@ -236,8 +237,8 @@ static bool peer_has_directly_reachable_endpoint(const tl_peer_t *peer,
  * (sharing our CGNAT public) before a remote node we can actually
  * reach. Prefer the first peer with at least one cross-NAT public
  * endpoint; fall back to peers[0] when no peer qualifies (DERP-relay
- * territory — that's the M5+ work). */
-static const tl_peer_t *select_target_peer(const tl_peer_t *peers, size_t n_peers)
+ * territory — that's the M5+ work). `*qualified` false = the fallback. */
+static size_t target_index(const tl_peer_t *peers, size_t n_peers, bool *qualified)
 {
     uint8_t  our_addr[4];
     uint16_t our_port_unused;
@@ -248,27 +249,41 @@ static const tl_peer_t *select_target_peer(const tl_peer_t *peers, size_t n_peer
     }
 
     for (size_t i = 0; i < n_peers; i++) {
-        const tl_peer_t *p = &peers[i];
-        if (peer_has_directly_reachable_endpoint(p, have_our_public, our_v4_be)) {
-            if (i != 0) {
-                const char *addr = (p->n_addresses > 0)
-                    ? p->addresses[0].str : "(no-addr)";
-                ESP_LOGI(TAG, "selected peer #%u (%s) over peers[0] — "
-                              "first peer with cross-NAT-reachable endpoint",
-                         (unsigned)i, addr);
-            }
-            return p;
+        if (peer_has_directly_reachable_endpoint(&peers[i], have_our_public, our_v4_be)) {
+            *qualified = true;
+            return i;
         }
+    }
+    *qualified = false;
+    return 0;
+}
+
+size_t wg_dataplane_target_index(const tl_peer_t *peers, size_t n_peers)
+{
+    bool qualified;
+    return (peers == NULL || n_peers == 0) ? 0 : target_index(peers, n_peers, &qualified);
+}
+
+static const tl_peer_t *select_target_peer(const tl_peer_t *peers, size_t n_peers)
+{
+    bool qualified = false;
+    const size_t i = target_index(peers, n_peers, &qualified);
+    if (qualified && i != 0) {
+        const tl_peer_t *p = &peers[i];
+        const char *addr = (p->n_addresses > 0) ? p->addresses[0].str : "(no-addr)";
+        ESP_LOGI(TAG, "selected peer #%u (%s) over peers[0] — "
+                      "first peer with cross-NAT-reachable endpoint",
+                 (unsigned)i, addr);
     }
     /* Every peer's only public endpoint is our own public IP — pure
      * CGNAT scenario. Fall through to peers[0]; direct path will fail
      * but we keep the legacy behavior so DERP-relay (M5+) can take
      * over once it lands. */
-    if (n_peers > 0) {
+    if (!qualified && n_peers > 0) {
         ESP_LOGW(TAG, "no peer has a cross-NAT public endpoint; "
                       "falling back to peers[0] — DERP relay required for ping");
     }
-    return &peers[0];
+    return &peers[i];
 }
 
 esp_err_t wg_dataplane_start(const tinylink_keys_t *keys,
@@ -351,6 +366,7 @@ esp_err_t wg_dataplane_start(const tinylink_keys_t *keys,
     peer_cfg.self_tailnet_v4_be  = first_host_v4(self_addrs, n_self);
     peer_cfg.peer_tailnet_v4_be  = first_host_v4(peer->addresses,
                                                  peer->n_addresses);
+    s_peer_tailnet_v4_be = peer_cfg.peer_tailnet_v4_be;
     err = wg_netif_start(&peer_cfg);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "wg_netif_start: %s", esp_err_to_name(err));
@@ -495,6 +511,27 @@ esp_err_t wg_dataplane_update_peers(const tinylink_keys_t *keys,
      * both, and the cold-handshake INIT a new NodeKey triggers must go
      * to the new address, not wait out a 5-s retry against the old. */
     esp_err_t err = apply_peer_endpoint(peer);
+
+    /* Same peer, new tailnet address (an admin edit; round 1.3.9 — the
+     * warm start's cached one can be stale too): the TSMP advert must
+     * carry the address the peer accepts. Before 1.3.9 a change here was
+     * ignored for the rest of the run. Our own address is the caller's
+     * (long_poll_handler restarts on it). An address list without a /32
+     * leaves the last one. */
+    const uint32_t ts_v4 = first_host_v4(peer->addresses, peer->n_addresses);
+    if (ts_v4 != 0 && ts_v4 != s_peer_tailnet_v4_be) {
+        char was[16], now[16];
+        inet_ntop(AF_INET, &s_peer_tailnet_v4_be, was, sizeof(was));
+        inet_ntop(AF_INET, &ts_v4, now, sizeof(now));
+        ESP_LOGI(TAG, "peer tailnet address changed: %s → %s — updating the session",
+                 was, now);
+        esp_err_t aerr = wg_netif_update_peer_tailnet(ts_v4);
+        if (aerr == ESP_OK) {
+            s_peer_tailnet_v4_be = ts_v4;
+        } else {
+            err = aerr;
+        }
+    }
 
     /* Same peer, new identity keys: a re-login (NodeKey) or a
      * tailscaled restart (DiscoKey, every start). Without this the

@@ -2572,6 +2572,18 @@ esp_err_t wg_netif_update_peer_endpoint(uint32_t v4_be, uint16_t port)
     return ESP_OK;
 }
 
+esp_err_t wg_netif_update_peer_tailnet(uint32_t v4_be)
+{
+    if (!g.initialized) return ESP_ERR_INVALID_STATE;
+    /* send_disco_advert reads it unlocked on wg_rx / the DERP task: an
+     * aligned 32-bit store, never torn. */
+    xSemaphoreTake(g.lock, portMAX_DELAY);
+    g.peer.peer_tailnet_v4_be = v4_be;
+    xSemaphoreGive(g.lock);
+    if (wg_netif_is_up()) send_disco_advert();
+    return ESP_OK;
+}
+
 esp_err_t wg_netif_update_peer_keys(const uint8_t static_pub[WG_KEY_LEN],
                                     const uint8_t *disco_pub)
 {

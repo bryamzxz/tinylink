@@ -284,9 +284,17 @@ static esp_err_t bringup(void)
         return err;
     }
 
-    /* Telemetry starts from the long-poll handler on the first netmap
-     * (so it never sends to a 100.64.x.y destination before the WG
-     * netif exists) — nothing to start here. */
+    /* Warm start (round 1.3.9): WireGuard up from the previous boot's
+     * netmap while the push and the map stream just sent are answered —
+     * this task runs once the long-poll blocks on them. Registered above
+     * (keys confirmed, node authorized); the netmap then confirms or
+     * corrects it (tinylink.c). Best effort, logs its outcome. */
+    tinylink_warm_start();
+
+    /* Telemetry starts with the WG netif — from the warm start above, or
+     * from the long-poll handler on the first netmap (so it never sends
+     * to a 100.64.x.y destination before the WG netif exists) — nothing
+     * to start here. */
 
     /* Periodic STUN re-probe so HostInfo.Endpoints stays fresh against
      * NAT rebinds and WAN address changes. Best-effort, silent on

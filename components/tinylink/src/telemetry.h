@@ -54,6 +54,13 @@ int64_t tinylink_stun_reprobe_poll(int64_t now_us, int64_t early_us);
  * so an NVS write never lands on the boot path. */
 void tinylink_addr_persist_poll(void);
 
+/* Provided by tinylink.c (round 1.3.9, tl_warm.h): write the warm-start
+ * record when it changed enough (at most hourly for endpoints / DiscoKey
+ * alone), and end a warm start no netmap confirmed within
+ * CONFIG_TINYLINK_WARM_START_MAX_S (erase, restart). 60-s housekeeping
+ * only; a no-op without CONFIG_TINYLINK_WARM_START. */
+void tinylink_warm_persist_poll(void);
+
 #ifdef __cplusplus
 }
 #endif

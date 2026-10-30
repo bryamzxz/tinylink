@@ -239,6 +239,17 @@ esp_err_t tinylink_dataplane_start(void);
  */
 esp_err_t tinylink_long_poll_start(void);
 
+/* Round 1.3.9 (CONFIG_TINYLINK_WARM_START): bring the WireGuard data
+ * plane up from the previous boot's netmap (NVS tl_state "warm_rec")
+ * while the long-poll's endpoint push and map stream run — after a
+ * successful tinylink_register that sent no auth key, and after
+ * tinylink_long_poll_start (so the push is out first). The first netmap
+ * confirms it, updates it in place, or erases the record and restarts
+ * into a cold boot when the session cannot follow (src/tl_warm.h,
+ * tinylink.c). Logs what it did; a no-op when there is no usable record,
+ * the netmap came first, or the option is off. */
+void tinylink_warm_start(void);
+
 /* True once the WG session has transport keys (a handshake response
  * was accepted). Non-blocking, callable from any task or an esp_timer
  * callback; app_wifi.c polls it to end the modem-awake boot window. */

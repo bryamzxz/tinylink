@@ -330,6 +330,7 @@ static void telemetry_task(void *arg)
             tinylink_diag_dump_stacks();
             tl_time_poll_persist();
             tinylink_addr_persist_poll();
+            tinylink_warm_persist_poll();
             void (*persist_hook)(void) = __atomic_load_n(&s_persist_hook, __ATOMIC_ACQUIRE);
             if (persist_hook != NULL) persist_hook();
             now = esp_timer_get_time();
