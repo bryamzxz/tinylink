@@ -15,7 +15,7 @@ extern "C" {
 
 #define TINYLINK_VERSION_MAJOR 1
 #define TINYLINK_VERSION_MINOR 3
-#define TINYLINK_VERSION_PATCH 7
+#define TINYLINK_VERSION_PATCH 8
 
 /* String forms derived from the integer components above so a future
  * bump only touches the three #defines. Adjacent-string-literal
