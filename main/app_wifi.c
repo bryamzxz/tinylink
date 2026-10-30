@@ -22,6 +22,7 @@
 #include "app_nvs.h"
 #include "backoff.h"
 #include "tinylink.h"
+#include "wifi_diag.h"
 #include "wifi_hint.h"
 
 static const char *TAG = "app_wifi";
@@ -197,6 +198,9 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
 
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
         ESP_LOGI(TAG, "STA start, connecting");
+#if CONFIG_TINYLINK_WIFI_DIAG
+        wifi_diag_start();
+#endif
         esp_err_t cerr = esp_wifi_connect();
         if (cerr != ESP_OK) {
             /* A synchronous error queues no DISCONNECTED event, so the
@@ -211,6 +215,9 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
         const bool changed = tl_wifi_on_connected(&s_conn, c->channel, c->bssid, s_ssid_hash);
         const tl_wifi_ap_t ap = s_conn.ap;
         portEXIT_CRITICAL(&s_conn_mux);
+#if CONFIG_TINYLINK_WIFI_DIAG
+        wifi_diag_note(WIFI_DIAG_CONNECTED, c->channel, 0);
+#endif
         if (ap.channel != 0) tl_wifi_rtc_put(&s_hint_rtc, &ap);     /* free: every connect */
         if (changed) {
             ESP_LOGI(TAG, "wifi hint: AP on channel %u — in RTC now, NVS at the next housekeeping",
@@ -242,6 +249,11 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
                          reason, s_retry_count, (unsigned)delay_ms);
             }
         }
+#if CONFIG_TINYLINK_WIFI_DIAG
+        wifi_diag_note(WIFI_DIAG_DISCONNECTED, (uint16_t)reason, d ? d->rssi : 0);
+        wifi_diag_note(WIFI_DIAG_RETRY, n.channel, (int16_t)(delay_ms < 32767u ? delay_ms : 32767u));
+        wifi_diag_flush();
+#endif
         xEventGroupClearBits(s_wifi_events, WIFI_CONNECTED_BIT);
         if (s_reconnect_timer != NULL) {
             (void)esp_timer_stop(s_reconnect_timer);   /* coalesce bursts */
@@ -258,6 +270,10 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)data;
         ESP_LOGI(TAG, "got ip " IPSTR, IP2STR(&event->ip_info.ip));
         s_retry_count = 0;
+#if CONFIG_TINYLINK_WIFI_DIAG
+        wifi_diag_note(WIFI_DIAG_GOT_IP, 0, 0);
+        wifi_diag_flush();
+#endif
         xEventGroupSetBits(s_wifi_events, WIFI_CONNECTED_BIT);
     }
 }
