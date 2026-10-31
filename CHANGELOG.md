@@ -9,10 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [1.4.0] - 2026-10-30
 
-The first tagged release: it covers the 1.3.x optimization rounds
-(1.3.0–1.3.9) below and everything before them, which was never tagged.
+Tagged `v1.4.0`, the last release of this work line; what is left is in
+`docs/BACKLOG.md`. It covers the 1.3.x optimization rounds (1.3.0–1.3.9)
+below; the entries after them are the history before, of which only
+`v1.2.0` (2026-09-04, M14 + M15) was tagged.
 
-### Optimization round 1.3.9 — ships as 1.4.0 (in progress, branch `feat/opt-1.3.9`)
+### Optimization round 1.3.9 — ships as 1.4.0 (branch `feat/opt-1.3.9`)
 
 The last round of the 1.3.x line: the firmware reports **1.4.0**, the
 last release of this work line. What is left is in `docs/BACKLOG.md`.
@@ -512,7 +514,7 @@ before). Not yet on the sensor.
   the netmap is off the WireGuard path, so its median matters less than
   its tail.
 
-### Optimization round 1.3.8 — TLS handshake, WireGuard silence, stalled polls, PSK (in progress, branch `feat/opt-1.3.8`)
+### Optimization round 1.3.8 — TLS handshake, WireGuard silence, stalled polls, PSK (branch `feat/opt-1.3.8`)
 
 Four parallel tracks on top of 1.3.7 plus a register retry ladder;
 independent reviews: three passes on the data plane (a medium finding
@@ -1655,7 +1657,7 @@ Backup valid (1.3.6 `gf7d95e1`, image checksum and hash OK; otadata seq
   `wg_rx` 4 084 of 8 192, `wg_tx` 2 852 of 5 120, `tinylink_tlm` 2 620
   of 4 608, `esp_timer` 3 032 of 4 608.
 
-### Optimization round 1.3.6 — data-plane path selection (in progress, branch `feat/opt-1.3.6`)
+### Optimization round 1.3.6 — data-plane path selection (branch `feat/opt-1.3.6`)
 
 What the 1.3.5 hardware runs showed about the direct path: any
 authenticated datagram on the UDP socket "confirmed" it and stopped the
@@ -1763,7 +1765,7 @@ CRC OK; flashed `827c1b9` (reports `gf7d95e1`, the pre-rewrite hash).
   2 780 of 5 120, `tinylink_tlm` 2 628 of 4 608, `esp_timer` 3 024 of
   4 608.
 
-### Optimization round 1.3.5 — boot and reconnect latency (in progress, branch `feat/opt-1.3.5`)
+### Optimization round 1.3.5 — boot and reconnect latency (branch `feat/opt-1.3.5`)
 
 The rest of round D's latency items (D9, D10, a D11 slice), built in three
 parallel branches — control transport (`feat/r135-ctl`), bringup order
@@ -1952,7 +1954,7 @@ serial reset took 3–9 s and is not ours).
   `tinylink_derp` 4 532 of 8 192, `wg_rx` 4 116 of 8 192, `wg_tx` 2 904
   of 5 120, `tinylink_tlm` 2 636 of 4 608, `esp_timer` 3 032 of 4 608.
 
-### Optimization round D 1.3.4 (in progress, branch `feat/opt-1.3.4`)
+### Optimization round D 1.3.4 (branch `feat/opt-1.3.4`)
 
 Round D of `docs/rounds/2026-10-optimization-list.md` (memory), built in
 two parallel branches — control transport (`feat/r134-ctl`) and map
@@ -2082,7 +2084,7 @@ CRC OK; flashed `2c22a8b`.
   7-KiB long-poll stack: `tinylink_lp` 3 444 B used (static worst case
   4 864), netmap 4.7 s after the drop, heap unchanged.
 
-### Optimization round 1.3.3 (in progress, branch `feat/opt-1.3.3`)
+### Optimization round 1.3.3 (branch `feat/opt-1.3.3`)
 
 - **B22 — a known node registers without Auth.** A restarted tailscaled
   sends `RegisterRequest` with `Auth` nil (`json:",omitempty"`) and
@@ -4918,4 +4920,5 @@ each flash.
 - `examples/milestone1_static_wg/`, `examples/milestone1_tailscale_peer/`.
   Replaced by `examples/milestone1_register/`.
 
-[Unreleased]: https://github.com/bryamzxz/tinylink/commits/main
+[Unreleased]: https://github.com/bryamzxz/tinylink/compare/v1.4.0...HEAD
+[1.4.0]: https://github.com/bryamzxz/tinylink/compare/v1.2.0...v1.4.0
