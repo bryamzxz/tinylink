@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-10-30
+
+The first tagged release: it covers the 1.3.x optimization rounds
+(1.3.0–1.3.9) below and everything before them, which was never tagged.
+
 ### Optimization round 1.3.9 — ships as 1.4.0 (in progress, branch `feat/opt-1.3.9`)
 
 The last round of the 1.3.x line: the firmware reports **1.4.0**, the
@@ -38,7 +43,26 @@ independent reviews of the warm start (no high; one medium each, fixed).
   after 2 s). The fixed local UDP port in `docs/BACKLOG.md` targets it.
   Heap at the warm start 160 416 → 149 944 B free, largest block
   110 592 B unchanged.
-- **Soak (`a030d5c`):** running.
+- **Soak (`a030d5c`, 6 h 05 min):** 0 resets / panics / WDT /
+  brown-outs; the 3 E lines are a boot-connection FIN from tailscale.com
+  at 40 s (reconnected over :443, netmap 3.4 s later). The collector went
+  through its ISP failover and back during the run, its backup link at
+  26 ms–4.9 s RTT (pong median 499 ms, p90 4.0 s): 10 endpoint roams,
+  each following one of its endpoint changes (191.89.x:9201 →
+  181.61.x:41641 / 41642 / 1031 → 191.89.x:60523 at ~290 min), 59
+  lapses, 18 dead / 3 undelivered verdicts and 27 DERP re-sends of
+  unproven frames. Over the failover's worst stretch (57–66 min) the
+  collector answered DISCO but none of ~70 INITs for 9 min 15 s (105
+  samples lost, the session up again by itself; `docs/BACKLOG.md`).
+  Outside the failover window: 194 rekeys, 7 rekey retries, 3 RX-stale,
+  0 lost samples. The home NAT remapped the sensor's port once (STUN
+  re-probe → endpoint push → reconnect, netmap in 3.2 s). 4 279
+  telemetry samples sent. heap_free min **148 848 B**, largest block
+  110 592 B; stack lows (B free) `tinylink_lp` 3 952 of 7 168,
+  `tinylink_derp` 4 724 of 8 192, `wg_rx` 3 880 of 8 192, `wg_tx` 2 588
+  of 5 120, `tinylink_tlm` 2 516 of 4 608, `esp_timer` 3 024 of 4 608.
+  Firmware sources after `a030d5c` changed only for the neutral defaults
+  (the sensor's `sdkconfig.local` gives the same `sdkconfig`).
 
 #### Warm start: WireGuard up before the netmap (`feat/r139-warm`)
 

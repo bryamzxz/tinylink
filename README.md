@@ -2,10 +2,10 @@
 
 # tinylink
 
-**A clean-room, single-peer Tailscale-compatible node for the bare ESP32 — no PSRAM, ~728 KiB of flash, pure C.**
+**A clean-room, single-peer Tailscale-compatible node for the bare ESP32 — no PSRAM, ~741 KiB of flash, pure C.**
 
 [![CI](https://github.com/bryamzxz/tinylink/actions/workflows/build.yml/badge.svg)](https://github.com/bryamzxz/tinylink/actions/workflows/build.yml)
-[![Firmware](https://img.shields.io/badge/firmware-1.3.8-yellow)](CHANGELOG.md)
+[![Firmware](https://img.shields.io/badge/firmware-1.4.0-green)](CHANGELOG.md)
 [![Target](https://img.shields.io/badge/target-ESP32--WROOM%20(no%20PSRAM)-orange)](#hardware)
 [![Framework](https://img.shields.io/badge/ESP--IDF-v5.5-e7352c)](docs/BUILDING.md)
 [![Host tests](https://img.shields.io/badge/host%20KATs-546%20%C2%B7%200%20fail-brightgreen)](#testing)
@@ -46,11 +46,11 @@ the tunnel — 24/7, on a 4 MB module with 520 KiB of SRAM.
   in-place re-register on server-side node loss, `esp_restart()` wedge
   last-resort. A control-plane change is a blip, not a brick.
 - **Audited, tested, measured** — three security-audit rounds closed,
-  2 318 host checks (known-answer vectors lifted from upstream, interop
+  2 733 host checks (known-answer vectors lifted from upstream, interop
   against nghttp2 / Go HTTP/2, simulations of the data-plane timers),
   multi-hour hardware soaks behind every riskier change, per-PR
   CHANGELOG with flash/RAM deltas.
-- **Tiny footprint** — ~728 KiB app image (53 % of the partition free),
+- **Tiny footprint** — ~741 KiB app image (52 % of the partition free),
   static-first memory design tuned for a PSRAM-less ESP32.
 
 ## Why
@@ -64,7 +64,7 @@ cutting scope to a single peer.
 
 |                    | `tailscaled`            | MicroLink            | **tinylink**             |
 |--------------------|-------------------------|----------------------|--------------------------|
-| Footprint          | ~23 MB (~4.5 MB small)  | ~950 KiB             | **~728 KiB**             |
+| Footprint          | ~23 MB (~4.5 MB small)  | ~950 KiB             | **~741 KiB**             |
 | RAM requirement    | tens of MB              | PSRAM                | **no PSRAM (520 KiB SRAM)** |
 | Language / runtime | Go                      | —                    | **pure C, ESP-IDF v5.5** |
 | Scope              | full Tailscale          | reduced              | **single-peer sensor node** |
@@ -123,6 +123,7 @@ What works today, verified on real hardware:
 | 23 | Optimization round 1.3.6 (2026-10-29) | done — 3.5-h soak; data-plane path selection by proof (doubt / silent / undelivered), DERP re-send ring, no endpoint flapping (149 → 1 roam) |
 | 24 | Optimization round 1.3.7 (2026-10-30) | done — reset → WG up median 9.3 → 7.1 s: Wi-Fi channel hint, immediate retry after the AP's 4-way timeout, DHCP INIT-REBOOT, 18 instead of 33 X25519 per boot; MAX_MODEM at listen interval 3 (light sleep 81 → 90 % of the time) |
 | 25 | Optimization round 1.3.8 (2026-10-30) | 161-min soak clean (0 resets, 0 RX-stale) — TLS handshake CPU 1.18 s → 66 ms on the chip (RSA chains first, in-tree X25519), PMK on the second core, WG-silence recovery 30 → ~13 s (doubt handshake), stalled-poll deadline, `Ts-Lb` hint |
+| 26 | Optimization round 1.3.9 → **release 1.4.0** (2026-10-30) | 6-h soak clean (0 resets), through the collector's ISP failover — warm start (WireGuard before the netmap: got-ip → session median 1.55 s, was 2.2), the netmap body timed per boot and SACK on (36-boot A/B), DERP write lock vs the task WDT, the boot's first telemetry sample kept, neutral Kconfig defaults + a private `sdkconfig.local`; the last release of this line — what is left is in `docs/BACKLOG.md` |
 
 Two further 2026-05-12 rounds — sdkconfig perf-trim (#76–#80) and DERP
 outbound (#82–#83: supervisor spawn + lossless relay fallback during
