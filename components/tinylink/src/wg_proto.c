@@ -9,6 +9,7 @@
 
 #include "crypto/blake2s.h"
 #include "crypto/hkdf_blake2s.h"
+#include "crypto/secure_zero.h"
 
 #ifdef ESP_PLATFORM
 #include "esp_timer.h"
@@ -77,7 +78,7 @@ void wg_mix_key(uint8_t ck[WG_HASH_LEN],
     noise_hkdf2(ck, x, x_len, new_ck, out_key);
     memcpy(ck, new_ck, WG_HASH_LEN);
     /* Best-effort scrub the temporary. */
-    memset(new_ck, 0, sizeof(new_ck));
+    tl_secure_zero(new_ck, sizeof(new_ck));
 }
 
 void wg_mix_chain_only(uint8_t ck[WG_HASH_LEN],
@@ -87,7 +88,7 @@ void wg_mix_chain_only(uint8_t ck[WG_HASH_LEN],
     uint8_t new_ck[WG_HASH_LEN];
     noise_hkdf1(ck, x, x_len, new_ck);
     memcpy(ck, new_ck, WG_HASH_LEN);
-    memset(new_ck, 0, sizeof(new_ck));
+    tl_secure_zero(new_ck, sizeof(new_ck));
 }
 
 void wg_mac1_key(uint8_t out_key[WG_HASH_LEN],

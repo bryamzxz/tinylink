@@ -3,11 +3,14 @@
 //
 // X25519 (Curve25519 Diffie-Hellman) wrapper.
 //
-// The scalarmult primitive is curve25519-donna (Adam Langley, Google
-// BSD-3, see crypto/curve25519_donna.c). Donna is the canonical
-// constant-time 32-bit X25519 implementation and is the right fit for
-// the Xtensa LX6. RFC 7748 §5.2 / §6.1 vectors are checked in
-// tools/test/test_curve25519.c.
+// The scalarmult primitive is fiat-crypto's formally verified 32-bit
+// Curve25519 as carried by Linux (MIT, see crypto/curve25519_fiat32.c),
+// with field multiplication rewritten so the Xtensa LX6 build has no
+// secret-dependent branch (round 1.3.3; it replaced curve25519-donna,
+// whose 64-bit limb sums compile to carry branches on a core without a
+// carry flag). RFC 7748 §5.2 / §6.1 vectors are checked in
+// tools/test/test_curve25519.c, the 1 000-iteration vector and
+// cross-checks against donna in tools/test/test_x25519.c.
 
 #pragma once
 

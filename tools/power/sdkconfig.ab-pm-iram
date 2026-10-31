@@ -1,0 +1,8 @@
+# A/B (round 1.3.7): light-sleep entry/exit and the tickless-idle path in
+# IRAM (Kconfig help: ~310 µs + ~20 µs longer sleep per cycle at 160 MHz).
+# Selects nothing Wi-Fi: ESP_WIFI_SLP_IRAM_OPT (the option that broke
+# association on this AP, sdkconfig.defaults) selects PM_SLEEP_FUNC_IN_IRAM
+# and with it these two — not the other way round. PM_SLP_IRAM_OPT's own
+# select, ESP_TIMER_IN_IRAM, is already y.
+CONFIG_PM_SLP_IRAM_OPT=y
+CONFIG_PM_RTOS_IDLE_OPT=y

@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <stdbool.h>
 #include <stdint.h>
 
 #include "esp_err.h"
@@ -21,9 +22,10 @@ extern "C" {
  *      be exactly 64 hex chars), installed into NVS as the pin
  *      without any network round-trip. Eliminates the TOFU MITM
  *      window. Production firmware should ship this.
- *   3. HTTPS GET https://<host>/key?v=100 (TOFU). Legacy first-boot
- *      flow, logged as a WARN since it's vulnerable to a MITM during
- *      the initial fetch. Suitable for development only.
+ *   3. HTTPS GET https://<host>/key?v=<TINYLINK_CAPVER> (TOFU, on
+ *      esp_tls). Legacy first-boot flow, logged as a WARN since it's
+ *      vulnerable to a MITM during the initial fetch. Suitable for
+ *      development only.
  *
  * Subsequent calls take path 1 (cached pin). If the control plane
  * later presents a key that disagrees with the pin, the caller treats
@@ -31,6 +33,20 @@ extern "C" {
  * tinylink_register() after the handshake completes.
  */
 esp_err_t control_key_get(uint8_t out_pub[CONTROL_KEY_LEN]);
+
+/* The NVS pin alone (path 1): no fallback install, no fetch, no log,
+ * no change to control_key_pinned(). For the boot's Noise precompute
+ * (round 1.3.7), which runs before Wi-Fi is up; ESP_OK when a pin is
+ * stored. control_key_get stays the authority. */
+esp_err_t control_key_peek(uint8_t out_pub[CONTROL_KEY_LEN]);
+
+/* True when the key control_key_get returned was pinned before this
+ * boot's network activity — path 1 or 2 — and false after a TOFU fetch
+ * (path 3) or before any call. Gates ts2021 over plain HTTP :80 (round
+ * 1.3.5): there the server is authenticated by Noise IK against this key
+ * alone, so a key whose only evidence is this boot's TLS fetch keeps the
+ * whole boot on TLS; the next boot loads it from NVS as a pin. */
+bool control_key_pinned(void);
 
 #ifdef __cplusplus
 }

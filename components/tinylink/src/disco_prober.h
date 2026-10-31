@@ -99,6 +99,14 @@ bool disco_prober_match_and_remove(const uint8_t txid[DISCO_TXID_LEN],
                                    uint32_t src_v4_be, uint16_t src_port,
                                    int64_t now_us);
 
+/* disco_prober_match_and_remove that also reports, on a match, when the
+ * matched Ping was recorded (*sent_us, may be NULL): now_us - *sent_us is
+ * the Pong's round-trip time, which the path selection compares between
+ * endpoints (round 1.3.6, wg_path.h; upstream sentPing.at). */
+bool disco_prober_take(const uint8_t txid[DISCO_TXID_LEN],
+                       uint32_t src_v4_be, uint16_t src_port,
+                       int64_t now_us, int64_t *sent_us);
+
 /* Test helper: wipe the table. Production code never needs this
  * because boot-time disco_prober_init zeros the state. */
 void disco_prober_reset(void);

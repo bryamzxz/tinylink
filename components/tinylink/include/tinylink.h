@@ -14,7 +14,7 @@ extern "C" {
 #endif
 
 #define TINYLINK_VERSION_MAJOR 1
-#define TINYLINK_VERSION_MINOR 2
+#define TINYLINK_VERSION_MINOR 4
 #define TINYLINK_VERSION_PATCH 0
 
 /* String forms derived from the integer components above so a future
@@ -26,7 +26,9 @@ extern "C" {
  * the MINOR component via `version.IsUnstableBuild` in
  * tailscale/version/prop.go — minor%2==1 → unstable, even → stable. So
  * a MINOR bump 1→0 (or any even value) flips the admin panel from
- * "unstable" to "stable" automatically. */
+ * "unstable" to "stable" automatically. Release line (owner, 2026-10):
+ * 1.3.x is the work line (upstream sync + optimization rounds, shown as
+ * unstable on purpose), 1.4.0 the next stable release. */
 #define TINYLINK_STR_HELPER(x) #x
 #define TINYLINK_STR(x) TINYLINK_STR_HELPER(x)
 #define TINYLINK_VERSION_STRING                                         \
@@ -51,22 +53,31 @@ extern "C" {
  *      the old fixed "v=100" now gets a 400 there.
  *
  * Floor check (verify on every upstream-audit round): headscale main
- * enforces MinSupportedCapabilityVersion = 115 (= Tailscale v1.82) as of
- * 89fa72e0 (audit 2026-09-03; was 113 in 2026-07 — the floor is "latest
- * 10 minor versions" and moves with every capver regen). Bumped 138 → 142
- * (= Tailscale v1.102, the newest version headscale's capver table maps)
- * on 2026-09-04 with a hardware A/B smoke against tailscale.com: 139–142
- * gate only client-side node attributes (runtime metrics, GRO/GSO
- * toggles) and the c2n localapi proxy, none of which changes what
- * control sends or expects from a register+map+disco+derp client; 143
- * (conn25 attrs), 144 (client SENDS TSMP disco-key adverts) and 145
- * (macOS quad-100 scoping) are deliberately not claimed — 144 would
- * promise a behaviour tinylink does not implement. Upstream
- * CurrentCapabilityVersion is 145 as of 2026-09-03. Bumping the value
- * changes the Noise prologue hash, so every bump requires a hardware
- * A/B smoke against the live control plane per the repo's
- * verify-regression rule. */
-#define TINYLINK_CAPVER 142
+ * enforces MinSupportedCapabilityVersion = 116 (= Tailscale v1.84) as of
+ * 2d220b2e (audit 2026-10-28; 0.29.x releases still enforce 113; the
+ * floor is "latest 10 minor versions" and moves with every capver regen)
+ * and has no upper bound. Its capver table maps up to 148 (= v1.104).
+ *
+ * Value policy (owner): claim only a capver that maps to an even-minor
+ * (stable) Tailscale release, never a sentinel from an odd -pre line.
+ * 148 = v1.104 since round 1.3.0 (2026-10-28), every step honoured:
+ *   143  control stops sending conn25 attrs below it — nothing to do
+ *        (CapMap / DNSConfig are skipped);
+ *   144  client SENDS a TSMPDiscoKeyAdvertisement on every new keypair —
+ *        implemented (wg_netif.c send_disco_advert, tsmp.h);
+ *   145  macOS quad-100 DNS scoping — n/a;
+ *   146  debug-conn-reject attr + c2n /debug/rejects: a local aggregator
+ *        only, nothing to enforce; c2n is ignored like 127/128/138/142;
+ *   147  Retry-After on /machine/register + /machine/map with upstream's
+ *        exact rules (h2_retry_after.h);
+ *   148  Node.StableTailnetID — an unknown key, skipped.
+ * 149 (upstream CurrentCapabilityVersion as of f7c1b8e52, a sentinel
+ * asking control to enable cache-network-maps on the odd 1.105-pre line)
+ * is not claimed. Peers only gate on a remote's capver ≥ 121 (relay) and
+ * ≥ 26 (DNS proxy). Bumping the value changes the Noise prologue hash,
+ * so every bump requires a hardware A/B smoke against the live control
+ * plane per the repo's verify-regression rule. */
+#define TINYLINK_CAPVER 148
 
 #define TINYLINK_KEY_LEN 32
 
@@ -88,6 +99,16 @@ typedef struct {
  *      subsystem seeds the entropy pool).
  *   2. DNS/TLS to controlplane.tailscale.com is reachable.
  */
+/* Optional, before tinylink_init (round 1.3.7): load the identity keys
+ * and, with a control key pinned in NVS, precompute the first control
+ * connect's Noise IK DH work — CPU only, no network, so it can run while
+ * Wi-Fi associates instead of after got-ip (~75 ms of X25519 off the
+ * boot path). Only once the radio is on (after esp_wifi_start): a
+ * missing key is generated here and the ephemeral is drawn, and
+ * esp_fill_random is a true RNG only with RF enabled (point 1 below).
+ * tinylink_init does whatever this did not. */
+esp_err_t tinylink_preload(void);
+
 esp_err_t tinylink_init(void);
 
 /* Floor the wall clock (build time / last NTP sync persisted in NVS)
@@ -98,10 +119,20 @@ esp_err_t tinylink_time_start(void);
 
 /* Read-only runtime snapshot, served as JSON by the telemetry task's
  * /stats responder (CONFIG_TINYLINK_STATS_PORT) and usable from any
- * task. All counters are since boot. */
+ * task. All counters are since boot, except boots*. */
 typedef struct {
     uint32_t uptime_s;
+    int      reset_reason;           /* esp_reset_reason_t of this boot */
+    /* Boot counters (RTC no-init memory, tl_bootstat.h): boots since the
+     * record last restarted — normally the last power-on — this one
+     * included, and how many followed each kind of reset. */
+    uint32_t boots;
+    uint32_t boots_brownout;
+    uint32_t boots_panic;
+    uint32_t boots_task_wdt;
+    uint32_t boots_int_wdt;
     uint32_t heap_free;
+    uint32_t heap_min;               /* lowest heap_free since boot */
     uint32_t heap_largest;
     bool     ntp_synced;
     /* control plane */
@@ -122,13 +153,24 @@ typedef struct {
     uint32_t wg_cold_handshakes;
     uint32_t wg_rx_stale_events;
     uint32_t wg_roams;
+    uint32_t wg_disco_adverts;       /* TSMP disco-key adverts (capver 144) */
     uint32_t wg_tx_drops;
     uint32_t wg_relayed_stale;
     uint32_t wg_relay_errors;
     uint32_t wg_last_rx_age_s;
+    uint8_t  wg_path;                /* 0 direct + DERP, 1 direct, 2 DERP only (1.3.6) */
+    uint32_t wg_path_lapses;         /* direct → direct + DERP since boot */
 } tinylink_stats_t;
 
 void tinylink_get_stats(tinylink_stats_t *out);
+
+/* Count this boot in the RTC boot counters (by esp_reset_reason()) and
+ * log them, and scrub the TLS sessions kept in RTC memory unless this is
+ * a warm reset (round 1.3.8). Call first thing in app_main, before
+ * anything that can reset again, so a boot that dies early still records
+ * why the previous one ended and cannot pass a cold boot's sessions on to
+ * a software-reset boot. Idempotent; tinylink_get_stats calls it too. */
+void tinylink_bootstat_record(void);
 
 /* Load the persisted TAI64N floor from NVS namespace "tl_state" key
  * "tai_floor" (default 0 on first ever boot), pre-reserve a 1-day
@@ -145,8 +187,11 @@ void tinylink_get_stats(tinylink_stats_t *out);
  * device. */
 esp_err_t tinylink_tai64n_floor_init(void);
 
-/* Run the ts2021 Noise IK handshake and POST /machine/register. Reads the
- * Tailscale auth key from NVS namespace "tl_creds", key "auth_key".
+/* Run the ts2021 Noise IK handshake and POST /machine/register. A node
+ * control authorized before (NVS "tl_state"/"reg_keys" matches the
+ * device keys) registers without Auth, like a restarted tailscaled;
+ * otherwise, or when control refuses that, it sends the Tailscale auth
+ * key from NVS namespace "tl_creds", key "auth_key" (round 1.3.3, B22).
  * Blocks until either MachineAuthorized=true (returns ESP_OK) or a hard
  * failure (returns an esp_err_t describing the failure). The caller is
  * expected to retry on transient failures; tinylink_register() does not
@@ -154,14 +199,12 @@ esp_err_t tinylink_tai64n_floor_init(void);
  */
 esp_err_t tinylink_register(void);
 
-/* Returns the most recent Retry-After hint (RFC 7231 §7.1.3
- * delta-seconds, clamped into [1, 300]) parsed from the last response
- * on the shared control-plane ts2021 conn — typically the most recent
- * tinylink_register() attempt. Returns 0 if the last response had no
- * Retry-After header, the value was malformed, or no request has
- * completed yet. Callers use this to pace boot-loop retries when the
- * control plane signals a 429/503. */
-int tinylink_last_retry_after_s(void);
+/* Rate-limit wait, in ms, from the last tinylink_register() attempt
+ * (capver 147): non-zero only when control answered 429, or 503 with a
+ * Retry-After — the server's delay when valid (capped at 5 min), else
+ * 5–10 s. 0 means "not rate limited": use your own retry cadence.
+ * main.c's boot register loop paces itself with it. */
+uint32_t tinylink_last_rate_limit_ms(void);
 
 /* Read-only view of the current node identities, useful for debugging and
  * for M2+ which needs the NodeKey for the WireGuard data plane. The output
@@ -171,17 +214,16 @@ esp_err_t tinylink_get_keys(tinylink_keys_t *out);
 
 /* M2 — fetch one MapResponse from the control plane and bring up the
  * WireGuard data plane against the first peer it announces. Internally:
- *   1. Open a fresh ts2021 Noise channel.
- *   2. POST /machine/map with `Stream:false`; parse the single
- *      MapResponse.
- *   3. Translate the netmap into a `wireguard_config_t` and call
- *      `esp_wireguard_init` + `esp_wireguard_connect`.
+ * Today (round 1.3.7): takes the boot STUN probe's result (waiting
+ * ≤ 300 ms for it) and queues the endpoint push, which the long-poll's
+ * first cycle sends as a second HTTP/2 stream with the map stream; the
+ * data plane comes up from that stream's first netmap. Nothing goes on
+ * the wire here.
  *
- * Returns ESP_OK once the WG netif is up. Note: this only means the
- * device is *trying* to handshake; whether the peer is reachable is a
- * separate poll via the underlying `esp_wireguardif_peer_is_up`. The
- * long-poll `Stream:true` form, which keeps the netmap fresh, lands
- * with the M3 DISCO loop.
+ * History: it opened a fresh ts2021 channel, POSTed a `Stream:false`
+ * MapRequest and brought the WireGuard netif up from that one
+ * MapResponse (M2); from M3 the long-poll's first frame did that and
+ * this pushed the endpoints, a round trip of its own, until 1.3.7.
  */
 esp_err_t tinylink_dataplane_start(void);
 
@@ -197,21 +239,27 @@ esp_err_t tinylink_dataplane_start(void);
  */
 esp_err_t tinylink_long_poll_start(void);
 
-/* Block until the long-poll task has received its first MapResponse
- * and called wg_dataplane_start(), or until timeout_ms elapses.
- *
- * Used by main.c bringup to sequence the DERP supervisor AFTER the
- * long-poll has its TLS conn + nghttp2 session in steady state — if
- * supervised goes first, its alive TLS conn fragments the heap below
- * the contiguous block long-poll's mbedtls cert verify needs, and
- * long-poll repeatedly fails. Waiting for s_dataplane_started=true
- * means: TLS up, Noise IK done, h2 session allocated, first
- * MapRequest fired, first netmap parsed, WG netif up, our HostInfo
- * (with PreferredDERP region) advertised to the control plane.
- *
- * Returns ESP_OK if dataplane came up within timeout, ESP_ERR_TIMEOUT
- * otherwise. */
-esp_err_t tinylink_wait_dataplane_ms(uint32_t timeout_ms);
+/* Round 1.3.9 (CONFIG_TINYLINK_WARM_START): bring the WireGuard data
+ * plane up from the previous boot's netmap (NVS tl_state "warm_rec")
+ * while the long-poll's endpoint push and map stream run — after a
+ * successful tinylink_register that sent no auth key, and after
+ * tinylink_long_poll_start (so the push is out first). The first netmap
+ * confirms it, updates it in place, or erases the record and restarts
+ * into a cold boot when the session cannot follow (src/tl_warm.h,
+ * tinylink.c). Logs what it did; a no-op when there is no usable record,
+ * the netmap came first, or the option is off. */
+void tinylink_warm_start(void);
+
+/* True once the long-poll handled the first full netmap of the boot (a
+ * cold start, or a warm start's confirmation; round 1.3.9). app_wifi.c
+ * keeps the modem awake until then (the netmap's body is the boot's
+ * largest download). Any task. */
+bool tinylink_netmap_seen(void);
+
+/* True once the WG session has transport keys (a handshake response
+ * was accepted). Non-blocking, callable from any task or an esp_timer
+ * callback; app_wifi.c polls it to end the modem-awake boot window. */
+bool tinylink_session_up(void);
 
 /* M5 step 2a — best-effort DERP smoke test. Opens a TLS connection
  * to CONFIG_TINYLINK_DERP_SMOKE_HOST:443, runs the HTTP Upgrade dance,
@@ -230,23 +278,22 @@ esp_err_t tinylink_wait_dataplane_ms(uint32_t timeout_ms);
  * the pre-M5 baseline. */
 esp_err_t tinylink_derp_smoke(void);
 
-/* M5 step 2b — spawn the supervised DERP recv-loop task. The task:
- *   1. Connects to CONFIG_TINYLINK_DERP_SMOKE_HOST:443 and runs the
- *      login handshake (same as derp_smoke).
+/* M5 step 2b — spawn the supervised DERP recv-loop task. Call before
+ * the register (the stack wants a pristine heap). The task:
+ *   1. Connects to CONFIG_TINYLINK_DERP_SMOKE_HOST:443 (the netmap's
+ *      node of CONFIG_TINYLINK_PREFERRED_DERP once known) and runs the
+ *      login handshake (same as derp_smoke) — at once, alongside the
+ *      register, since round 1.3.5 (it waited for the first netmap
+ *      before), so the relay is up for the first WG handshake INIT.
  *   2. Drives derp_client_run() until the stream errors or the server
  *      sends FrameRestarting.
  *   3. Sleeps the configured backoff and reconnects.
  *
  * Opt-in: callable only when CONFIG_TINYLINK_DERP_SUPERVISED=y. When
  * disabled, returns ESP_OK without doing anything (so main.c can call
- * unconditionally). The supervised conn coexists with the long-poll's
- * TLS conn at steady state but the second handshake competes for
- * mbedtls cert-chain-verify heap (~12 KiB), so connect failures will
- * be retried with backoff rather than treated as fatal.
- *
- * Recv events are currently logged only — wiring received WireGuard
- * packets back into the data plane lands with M5 step 3 (magicsock
- * fallback) once DISCO peer-pub bookkeeping exists. */
+ * unconditionally). Connect failures are retried with backoff rather
+ * than treated as fatal. Relayed DISCO is answered / acted on in the
+ * task, relayed WireGuard goes to the data plane (wg_netif inject). */
 esp_err_t tinylink_derp_supervised_start(void);
 
 /* Ship an opaque encrypted packet to `dst_node_pub` via the DERP
@@ -263,19 +310,23 @@ esp_err_t tinylink_derp_supervised_start(void);
  *   ESP_ERR_NOT_SUPPORTED if CONFIG_TINYLINK_DERP_SUPERVISED=n
  *   ESP_FAIL on TLS write error
  *
+ * `best_effort` = a redundant copy (wg_netif_relay_fn): never blocks,
+ * ESP_ERR_TIMEOUT when the DERP conn cannot take it at once.
+ *
  * Wired into wg_netif via wg_netif_set_relay_callback at startup. The
  * signature matches wg_netif_relay_fn so it can be registered
  * directly. Safe to call from any task; serialized by the DERP client's
- * write_lock mutex internally. */
+ * write lock internally (derp_wlock.h). */
 esp_err_t tinylink_relay_via_derp(const uint8_t *dst_node_pub,
                                   const uint8_t *packet,
                                   size_t len,
+                                  bool best_effort,
                                   void *user);
 
 /* Bring up the WireGuard UDP socket early — bind only, no handshake.
  * Must be called after tinylink_init (so the local node identity is
- * loaded from NVS) and before tinylink_stun_probe (so STUN can probe
- * through the same socket). Without this prologue, STUN runs on its
+ * loaded from NVS) and before tinylink_stun_probe_start (so STUN can
+ * probe through the same socket). Without this prologue, STUN runs on its
  * own ephemeral socket and the public AddrPort the control plane
  * advertises to peers does NOT match the WG socket's NAT mapping, so
  * inbound DISCO/transport from peers never reaches the device.
@@ -286,28 +337,41 @@ esp_err_t tinylink_wg_socket_init(void);
 
 /* M4 — best-effort STUN binding probe to discover the device's public
  * AddrPort. Result is cached and uploaded to the control plane via
- * Hostinfo.Endpoints on the next MapRequest, so peers learn an address
- * they can try to dial directly even before DERP-mediated CallMeMaybe
- * (M5) is wired up. Failure is non-fatal; the device just operates
- * without a reflexive endpoint advertised, exactly like the pre-M4
- * baseline. Safe to call only after WiFi is up.
+ * Hostinfo.Endpoints by the endpoint push, so peers learn an address
+ * they can try to dial directly. Failure is non-fatal; the device just
+ * operates without a reflexive endpoint advertised, exactly like the
+ * pre-M4 baseline. Call after tinylink_wg_socket_init, before the
+ * register.
  *
- * Probes through the WireGuard socket if it has been brought up
- * (tinylink_wg_socket_init) and the RX task hasn't started yet. Else
- * falls back to an ephemeral socket — useful only for re-probes that
- * detect WAN-IP changes; the port they discover does NOT match the
- * WG socket's bound port. */
+ * Since round 1.3.5 the probe runs on its own short-lived task
+ * (`tinylink_stun`) while the register runs, through the WireGuard
+ * socket, which it reads itself until wg_rx exists: it used to cost the
+ * boot its whole duration (0.04–7.1 s on the sensor) ahead of the
+ * register. tinylink_dataplane_start waits for it ≤ 300 ms, and the
+ * push goes without it after that; the STUN re-probe pushes the
+ * endpoint once the data plane is up. ESP_OK when the probe runs (inline on this task if
+ * the spawn fails — the 1.3.4 order); once per boot. */
+esp_err_t tinylink_stun_probe_start(void);
+
+/* One STUN re-probe through the running WireGuard socket: the request is
+ * sent on it and wg_rx hands the answer back (ESP_ERR_INVALID_STATE
+ * before the first netmap has started wg_rx — the boot probe is
+ * tinylink_stun_probe_start). A changed endpoint (or the first one)
+ * queues a control-plane push. The STUN re-probe loop calls this. */
 esp_err_t tinylink_stun_probe(void);
 
-/* Spawn a low-priority FreeRTOS task that re-runs the STUN probe every
- * CONFIG_TINYLINK_STUN_REPROBE_MS milliseconds, refreshing the cached
- * public AddrPort so subsequent MapRequests advertise the current
- * NAT mapping (which can drift when the NAT rebinds an idle port or
- * the WAN address changes). A failed re-probe leaves the previously
- * cached endpoint untouched — losing the cache only on confirmed
- * change would require explicit "this is invalid" signaling we don't
- * have a way to receive. Best-effort, no return-value contract for
- * the task itself; callers get ESP_OK if the task spawned. */
+/* Re-run the STUN probe every CONFIG_TINYLINK_STUN_REPROBE_MS
+ * milliseconds — and at once when IP_EVENT_STA_GOT_IP reports a new
+ * local address — refreshing the cached public AddrPort so subsequent
+ * MapRequests advertise the current NAT mapping (which can drift when
+ * the NAT rebinds an idle port or the WAN address changes). A changed
+ * endpoint queues a control-plane push. A failed re-probe leaves the
+ * previously cached endpoint untouched — losing the cache only on
+ * confirmed change would require explicit "this is invalid" signaling
+ * we don't have a way to receive. The probes run on the telemetry task
+ * (since 1.3.2; it had its own task before), which this call spawns if
+ * needed in every build. Best-effort; ESP_OK means the re-probe loop
+ * runs or will (a NO_MEM spawn retries every 30 s). */
 esp_err_t tinylink_stun_reprobe_start(void);
 
 /* Endpoint changes found by the STUN re-probe are pushed to the control
@@ -347,13 +411,22 @@ const char *tinylink_version_string(void);
  *
  * Cost: ~1.2 KiB static BSS for the TaskStatus_t snapshot buffer +
  * one ESP_LOGI line per task per call. Called every 60 s from
- * telemetry_task (every 12th tx at the default 5 s telemetry period).
+ * telemetry_task (its own deadline since 1.3.2; every 12th sample
+ * before), with or without CONFIG_TINYLINK_TELEMETRY_ENABLE.
  *
  * Intended audience: this is the data source for the deferred audit
  * items "task stack trim" and (via correlation with the mapresp parse
  * logs added in the same PR) "jsmn / body_buf trim". Once those land
  * the diag dump can be Kconfig-gated off for production. */
 void tinylink_diag_dump_stacks(void);
+
+/* An application record to persist from the 60-s housekeeping (round
+ * 1.3.7: the Wi-Fi association hint, app_wifi.c), after the address
+ * cache: the place where NVS writes may stall both CPUs without landing
+ * on the boot path. `fn` runs on the telemetry task (≈ 2.5 KB of its
+ * 4.5 KiB stack free there) and must write only what changed. One hook;
+ * NULL clears it. Any task, any time. */
+void tinylink_set_persist_hook(void (*fn)(void));
 
 #ifdef __cplusplus
 }

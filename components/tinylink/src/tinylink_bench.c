@@ -8,10 +8,13 @@
 #include <stdint.h>
 #include <string.h>
 
+#include "esp_cpu.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 
+#include "crypto/chacha20.h"
 #include "crypto/chacha20poly1305.h"
+#include "crypto/curve25519.h"
 
 static const char *TAG = "bench-aead";
 
@@ -119,6 +122,22 @@ static void bench_cold(const char *label, size_t mlen, uint32_t iters)
              (unsigned)(enc_us / iters), (unsigned)(dec_us / iters), rc, (unsigned)sink);
 }
 
+/* The keystream half of the MTU number alone (round 1.3.3, C4), so the
+ * ChaCha20 and Poly1305 shares can be told apart across builds. */
+static void bench_chacha20(size_t mlen, uint32_t iters)
+{
+    struct chacha20_ctx ctx;
+    int64_t t0 = esp_timer_get_time();
+    for (uint32_t i = 0; i < iters; ++i) {
+        chacha20_init(&ctx, s_key, i);
+        chacha20(&ctx, s_ct, s_pt, (uint32_t)mlen);
+    }
+    int64_t us = esp_timer_get_time() - t0;
+    ESP_LOGI(TAG, "chacha20 mlen=%4u iters=%4u | %u ns/call, %u ns/B",
+             (unsigned)mlen, (unsigned)iters,
+             (unsigned)((us * 1000) / iters), (unsigned)((us * 1000) / iters / mlen));
+}
+
 esp_err_t tinylink_bench_aead(void)
 {
     /* Fixed inputs: we want bit-identical work across builds so two
@@ -156,8 +175,22 @@ esp_err_t tinylink_bench_aead(void)
         static const uint8_t tag[16] = { 0x1a,0xe1,0x0b,0x59,0x4f,0x09,0xe2,0x6a,0x7e,0x90,0x2e,0xcb,0xd0,0x60,0x06,0x91 };
         uint8_t out[114 + 16];
         chacha20poly1305_encrypt(out, (const uint8_t *)pt, 114, ad, sizeof(ad), k, n12);
-        const bool ok = memcmp(out, ct_head, 16) == 0 && memcmp(out + 114, tag, 16) == 0;
-        ESP_LOGI(TAG, "RFC 8439 2.8.2 KAT: %s", ok ? "OK" : "MISMATCH");
+        bool ok = memcmp(out, ct_head, 16) == 0 && memcmp(out + 114, tag, 16) == 0;
+        /* Both ChaCha20 paths (round 1.3.3, C4): word-aligned buffers take
+         * the fused block → XOR loop for every full block, others the
+         * keystream + byte-assembly one; the tag covers every ciphertext
+         * byte. The 1500-B round trip above cannot tell: it decrypts with
+         * the same keystream it encrypted with. */
+        memcpy(s_pt, pt, 114);
+        chacha20poly1305_encrypt(s_ct, s_pt, 114, ad, sizeof(ad), k, n12);
+        const bool ok_al = memcmp(s_ct, ct_head, 16) == 0 && memcmp(s_ct + 114, tag, 16) == 0;
+        memmove(s_pt + 1, s_pt, 114);
+        chacha20poly1305_encrypt(s_ct + 3, s_pt + 1, 114, ad, sizeof(ad), k, n12);
+        const bool ok_un = memcmp(s_ct + 3, ct_head, 16) == 0 && memcmp(s_ct + 3 + 114, tag, 16) == 0;
+        ESP_LOGI(TAG, "RFC 8439 2.8.2 KAT: %s (aligned %s, unaligned %s)", ok ? "OK" : "MISMATCH",
+                 ok_al ? "OK" : "MISMATCH", ok_un ? "OK" : "MISMATCH");
+        ok = ok && ok_al && ok_un;
+        for (int i = 0; i < BENCH_MAX_PT; ++i) s_pt[i] = (uint8_t)(i & 0xff);
         if (!ok) return ESP_FAIL;
     }
 
@@ -171,7 +204,77 @@ esp_err_t tinylink_bench_aead(void)
     bench_one("mtu",   1500,   500);
     bench_cold("cold", 64, 50);
     bench_cold("cold", 1500, 50);
+    bench_chacha20(1500, 500);
 
+    return ESP_OK;
+}
+
+/* X25519 (round 1.3.3, C6). RFC 7748 §5.2 vector 1 through the shim
+ * first: on the device it is the only oracle for the Xtensa asm in the
+ * field multiplication (mull / muluh / src with SAR = 28), which the host
+ * KATs never compile. Then the time per scalarmult, and a timing probe:
+ * CCOUNT cycles for eight scalar/point pairs, 3 runs each. The field code
+ * has no secret-dependent branch or address (round 1.3.3 notes); what
+ * this probes is the rest — the multiplier's latency is not documented
+ * as constant (REFERENCE.md, "Multiplier timing is unspecified"). The
+ * runs are not interrupt-free (the 100 Hz FreeRTOS tick lands once or
+ * twice per scalarmult, Wi-Fi may), so the spread across inputs (of the
+ * per-input minimum) is reported next to the jitter of one input against
+ * itself; an operand-dependent multiplier would show as a spread well
+ * above that jitter. Run the same build twice to see the noise floor. */
+esp_err_t tinylink_bench_x25519(void)
+{
+    static const char *TAG_X = "bench-x25519";
+    static const uint8_t k[32] = {
+        0xa5,0x46,0xe3,0x6b,0xf0,0x52,0x7c,0x9d,0x3b,0x16,0x15,0x4b,0x82,0x46,0x5e,0xdd,
+        0x62,0x14,0x4c,0x0a,0xc1,0xfc,0x5a,0x18,0x50,0x6a,0x22,0x44,0xba,0x44,0x9a,0xc4 };
+    static const uint8_t u[32] = {
+        0xe6,0xdb,0x68,0x67,0x58,0x30,0x30,0xdb,0x35,0x94,0xc1,0xa4,0x24,0xb1,0x5f,0x7c,
+        0x72,0x66,0x24,0xec,0x26,0xb3,0x35,0x3b,0x10,0xa9,0x03,0xa6,0xd0,0xab,0x1c,0x4c };
+    static const uint8_t want[32] = {
+        0xc3,0xda,0x55,0x37,0x9d,0xe9,0xc6,0x90,0x8e,0x94,0xea,0x4d,0xf2,0x8d,0x08,0x4f,
+        0x32,0xec,0xcf,0x03,0x49,0x1c,0x71,0xf7,0x54,0xb4,0x07,0x55,0x77,0xa2,0x85,0x52 };
+    uint8_t q[32], sk[32], pt[32];
+
+    int rc = curve25519_scalarmult(q, k, u);
+    const bool ok = rc == 0 && memcmp(q, want, 32) == 0;
+    ESP_LOGI(TAG_X, "RFC 7748 5.2 KAT: %s", ok ? "OK" : "MISMATCH");
+    if (!ok) return ESP_FAIL;
+
+    const uint32_t iters = 10;
+    int64_t t0 = esp_timer_get_time();
+    for (uint32_t i = 0; i < iters; ++i) {
+        rc |= curve25519_scalarmult(q, k, u);
+    }
+    const int64_t us = esp_timer_get_time() - t0;
+    ESP_LOGI(TAG_X, "scalarmult iters=%u | %u us/call rc=%d",
+             (unsigned)iters, (unsigned)(us / iters), rc);
+
+    /* Inputs: zero / all-ones / alternating scalars (clamped inside),
+     * the base point, the RFC point, an all-ones (non-canonical) u. */
+    uint32_t cmin = UINT32_MAX, cmax = 0, jitter = 0;
+    for (int v = 0; v < 8; ++v) {
+        for (int i = 0; i < 32; ++i) {
+            sk[i] = v == 0 ? 0x00 : v == 1 ? 0xff : v == 2 ? 0x55 : (uint8_t)(k[i] * (v + 1) + i);
+            pt[i] = v == 3 ? (i == 0 ? 9 : 0) : v == 4 ? 0xff : (uint8_t)(u[i] ^ (uint8_t)(v * 37));
+        }
+        pt[31] &= v == 4 ? 0xff : 0x7f;
+        uint32_t best = UINT32_MAX, worst = 0;
+        for (int r = 0; r < 3; ++r) {
+            const uint32_t c0 = esp_cpu_get_cycle_count();
+            (void)curve25519_scalarmult(q, sk, pt);
+            const uint32_t c = esp_cpu_get_cycle_count() - c0;
+            if (c < best) best = c;
+            if (c > worst) worst = c;
+        }
+        if (best < cmin) cmin = best;
+        if (best > cmax) cmax = best;
+        if (worst - best > jitter) jitter = worst - best;
+        ESP_LOGI(TAG_X, "input %d: %u..%u cycles", v, (unsigned)best, (unsigned)worst);
+    }
+    ESP_LOGI(TAG_X, "timing probe: per-input minimum %u..%u, spread %u cycles over 8 inputs; "
+             "same-input jitter up to %u cycles",
+             (unsigned)cmin, (unsigned)cmax, (unsigned)(cmax - cmin), (unsigned)jitter);
     return ESP_OK;
 }
 

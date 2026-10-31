@@ -1,0 +1,2 @@
+# Round 1.3.8 A/B: no RSA/MPI accelerator at all (RSA exponentiation too).
+CONFIG_MBEDTLS_HARDWARE_MPI=n

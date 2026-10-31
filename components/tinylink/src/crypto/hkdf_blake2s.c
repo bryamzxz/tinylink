@@ -53,7 +53,7 @@ int hmac_blake2s(uint8_t out[HKDF_BLAKE2S_HASHLEN],
     tl_secure_zero(k, sizeof(k));
     tl_secure_zero(ipad, sizeof(ipad));
     tl_secure_zero(opad, sizeof(opad));
-    memset(inner, 0, sizeof(inner));
+    tl_secure_zero(inner, sizeof(inner));
     return 0;
 }
 
@@ -103,30 +103,37 @@ int noise_hkdf2(const uint8_t ck[HKDF_BLAKE2S_HASHLEN],
     return 0;
 }
 
+/* One extract and three expansions (round 1.3.3, C9). Until 1.3.2 this
+ * ran noise_hkdf2 and then the extract HMAC a second time for T3: 5
+ * HMACs, 20 BLAKE2s compressions, now 4 HMACs / 16 (one per WireGuard
+ * handshake, the IKpsk2 PSK mix). */
 int noise_hkdf3(const uint8_t ck[HKDF_BLAKE2S_HASHLEN],
                 const uint8_t *input, size_t input_len,
                 uint8_t out1[HKDF_BLAKE2S_HASHLEN],
                 uint8_t out2[HKDF_BLAKE2S_HASHLEN],
                 uint8_t out3[HKDF_BLAKE2S_HASHLEN])
 {
-    if (noise_hkdf2(ck, input, input_len, out1, out2) != 0) return -1;
-
     uint8_t temp_key[HKDF_BLAKE2S_HASHLEN];
     uint8_t buf[HKDF_BLAKE2S_HASHLEN + 1];
+    const uint8_t one = 0x01;
+    int rc = -1;
 
     if (hmac_blake2s(temp_key, ck, HKDF_BLAKE2S_HASHLEN,
                      input, input_len) != 0) return -1;
+    if (hmac_blake2s(out1, temp_key, HKDF_BLAKE2S_HASHLEN, &one, 1) != 0) goto out;
+    memcpy(buf, out1, HKDF_BLAKE2S_HASHLEN);
+    buf[HKDF_BLAKE2S_HASHLEN] = 0x02;
+    if (hmac_blake2s(out2, temp_key, HKDF_BLAKE2S_HASHLEN,
+                     buf, HKDF_BLAKE2S_HASHLEN + 1) != 0) goto out;
     memcpy(buf, out2, HKDF_BLAKE2S_HASHLEN);
     buf[HKDF_BLAKE2S_HASHLEN] = 0x03;
     if (hmac_blake2s(out3, temp_key, HKDF_BLAKE2S_HASHLEN,
-                     buf, HKDF_BLAKE2S_HASHLEN + 1) != 0) {
-        tl_secure_zero(temp_key, sizeof(temp_key));
-        tl_secure_zero(buf, sizeof(buf));
-        return -1;
-    }
+                     buf, HKDF_BLAKE2S_HASHLEN + 1) != 0) goto out;
+    rc = 0;
+out:
     tl_secure_zero(temp_key, sizeof(temp_key));
     tl_secure_zero(buf, sizeof(buf));
-    return 0;
+    return rc;
 }
 
 int hkdf_blake2s_extract(const uint8_t *salt, size_t salt_len,

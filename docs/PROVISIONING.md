@@ -29,7 +29,7 @@ deliberately not enabled (eFuse burns are irreversible; see
 | `tl_creds`  | provisioner | WiFi credentials + Tailscale auth key           |
 | `tl_keys`   | firmware    | Curve25519 identities, generated on first boot  |
 | `tl_pin`    | firmware    | Pinned control plane public key (TOFU / fallback) |
-| `tl_state`  | firmware    | TAI64N floor for WireGuard handshake timestamps |
+| `tl_state`  | firmware    | TAI64N floor for WireGuard handshake timestamps, clock floor, register hint, last-known server addresses (`derp_node`, `ctl_addr`, round 1.3.5) |
 
 You only need to populate `tl_creds`. The firmware fills the other
 namespaces by itself.
@@ -40,7 +40,7 @@ namespaces by itself.
 |-------------|--------|------------------------------------------------------|
 | `wifi_ssid` | string | WPA2-PSK SSID                                        |
 | `wifi_pass` | string | WPA2-PSK passphrase                                  |
-| `auth_key`  | string | Tailscale auth key (`tskey-auth-…`)                  |
+| `auth_key`  | string | Pre-auth key: tailscale.com `tskey-auth-…`, headscale `hskey-auth-…` |
 
 There are no WireGuard keys to provision — the node's MachineKey,
 NodeKey and DiscoKey are generated on-device at first boot.
@@ -90,6 +90,14 @@ In the Tailscale admin panel (`Settings → Keys → Generate auth key`):
 The `tskey-auth-…` string only appears once in the admin UI; copy it
 straight into `tools/credentials.csv`.
 
+**headscale**: `headscale preauthkeys create --user <u> --reusable`
+prints an `hskey-auth-…` key, accepted as is (a pre-0.28 plaintext key
+needs `--allow-legacy-key`). Use a **reusable** (or tagged) key: since
+headscale 0.29.4 a deleted or expired node is told so on its map stream
+and tinylink re-registers with the stored key, which a spent single-use
+key cannot do (expired user-owned nodes need a valid key,
+`state.go pakSkipsValidation`).
+
 ## Rotating credentials
 
 - WiFi password change → re-generate `nvs_creds.bin` and re-flash the
@@ -97,6 +105,7 @@ straight into `tools/credentials.csv`.
 - Tailscale auth key change → only relevant if the device needs to
   re-register (e.g. node was force-deleted from the admin panel). The
   on-device NodeKey persists across reboots, so under normal operation
-  no re-registration is needed.
+  no re-registration is needed — since 1.3.3 a reboot registers without
+  the auth key (NVS `tl_state/reg_keys` records the authorized keys).
 - Node identity rotation is not implemented (no remote trigger; see
   `docs/ROADMAP.md` § OTA).

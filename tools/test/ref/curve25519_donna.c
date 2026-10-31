@@ -1,3 +1,9 @@
+/* tinylink test oracle: agl's curve25519-donna, the X25519 the firmware
+ * ran until round 1.3.3 (components/tinylink/src/crypto/curve25519_donna.c,
+ * 1:1 upstream). Host tests only — never built into the firmware since
+ * curve25519_fiat32.c replaced it (C6); test_x25519.c cross-checks the
+ * two over random scalars and points. Unchanged below this note. */
+
 /* Copyright 2008, Google Inc.
  * All rights reserved.
  *

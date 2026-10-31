@@ -20,13 +20,25 @@
  *   - Partial-success returns are accumulated until `need` is satisfied.
  *   - Long sequences of WANT_READ before data work without bound.
  *   - NULL-arg guards reject misuse.
+ *   - round 1.3.5 (ts2021 on :80): tls_io_sock_read / _write over a real
+ *     socketpair keep that contract without TLS — an SO_RCVTIMEO expiry
+ *     is WANT_READ (one idle poll, so the *_full budget counts socket
+ *     timeouts as over esp_tls), a FIN is 0, a write to a closed peer
+ *     is -EPIPE and not a SIGPIPE, a bad fd is -EBADF.
  */
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <stdbool.h>
 #include <string.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <sys/time.h>
 #include <sys/types.h>
+#include <time.h>
+#include <unistd.h>
 
 #include "mbedtls/ssl.h"
 #include "tls_io.h"
@@ -408,6 +420,113 @@ static void test_write_full_null_args(void) {
 /* main                                                               */
 /* ------------------------------------------------------------------ */
 
+/* ------------------------------------------------------------------ */
+/* plain-socket adapters (round 1.3.5)                                 */
+/* ------------------------------------------------------------------ */
+
+static ssize_t sock_rd(void *ctx, uint8_t *buf, size_t len) {
+    return tls_io_sock_read(*(int *)ctx, buf, len);
+}
+static ssize_t sock_wr(void *ctx, const uint8_t *buf, size_t len) {
+    return tls_io_sock_write(*(int *)ctx, buf, len);
+}
+
+static int sock_pair(int sv[2], int rcv_ms) {
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) return -1;
+    struct timeval tv = { .tv_sec = rcv_ms / 1000, .tv_usec = (rcv_ms % 1000) * 1000 };
+    setsockopt(sv[0], SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(sv[0], SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    return 0;
+}
+
+static long ms_since(const struct timespec *t0) {
+    struct timespec t1;
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    return (t1.tv_sec - t0->tv_sec) * 1000 + (t1.tv_nsec - t0->tv_nsec) / 1000000;
+}
+
+/* tls_io_sock_peer_v4 (round 1.3.5): the address a by-name control conn
+ * reached, for the address cache — a real loopback TCP pair; AF_UNIX,
+ * unconnected and closed sockets are not an address. */
+static void test_sock_peer_v4(void) {
+    int ls = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in a;
+    memset(&a, 0, sizeof(a));
+    a.sin_family = AF_INET;
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    socklen_t al = sizeof(a);
+    int c = -1, sv = -1;
+    if (ls >= 0 && bind(ls, (struct sockaddr *)&a, sizeof(a)) == 0 && listen(ls, 1) == 0 &&
+        getsockname(ls, (struct sockaddr *)&a, &al) == 0) {
+        c = socket(AF_INET, SOCK_STREAM, 0);
+        if (c >= 0 && connect(c, (struct sockaddr *)&a, sizeof(a)) == 0) sv = accept(ls, NULL, NULL);
+    }
+    uint8_t ip[4] = { 0 };
+    static const uint8_t lo[4] = { 127, 0, 0, 1 };
+    fails += eq_int("sock_peer_v4/tcp_loopback", sv >= 0 && tls_io_sock_peer_v4(c, ip), 1);
+    fails += eq_bytes("sock_peer_v4/tcp_loopback_addr", ip, lo, 4);
+    int up[2];
+    const bool ux = socketpair(AF_UNIX, SOCK_STREAM, 0, up) == 0;
+    const int u = socket(AF_INET, SOCK_STREAM, 0);
+    fails += eq_int("sock_peer_v4/not_an_address",
+                    ux && !tls_io_sock_peer_v4(up[0], ip) && !tls_io_sock_peer_v4(u, ip) &&
+                    !tls_io_sock_peer_v4(-1, ip), 1);
+    if (ux) { close(up[0]); close(up[1]); }
+    if (u >= 0) close(u);
+    if (sv >= 0) close(sv);
+    if (c >= 0) close(c);
+    if (ls >= 0) close(ls);
+}
+
+static void test_sock_read_write(void) {
+    int sv[2];
+    fails += eq_int("sock/pair", sock_pair(sv, 50), 0);
+    static const uint8_t msg[] = "ts2021 over :80";
+    fails += eq_int("sock/write", (int)tls_io_sock_write(sv[1], msg, sizeof(msg)),
+                    (int)sizeof(msg));
+    uint8_t buf[32] = {0};
+    int rc = tls_io_read_full(sock_rd, &sv[0], buf, sizeof(msg), 2);
+    fails += eq_int("sock/read_full/rc", rc, 0);
+    fails += eq_bytes("sock/read_full/buf", buf, msg, sizeof(msg));
+
+    /* nothing on the wire: one SO_RCVTIMEO = one WANT_READ */
+    struct timespec t0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    fails += eq_int("sock/timeout_is_want_read",
+                    (int)tls_io_sock_read(sv[0], buf, 1), MBEDTLS_ERR_SSL_WANT_READ);
+    long ms = ms_since(&t0);
+    fails += eq_int("sock/timeout_waited_rcvtimeo", ms >= 40 && ms < 1000, 1);
+
+    /* the budget counts socket timeouts: 3 polls → idle timeout */
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    rc = tls_io_read_full(sock_rd, &sv[0], buf, 1, 3);
+    ms = ms_since(&t0);
+    fails += eq_int("sock/idle_budget/rc", rc, TLS_IO_ERR_IDLE_TIMEOUT);
+    fails += eq_int("sock/idle_budget/three_polls", ms >= 140 && ms < 2000, 1);
+
+    /* a partial read resets the budget, then FIN ends it */
+    fails += eq_int("sock/write_two", (int)write(sv[1], "ab", 2), 2);
+    shutdown(sv[1], SHUT_WR);
+    rc = tls_io_read_full(sock_rd, &sv[0], buf, 3, 3);
+    fails += eq_int("sock/fin_mid_read/rc", rc, -1);
+    fails += eq_int("sock/fin_is_zero", (int)tls_io_sock_read(sv[0], buf, 1), 0);
+
+    /* writing to a closed peer: -EPIPE (MSG_NOSIGNAL), the process lives */
+    close(sv[1]);
+    ssize_t w = 0;
+    for (int i = 0; i < 4 && w >= 0; i++) w = tls_io_sock_write(sv[0], msg, sizeof(msg));
+    fails += eq_int("sock/write_closed_epipe", (int)w, -EPIPE);
+    rc = tls_io_write_full(sock_wr, &sv[0], msg, sizeof(msg), 2);
+    fails += eq_int("sock/write_full_closed", rc, -EPIPE);
+    close(sv[0]);
+
+    /* a dead fd is a hard error, not a poll */
+    fails += eq_int("sock/bad_fd_read", (int)tls_io_sock_read(sv[0], buf, 1), -EBADF);
+    fails += eq_int("sock/bad_fd_write", (int)tls_io_sock_write(sv[0], msg, 1), -EBADF);
+    rc = tls_io_read_full(sock_rd, &sv[0], buf, 1, 0);
+    fails += eq_int("sock/bad_fd_read_full_not_retried", rc, -EBADF);
+}
+
 int main(void) {
     test_read_full_simple();
     test_read_full_retry_on_want_read();
@@ -430,6 +549,9 @@ int main(void) {
     test_write_full_partial_returns();
     test_write_full_propagates_real_error();
     test_write_full_null_args();
+
+    test_sock_read_write();
+    test_sock_peer_v4();
 
     if (fails) {
         printf("\n[FAIL] %d assertion(s) failed\n", fails);

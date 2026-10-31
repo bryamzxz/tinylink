@@ -1,0 +1,10 @@
+# The suites run in app_main; X25519 + the donna oracle need a big stack.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=65536
+# Minutes of uninterrupted crypto: no watchdogs in the emulator.
+CONFIG_ESP_TASK_WDT_EN=n
+CONFIG_ESP_INT_WDT=n
+# Same global level as the firmware; the crypto -O2 islands are per source.
+CONFIG_COMPILER_OPTIMIZATION_SIZE=y
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE=y

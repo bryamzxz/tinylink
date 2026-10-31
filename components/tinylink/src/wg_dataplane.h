@@ -1,17 +1,13 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Bryam (bryamzxz)
 //
-// Thin shim translating tinylink's parsed netmap into the
-// `wireguard_config_t` struct that trombik/esp_wireguard expects, then
-// driving its init / connect cycle.
+// Glue between tinylink's merged netmap and the WireGuard runtime:
+// picks the one peer the session runs against, brings up wg_netif +
+// the lwIP tunnel netif, and applies later netmap changes (endpoint
+// roam, peer NodeKey / DiscoKey rotation) to the live session.
 //
-// Single-peer only for M2. trombik's API exposes one peer per
-// `wireguard_config_t`; the multi-peer case is the explicit non-goal
-// for tinylink (see README §Non-goals). The "demuxer for multiplexed
-// DISCO/STUN" patch the research artifact references is deferred to
-// M3 — until DISCO actually needs the same UDP socket, the bare
-// `udp_bind(IP_ADDR_ANY, port)` that the upstream component does is
-// fine.
+// Single-peer by design (README §Scope): the session is pinned to one
+// peer, tracked by NodeID for its whole lifetime.
 
 #pragma once
 
@@ -26,39 +22,41 @@
 extern "C" {
 #endif
 
-/* Bring up the WG netif against the home peer announced in `nm`. The
- * function picks `nm->peers[0]` (single-peer client by design) and uses
- * `nm->self_addresses[0]` as the local 100.x address.
+/* Bring up the WG netif. `self_addrs[0]` is the local 100.x address;
+ * the target is the first peer in `peers` with a cross-NAT public
+ * endpoint (else peers[0]). Takes the caller's merged peer table, not a
+ * single MapResponse frame, so a start after delta frames sees the
+ * merged state.
  *
- * Returns ESP_OK once `esp_wireguard_init` + `esp_wireguard_connect`
- * succeed. Note that ESP_OK does not yet mean a handshake has
- * completed — callers should poll `wg_dataplane_peer_is_up()`. */
+ * ESP_OK means the handshake INIT is out, not that it completed — poll
+ * `wg_dataplane_peer_is_up()`. */
 esp_err_t wg_dataplane_start(const tinylink_keys_t *keys,
-                             const tl_netmap_t *nm);
+                             const tl_cidr_t *self_addrs, size_t n_self,
+                             const tl_peer_t *peers, size_t n_peers);
+
+/* Index in `peers` of the peer wg_dataplane_start would run against
+ * (its select_target_peer, without the log lines; 0 when none has a
+ * cross-NAT endpoint, as it falls back). Reads the STUN result. */
+size_t wg_dataplane_target_index(const tl_peer_t *peers, size_t n_peers);
 
 /* Returns ESP_OK if the peer has completed at least one WG handshake. */
 esp_err_t wg_dataplane_peer_is_up(void);
 
+/* Tunnel-side IPv4 (network order) the netif was attached with, or 0
+ * before start. The caller compares it against later self Addresses:
+ * a re-registered (deleted) node can come back with a new address. */
+uint32_t wg_dataplane_self_v4(void);
+
 /* Tear down. Safe to call even if start() was never called. */
 void wg_dataplane_stop(void);
 
-/* Hot-path update: the long-poll MapRequest loop calls this when the
- * peer's endpoint changes between MapResponses. tinylink reuses
- * peers[0] (single-peer model) and only acts on a real change to
- * `peer->endpoints[0]`; same-endpoint calls are no-ops.
- *
- * For now this tears down the WG netif and brings it back up against
- * the new endpoint. trombik/esp_wireguard does not expose a stable
- * "update peer" entry point, so a reconnect is the cleanest option.
- * Frequency in practice is "rare" — magicsock-equivalent endpoint
- * churn after DISCO lands in M3 will replace this with a less
- * disruptive update.
- */
-esp_err_t wg_dataplane_update_peer(const tinylink_keys_t *keys,
-                                   const tl_netmap_t *nm);
-
-/* Same, from the caller's merged peer table (tinylink.c keeps the
- * canonical table across Peers / PeersChanged / PeersRemoved frames). */
+/* Apply the caller's merged peer table (tinylink.c keeps it across
+ * Peers / PeersChanged / PeersRemoved / PeersChangedPatch frames) to the
+ * live session: the session's peer is found by NodeID; a changed
+ * NodeKey or DiscoKey goes to wg_netif_update_peer_keys, a changed
+ * endpoint roams the WG target without a new handshake, a changed
+ * tailnet address (round 1.3.9) moves the TSMP advert's destination.
+ * Runs X25519 on a DiscoKey change — call from the long-poll task. */
 esp_err_t wg_dataplane_update_peers(const tinylink_keys_t *keys,
                                     const tl_peer_t *peers, size_t n_peers);
 

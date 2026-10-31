@@ -13,8 +13,12 @@
  *      mac2-zero, ephemeral matches state, and the encrypted fields /
  *      mac1 are non-zero (with overwhelming probability).
  *
- * Step 3b will add a byte-exact KAT once we expose a test hook that
- * lets us inject a fixed ephemeral keypair and timestamp.
+ *   4. Per-peer cache (round 1.3.2, B11): an INIT built on a cached
+ *      state (no static-static DH, no mac1-key BLAKE2s) is byte-identical
+ *      to one built from scratch, for a fixed ephemeral (the xorshift
+ *      seed below) and timestamp (recovered by the simulated responder);
+ *      identity changes recompute the cache; a scrubbed state refuses
+ *      responses.
  */
 
 #include <stddef.h>
@@ -25,6 +29,7 @@
 
 #include "wg_proto.h"
 #include "wg_handshake.h"
+#include "wg_path.h"
 
 #include "crypto/blake2s.h"
 #include "crypto/chacha20poly1305.h"
@@ -237,6 +242,7 @@ struct sim_responder {
 
     /* Outputs after process_initiation + create_response. */
     uint8_t  initiator_static_pub_recovered[32];
+    uint8_t  timestamp_recovered[WG_TAI64N_LEN];
     uint32_t remote_sender_index;
     uint8_t  send_key[32];   /* responder-side: encrypts resp→init */
     uint8_t  recv_key[32];   /* responder-side: decrypts init→resp */
@@ -255,7 +261,7 @@ static int sim_resp_process_initiation_and_build_response(
 {
     uint8_t key[32];
     uint8_t dh[32];
-    uint8_t timestamp_recovered[WG_TAI64N_LEN];
+    uint8_t *const timestamp_recovered = r->timestamp_recovered;
     uint8_t nonce[CHACHA20POLY1305_NONCE_LEN] = {0};
 
     /* --- Mirror initiator's prefix mixing (§5.4.3 lines 1–3). --- */
@@ -364,7 +370,6 @@ static int sim_resp_process_initiation_and_build_response(
     /* Scrub. */
     memset(key, 0, sizeof(key));
     memset(dh, 0, sizeof(dh));
-    memset(timestamp_recovered, 0, sizeof(timestamp_recovered));
     memset(e_priv, 0, sizeof(e_priv));
     memset(mac1_key, 0, sizeof(mac1_key));
     return 0;
@@ -442,6 +447,64 @@ static void test_full_handshake_roundtrip(void) {
         } else { printf("[full/tamper-tag] OK\n"); }
     }
 
+    /* Bad mac1 (tag and everything else intact): rejected before any DH. */
+    {
+        struct wg_handshake_state istm;
+        wg_handshake_init(&istm, init_priv, init_pub, resp_pub, psk);
+        struct wg_msg_initiation init_msgm;
+        wg_handshake_create_initiation(&istm, 0xCAFEBABE, &init_msgm);
+        struct sim_responder rsimm;
+        memcpy(rsimm.static_priv, resp_priv, 32);
+        memcpy(rsimm.static_pub,  resp_pub,  32);
+        struct wg_msg_response resp_m;
+        sim_resp_process_initiation_and_build_response(
+            &rsimm, &init_msgm, &resp_m, 0xFEEDF00D, psk);
+        resp_m.mac1[3] ^= 0x40;
+        uint8_t s[32], r[32]; uint32_t ri;
+        if (wg_handshake_process_response(&istm, &resp_m, s, r, &ri) == 0) {
+            printf("[full/bad-mac1] FAIL: accepted\n"); fails++;
+        } else { printf("[full/bad-mac1] OK\n"); }
+    }
+
+    /* A forged response (right receiver index, valid mac1 — anyone who
+     * knows our public key can compute it — garbage ephemeral) must not
+     * poison the in-flight handshake: the genuine response that arrives
+     * after it is still accepted and yields the same keys. */
+    {
+        struct wg_handshake_state istf;
+        wg_handshake_init(&istf, init_priv, init_pub, resp_pub, psk);
+        struct wg_msg_initiation init_msgf;
+        wg_handshake_create_initiation(&istf, 0xCAFEBABE, &init_msgf);
+        struct sim_responder rsimf;
+        memcpy(rsimf.static_priv, resp_priv, 32);
+        memcpy(rsimf.static_pub,  resp_pub,  32);
+        struct wg_msg_response genuine;
+        sim_resp_process_initiation_and_build_response(
+            &rsimf, &init_msgf, &genuine, 0xFEEDF00D, psk);
+
+        struct wg_msg_response forged = genuine;
+        uint8_t junk_priv[32], junk_pub[32];
+        curve25519_keypair(junk_priv, junk_pub);
+        memcpy(forged.ephemeral, junk_pub, 32);
+        uint8_t mk[32];
+        wg_mac1_key(mk, init_pub);
+        wg_keyed_mac16(forged.mac1, mk, (const uint8_t *)&forged,
+                       offsetof(struct wg_msg_response, mac1));
+
+        uint8_t s[32], r[32]; uint32_t ri;
+        if (wg_handshake_process_response(&istf, &forged, s, r, &ri) == 0) {
+            printf("[full/forged-rejected] FAIL: accepted\n"); fails++;
+        } else { printf("[full/forged-rejected] OK\n"); }
+        ri = 0;
+        if (wg_handshake_process_response(&istf, &genuine, s, r, &ri) != 0 ||
+            ri != 0xFEEDF00D) {
+            printf("[full/genuine-after-forged] FAIL\n"); fails++;
+        } else {
+            printf("[full/genuine-after-forged] OK\n");
+            fails += check("full/genuine-after-forged-keys", s, rsimf.recv_key, 32);
+        }
+    }
+
     /* Tamper detection: wrong receiver_index. Initiator must reject
      * before doing any crypto. */
     {
@@ -510,11 +573,256 @@ static void test_full_handshake_roundtrip(void) {
     wg_handshake_scrub(&ist);
 }
 
+/* --- Per-peer cache (B11) ------------------------------------------ */
+
+/* The pre-1.3.2 INIT construction, written out from the whitepaper
+ * (§5.4.2) with the static-static DH and the mac1 key computed afresh
+ * for this one message — what wg_handshake_init + create_initiation did
+ * on every attempt before the cache. */
+static void ref_build_initiation(const uint8_t lpriv[32], const uint8_t lpub[32],
+                                 const uint8_t ppub[32],
+                                 const uint8_t eph_priv[32], const uint8_t eph_pub[32],
+                                 const uint8_t ts[WG_TAI64N_LEN], uint32_t idx,
+                                 struct wg_msg_initiation *out)
+{
+    uint8_t ck[32], h[32], key[32], dh[32], mk[32];
+    uint8_t nonce[CHACHA20POLY1305_NONCE_LEN] = {0};
+    memset(out, 0, sizeof(*out));
+    memcpy(ck, wg_initial_chain_key(), 32);
+    memcpy(h,  wg_initial_hash(),      32);
+    wg_mix_hash(h, ppub, 32);
+    memcpy(out->ephemeral, eph_pub, 32);
+    wg_mix_chain_only(ck, eph_pub, 32);
+    wg_mix_hash(h, eph_pub, 32);
+    curve25519_dh(dh, eph_priv, ppub);
+    wg_mix_key(ck, dh, 32, key);
+    chacha20poly1305_encrypt(out->encrypted_static, lpub, 32, h, 32, key, nonce);
+    wg_mix_hash(h, out->encrypted_static, sizeof(out->encrypted_static));
+    curve25519_dh(dh, lpriv, ppub);                     /* static-static, fresh */
+    wg_mix_key(ck, dh, 32, key);
+    chacha20poly1305_encrypt(out->encrypted_timestamp, ts, WG_TAI64N_LEN,
+                             h, 32, key, nonce);
+    out->message_type = WG_MSG_INITIATION;
+    out->sender_index = idx;
+    wg_mac1_key(mk, ppub);                              /* mac1 key, fresh */
+    wg_keyed_mac16(out->mac1, mk, (const uint8_t *)out,
+                   offsetof(struct wg_msg_initiation, mac1));
+}
+
+/* Build an INIT on *st with the RNG at `seed`, recover its timestamp via
+ * the simulated responder, rebuild it with ref_build_initiation from the
+ * same ephemeral + timestamp and compare all 148 bytes. Leaves the
+ * responder's MessageResponse in *resp for the caller. */
+static void check_init_vs_ref(const char *name, struct wg_handshake_state *st,
+                              const uint8_t lpriv[32], const uint8_t lpub[32],
+                              const uint8_t rpriv[32], const uint8_t rpub[32],
+                              uint64_t seed, uint32_t idx,
+                              struct sim_responder *rsim,
+                              struct wg_msg_response *resp)
+{
+    char tag[96];
+    struct wg_msg_initiation got, want;
+    s_rng_state = seed;
+    if (wg_handshake_create_initiation(st, idx, &got) != 0) {
+        printf("[%s/create] FAIL\n", name); fails++; return;
+    }
+    uint8_t eph_priv[32], eph_pub[32];
+    s_rng_state = seed;                       /* same draw as inside create */
+    curve25519_keypair(eph_priv, eph_pub);
+
+    memcpy(rsim->static_priv, rpriv, 32);
+    memcpy(rsim->static_pub,  rpub,  32);
+    static const uint8_t psk[32] = {0};
+    if (sim_resp_process_initiation_and_build_response(rsim, &got, resp,
+                                                       0x5EED0000u ^ idx, psk) != 0) {
+        printf("[%s/responder] FAIL\n", name); fails++; return;
+    }
+    ref_build_initiation(lpriv, lpub, rpub, eph_priv, eph_pub,
+                         rsim->timestamp_recovered, idx, &want);
+    snprintf(tag, sizeof(tag), "%s/bytes-vs-uncached", name);
+    fails += check(tag, (const uint8_t *)&got, (const uint8_t *)&want, sizeof(got));
+}
+
+static void test_cached_identity(void) {
+    uint8_t a_priv[32], a_pub[32];     /* local */
+    uint8_t b_priv[32], b_pub[32];     /* peer  */
+    uint8_t c_priv[32], c_pub[32];     /* peer after a re-login */
+    uint8_t d_priv[32], d_pub[32];     /* regenerated local key */
+    curve25519_keypair(a_priv, a_pub);
+    curve25519_keypair(b_priv, b_pub);
+    curve25519_keypair(c_priv, c_pub);
+    curve25519_keypair(d_priv, d_pub);
+    static const uint8_t psk[32] = {0};
+
+    struct wg_handshake_state st;
+    memset(&st, 0, sizeof(st));
+    struct sim_responder rsim;
+    struct wg_msg_response resp;
+    uint8_t s[32], r[32];
+    uint32_t ri = 0;
+
+    /* Cold: first INIT computes the cache. */
+    if (wg_handshake_init(&st, a_priv, a_pub, b_pub, psk) != 0) {
+        printf("[cache/init-cold] FAIL\n"); fails++; return;
+    }
+    uint8_t ss_want[32];
+    curve25519_dh(ss_want, a_priv, b_pub);
+    fails += check("cache/static-dh-computed", st.static_static_dh, ss_want, 32);
+    check_init_vs_ref("cache/cold", &st, a_priv, a_pub, b_priv, b_pub,
+                      0x1111222233334444ULL, 0x01020304u, &rsim, &resp);
+    if (wg_handshake_process_response(&st, &resp, s, r, &ri) != 0) {
+        printf("[cache/cold-response] FAIL\n"); fails++;
+    } else {
+        fails += check("cache/cold-keys", s, rsim.recv_key, 32);
+    }
+
+    /* Session up: live material goes, the cache stays; a scrubbed state
+     * refuses even the genuine response it just accepted. */
+    wg_handshake_scrub_live(&st);
+    fails += check("cache/static-dh-kept", st.static_static_dh, ss_want, 32);
+    if (wg_handshake_process_response(&st, &resp, s, r, &ri) == 0) {
+        printf("[cache/scrubbed-refuses] FAIL: accepted\n"); fails++;
+    } else { printf("[cache/scrubbed-refuses] OK\n"); }
+
+    /* Rekey towards the same peer: cached path, same bytes as uncached. */
+    if (wg_handshake_init(&st, a_priv, a_pub, b_pub, psk) != 0 || !st.identity_valid) {
+        printf("[cache/init-rekey] FAIL\n"); fails++; return;
+    }
+    check_init_vs_ref("cache/rekey", &st, a_priv, a_pub, b_priv, b_pub,
+                      0x5555666677778888ULL, 0x0A0B0C0Du, &rsim, &resp);
+    if (wg_handshake_process_response(&st, &resp, s, r, &ri) != 0) {
+        printf("[cache/rekey-response] FAIL\n"); fails++;
+    } else {
+        fails += check("cache/rekey-keys", s, rsim.recv_key, 32);
+        fails += check("cache/rekey-keys-recv", r, rsim.send_key, 32);
+    }
+
+    /* Retry without a response in between (state armed, not scrubbed). */
+    wg_handshake_init(&st, a_priv, a_pub, b_pub, psk);
+    check_init_vs_ref("cache/retry", &st, a_priv, a_pub, b_priv, b_pub,
+                      0x0123456789ABCDEFULL, 0x11111111u, &rsim, &resp);
+
+    /* Peer re-login (new static key): cache recomputed for C. */
+    wg_handshake_init(&st, a_priv, a_pub, c_pub, psk);
+    curve25519_dh(ss_want, a_priv, c_pub);
+    fails += check("cache/peer-change-recomputed", st.static_static_dh, ss_want, 32);
+    check_init_vs_ref("cache/peer-change", &st, a_priv, a_pub, c_priv, c_pub,
+                      0x2222333344445555ULL, 0x22222222u, &rsim, &resp);
+    if (wg_handshake_process_response(&st, &resp, s, r, &ri) != 0) {
+        printf("[cache/peer-change-response] FAIL\n"); fails++;
+    } else { printf("[cache/peer-change-response] OK\n"); }
+
+    /* Local key regenerated: recomputed again (static DH and the mac1 key
+     * the response is checked with both depend on it). */
+    wg_handshake_init(&st, d_priv, d_pub, c_pub, psk);
+    curve25519_dh(ss_want, d_priv, c_pub);
+    fails += check("cache/local-change-recomputed", st.static_static_dh, ss_want, 32);
+    check_init_vs_ref("cache/local-change", &st, d_priv, d_pub, c_priv, c_pub,
+                      0x3333444455556666ULL, 0x33333333u, &rsim, &resp);
+    if (wg_handshake_process_response(&st, &resp, s, r, &ri) != 0) {
+        printf("[cache/local-change-response] FAIL\n"); fails++;
+    } else { printf("[cache/local-change-response] OK\n"); }
+
+    /* A new PSK is an identity change too. */
+    uint8_t psk2[32];
+    memset(psk2, 0x5a, sizeof(psk2));
+    uint8_t mk_before[32];
+    memcpy(mk_before, st.mac1_key, 32);
+    wg_handshake_init(&st, d_priv, d_pub, c_pub, psk2);
+    fails += check("cache/psk-change-copied", st.preshared_key, psk2, 32);
+    fails += check("cache/psk-change-mac1-same-peer", st.mac1_key, mk_before, 32);
+
+    /* Low-order peer key: init fails, state wiped (no stale cache), and
+     * the next valid identity computes cleanly. */
+    static const uint8_t low_order[32] = {0};
+    if (wg_handshake_init(&st, a_priv, a_pub, low_order, psk) == 0 ||
+        st.identity_valid || st.armed) {
+        printf("[cache/low-order-wipes] FAIL\n"); fails++;
+    } else { printf("[cache/low-order-wipes] OK\n"); }
+    if (wg_handshake_init(&st, a_priv, a_pub, b_pub, psk) != 0) {
+        printf("[cache/after-low-order] FAIL\n"); fails++;
+    } else {
+        check_init_vs_ref("cache/after-low-order", &st, a_priv, a_pub, b_priv, b_pub,
+                          0x7777888899990000ULL, 0x44444444u, &rsim, &resp);
+    }
+
+    /* Full scrub drops the cache. */
+    wg_handshake_scrub(&st);
+    if (st.identity_valid || !is_all_zero(st.static_static_dh, 32)) {
+        printf("[cache/scrub-drops-cache] FAIL\n"); fails++;
+    } else { printf("[cache/scrub-drops-cache] OK\n"); }
+}
+
+/* Round 1.3.6, late answers. wg_netif replaces the INIT in flight on a
+ * path event (B7b) only once it is WG_INIT_FRESH_AFTER_MS old — 1 s until
+ * 1.3.5, when answers arriving later were refused on the sensor. An
+ * answer 2 s after its INIT now finds it; past the bound the INIT is
+ * replaced, the old answer is refused (its Noise state is gone — keeping
+ * it was rejected, see wg_netif.c) and the new INIT's answer completes. */
+static void test_late_response(void) {
+    uint8_t ipriv[32], ipub[32], rpriv[32], rpub[32], psk[32] = {0};
+    if (curve25519_keypair(ipriv, ipub) != 0 || curve25519_keypair(rpriv, rpub) != 0) {
+        printf("[late/keypairs] FAIL\n"); fails++; return;
+    }
+    struct sim_responder r;
+    memcpy(r.static_priv, rpriv, 32);
+    memcpy(r.static_pub, rpub, 32);
+    const int64_t t_init = 10000000;   /* µs */
+
+    /* A pong 1.5 s after the INIT: re-send, not replace; the answer at
+     * 2 s completes the handshake. */
+    struct wg_handshake_state st;
+    struct wg_msg_initiation i1;
+    struct wg_msg_response a1;
+    uint8_t sk[32], rk[32];
+    uint32_t ridx = 0;
+    int good = wg_handshake_init(&st, ipriv, ipub, rpub, psk) == 0 &&
+               wg_handshake_create_initiation(&st, 0x11111111, &i1) == 0 &&
+               sim_resp_process_initiation_and_build_response(&r, &i1, &a1, 0xA1, psk) == 0;
+    good &= !wg_init_fresh_due(t_init + 1500000, t_init);
+    good &= wg_handshake_process_response(&st, &a1, sk, rk, &ridx) == 0 && ridx == 0xA1;
+    printf("[late/young-init-kept-answer-taken] %s\n", good ? "OK" : "FAIL");
+    fails += !good;
+
+    /* A pong 3 s after: a new INIT replaces it; the first INIT's answer
+     * is refused, the second's taken. */
+    struct wg_msg_initiation i2, i3;
+    struct wg_msg_response a2, a3;
+    good = wg_handshake_init(&st, ipriv, ipub, rpub, psk) == 0 &&
+           wg_handshake_create_initiation(&st, 0x22222222, &i2) == 0 &&
+           sim_resp_process_initiation_and_build_response(&r, &i2, &a2, 0xA2, psk) == 0;
+    good &= wg_init_fresh_due(t_init + 3000000, t_init);
+    good &= wg_handshake_init(&st, ipriv, ipub, rpub, psk) == 0 &&
+            wg_handshake_create_initiation(&st, 0x33333333, &i3) == 0;
+    good &= wg_handshake_process_response(&st, &a2, sk, rk, &ridx) != 0;
+    printf("[late/replaced-init-answer-refused] %s\n", good ? "OK" : "FAIL");
+    fails += !good;
+    good = sim_resp_process_initiation_and_build_response(&r, &i3, &a3, 0xA3, psk) == 0 &&
+           wg_handshake_process_response(&st, &a3, sk, rk, &ridx) == 0 && ridx == 0xA3;
+    printf("[late/new-init-answer-taken] %s\n", good ? "OK" : "FAIL");
+    fails += !good;
+    /* Even with the old answer's index rewritten to the new INIT's and its
+     * mac1 recomputed, it was sealed for another ephemeral: refused by the
+     * AEAD (the index check is not the only guard). */
+    wg_handshake_init(&st, ipriv, ipub, rpub, psk);
+    wg_handshake_create_initiation(&st, 0x44444444, &i3);
+    a2.receiver_index = 0x44444444;
+    uint8_t mk[WG_HASH_LEN];
+    wg_mac1_key(mk, ipub);
+    wg_keyed_mac16(a2.mac1, mk, (const uint8_t *)&a2, offsetof(struct wg_msg_response, mac1));
+    good = wg_handshake_process_response(&st, &a2, sk, rk, &ridx) != 0;
+    printf("[late/old-answer-new-index-refused] %s\n", good ? "OK" : "FAIL");
+    fails += !good;
+    wg_handshake_scrub(&st);
+}
+
 int main(void) {
     test_initial_constants();
     test_mac1_key();
     test_create_initiation_shape();
     test_full_handshake_roundtrip();
+    test_cached_identity();
+    test_late_response();
     if (fails == 0) printf("\nALL OK\n");
     return fails ? 1 : 0;
 }

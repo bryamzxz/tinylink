@@ -247,3 +247,20 @@ int stun_parse_response(const uint8_t *buf, size_t len,
     }
     return STUN_ERR_NO_MAPPED_ADDR;
 }
+
+int stun_match_v4(const uint8_t *buf, size_t len,
+                  const uint8_t txid[STUN_TXID_LEN],
+                  uint8_t addr_v4[4], uint16_t *port)
+{
+    if (txid == NULL || addr_v4 == NULL || port == NULL) return STUN_ERR_BAD_ARG;
+    uint8_t     got_txid[STUN_TXID_LEN];
+    stun_addr_t addr;
+    int rc = stun_parse_response(buf, len, got_txid, &addr);
+    if (rc != 0) return rc;
+    if (memcmp(got_txid, txid, STUN_TXID_LEN) != 0) return STUN_ERR_TXID_MISMATCH;
+    if (addr.is_v6) return STUN_ERR_NOT_V4;
+    /* v4-mapped (::ffff:a.b.c.d): the four octets are at the tail. */
+    memcpy(addr_v4, &addr.addr[12], 4);
+    *port = addr.port;
+    return 0;
+}

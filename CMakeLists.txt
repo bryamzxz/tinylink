@@ -25,6 +25,11 @@ cmake_minimum_required(VERSION 3.16)
 #   wifi_provisioning, protocomm, esp_local_ctrl, protobuf-c
 #   (protobuf-c is only pulled by protocomm; safe to drop together)
 #
+#   No HTTP client / JSON library (round 1.3.2): esp_http_client (+ its
+#   tcp_transport) had one user, the TOFU GET /key, now on esp_tls
+#   (control_key.c + tl_http1.h); cJSON (json) is replaced by
+#   jsmn / jsmn_split.h + json_helpers.c
+#
 #   No display / camera / imaging / audio peripherals:
 #   esp_lcd, esp_driver_cam, esp_driver_isp, esp_driver_jpeg,
 #   esp_driver_ppa, esp_driver_i2s, esp_driver_dac
@@ -67,6 +72,10 @@ set(EXCLUDE_COMPONENTS
     esp_local_ctrl
     protobuf-c
 
+    esp_http_client
+    tcp_transport
+    json
+
     esp_lcd
     esp_driver_cam
     esp_driver_isp
@@ -95,17 +104,99 @@ set(EXCLUDE_COMPONENTS
     ulp
 )
 
+# A deployment's own values (round 1.3.9): the device hostname and the
+# telemetry destination default to neutral ones (main/Kconfig.projbuild);
+# a git-ignored sdkconfig.local next to this file carries the real ones
+# and is applied last, after sdkconfig.defaults and any -D
+# SDKCONFIG_DEFAULTS list (the tools/power A/B fragments).
+# sdkconfig.local.example shows the shape.
+if(EXISTS "${CMAKE_CURRENT_LIST_DIR}/sdkconfig.local")
+    if(NOT DEFINED SDKCONFIG_DEFAULTS)
+        set(SDKCONFIG_DEFAULTS "sdkconfig.defaults")
+    endif()
+    list(APPEND SDKCONFIG_DEFAULTS "sdkconfig.local")
+endif()
+
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
+
+# mbedTLS user config (round 1.3.2): mbedtls_user_config.h #undefs what
+# esp_config.h enables without a Kconfig (ARIA, CFB/OFB, 3 paddings,
+# PKCS#12; reasons in the header). A build-wide COMPILE_DEFINITION, set
+# before project(): every component's directory scope picks it up
+# (idf_component_register), including mbedTLS's own mbedtls / mbedx509 /
+# mbedcrypto targets, so all translation units that include mbedTLS
+# headers compile the same configuration — the same reach as IDF's own
+# MBEDTLS_CONFIG_FILE. Path from this file's directory, so it follows
+# moves and other checkouts. The bootloader is a separate project and
+# does not see it (bootloader.bin is byte-identical).
+idf_build_set_property(COMPILE_DEFINITIONS
+    "MBEDTLS_USER_CONFIG_FILE=\"${CMAKE_CURRENT_LIST_DIR}/mbedtls_user_config.h\"" APPEND)
 
 project(tinylink)
 
-# -O2 for IDF's mbedcrypto library only. This is what mbedtls uses for
-# its symmetric/asymmetric primitives — i.e. the SHA/AES/RSA building
-# blocks behind every TLS handshake on the control plane and DERP
-# uplink. HW SHA/AES paths are already enabled (HARDWARE_AES=y,
-# HARDWARE_SHA=y, HARDWARE_MPI=y in sdkconfig.defaults), so the win
-# is on the SW glue around them. mbedtls + mbedx509 are intentionally
-# left at the default opt level — the bulk of their code is parsing/
-# validation, not arithmetic, and we want to minimize binary growth
-# on the cold paths.
-target_compile_options(mbedcrypto PRIVATE -O2)
+# An existing sdkconfig always wins over sdkconfig.defaults, so one
+# generated before round 1.3.1 silently keeps the old choice selections
+# (-Og, full cert bundle, Log V1, DHCP ARP probe, brown-out level 0) in
+# a build that reports 1.3.1. Say so; deleting sdkconfig regenerates it.
+if(NOT CONFIG_COMPILER_OPTIMIZATION_SIZE OR NOT CONFIG_LOG_VERSION_2
+   OR NOT CONFIG_LWIP_DHCP_DOES_NOT_CHECK_OFFERED_IP)
+    message(WARNING "sdkconfig does not carry the round-1.3.1 defaults "
+                    "(COMPILER_OPTIMIZATION_SIZE / LOG_VERSION_2 / "
+                    "LWIP_DHCP_DOES_NOT_CHECK_OFFERED_IP). If it predates "
+                    "1.3.1, delete it and rebuild; ignore this for a "
+                    "deliberate debug configuration.")
+endif()
+
+# -O2 islands inside mbedcrypto (round 1.3.2, B6); the rest of mbedTLS
+# (mbedcrypto, mbedtls, mbedx509) runs at the global -Os. Measured on
+# the host (IDF's mbedTLS 3.6.7, gcov line counts of a full TLS 1.2
+# handshake + response against controlplane): bignum_core.c 44.5 %, the
+# constant_time_impl.h inlines 25.7 %, bignum.c 16.2 %, ecp_curves.c
+# 10.1 %, ecp.c 2.0 %, everything else < 0.5 % (SHA, AES, ASN.1,
+# X.509, RSA glue). Every handshake does X25519 ECDHE (mbedTLS ECP),
+# one P-256 and three P-384 ECDSA verifies and one RSA verify. On the
+# ESP32 each field multiplication goes through the MPI accelerator, so
+# its glue (esp_bignum.c, bignum_alt.c) is per-mul hot too, and since
+# TLS records are AES-128-GCM (B4) the record path is esp_aes_gcm.c
+# (software GHASH, GCM_ALT) + esp_aes.c (HW block) per 16 bytes.
+# ecdh.c, pk.c, pk_wrap.c, cipher_wrap.c and esp_sha512.c come out
+# smaller at -O2 than at -Os, so they keep it. Everything else at -Os:
+# libmbedcrypto.a 4.2 KB smaller than all-at-O2.
+idf_component_get_property(tl_mbedtls_dir mbedtls COMPONENT_DIR)
+set_property(SOURCE
+        "${tl_mbedtls_dir}/mbedtls/library/bignum.c"
+        "${tl_mbedtls_dir}/mbedtls/library/bignum_core.c"
+        "${tl_mbedtls_dir}/mbedtls/library/ecp.c"
+        "${tl_mbedtls_dir}/mbedtls/library/ecp_curves.c"
+        "${tl_mbedtls_dir}/port/bignum/esp_bignum.c"
+        "${tl_mbedtls_dir}/port/bignum/bignum_alt.c"
+        "${tl_mbedtls_dir}/port/aes/esp_aes_gcm.c"
+        "${tl_mbedtls_dir}/port/aes/block/esp_aes.c"
+        "${tl_mbedtls_dir}/mbedtls/library/ecdh.c"
+        "${tl_mbedtls_dir}/mbedtls/library/pk.c"
+        "${tl_mbedtls_dir}/mbedtls/library/pk_wrap.c"
+        "${tl_mbedtls_dir}/mbedtls/library/cipher_wrap.c"
+        "${tl_mbedtls_dir}/port/sha/parallel_engine/esp_sha512.c"
+    TARGET_DIRECTORY mbedcrypto
+    APPEND PROPERTY COMPILE_OPTIONS -O2)
+
+# -O2 islands inside IDF components (round 1.3.1). The global level is
+# -Os (CONFIG_COMPILER_OPTIMIZATION_SIZE); these files sit on every WG
+# packet: lwIP's Internet checksum (21 → 9 µs per 1 500 B at -O2), pbuf
+# alloc/copy, UDP and IPv4 in/out, and the FreeRTOS queue the wg_tx task
+# and the socket layer block on. Source-level COMPILE_OPTIONS land after
+# the component's own flags on the command line, so -O2 wins.
+idf_component_get_property(tl_lwip_lib lwip COMPONENT_LIB)
+idf_component_get_property(tl_lwip_dir lwip COMPONENT_DIR)
+set_property(SOURCE
+        "${tl_lwip_dir}/lwip/src/core/inet_chksum.c"
+        "${tl_lwip_dir}/lwip/src/core/pbuf.c"
+        "${tl_lwip_dir}/lwip/src/core/udp.c"
+        "${tl_lwip_dir}/lwip/src/core/ipv4/ip4.c"
+    TARGET_DIRECTORY ${tl_lwip_lib}
+    APPEND PROPERTY COMPILE_OPTIONS -O2)
+idf_component_get_property(tl_freertos_lib freertos COMPONENT_LIB)
+idf_component_get_property(tl_freertos_dir freertos COMPONENT_DIR)
+set_property(SOURCE "${tl_freertos_dir}/FreeRTOS-Kernel/queue.c"
+    TARGET_DIRECTORY ${tl_freertos_lib}
+    APPEND PROPERTY COMPILE_OPTIONS -O2)

@@ -7,6 +7,8 @@
 //      control plane public key.
 //   3. tinylink_register() — POST /machine/register; retry slow on
 //      MachineAuthorized=false until the operator approves the node.
+//      The DERP relay connect and the STUN probe run alongside it on
+//      their own tasks (round 1.3.5).
 //   4. tinylink_dataplane_start() — fetch one MapResponse and bring up
 //      the WireGuard netif against the home peer it announces. The
 //      long-lived `Stream:true` MapRequest loop and DISCO/STUN follow
@@ -18,6 +20,7 @@
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_pm.h"
+#include "esp_random.h"
 #include "esp_system.h"
 #include "sdkconfig.h"
 
@@ -25,21 +28,43 @@
 #include "tinylink_bench.h"
 
 #include "app_nvs.h"
+#include "backoff.h"
 #include "app_wifi.h"
 
 static const char *TAG = "tinylink";
 
 #define WIFI_TIMEOUT_MS 30000
 
+static const char *reset_reason_name(esp_reset_reason_t r)
+{
+    switch (r) {
+    case ESP_RST_POWERON:   return "power-on";
+    case ESP_RST_SW:        return "software";
+    case ESP_RST_PANIC:     return "panic";
+    case ESP_RST_INT_WDT:   return "interrupt WDT";
+    case ESP_RST_TASK_WDT:  return "task WDT";
+    case ESP_RST_WDT:       return "other WDT";
+    case ESP_RST_DEEPSLEEP: return "deep-sleep wake";
+    case ESP_RST_BROWNOUT:  return "brown-out";
+    default:                return "other";
+    }
+}
+
 /* Enable automatic light-sleep entry from FreeRTOS tickless idle. Without
  * this call, esp_pm/pm_impl.c:561+829 short-circuit the tickless idle
  * sleep path (PM_MODE_LIGHT_SLEEP is never selected when
  * s_light_sleep_en is false). Pair with esp_wifi_set_ps(WIFI_PS_MIN_MODEM)
- * in app_wifi_start() so the WiFi modem also sleeps between DTIM beacons. */
+ * (app_wifi.c, once the WG session is up) so the WiFi modem also sleeps
+ * between DTIM beacons. Errata RTC-126 (RTC register reads after a
+ * light-sleep wake with RTC_PERIPH powered down) needs nothing here:
+ * IDF's hidden CONFIG_ESP_SLEEP_RTC_BUS_ISO_WORKAROUND (y on ESP32)
+ * keeps RTC_PERIPH on in every light sleep (sleep_modes.c:2895). */
 static esp_err_t configure_pm(void)
 {
+    /* The max is the boot frequency, 240 MHz (sdkconfig.defaults.esp32):
+     * one knob for the 160-MHz A/B of round 1.3.7 (tools/power/). */
     esp_pm_config_t cfg = {
-        .max_freq_mhz       = 240,
+        .max_freq_mhz       = CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ,
         .min_freq_mhz       = 80,
         .light_sleep_enable = true,
     };
@@ -48,8 +73,18 @@ static esp_err_t configure_pm(void)
 
 static esp_err_t bringup(void)
 {
-    ESP_LOGI(TAG, "tinylink %s starting on %s",
-             tinylink_version_string(), CONFIG_TINYLINK_DEVICE_HOSTNAME);
+    const esp_reset_reason_t rst = esp_reset_reason();
+    ESP_LOGI(TAG, "tinylink %s starting on %s (reset: %s, %d)",
+             tinylink_version_string(), CONFIG_TINYLINK_DEVICE_HOSTNAME,
+             reset_reason_name(rst), (int)rst);
+    tinylink_bootstat_record();   /* RTC boot counters for /stats */
+
+#if CONFIG_TINYLINK_BENCH_TLS
+    /* TLS handshake crypto (round 1.3.8) before anything else runs: no
+     * Wi-Fi interrupts, no other task, a pristine heap. A capture that
+     * opens the port resets the board, so it sees this from the start. */
+    (void)tinylink_bench_tls();
+#endif
 
     esp_err_t err = app_nvs_init();
     if (err != ESP_OK) {
@@ -62,6 +97,12 @@ static esp_err_t bringup(void)
         ESP_LOGE(TAG, "wifi start failed: 0x%x", err);
         return err;
     }
+    /* Key derivation + the first control connect's Noise DH while the
+     * AP associates (round 1.3.7): CPU the boot path no longer waits
+     * for after got-ip. After esp_wifi_start — the RNG draws the
+     * ephemeral, and it is a true RNG only with the radio on. Best
+     * effort — tinylink_init redoes what failed. */
+    (void)tinylink_preload();
     err = app_wifi_wait_connected(WIFI_TIMEOUT_MS);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "wifi did not connect within %d ms", WIFI_TIMEOUT_MS);
@@ -71,20 +112,32 @@ static esp_err_t bringup(void)
     /* Enable light-sleep PM only AFTER WiFi associates. If we enable it
      * before assoc, tickless idle can put the chip to sleep during AUTH
      * /ASSOC where the WiFi PS state machine isn't engaged yet, and the
-     * AP kicks us out after ~6 s of missed beacons. esp_wifi_set_ps()
-     * has been called in app_wifi_start() and takes effect on first
-     * assoc, so by the time wait_connected() returns the modem-sleep
-     * path is fully primed and safe for tickless light sleep to use. */
+     * AP kicks us out after ~6 s of missed beacons. Since round 1.3.1
+     * the modem stays awake (WIFI_PS_NONE, esp_wifi's APB_FREQ_MAX lock
+     * held) until the WG session is up or 60 s have passed (app_wifi.c
+     * power-save timer), so light sleep only engages after that. */
     esp_err_t pm_err = configure_pm();
     if (pm_err != ESP_OK) {
         ESP_LOGW(TAG, "pm configure failed: 0x%x — continuing without light sleep", pm_err);
     } else {
-        ESP_LOGI(TAG, "pm: light-sleep enabled, DFS 240/80 MHz");
+        ESP_LOGI(TAG, "pm: light-sleep enabled, DFS %d/80 MHz",
+                 CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ);
     }
 
     /* Clock floor + SNTP before the first TLS handshake (tinylink_init
      * may fetch /key over TLS). Certificate dates are enforced once the
-     * first sync lands; until then they are tolerated. See tl_time.h. */
+     * first sync lands; until then they are tolerated. See tl_time.h.
+     *
+     * Not moved later (round 1.3.5): lwIP already sends the first SNTP
+     * query — and its pool.ntp.org lookup — at a random 0–5 s after this
+     * (CONFIG_LWIP_SNTP_STARTUP_DELAY, max 5 000 ms), and with the
+     * address cache (tl_addr.h) a boot with records makes no other DNS
+     * query: DERP, STUN and control go to their last-known addresses. So
+     * there is no burst left for it to join, and nothing on the boot
+     * path waits for it. Starting it after the bringup would only make
+     * the boot's TLS handshakes (DERP, a :443 fallback, the TOFU /key)
+     * run date-unchecked every time instead of whenever the sync is
+     * late. */
     err = tinylink_time_start();
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "time start failed: 0x%x — certificate dates unchecked", err);
@@ -109,14 +162,15 @@ static esp_err_t bringup(void)
     }
 
 #if CONFIG_TINYLINK_BENCH_AEAD
-    /* AEAD baseline. Runs before register/dataplane so the heap is
-     * still pristine and the timer numbers aren't confounded by
-     * background TLS/long-poll work. The 8 s delay is purely so the
+    /* AEAD + X25519 baseline. Runs before register/dataplane so the
+     * heap is still pristine and the timer numbers aren't confounded
+     * by background TLS/long-poll work. The 8 s delay is purely so the
      * host serial capture can attach after `idf.py flash` releases the
      * port — without it the bench fires before capture is listening
      * and the numbers are lost. */
     vTaskDelay(pdMS_TO_TICKS(8000));
     (void)tinylink_bench_aead();
+    (void)tinylink_bench_x25519();
 #endif
 
     /* Bring up the WG UDP socket EARLY (bind only — no handshake yet)
@@ -136,20 +190,20 @@ static esp_err_t bringup(void)
 
 #if CONFIG_TINYLINK_DERP_SUPERVISED
     /* Spawn the DERP supervisor task NOW — before any TLS handshake
-     * (register, long-poll, supervisor's own DERP TLS) lands and
-     * fragments the heap below the 12 KiB contiguous needed for the
-     * task stack. Without this move the spawn fails with
+     * (register, the supervisor's own DERP TLS) lands. In the 2026-05
+     * tree, with the spawn after the long-poll, it failed with
      * `heap_free=~11.7K largest=~11.2K need 12K contiguous` (observed
      * across 3 soaks) and ALL DERP-dependent features (CMM ingestion,
-     * relayed DISCO, future DERP outbound fallback) stay dead.
+     * relayed DISCO, DERP outbound fallback) stayed dead.
      *
-     * The task body itself waits internally for the first netmap
-     * (tinylink_wait_dataplane_ms) before opening its TLS conn to the
-     * DERP relay, so we still respect the "long-poll handshake gets a
-     * pristine arena" + "PreferredDERP region known before connecting"
-     * invariants documented in the previous wait-then-spawn shape.
-     * Spawn-now-connect-later separates the two concerns cleanly:
-     * xTaskCreate gets a clean heap, TLS handshake gets a known region. */
+     * Since round 1.3.5 the task also connects NOW, its TLS handshake
+     * overlapping the register's, instead of waiting for the first
+     * netmap: the relay is then up when the first WG handshake INIT
+     * goes out, whose DERP copy reaches the peer — 1.3.4 had the
+     * session up only on attempt 2, ~1.9 s after the netmap, after the
+     * DERP login. The old wait's two invariants (a pristine arena for
+     * the long-poll's handshake; the PreferredDERP region known before
+     * connecting) no longer hold — derp_supervised_task has why. */
     esp_err_t derp_sup_err = tinylink_derp_supervised_start();
     if (derp_sup_err != ESP_OK) {
         ESP_LOGW(TAG, "derp supervised start failed: 0x%x — continuing",
@@ -157,35 +211,49 @@ static esp_err_t bringup(void)
     }
 #endif
 
-    /* M4 — best-effort STUN probe. Runs once before the first
-     * MapRequest so HostInfo.Endpoints can advertise our reflexive
-     * AddrPort to the control plane (which forwards it to peers).
-     * Non-load-bearing: a probe failure leaves us with no endpoint
-     * advertised, identical to the pre-M4 baseline. */
-    esp_err_t serr = tinylink_stun_probe();
+    /* M4 — best-effort STUN probe, so HostInfo.Endpoints can advertise
+     * our reflexive AddrPort to the control plane (which forwards it to
+     * peers). Since round 1.3.5 it runs on its own task WHILE the
+     * register runs — it cost the boot 0.04–7.1 s here before — and
+     * tinylink_dataplane_start waits ≤ 300 ms for it; the endpoint push
+     * goes with the long-poll's first map stream (round 1.3.7).
+     * Non-load-bearing: no result in time = the push goes without an
+     * endpoint, and the re-probe pushes it once the data plane is up. */
+    esp_err_t serr = tinylink_stun_probe_start();
     if (serr != ESP_OK) {
-        ESP_LOGW(TAG, "stun probe failed: 0x%x — continuing without endpoint", serr);
+        ESP_LOGW(TAG, "stun probe start failed: 0x%x — continuing without endpoint",
+                 serr);
     }
 
     /* Register loop: control plane may answer MachineAuthorized=false until
-     * the operator approves the new node. Retry on a slow cadence. When
-     * the server returns 429/503 with a Retry-After header, honor that
-     * delay instead of CONFIG_TINYLINK_REGISTER_RETRY_MS so we pace at
-     * the server's requested cadence. */
+     * the operator approves the new node. When control rate-limits us
+     * (429, or 503 + Retry-After) wait what it asks (capver 147). Else a
+     * jittered ladder 2 → 4 → 8 → 16 s up to CONFIG_TINYLINK_REGISTER_RETRY_MS
+     * (round 1.3.8): a fixed 30 s turned a ~20-s network stall right after
+     * association (both TCP conns dead at once, seen on the sensor) into a
+     * 40-s wait for the first retry; the slow cadence is still reached
+     * while the node waits for approval. */
+    uint32_t reg_attempt = 0;
     for (;;) {
         err = tinylink_register();
         if (err == ESP_OK) {
             ESP_LOGI(TAG, "node registered");
             break;
         }
-        int retry_after_s = tinylink_last_retry_after_s();
-        uint32_t delay_ms = (retry_after_s > 0)
-                              ? (uint32_t)retry_after_s * 1000U
-                              : (uint32_t)CONFIG_TINYLINK_REGISTER_RETRY_MS;
+        const uint32_t rate_limit_ms = tinylink_last_rate_limit_ms();
+        const uint32_t delay_ms = (rate_limit_ms > 0)
+                                    ? rate_limit_ms
+                                    : tl_backoff_ms(reg_attempt, 2000u,
+                                                    (uint32_t)CONFIG_TINYLINK_REGISTER_RETRY_MS,
+                                                    esp_random());
+        if (reg_attempt < 16) reg_attempt++;
         ESP_LOGW(TAG, "register attempt failed: 0x%x — retrying in %u ms%s",
                  err, (unsigned)delay_ms,
-                 retry_after_s > 0 ? " (server Retry-After)" : "");
+                 rate_limit_ms > 0 ? " (rate limited by control)" : "");
         vTaskDelay(pdMS_TO_TICKS(delay_ms));
+        /* The Wi-Fi hint's NVS copy, if it changed (round 1.3.7): the
+         * telemetry task's housekeeping only exists once registered. */
+        app_wifi_persist_hint();
     }
 
     err = tinylink_dataplane_start();
@@ -204,19 +272,29 @@ static esp_err_t bringup(void)
     }
 #endif
 
-    /* Long-poll FIRST so its TLS conn + nghttp2 session land on a
-     * fresh heap. The long-poll task runs at priority IDLE+4 (higher
-     * than this bringup task) so it preempts here and starts its
-     * handshake immediately. */
+    /* The long-poll's first stream — with the endpoint push as a second
+     * HTTP/2 stream in the same burst (round 1.3.7) — rides the
+     * register's control conn — no handshake at boot.
+     * The long-poll task runs at priority IDLE+4 (higher than this
+     * bringup task) so it preempts here and sends its MapRequest
+     * immediately. */
     err = tinylink_long_poll_start();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "long-poll start failed: 0x%x", err);
         return err;
     }
 
-    /* Telemetry starts from the long-poll handler on the first netmap
-     * (so it never sends to a 100.64.x.y destination before the WG
-     * netif exists) — nothing to start here. */
+    /* Warm start (round 1.3.9): WireGuard up from the previous boot's
+     * netmap while the push and the map stream just sent are answered —
+     * this task runs once the long-poll blocks on them. Registered above
+     * (keys confirmed, node authorized); the netmap then confirms or
+     * corrects it (tinylink.c). Best effort, logs its outcome. */
+    tinylink_warm_start();
+
+    /* Telemetry starts with the WG netif — from the warm start above, or
+     * from the long-poll handler on the first netmap (so it never sends
+     * to a 100.64.x.y destination before the WG netif exists) — nothing
+     * to start here. */
 
     /* Periodic STUN re-probe so HostInfo.Endpoints stays fresh against
      * NAT rebinds and WAN address changes. Best-effort, silent on
@@ -233,6 +311,12 @@ static esp_err_t bringup(void)
 void app_main(void)
 {
     esp_err_t err = bringup();
+    /* The main task is gone before the first 60-s stack diag, so its
+     * peak is logged here: 8 KiB since round 1.3.4 (D4), sized from
+     * tools/stack_worst.py (see sdkconfig.defaults). */
+    ESP_LOGI(TAG, "main stack: hwm=%u B free of %u",
+             (unsigned)uxTaskGetStackHighWaterMark(NULL),
+             (unsigned)CONFIG_ESP_MAIN_TASK_STACK_SIZE);
     if (err != ESP_OK) {
 #if CONFIG_TINYLINK_CONTROL_WEDGE_RESTART_S > 0
         /* Unattended-deployment stance (paired with the long-poll's

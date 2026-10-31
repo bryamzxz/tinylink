@@ -5,10 +5,10 @@
 
 #include <string.h>
 
-#include "mbedtls/poly1305.h"
-
 #include "curve25519.h"
+#include "poly1305_donna.h"
 #include "salsa20.h"
+#include "secure_zero.h"
 
 /* Maximum stack-resident keystream + tag-input buffer used by
  * nacl_box / nacl_box_open. The largest inner plaintext the firmware
@@ -33,7 +33,7 @@ static int box_beforenm(uint8_t k[NACL_BOX_KEY_LEN],
         return -1;
     }
     hsalsa20(k, shared, zero16);
-    memset(shared, 0, sizeof(shared));
+    tl_secure_zero(shared, sizeof(shared));
     return 0;
 }
 
@@ -42,6 +42,24 @@ int nacl_box_compute_shared(uint8_t k[NACL_BOX_KEY_LEN],
                             const uint8_t my_priv[NACL_BOX_KEY_LEN])
 {
     return box_beforenm(k, peer_pub, my_priv);
+}
+
+/* One-shot Poly1305 (crypto_onetimeauth) on the in-tree poly1305-donna —
+ * the same IRAM code the WireGuard AEAD uses. Byte-identical to the
+ * mbedtls_poly1305_mac() it replaced in round 1.3.2 (RFC 8439 §2.5 both;
+ * tools/test: libsodium vectors + the mbedTLS differential). The context
+ * holds r and the pad s, so it is scrubbed. noinline: the 144-byte
+ * context then lives only in this frame, not in nacl_box() /
+ * nacl_box_open_after_shared() across the XSalsa20 call (wg_rx stack). */
+static __attribute__((noinline)) void onetimeauth(uint8_t mac[NACL_BOX_TAG_LEN],
+                        const uint8_t *m, size_t mlen,
+                        const uint8_t key[32])
+{
+    poly1305_context p;
+    poly1305_init(&p, key);
+    poly1305_update(&p, m, mlen);
+    poly1305_finish(&p, mac);
+    tl_secure_zero(&p, sizeof(p));
 }
 
 /* Constant-time memcmp for auth tag verification. Returns 0 on equal,
@@ -59,10 +77,25 @@ int nacl_box(uint8_t *c,
              const uint8_t peer_pub[NACL_BOX_KEY_LEN],
              const uint8_t my_priv[NACL_BOX_KEY_LEN])
 {
-    if (mlen > NACL_BOX_MAX_INNER) return -1;
-
     uint8_t k[NACL_BOX_KEY_LEN];
     if (box_beforenm(k, peer_pub, my_priv) != 0) return -1;
+    const int rc = nacl_box_after_shared(c, m, mlen, nonce, k);
+    tl_secure_zero(k, sizeof(k));
+    return rc;
+}
+
+/* crypto_box_afternm. Seals with a K from nacl_box_compute_shared. */
+int nacl_box_after_shared(uint8_t *c,
+                          const uint8_t *m, size_t mlen,
+                          const uint8_t nonce[NACL_BOX_NONCE_LEN],
+                          const uint8_t shared_k[NACL_BOX_KEY_LEN])
+{
+    if (mlen > NACL_BOX_MAX_INNER) return -1;
+
+    /* Local copy: the scrub at the end wipes only memory this function
+     * owns; the caller's (cached) K is left alone. */
+    uint8_t k[NACL_BOX_KEY_LEN];
+    memcpy(k, shared_k, NACL_BOX_KEY_LEN);
 
     /* Generate keystream of length mlen + 32 (first 32 bytes are the
      * Poly1305 one-time key). Stack-resident, sized for the worst case
@@ -76,11 +109,11 @@ int nacl_box(uint8_t *c,
         c[NACL_BOX_TAG_LEN + i] = m[i] ^ stream[32 + i];
     }
     /* Authenticate ciphertext with Poly1305 keyed by stream[0..32]. */
-    int rc = mbedtls_poly1305_mac(stream, c + NACL_BOX_TAG_LEN, mlen, c);
+    onetimeauth(c, c + NACL_BOX_TAG_LEN, mlen, stream);
 
-    memset(stream, 0, sizeof(stream));
-    memset(k, 0, sizeof(k));
-    return rc == 0 ? 0 : -1;
+    tl_secure_zero(stream, sizeof(stream));
+    tl_secure_zero(k, sizeof(k));
+    return 0;
 }
 
 int nacl_box_open_after_shared(uint8_t *m,
@@ -96,18 +129,15 @@ int nacl_box_open_after_shared(uint8_t *m,
     xsalsa20_keystream(stream, mlen + 32, k, nonce);
 
     uint8_t tag[NACL_BOX_TAG_LEN];
-    if (mbedtls_poly1305_mac(stream, c + NACL_BOX_TAG_LEN, mlen, tag) != 0) {
-        memset(stream, 0, sizeof(stream));
-        return -1;
-    }
+    onetimeauth(tag, c + NACL_BOX_TAG_LEN, mlen, stream);
     if (ct_memeq(tag, c, NACL_BOX_TAG_LEN) != 0) {
-        memset(stream, 0, sizeof(stream));
+        tl_secure_zero(stream, sizeof(stream));
         return -1;
     }
     for (size_t i = 0; i < mlen; i++) {
         m[i] = c[NACL_BOX_TAG_LEN + i] ^ stream[32 + i];
     }
-    memset(stream, 0, sizeof(stream));
+    tl_secure_zero(stream, sizeof(stream));
     return 0;
 }
 
@@ -120,6 +150,6 @@ int nacl_box_open(uint8_t *m,
     uint8_t k[NACL_BOX_KEY_LEN];
     if (box_beforenm(k, peer_pub, my_priv) != 0) return -1;
     int rc = nacl_box_open_after_shared(m, c, clen, nonce, k);
-    memset(k, 0, sizeof(k));
+    tl_secure_zero(k, sizeof(k));
     return rc;
 }

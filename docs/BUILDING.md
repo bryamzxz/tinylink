@@ -2,8 +2,10 @@
 
 ## Prerequisites
 
-- ESP-IDF **v5.5.4** installed (the project is frozen on this exact
-  release — see "CI" below). `$IDF_PATH` below is its checkout.
+- ESP-IDF **v5.5.6** installed (the project is pinned to this exact
+  release — see "CI" below; moved from v5.5.4 in round 1.3.0, 2026-10:
+  same toolchain `esp-14.2.0_20260121`, Wi-Fi supplicant security fixes,
+  both `idf-patches/` still needed). `$IDF_PATH` below is its checkout.
 - A Python virtualenv with the project tooling installed (the helper scripts
   in `tools/` use `pyserial` and the IDF Python deps).
 - A Freenove ESP32-WROOM-32E DevKit on `/dev/ttyUSB0` (CH340).
@@ -53,7 +55,7 @@ To revert (e.g. to test against stock IDF — expect the panic):
 
 ```bash
 cd "$IDF_PATH"
-git reset --hard v5.5.4
+git reset --hard v5.5.6
 ```
 
 See [`idf-patches/README.md`](../idf-patches/README.md) for the full
@@ -62,29 +64,53 @@ diagnostic history (esp-protocols#800, commit `c8c10214f8`, and the
 
 ## Build / flash / monitor
 
+A deployment's own values — the device hostname and the telemetry
+destination — go in `sdkconfig.local` next to `sdkconfig.defaults`
+(git-ignored; copy `sdkconfig.local.example`). The build applies it
+last, after `sdkconfig.defaults` and any `-D SDKCONFIG_DEFAULTS` list.
+Without it the hostname is `tinylink` and no telemetry is sent (the
+device still joins the tailnet). An existing `sdkconfig` wins over every
+defaults file: after changing `sdkconfig.local`, delete `sdkconfig` or
+build in a fresh directory.
+
 ```bash
 idf.py build
 idf.py -p /dev/ttyUSB0 flash
 idf.py -p /dev/ttyUSB0 monitor   # Ctrl-] to exit
 ```
 
-## Benchmarking AEAD
+The console runs at **500 000 baud** since 1.3.1
+(`CONFIG_ESP_CONSOLE_UART_BAUDRATE`; `idf.py monitor` and
+`tools/serial_capture.py` default to it). Any other terminal must be set
+to 500 000 — at 115 200 only the ROM loader's first lines are readable.
+On this board opening the port resets the chip even with DTR/RTS
+requested low (observed 2026-10-28: Linux raises both on open before
+pyserial can drop them, and the CH340 auto-reset circuit turns that into
+an EN pulse), so a capture starts from a fresh boot.
 
-The ChaCha20-Poly1305 hot path has an opt-in micro-benchmark that runs
-once on boot, prints µs/call + ns/B + MB/s for 64 B and 1500 B payloads
-(encrypt and decrypt), and verifies a round-trip before reporting any
-numbers.
+## Benchmarking AEAD and X25519
+
+The ChaCha20-Poly1305 hot path and X25519 have an opt-in micro-benchmark
+that runs once on boot. AEAD (`bench-aead`): the RFC 8439 §2.8.2 KAT on
+word-aligned and unaligned buffers, a 1500 B round trip, then µs/call +
+ns/B + MB/s for 64 B and 1500 B payloads (encrypt and decrypt, hot and
+cold cache) and raw ChaCha20 per MTU. X25519 (`bench-x25519`, round
+1.3.3): the RFC 7748 §5.2 KAT — the only on-device check of the field
+multiplication's Xtensa asm — µs per scalarmult, and the CCOUNT cycle
+spread over eight scalar/point pairs (a timing probe: the code has no
+secret-dependent branch, the multiplier's latency is undocumented). No
+number is reported if a KAT fails.
 
 Enable, build, flash, capture:
 
 ```bash
 idf.py menuconfig             # tinylink core → Run ChaCha20-Poly1305 AEAD
-                              # micro-benchmark on boot → y
+                              # and X25519 micro-benchmarks on boot → y
 idf.py build
 idf.py -p /dev/ttyUSB0 flash
-python tools/serial_capture.py --port /dev/ttyUSB0 --duration 30 \
+python tools/serial_capture.py --port /dev/ttyUSB0 --duration 40 \
     --out /tmp/bench.log
-grep "bench-aead" /tmp/bench.log
+grep -E "bench-(aead|x25519)" /tmp/bench.log
 ```
 
 The bench fires after `tinylink_init()` returns and before
@@ -97,7 +123,7 @@ is not set`); the bench code drops out of the binary entirely.
 ## Size budget snapshot
 
 Reference `idf.py size` numbers for the ESP32-WROOM-32E (no PSRAM)
-target on ESP-IDF v5.5.4:
+target (M16 and earlier on ESP-IDF v5.5.4, 1.3.0 on v5.5.6):
 
 | Region        | Post-η baseline (`4bd5b0f`) | M13 (`c383e49`)     | M14 (`8f353c5`)       | M15 (`8a18425`)       | **M16**                       |
 |---------------|----------------------------:|--------------------:|----------------------:|----------------------:|------------------------------:|
@@ -189,7 +215,7 @@ GitHub Actions (`.github/workflows/build.yml`) runs, on every push and PR:
    number of `OK` cases) and the same suite under ASan + UBSan;
 2. a dry-run of the two `idf-patches/` against the pinned ESP-IDF, so a
    patch that stops applying is caught before a device panics;
-3. `idf.py build` for `esp32` against the pinned ESP-IDF **v5.5.4**, plus
+3. `idf.py build` for `esp32` against the pinned ESP-IDF **v5.5.6**, plus
    `idf.py size` / `size-components` (posted to the run summary) and a
    check that `dependencies.lock` was not rewritten.
 

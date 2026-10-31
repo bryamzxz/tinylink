@@ -4,12 +4,16 @@
 #include "tinylink.h"
 
 #include <errno.h>
+#include <stdint.h>
 #include <string.h>
+#include <time.h>
 
 #include "freertos/FreeRTOS.h"
+#include "freertos/event_groups.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 
+#include "esp_attr.h"
 #include "esp_event.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
@@ -21,9 +25,13 @@
 #include "sdkconfig.h"
 
 #include "backoff.h"
+#include "h2_client.h"        /* h2_client_set_lb */
+#include "h2_retry_after.h"
 #include "tl_wdt.h"
 #include "tl_time.h"
 #include "control_key.h"
+#include "crypto/nacl_box.h"
+#include "crypto/secure_zero.h"
 #include "derp_client.h"
 #include "disco.h"
 #include "disco_handler.h"
@@ -37,10 +45,19 @@
 #endif
 #include "mapreq.h"
 #include "netmap.h"
+#if CONFIG_TINYLINK_POWER_DIAG
+#include "pwr_diag.h"
+#endif
 #include "register.h"
+#include "register_json.h"   /* register_retry_with_auth */
 #include "stun.h"
+#include "stun_boot.h"
 #include "stun_probe.h"
 #include "telemetry.h"
+#include "tl_addr.h"
+#include "tl_warm.h"
+#include "tls_resume.h"
+#include "tl_bootstat.h"
 #include "ts2021_client.h"
 #include "wg_dataplane.h"
 #include "wg_netif.h"
@@ -51,6 +68,7 @@ static const char *TAG = "tinylink";
 static const char k_version[] = TINYLINK_VERSION_STRING;
 
 static tinylink_keys_t s_keys;
+static bool            s_keys_loaded;   /* by tinylink_preload or tinylink_init */
 static uint8_t         s_control_pub[32];
 static bool            s_initialized;
 
@@ -67,13 +85,29 @@ static stun_probe_result_t s_stun_result;
 static ts2021_conn_t   s_conn;
 static bool            s_conn_open;
 
+/* The control plane's last good address (round 1.3.5: s_conn.peer_v4 of
+ * the last conn that came up), packed for an atomic hand-over to the
+ * telemetry task's NVS write (tinylink_addr_persist_poll); 0 = none.
+ * ts2021_client.c dials it first on its own. */
+static uint32_t        s_ctl_addr;
+
 static esp_err_t ensure_control_conn(void)
 {
     if (s_conn_open) return ESP_OK;
     esp_err_t err = ts2021_connect(&s_conn, s_keys.machine_priv,
-                                   s_keys.machine_pub, s_control_pub);
+                                   s_keys.machine_pub, s_control_pub,
+                                   control_key_pinned());
     if (err == ESP_OK) {
         s_conn_open = true;
+        /* Every request on it names the node for control's load
+         * balancer, as upstream's (round 1.3.8, h2_client_set_lb). */
+        h2_client_set_lb(s_keys.node_pub);
+        /* For the next boot (round 1.3.5): the telemetry housekeeping
+         * stores it when it differs from NVS (tl_addr.h). An unknown peer
+         * (0) leaves the record alone. */
+        uint32_t v;
+        memcpy(&v, s_conn.peer_v4, sizeof(v));
+        if (v != 0) __atomic_store_n(&s_ctl_addr, v, __ATOMIC_RELAXED);
         /* A completed TLS + Noise IK handshake proves the control plane
          * is reachable and our local stack is not wedged — exactly what
          * the wedge-restart last resort exists to detect. Feed it here
@@ -93,14 +127,22 @@ static void drop_control_conn(void)
     s_conn_open = false;
 }
 
-/* Snapshotted from s_conn.h2_retry_after_s inside tinylink_register, before
- * drop_control_conn tears the conn down. Lets the boot register loop
- * (main.c) read the hint without holding a reference to the live conn. */
-static int s_last_register_retry_after_s;
-
-int tinylink_last_retry_after_s(void)
+/* Rate-limit wait for the response currently on s_conn (capver 147):
+ * 0 unless control answered 429, or 503 with a Retry-After. */
+static uint32_t control_rate_limit_ms(void)
 {
-    return s_last_register_retry_after_s;
+    return h2_rate_limit_wait_ms(s_conn.h2_status, s_conn.h2_retry_after_present,
+                                 s_conn.h2_retry_after_s, esp_random());
+}
+
+/* Snapshotted inside tinylink_register, before drop_control_conn tears
+ * the conn down. Lets the boot register loop (main.c) and the in-loop
+ * re-register read it without a reference to the live conn. */
+static uint32_t s_last_register_wait_ms;
+
+uint32_t tinylink_last_rate_limit_ms(void)
+{
+    return s_last_register_wait_ms;
 }
 
 const char *tinylink_version_string(void)
@@ -116,7 +158,7 @@ void tinylink_diag_dump_stacks(void)
      * gives slack. If uxTaskGetSystemState returns 0 the buffer was
      * too small — log a warning so we know to bump this constant
      * rather than silently truncating the dump. */
-    enum { TL_DIAG_MAX_TASKS = 32 };
+    enum { TL_DIAG_MAX_TASKS = 20 };   /* 13 tasks live (round 1.3.3, B18) */
     static TaskStatus_t snap[TL_DIAG_MAX_TASKS];
     UBaseType_t n = uxTaskGetSystemState(snap, TL_DIAG_MAX_TASKS, NULL);
     if (n == 0) {
@@ -141,22 +183,57 @@ void tinylink_diag_dump_stacks(void)
                  snap[i].pcTaskName,
                  (unsigned)snap[i].usStackHighWaterMark);
     }
+#if CONFIG_TINYLINK_POWER_DIAG
+    tl_pwr_diag_dump(snap, (unsigned)n);   /* round 1.3.7, pwr_diag.h */
+#endif
+}
+
+static void reg_hint_load(void);
+static void addr_cache_load(void);
+static void warm_load(void);
+
+/* Round 1.3.7, B2: the boot's static key work while Wi-Fi associates
+ * (main.c calls this between starting Wi-Fi and waiting for it; 3–9 s of
+ * idle CPU on the sensor) instead of in the first ~90 ms after got-ip:
+ * the three public keys derived from NVS (3 X25519 — the 40 ms between
+ * "sntp started" and the control-key line on the 1.3.6 logs) and, with a
+ * control key pinned in NVS, the first connect's Noise msg1 DH (ss, e,
+ * es: 3 more; ts2021_precompute). No network, nothing logged on
+ * success; a failure here is retried and reported by tinylink_init. */
+esp_err_t tinylink_preload(void)
+{
+    if (!s_keys_loaded) {
+        if (keys_load_or_generate(&s_keys) != ESP_OK) return ESP_FAIL;
+        s_keys_loaded = true;
+    }
+    uint8_t pub[32];
+    if (control_key_peek(pub) == ESP_OK) {
+        ts2021_precompute(s_keys.machine_priv, s_keys.machine_pub, pub);
+    }
+    return ESP_OK;
 }
 
 esp_err_t tinylink_init(void)
 {
     /* Task-WDT feed for every blocking TLS poll (see tl_wdt.h). */
     tls_io_set_poll_hook(tl_wdt_feed);
-    esp_err_t err = keys_load_or_generate(&s_keys);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "keys_load_or_generate failed: 0x%x", err);
-        return err;
+    esp_err_t err = ESP_OK;
+    if (!s_keys_loaded) {
+        err = keys_load_or_generate(&s_keys);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "keys_load_or_generate failed: 0x%x", err);
+            return err;
+        }
+        s_keys_loaded = true;
     }
     err = control_key_get(s_control_pub);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "control_key_get failed: 0x%x", err);
         return err;
     }
+    reg_hint_load();
+    addr_cache_load();
+    warm_load();
     s_initialized = true;
     return ESP_OK;
 }
@@ -273,38 +350,128 @@ static esp_err_t read_auth_key(char *out, size_t out_size)
     return err;
 }
 
-esp_err_t tinylink_register(void)
+/* B22 (round 1.3.3): the keys control last authorized — machine_pub ‖
+ * node_pub, so a regenerated key of either kind misses — in the TAI64N
+ * namespace. While they match, a register sends no Auth, the way a
+ * restarted tailscaled re-registers: control answers with the node's
+ * current state instead of re-running the auth-key login (a node-record
+ * write on its side) on every boot, and the auth key is not even read
+ * out of NVS. Written only when the verdict changes. */
+#define REG_NVS_KEY "reg_keys"
+static bool s_reg_known;   /* NVS reg_keys == this device's keys */
+/* The last successful register sent no auth key: control answered for
+ * the node it already knew with these keys (round 1.3.9: the warm start
+ * needs that — one that needed the key may be a new node). */
+static bool s_reg_no_auth;
+
+static void reg_hint_load(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(TAI64N_NVS_NS, NVS_READONLY, &h) != ESP_OK) return;
+    uint8_t blob[2 * TINYLINK_KEY_LEN];
+    size_t  len = sizeof(blob);
+    s_reg_known = nvs_get_blob(h, REG_NVS_KEY, blob, &len) == ESP_OK &&
+                  len == sizeof(blob) &&
+                  memcmp(blob, s_keys.machine_pub, TINYLINK_KEY_LEN) == 0 &&
+                  memcmp(blob + TINYLINK_KEY_LEN, s_keys.node_pub,
+                         TINYLINK_KEY_LEN) == 0;
+    nvs_close(h);
+}
+
+/* RAM follows the verdict even when NVS fails: worst case the next boot
+ * pays one extra register round trip (or sends Auth it did not need). */
+static void reg_hint_store(bool known)
+{
+    if (s_reg_known == known) return;
+    s_reg_known = known;
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(TAI64N_NVS_NS, NVS_READWRITE, &h);
+    if (err == ESP_OK) {
+        if (known) {
+            uint8_t blob[2 * TINYLINK_KEY_LEN];
+            memcpy(blob, s_keys.machine_pub, TINYLINK_KEY_LEN);
+            memcpy(blob + TINYLINK_KEY_LEN, s_keys.node_pub, TINYLINK_KEY_LEN);
+            err = nvs_set_blob(h, REG_NVS_KEY, blob, sizeof(blob));
+        } else {
+            err = nvs_erase_key(h, REG_NVS_KEY);
+            if (err == ESP_ERR_NVS_NOT_FOUND) err = ESP_OK;
+        }
+        if (err == ESP_OK) err = nvs_commit(h);
+        nvs_close(h);
+    }
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "register hint: nvs %s failed: 0x%x",
+                 known ? "set" : "erase", err);
+    }
+}
+
+/* force_auth: the long-poll recovery ladder (node expired / deleted /
+ * map rejected) — control already refused this node, so go straight to
+ * the auth key, as before B22. */
+static esp_err_t register_node(bool force_auth)
 {
     if (!s_initialized) return ESP_ERR_INVALID_STATE;
 
-    /* Reset the per-attempt retry-after hint so a TLS / NVS / network
-     * failure path doesn't surface a stale value from a previous 429. */
-    s_last_register_retry_after_s = 0;
+    /* Reset the per-attempt wait so a TLS / NVS / network failure path
+     * doesn't surface a stale value from a previous 429. */
+    s_last_register_wait_ms = 0;
 
+    /* Read before connecting when it is going to be sent: a missing key
+     * then fails without a TLS + Noise handshake per retry. */
+    const bool known = s_reg_known && !force_auth;
+    bool retried = false;
     char auth_key[128];
-    esp_err_t err = read_auth_key(auth_key, sizeof(auth_key));
-    if (err != ESP_OK) return err;
+    esp_err_t err;
+    if (!known) {
+        err = read_auth_key(auth_key, sizeof(auth_key));
+        if (err != ESP_OK) return err;
+    }
 
     err = ensure_control_conn();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "ts2021_connect failed: 0x%x", err);
-        mbedtls_platform_zeroize(auth_key, sizeof(auth_key));
+        if (!known) mbedtls_platform_zeroize(auth_key, sizeof(auth_key));
         return err;
     }
 
-    err = register_emit(&s_conn, &s_keys, auth_key);
+    int status = 0;
+    if (known) {
+        err = register_emit(&s_conn, &s_keys, NULL, &status);
+        if (register_retry_with_auth(status, err)) {
+            ESP_LOGW(TAG, "register without auth refused (HTTP %d, 0x%x) — "
+                          "retrying with the stored auth key", status, err);
+            reg_hint_store(false);
+            retried = true;
+            err = read_auth_key(auth_key, sizeof(auth_key));
+            if (err == ESP_OK) {
+                err = register_emit(&s_conn, &s_keys, auth_key, &status);
+                mbedtls_platform_zeroize(auth_key, sizeof(auth_key));
+            }
+        }
+    } else {
+        err = register_emit(&s_conn, &s_keys, auth_key, &status);
+        /* Scrub the auth key in stack memory. mbedtls_platform_zeroize is
+         * a compiler-barrier'd zero (won't be optimized out as a dead
+         * store the way a plain memset on a no-longer-read buffer can). */
+        mbedtls_platform_zeroize(auth_key, sizeof(auth_key));
+    }
 
-    /* Snapshot before drop_control_conn — register.c parses Retry-After
-     * on 429/503 into s_conn; drop_control_conn calls ts2021_close
-     * which may zero per-conn state on a future change. */
-    s_last_register_retry_after_s = s_conn.h2_retry_after_s;
+    /* Snapshot before drop_control_conn — the status + Retry-After live
+     * on s_conn; drop_control_conn calls ts2021_close which may zero
+     * per-conn state on a future change. */
+    s_last_register_wait_ms = control_rate_limit_ms();
 
-    /* Scrub the auth key in stack memory. mbedtls_platform_zeroize is a
-     * compiler-barrier'd zero (won't be optimized out as a dead store the
-     * way a plain memset on a no-longer-read buffer can). */
-    mbedtls_platform_zeroize(auth_key, sizeof(auth_key));
+    /* An authorized node is known from now on; one control answered
+     * without authorizing is not (a throttle or a lost answer says
+     * nothing either way). */
+    if (err == ESP_OK) {
+        reg_hint_store(true);
+        s_reg_no_auth = tl_warm_reg_reused(known, retried);
+    } else if (register_retry_with_auth(status, err)) {
+        reg_hint_store(false);
+    }
 
-    /* Keep the conn on success: since M5-2c the nghttp2 session is
+    /* Keep the conn on success: since M5-2c the HTTP/2 session is
      * persistent per ts2021 conn, so the next request (the boot-time
      * endpoint push, then the map stream — or, on the in-place
      * re-register path, the push the long-poll runs right after) rides
@@ -317,6 +484,14 @@ esp_err_t tinylink_register(void)
     return err;
 }
 
+esp_err_t tinylink_register(void)
+{
+    return register_node(false);
+}
+
+static void stun_boot_join(void);
+static volatile bool s_ep_push_pending;   /* the long-poll's push request, below */
+
 esp_err_t tinylink_dataplane_start(void)
 {
     /* The streaming /machine/map (Stream=true) request delivers the
@@ -328,66 +503,195 @@ esp_err_t tinylink_dataplane_start(void)
      * `Addrs: null, Relay: ""` for sensor-cali after multiple
      * Stream=true cycles that included Endpoints + NetInfo.
      *
-     * Push the device's current endpoints + NetInfo via a one-shot
-     * Stream=false MapRequest before the long-poll grabs the conn.
-     * This is the "fresh state upload" that updates the server's
-     * cached Hostinfo/Endpoints record so peers see real dial
-     * candidates and a HomeDERP region in their MapResponse. The
-     * response (a full netmap) is parsed for status only — the
-     * long-poll will redeliver it as its first stream frame. */
+     * So the device's endpoints + NetInfo go up in a Stream=false,
+     * OmitPeers=true lite MapRequest — the "fresh state upload" that
+     * updates the server's cached Hostinfo/Endpoints record, so peers
+     * see real dial candidates and a HomeDERP region in their
+     * MapResponse. Until round 1.3.7 it ran here, a round trip on its
+     * own (~0.19 s on the sensor) between the register and the map
+     * stream. Now it is the long-poll's first push: a second HTTP/2
+     * stream in the same burst as the map stream (mapreq_run_stream),
+     * as upstream's updateRoutine sends its lite updates alongside the
+     * poll — the netmap no longer waits for it, and the endpoint is
+     * read when the burst is built, ~0.2 s later than here. */
     if (!s_initialized) return ESP_ERR_INVALID_STATE;
 
-    esp_err_t err = ensure_control_conn();
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "dataplane_start: ensure_conn failed: 0x%x — "
-                      "long-poll will retry the connect anyway", err);
-        return ESP_OK;  /* not fatal — long-poll task handles reconnect */
-    }
+    /* The boot STUN probe ran alongside the register (round 1.3.5):
+     * take its result, or give up on it after STUN_BOOT_WAIT_MS — first,
+     * before any return, because from here on it must stay off the WG
+     * socket (stun_boot.h). */
+    stun_boot_join();
 
     /* Observability: was the STUN-discovered endpoint available when
-     * we built the MapRequest body? STUN runs synchronously before
-     * tinylink_register() in main.c::bringup so by the time we get
-     * here it should be populated; log the actual state to surface
-     * any future boot-race regression and to give a clear breadcrumb
-     * when an admin-panel "Endpoints" field comes up empty. */
+     * the boot handed over? The push body is built from the same
+     * accessor a moment later; an admin-panel "Endpoints" field that
+     * comes up empty starts here. */
     uint8_t  ep_addr[4];
     uint16_t ep_port;
-    bool stun_ready = tinylink_get_public_endpoint(ep_addr, &ep_port);
-    if (stun_ready) {
-        ESP_LOGI(TAG, "dataplane_start: pushing endpoint %u.%u.%u.%u:%u",
+    if (tinylink_get_public_endpoint(ep_addr, &ep_port)) {
+        ESP_LOGI(TAG, "dataplane_start: endpoint %u.%u.%u.%u:%u goes up "
+                      "with the map stream",
                  ep_addr[0], ep_addr[1], ep_addr[2], ep_addr[3],
                  (unsigned)ep_port);
     } else {
-        ESP_LOGW(TAG, "dataplane_start: no STUN endpoint cached yet — "
-                      "Stream=false MapRequest will land NetInfo only; "
-                      "subsequent reprobe results never reach the server "
-                      "while the long-poll's Stream=true cycle ignores "
-                      "Hostinfo (followup PR: trigger fetch_once on "
-                      "stun_reprobe endpoint-change)");
+        ESP_LOGW(TAG, "dataplane_start: no STUN endpoint yet — the "
+                      "lite MapRequest lands NetInfo only; the "
+                      "re-probe pushes the endpoint once the data plane "
+                      "is up");
     }
-
-    err = mapreq_push_endpoints(&s_conn, &s_keys);
-    if (err != ESP_OK) {
-        /* Drop the conn so the long-poll's next ensure_control_conn
-         * gets a fresh one. Don't fail bringup — the long-poll path
-         * will keep trying and may eventually succeed (or surface a
-         * different error). */
-        ESP_LOGW(TAG, "dataplane_start: mapreq_push_endpoints: 0x%x — "
-                      "endpoints not pushed; long-poll will run anyway", err);
-        drop_control_conn();
-        return ESP_OK;
-    }
-    ESP_LOGI(TAG, "dataplane_start: pushed lite MapRequest "
-                  "(Stream=false, OmitPeers=true, stun=%s)",
-             stun_ready ? "ready" : "missing");
-    /* Keep s_conn open — the long-poll will reuse it for the
-     * Stream=true cycle. */
+    s_ep_push_pending = true;
+    /* s_conn stays open (the register's) — the long-poll's first cycle
+     * rides it. */
     return ESP_OK;
 }
 
 /* ---- long-poll MapRequest task ----------------------------------------- */
 
-static bool s_dataplane_started;
+/* Set by long_poll_handler (long-poll task) once the first netmap has
+ * started the data plane; read by the DERP task (handle_disco_relayed). */
+static volatile bool s_dataplane_started;
+
+/* ---- Last-known server addresses (round 1.3.5, tl_addr.h) ---------------
+ *
+ * The home DERP node: the node of CONFIG_TINYLINK_PREFERRED_DERP the
+ * netmap last named — host, DERPPort, its IPv4 and STUN port — restored
+ * from NVS `derp_node` by tinylink_init, else the Kconfig host with no
+ * address. The supervisor dials it (the address first, the name if that
+ * fails) and both STUN probes ask its STUN service, so a boot with a
+ * record does neither through DNS. Written by the long-poll task (each
+ * netmap), read by the DERP, STUN-boot and telemetry tasks: under
+ * s_home_derp_mux, with s_derp_host_gen (bumped when the node moves). */
+static tl_derp_addr_t    s_home_derp;
+static bool              s_home_derp_named;   /* by a netmap (not the boot record) */
+static volatile uint32_t s_derp_host_gen;
+static portMUX_TYPE      s_home_derp_mux = portMUX_INITIALIZER_UNLOCKED;
+
+/* What NVS holds for each record (tl_addr_store compares against it). */
+static tl_addr_blob_t s_derp_nvs;
+static tl_addr_blob_t s_ctl_nvs;
+
+static void home_derp_get(tl_derp_addr_t *out, uint32_t *gen)
+{
+    portENTER_CRITICAL(&s_home_derp_mux);
+    *out = s_home_derp;
+    if (gen != NULL) *gen = s_derp_host_gen;
+    portEXIT_CRITICAL(&s_home_derp_mux);
+}
+
+static void blob_load(nvs_handle_t h, const char *key, tl_addr_blob_t *m)
+{
+    size_t n = sizeof(m->b);
+    m->len = (nvs_get_blob(h, key, m->b, &n) == ESP_OK && n <= sizeof(m->b)) ? (uint8_t)n : 0;
+}
+
+/* tinylink_init: the records → RAM. Read-only; a missing namespace or
+ * key (first boot with 1.3.5) is the Kconfig DERP host and no addresses. */
+static void addr_cache_load(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(TAI64N_NVS_NS, NVS_READONLY, &h) == ESP_OK) {
+        blob_load(h, TL_ADDR_KEY_DERP, &s_derp_nvs);
+        blob_load(h, TL_ADDR_KEY_CTL, &s_ctl_nvs);
+        nvs_close(h);
+    }
+    tl_derp_addr_boot(s_derp_nvs.b, s_derp_nvs.len, CONFIG_TINYLINK_PREFERRED_DERP,
+                      CONFIG_TINYLINK_DERP_SMOKE_HOST, &s_home_derp);
+    char a[TL_IPV4_STRLEN] = "none";
+    if (tl_ipv4_usable(s_home_derp.ipv4)) tl_ipv4_str(s_home_derp.ipv4, a);
+    ESP_LOGI(TAG, "address cache: home DERP node %s (address %s, STUN %u)%s",
+             s_home_derp.host, a, (unsigned)s_home_derp.stun_port,
+             s_derp_nvs.len > 0 ? "" : " — Kconfig, nothing stored");
+
+    uint8_t ip[4];
+    if (tl_ctl_addr_decode(s_ctl_nvs.b, s_ctl_nvs.len, CONFIG_TINYLINK_CONTROL_HOST, ip)) {
+        ts2021_set_addr(ip);
+        uint32_t v;
+        memcpy(&v, ip, sizeof(v));
+        __atomic_store_n(&s_ctl_addr, v, __ATOMIC_RELAXED);
+        tl_ipv4_str(ip, a);
+        ESP_LOGI(TAG, "address cache: control %s at %s", CONFIG_TINYLINK_CONTROL_HOST, a);
+    }
+}
+
+static int addr_nvs_write(const uint8_t *b, size_t n, const void *ctx)
+{
+    const char *key = (const char *)ctx;
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(TAI64N_NVS_NS, NVS_READWRITE, &h);
+    if (err == ESP_OK) {
+        err = nvs_set_blob(h, key, b, n);
+        if (err == ESP_OK) err = nvs_commit(h);
+        nvs_close(h);
+    }
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "address cache: nvs %s write failed: 0x%x — next boot resolves",
+                 key, err);
+    }
+    return err == ESP_OK ? 0 : -1;
+}
+
+/* Telemetry housekeeping (every 60 s, first ~60 s after the first
+ * netmap): write the records whose bytes changed. Never on the boot path
+ * — an NVS write may erase a 4-KB sector and stall both CPUs for up to
+ * ~0.5 s (tl_time.c) — and only for a change: the DERP record moves
+ * with the DERP map, the control one when its cached address stopped
+ * answering and the name led elsewhere. */
+void tinylink_addr_persist_poll(void)
+{
+    uint8_t b[TL_ADDR_BLOB_MAX];
+    tl_derp_addr_t d;
+    bool named;
+    portENTER_CRITICAL(&s_home_derp_mux);
+    d = s_home_derp;
+    named = s_home_derp_named;
+    portEXIT_CRITICAL(&s_home_derp_mux);
+    size_t n = named ? tl_derp_addr_encode(&d, b, sizeof(b)) : 0;
+    if (n > 0 && tl_addr_store(&s_derp_nvs, b, n, addr_nvs_write, TL_ADDR_KEY_DERP) == 1) {
+        ESP_LOGI(TAG, "address cache: home DERP node %s stored", d.host);
+    }
+    const uint32_t v = __atomic_load_n(&s_ctl_addr, __ATOMIC_RELAXED);
+    uint8_t ip[4];
+    memcpy(ip, &v, sizeof(ip));
+    n = tl_ctl_addr_encode(ip, CONFIG_TINYLINK_CONTROL_HOST, b, sizeof(b));
+    if (n > 0 && tl_addr_store(&s_ctl_nvs, b, n, addr_nvs_write, TL_ADDR_KEY_CTL) == 1) {
+        char a[TL_IPV4_STRLEN];
+        tl_ipv4_str(ip, a);
+        ESP_LOGI(TAG, "address cache: control address %s stored", a);
+    }
+}
+
+/* The netmap's home node → s_home_derp (long-poll task, every netmap
+ * that carries the region). A new host or port moves the supervisor
+ * (s_derp_host_gen; derp_sup_event_cb leaves the stream at the next
+ * DERP frame); a new address or STUN port only applies from the next
+ * connect / probe — the live stream to that host is fine. The NVS copy
+ * follows in tinylink_addr_persist_poll. Not inlined: its ~130-B frame
+ * (the record, a log buffer) would otherwise sit in long_poll_handler's,
+ * under wg_dataplane_start — the long-poll's static worst case
+ * (tools/stack_worst.py: 4 864 → 4 992 B inlined). */
+static __attribute__((noinline)) void update_derp_host_from_netmap(const tl_netmap_t *nm)
+{
+    tl_derp_addr_t next;
+    if (!tl_derp_addr_from_netmap(nm, CONFIG_TINYLINK_PREFERRED_DERP, &next)) return;
+    portENTER_CRITICAL(&s_home_derp_mux);
+    const unsigned diff = tl_derp_addr_diff(&s_home_derp, &next);
+    s_home_derp = next;
+    s_home_derp_named = true;
+    if (diff & TL_DERP_MOVED) s_derp_host_gen++;
+    const uint32_t gen = s_derp_host_gen;
+    portEXIT_CRITICAL(&s_home_derp_mux);
+    if (diff & TL_DERP_MOVED) {
+        ESP_LOGI(TAG, "derp host updated to region %d node: %s:%u (gen %u)",
+                 CONFIG_TINYLINK_PREFERRED_DERP, next.host,
+                 next.port ? next.port : 443u, (unsigned)gen);
+    }
+    if (diff & TL_DERP_ADDR) {
+        char a[TL_IPV4_STRLEN] = "none";
+        if (tl_ipv4_usable(next.ipv4)) tl_ipv4_str(next.ipv4, a);
+        ESP_LOGI(TAG, "derp node %s: address %s, STUN %u (DERP map)",
+                 next.host, a, (unsigned)next.stun_port);
+    }
+}
 
 /* ---- DERP smoke test (M5 step 2a) --------------------------------------
  *
@@ -417,7 +721,7 @@ esp_err_t tinylink_derp_smoke(void)
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
 
     derp_client_t c = {0};
-    esp_err_t err = derp_client_connect_login(&c, host, 443,
+    esp_err_t err = derp_client_connect_login(&c, host, 443, NULL,
                                               s_keys.node_priv,
                                               s_keys.node_pub);
     if (err == ESP_OK) {
@@ -430,16 +734,75 @@ esp_err_t tinylink_derp_smoke(void)
     return err;
 }
 
+/* ---- The first INIT waits for the relay (round 1.3.7) -------------------
+ *
+ * At boot the first INIT reaches the peer directly, and the peer, with
+ * no validated direct path to our new NAT mapping yet, answers via DERP.
+ * If our DERP login is still under way that answer is lost, and the copy
+ * re-queued at the login (WG_NETIF_KICK_RELAY_UP) is the same INIT — a
+ * TAI64N replay to the peer: the session waits for the new INIT of
+ * WG_FIRST_RETRY_MS. In the 1.3.5 reboot series the 8 boots whose login
+ * came 0.21 s or more after the first INIT had the session up 1.2-2.2 s
+ * after the netmap (two far later); all others but one, 0.16-0.54 s.
+ * 1.3.6 had the login first in all six boots, by 40-390 ms: a margin
+ * the ~0.28 s earlier netmap of 1.3.7 (the push rides with the map
+ * stream, Noise DH ahead) eats in two of them. So the first netmap waits
+ * for the outcome of the supervisor's first connect attempt, at most
+ * RELAY_BOOT_WAIT_MS — in those boots the login was 0.3 s away or less.
+ * A stalled attempt (TCP to a dead cached address took 4.6 s in one
+ * 1.3.5 boot) costs the cap, then the 1.3.6 order applies. One-shot: a
+ * failed first attempt, later netmaps and reconnects never wait. */
+#define RELAY_BOOT_WAIT_MS   1000
+#define RELAY_BOOT_LOGIN_OK  BIT0
+#define RELAY_BOOT_FAILED    BIT1
+
+static volatile bool s_relay_boot_pending;   /* the first attempt is running */
+static EventGroupHandle_t s_relay_boot;
+
+#if CONFIG_TINYLINK_DERP_SUPERVISED
+static StaticEventGroup_t s_relay_boot_buf;
+
+/* Supervisor, after its first connect attempt. The kick that precedes
+ * it is a no-op before the dataplane exists, so the INIT this releases
+ * carries its own DERP copy — no second one from the kick. */
+static void relay_boot_done(bool login_ok)
+{
+    if (!s_relay_boot_pending) return;
+    s_relay_boot_pending = false;
+    xEventGroupSetBits(s_relay_boot, login_ok ? RELAY_BOOT_LOGIN_OK
+                                              : RELAY_BOOT_FAILED);
+}
+#endif
+
+/* long_poll_handler, before the first INIT (wg_dataplane_start). */
+static void relay_boot_join(void)
+{
+    if (!s_relay_boot_pending) return;   /* no supervisor, or it is done */
+    const int64_t t0 = esp_timer_get_time();
+    /* The bits stay set: an outcome that lands between the check above
+     * and this wait returns at once. */
+    const EventBits_t got = xEventGroupWaitBits(
+        s_relay_boot, RELAY_BOOT_LOGIN_OK | RELAY_BOOT_FAILED, pdFALSE,
+        pdFALSE, pdMS_TO_TICKS(RELAY_BOOT_WAIT_MS));
+    const unsigned waited_ms = (unsigned)((esp_timer_get_time() - t0) / 1000);
+    if (got & RELAY_BOOT_LOGIN_OK) {
+        ESP_LOGI(TAG, "first INIT waited %u ms for the DERP login", waited_ms);
+    } else if (got & RELAY_BOOT_FAILED) {
+        ESP_LOGI(TAG, "first INIT waited %u ms: DERP connect failed", waited_ms);
+    } else {
+        ESP_LOGW(TAG, "DERP login still pending after %u ms — first INIT "
+                      "goes ahead", waited_ms);
+    }
+}
+
 /* ---- DERP supervised recv-loop task (M5 step 2b) -----------------------
  *
  * Long-running task: connect+login → run recv loop → close → backoff →
- * repeat. Coexists with the long-poll's TLS conn at steady state but
- * the second handshake competes with mbedtls cert-chain-verify heap,
- * so connect failures are logged and retried with backoff (not fatal).
- *
- * Recv events are currently logged only — wiring relayed WireGuard
- * packets back into wg_demux is M5 step 3 work (depends on DISCO peer
- * registration to know which DERP src maps to which peer index). */
+ * repeat, from boot (round 1.3.5: alongside the register, see
+ * derp_supervised_task). Connect failures are logged and retried with
+ * backoff (not fatal). Relayed frames: DISCO is answered / acted on
+ * here (handle_disco_relayed), WireGuard goes to wg_netif's inject path;
+ * wg_tx sends through it (tinylink_relay_via_derp). */
 
 #if CONFIG_TINYLINK_DERP_SUPERVISED
 
@@ -447,29 +810,22 @@ esp_err_t tinylink_derp_smoke(void)
  * src-pub prefix and slack. */
 #define DERP_SUP_FRAME_CAP 1600
 
-/* Single DERP client owned by the supervisor task. File-scope so
- * tinylink_derp_supervised_start can establish it synchronously
- * before the long-poll claims heap, then hand ownership to the task. */
+/* Single DERP client owned by the supervisor task. File-scope: wg_tx
+ * sends through it (tinylink_relay_via_derp) and the GOT_IP handler
+ * aborts its reads. */
 static derp_client_t s_derp_sup;
 
-/* Latest DERP host the supervisor should connect to. Populated from
- * the netmap's derp_regions[] using CONFIG_TINYLINK_PREFERRED_DERP as
- * the region selector, so the supervisor lands at the same region we
- * advertise as our HomeDERP — peers send traffic to that region; if
- * we're connected elsewhere the relay can't route it.
- *
- * Initialized to the Kconfig fallback so the first connect attempt
- * (which races against the long-poll's first netmap) doesn't see an
- * empty string. Updated in-place from long_poll_handler each frame. */
-static char s_derp_host[TL_DERP_HOSTNAME_LEN] = CONFIG_TINYLINK_DERP_SMOKE_HOST;
-/* Bumped by update_derp_host_from_netmap on every host/port change; the
- * supervisor captures it at connect and its event callback stops the
- * stream when it moves, so a control-plane reroute reaches a LIVE
- * connection within one server keepalive instead of waiting for the
- * stream to die on its own (2026-09). */
-static volatile uint32_t s_derp_host_gen;
+/* The supervisor connects to s_home_derp (above): the node of
+ * CONFIG_TINYLINK_PREFERRED_DERP, the region we advertise as our
+ * HomeDERP — peers send traffic to that region; if we're connected
+ * elsewhere the relay can't route it. Before any netmap it is the NVS
+ * record or the Kconfig host, a node of that region: the first connect
+ * runs at boot (round 1.3.5). s_derp_conn_gen is the s_derp_host_gen
+ * captured at connect; the event callback stops the stream when the
+ * two differ, so a control-plane reroute reaches a LIVE connection
+ * within one server keepalive instead of waiting for the stream to die
+ * on its own (2026-09). */
 static uint32_t          s_derp_conn_gen;
-static uint16_t          s_derp_port;      /* 0 → DERP default 443 */
 
 
 typedef struct {
@@ -530,8 +886,13 @@ static bool disco_addr_is_v4_mapped(const uint8_t addr[16])
  * fail silently in the WiFi default route — cheap. */
 /* Refactored from `(const tl_netmap_t *nm)` so the path-stale callback
  * can cache JUST the peers array (~1 KiB) instead of the full netmap
- * struct (~7.5 KiB; derp_regions[28] dominates). The function only
+ * struct (~2.5 KiB since 1.3.2 keeps one DERP region; ~8 KiB before). The function only
  * ever reads n_peers + peers[] anyway. */
+/* Each peer's pings are sealed with one NaCl box key K (round 1.3.7,
+ * B2): the active WG peer's cached one (no X25519), else computed once
+ * for the peer — every ping was a full nacl_box before, one X25519 per
+ * endpoint (12 at the 1.3.6 boots: 12 pings across 4 peers, ~150 ms of
+ * the long-poll task right after the first netmap; 3 now). */
 static void prepunch_pings_to_peers(const tl_peer_t *peers, size_t n_peers)
 {
     if (peers == NULL || n_peers == 0) return;
@@ -539,11 +900,23 @@ static void prepunch_pings_to_peers(const tl_peer_t *peers, size_t n_peers)
     int sock = wg_netif_get_socket();
     if (sock < 0) return;  /* WG netif not yet bound: nothing to punch from */
 
+    disco_peer_key_t active;
+    memset(&active, 0, sizeof(active));
+    active.has_pub = wg_netif_get_peer_disco_k(active.pub, active.k, &active.k_valid);
+
     size_t total_sent = 0;
     for (size_t pi = 0; pi < n_peers; pi++) {
         const tl_peer_t *peer = &peers[pi];
         if (!peer->has_disco_pub) continue;        /* can't seal without DiscoKey */
         if (peer->n_endpoints == 0) continue;
+
+        uint8_t k[NACL_BOX_KEY_LEN];
+        if (active.has_pub && active.k_valid &&
+            memcmp(peer->disco_pub, active.pub, DISCO_KEY_LEN) == 0) {
+            memcpy(k, active.k, sizeof(k));
+        } else if (nacl_box_compute_shared(k, peer->disco_pub, s_keys.disco_priv) != 0) {
+            continue;                              /* low-order DiscoKey */
+        }
 
         for (size_t ei = 0; ei < peer->n_endpoints; ei++) {
             /* "ip:port" → split. Mirror of wg_dataplane.c::parse_endpoint
@@ -584,10 +957,9 @@ static void prepunch_pings_to_peers(const tl_peer_t *peers, size_t n_peers)
             esp_fill_random(nonce, sizeof(nonce));
 
             uint8_t wire[DISCO_HANDLER_REPLY_MAX];
-            size_t wire_len = disco_seal(wire, sizeof(wire),
-                                         inner, inner_len, nonce,
-                                         s_keys.disco_pub, peer->disco_pub,
-                                         s_keys.disco_priv);
+            size_t wire_len = disco_seal_with_shared(wire, sizeof(wire),
+                                                     inner, inner_len, nonce,
+                                                     s_keys.disco_pub, k);
             if (wire_len == 0) continue;
 
 #ifdef ESP_PLATFORM
@@ -599,8 +971,8 @@ static void prepunch_pings_to_peers(const tl_peer_t *peers, size_t n_peers)
             ssize_t n = sendto(sock, wire, wire_len, 0,
                                (struct sockaddr *)&dst, sizeof(dst));
             if (n < 0) {
-                ESP_LOGW(TAG, "prepunch sendto: errno=%d (peer=%zu ep=%s)",
-                         errno, pi, ep);
+                ESP_LOGW(TAG, "prepunch sendto: errno=%d (peer=%u ep=%s)",
+                         errno, (unsigned)pi, ep);
                 continue;
             }
             /* Record the outbound probe so handle_disco_direct can
@@ -613,39 +985,49 @@ static void prepunch_pings_to_peers(const tl_peer_t *peers, size_t n_peers)
                      ep, ping.txid[0], ping.txid[1],
                      ping.txid[2], ping.txid[3]);
         }
+        tl_secure_zero(k, sizeof(k));
     }
+    tl_secure_zero(&active, sizeof(active));
     if (total_sent > 0) {
-        ESP_LOGI(TAG, "prepunch on netmap-receive: sent %zu pings across %zu peers",
-                 total_sent, n_peers);
+        /* %u + casts: newlib-nano printf has no %zu (it printed "zu"). */
+        ESP_LOGI(TAG, "prepunch on netmap-receive: sent %u pings across %u peers",
+                 (unsigned)total_sent, (unsigned)n_peers);
     }
 }
 
-/* Thin wrapper for callers that already have a tl_netmap_t handy. */
-static inline void prepunch_pings_to_peer_endpoints(const tl_netmap_t *nm)
-{
-    if (nm == NULL) return;
-    prepunch_pings_to_peers(nm->peers, nm->n_peers);
-}
-
-static void send_disco_pings_to_cmm_endpoints(const derp_event_t *e)
+/* `peer`: the gate's view of the sender (handle_disco_relayed). */
+static void send_disco_pings_to_cmm_endpoints(const derp_event_t *e,
+                                              const disco_peer_key_t *peer)
 {
     /* Re-decrypt + re-parse: handle_disco_relayed already did this
-     * through disco_handle_recv, but that helper doesn't expose the
-     * parsed CallMeMaybe payload. Doing it twice is a few KB of
-     * NaCl-box CPU per CMM, which is rare enough to not matter. */
+     * through disco_handle_recv_from_peer, but that helper doesn't
+     * expose the parsed CallMeMaybe payload. With one key K for the
+     * sender — the active peer's cached one, else computed once — the
+     * second open and the punch pings cost no X25519 (round 1.3.7, B2:
+     * the open was one more, and each ping one per endpoint). */
+    uint8_t k[NACL_BOX_KEY_LEN];
+    if (disco_gate(e->data, e->data_len, peer) == DISCO_GATE_K) {
+        memcpy(k, peer->k, sizeof(k));
+    } else if (e->data_len < DISCO_MIN_WIRE_LEN ||
+               nacl_box_compute_shared(k, e->data + DISCO_MAGIC_LEN,
+                                       s_keys.disco_priv) != 0) {
+        return;
+    }
     uint8_t pt[256];
     uint8_t peer_disco_pub[DISCO_KEY_LEN];
-    size_t pt_len = disco_open(pt, sizeof(pt), peer_disco_pub,
-                               e->data, e->data_len, s_keys.disco_priv);
-    if (pt_len == 0) return;
-
+    size_t pt_len = disco_open_with_shared(pt, sizeof(pt), peer_disco_pub,
+                                           e->data, e->data_len, k);
     disco_msg_t msg;
-    if (disco_parse(pt, pt_len, &msg) != 0) return;
-    if (msg.type != DISCO_TYPE_CALLMEMAYBE) return;
-
-    int sock = wg_netif_get_socket();
+    int sock = -1;
+    if (pt_len == 0 || disco_parse(pt, pt_len, &msg) != 0 ||
+        msg.type != DISCO_TYPE_CALLMEMAYBE) {
+        tl_secure_zero(k, sizeof(k));
+        return;
+    }
+    sock = wg_netif_get_socket();
     if (sock < 0) {
         ESP_LOGW(TAG, "cmm: wg socket not up — cannot punch");
+        tl_secure_zero(k, sizeof(k));
         return;
     }
 
@@ -670,10 +1052,9 @@ static void send_disco_pings_to_cmm_endpoints(const derp_event_t *e)
         esp_fill_random(nonce, sizeof(nonce));
 
         uint8_t wire[DISCO_HANDLER_REPLY_MAX];
-        size_t wire_len = disco_seal(wire, sizeof(wire),
-                                     inner, inner_len, nonce,
-                                     s_keys.disco_pub, peer_disco_pub,
-                                     s_keys.disco_priv);
+        size_t wire_len = disco_seal_with_shared(wire, sizeof(wire),
+                                                 inner, inner_len, nonce,
+                                                 s_keys.disco_pub, k);
         if (wire_len == 0) continue;
 
 #ifdef ESP_PLATFORM
@@ -699,6 +1080,7 @@ static void send_disco_pings_to_cmm_endpoints(const derp_event_t *e)
                  (unsigned)ep->port,
                  ping.txid[0], ping.txid[1], ping.txid[2], ping.txid[3]);
     }
+    tl_secure_zero(k, sizeof(k));
     if (sent == 0 && msg.u.cmm.n > 0) {
         ESP_LOGW(TAG, "cmm: %u endpoints but none v4-mapped",
                  (unsigned)msg.u.cmm.n);
@@ -716,34 +1098,52 @@ static void send_disco_pings_to_cmm_endpoints(const derp_event_t *e)
 static void handle_disco_relayed(const derp_event_t *e,
                                  derp_sup_stats_t *st)
 {
+    /* Before the first netmap (the relay connects at boot since round
+     * 1.3.5) no peer is known, so no DISCO sender can be one: drop it
+     * unopened, like magicsock does for a DiscoKey outside its peer map
+     * — without paying the X25519 to open it (any DERP client that knows
+     * our NodeKey can send us frames), and without answering pings from,
+     * or punching the endpoints of, a node the gate below could not
+     * check yet. A WG frame goes on: wg_netif_inject_packet drops it
+     * until wg_netif_start has configured the peer. */
+    if (!s_dataplane_started && disco_looks_like(e->data, e->data_len)) {
+        ESP_LOGD(TAG, "relayed DISCO before the first netmap dropped");
+        return;
+    }
+
     uint8_t reply[DISCO_HANDLER_REPLY_MAX];
     disco_msg_type_t type = (disco_msg_type_t)0;
     uint8_t peer_disco_pub[DISCO_KEY_LEN] = {0};
     uint8_t txid[DISCO_TXID_LEN] = {0};
 
-    size_t reply_len = disco_handle_recv(reply, sizeof(reply),
-                                         e->data, e->data_len,
-                                         s_keys.disco_priv, s_keys.disco_pub,
-                                         &type, peer_disco_pub, txid);
-
     /* knownPeerDiscoKey gate (mirrors the direct-UDP path's gate in
-     * wg_netif.c handle_disco_direct). disco_handle_recv only proves the
-     * frame was sealed TO us — any tailnet node can do that. Before we
-     * answer a PING or, worse, punch the endpoints in a CallMeMaybe (a
-     * UDP ping flood to attacker-chosen addresses), require the sender's
-     * DiscoKey to match the active WG peer's. Only DISCO message types
-     * are gated; the default case below is relayed WireGuard traffic,
-     * which wg_netif_inject_packet gates separately by src NodeKey. When
-     * no peer DiscoKey is known yet (early bringup) the gate is
-     * permissive, same as the direct path. */
-    if (type == DISCO_TYPE_PING || type == DISCO_TYPE_PONG ||
-        type == DISCO_TYPE_CALLMEMAYBE) {
-        uint8_t known_disco[WG_KEY_LEN];
-        if (wg_netif_get_peer_disco_pub(known_disco) &&
-            memcmp(peer_disco_pub, known_disco, DISCO_KEY_LEN) != 0) {
-            ESP_LOGD(TAG, "drop relayed DISCO from unknown DiscoKey");
-            return;
-        }
+     * wg_netif.c handle_disco_direct). Opening a frame only proves it
+     * was sealed TO us — any tailnet node can do that. Before we answer
+     * a PING or, worse, punch the endpoints in a CallMeMaybe (a UDP ping
+     * flood to attacker-chosen addresses), the sender's DiscoKey must be
+     * the active WG peer's. Since round 1.3.7 (B2) it is read off the
+     * cleartext header before any crypto — another key cost an X25519
+     * to open (two for a PING: the pong was sealed before the gate) —
+     * and the peer's frames are opened and answered with its cached box
+     * key K, no X25519 at all (1–2 per relayed frame before; the
+     * relay's CallMeMaybe burst after each session up was ~60 ms of this
+     * task). Only DISCO frames are gated; anything else (type 0) is
+     * relayed WireGuard traffic, which wg_netif_inject_packet gates
+     * separately by src NodeKey. When the WG peer has no DiscoKey the
+     * gate is permissive, same as the direct path (before the first
+     * netmap DISCO never gets here). */
+    disco_peer_key_t peer;
+    memset(&peer, 0, sizeof(peer));
+    peer.has_pub = wg_netif_get_peer_disco_k(peer.pub, peer.k, &peer.k_valid);
+    bool gated = false;
+    size_t reply_len = disco_handle_recv_from_peer(reply, sizeof(reply),
+                                                   e->data, e->data_len, &peer,
+                                                   s_keys.disco_priv, s_keys.disco_pub,
+                                                   &type, peer_disco_pub, txid, &gated);
+    if (gated) {
+        tl_secure_zero(&peer, sizeof(peer));
+        ESP_LOGD(TAG, "drop relayed DISCO from unknown DiscoKey (pre-AEAD)");
+        return;
     }
 
     switch (type) {
@@ -771,7 +1171,10 @@ static void handle_disco_relayed(const derp_event_t *e,
     case DISCO_TYPE_CALLMEMAYBE:
         st->disco_cmms_seen++;
         ESP_LOGI(TAG, "disco call-me-maybe — punching endpoints");
-        send_disco_pings_to_cmm_endpoints(e);
+        send_disco_pings_to_cmm_endpoints(e, &peer);
+        /* The peer is punching towards us: if our handshake is still
+         * pending, its INIT can get through now (B7). */
+        wg_netif_handshake_kick(WG_NETIF_KICK_CALL_ME_MAYBE);
         break;
     default: {
         /* Not a DISCO frame for us — could be a relayed WireGuard
@@ -790,6 +1193,7 @@ static void handle_disco_relayed(const derp_event_t *e,
         break;
     }
     }
+    tl_secure_zero(&peer, sizeof(peer));
 }
 
 static int derp_sup_event_cb(const derp_event_t *e, void *ctx)
@@ -835,8 +1239,10 @@ static int derp_sup_event_cb(const derp_event_t *e, void *ctx)
         break;
     }
     if (s_derp_host_gen != s_derp_conn_gen) {
-        ESP_LOGI(TAG, "derp supervisor: preferred relay changed — leaving %s",
-                 s_derp_host);
+        tl_derp_addr_t node;
+        home_derp_get(&node, NULL);
+        ESP_LOGI(TAG, "derp supervisor: preferred relay changed — leaving for %s",
+                 node.host);
         return 1;   /* derp_client_run returns ESP_OK; supervisor reconnects */
     }
     return 0;
@@ -848,41 +1254,50 @@ static int derp_sup_event_cb(const derp_event_t *e, void *ctx)
 
 /* Task entry: own the connect + recv-loop + close + backoff cycle
  * end-to-end. Initial connect lives here (not in the start() caller)
- * so a transient heap shortage at bringup time doesn't tear the
- * supervisor down for the rest of the session — the task simply
- * loops on backoff until heap settles enough for the mbedtls cert
- * chain verify (~12 KiB contiguous). With the post-#32 budget
- * (DYNAMIC_BUFFER=y, SESSION_TICKETS=n) the supervisor's connect
- * peak slips below the largest free block once the long-poll's
- * first reconnect cycle frees its handshake scratch. */
+ * so a failed first connect (DNS, TLS, a relay restarting) doesn't tear
+ * the supervisor down for the rest of the session — the task simply
+ * loops on backoff. */
 static void derp_supervised_task(void *arg)
 {
     (void)arg;
 
-    /* This task is spawned PRE-TLS-bringup (main.c) so the
-     * 12 KiB xTaskCreate stack lands on a still-pristine heap arena.
-     * But we delay the actual TLS handshake to the DERP relay until
-     * the long-poll's first netmap arrives. Two reasons documented
-     * by the previous wait-then-spawn shape, still valid:
+    /* Connect at once (round 1.3.5), alongside the register, instead of
+     * after the first netmap. 1.3.4 logged the login ~1.8 s after the
+     * netmap, so the first WG INIT went out with no relay, the peer's
+     * answer via DERP was lost and the session came up on attempt 2,
+     * ~1.9 s after the netmap — every boot. Now the relay is up first
+     * and the INIT's own DERP copy (B7, wg_netif.c build_and_send_init)
+     * reaches the peer.
      *
-     *   1. Heap order: the long-poll's mbedtls cert verify needs ~12
-     *      KiB contiguous; opening our own TLS conn first fragments
-     *      that arena and the long-poll handshake fails.
-     *   2. Reachability: PreferredDERP region is only known after the
-     *      first MapResponse. Connecting earlier would dial the
-     *      Kconfig-fallback region; the netmap-resolved hostname (read
-     *      by the connect loop below from s_derp_host) wouldn't take
-     *      effect until the next reconnect cycle.
+     * The wait (tinylink_wait_dataplane_ms, 30-s cap, gone) kept two
+     * invariants of the 2026-05 tree; neither holds any more:
      *
-     * 30 s is generous: register + first MapRequest typically lands
-     * in 5-10 s on this hardware. On timeout we still proceed to the
-     * connect loop — best-effort with the fallback host. */
+     *   1. Heap order: with ~11 KiB free then, opening this TLS conn
+     *      first fragmented the arena below the ~12 KiB contiguous the
+     *      long-poll's cert verify needed. 1.3.4 has ~159 KB free and a
+     *      110 KB largest block with every conn up (60-s stack diag;
+     *      163 KB / 110 KB when this task connected after the netmap),
+     *      a handshake's transient is ~12 KiB, and the long-poll's first
+     *      stream rides the register's conn — no long-poll handshake at
+     *      boot is left to protect. This handshake now overlaps the
+     *      register's; the connect line below logs the heap.
+     *   2. Region: our home region is CONFIG_TINYLINK_PREFERRED_DERP,
+     *      compiled in and advertised by us in every MapRequest — known
+     *      before any netmap. The netmap only names its node, and the
+     *      Kconfig host is a node of it (on the sensor the very node the
+     *      DERPMap names: no "derp host updated" line in 1.3.4 boots). If
+     *      the netmap names another node, update_derp_host_from_netmap
+     *      bumps s_derp_host_gen and derp_sup_event_cb leaves the stream
+     *      at the next DERP frame (server keepalive, about once a
+     *      minute) for an immediate reconnect there.
+     *
+     * The login itself only proves the node key (tinylink_init loaded it;
+     * fixed for the boot) — DERP needs no registered node. Nothing on
+     * the receive side needs the netmap either: relayed WG frames are
+     * dropped by wg_netif_inject_packet until wg_netif_start configures
+     * the peer (zero key, IDLE state), relayed DISCO before the first
+     * netmap by handle_disco_relayed. */
     tl_wdt_subscribe();
-    esp_err_t wait_err = tinylink_wait_dataplane_ms(30000);
-    if (wait_err != ESP_OK) {
-        ESP_LOGW(TAG, "derp supervisor: dataplane wait timeout (0x%x) — "
-                      "connecting anyway", wait_err);
-    }
 
     /* Exponential backoff: start at the Kconfig base, double on each
      * consecutive connect failure, cap at 30 s (per WG/Tailscale
@@ -910,20 +1325,24 @@ static void derp_supervised_task(void *arg)
 
     for (;;) {
         /* Connect with backoff — runs at boot too, not just on
-         * reconnect. Re-read s_derp_host every iteration so a netmap
-         * update that changes the preferred region's host steers the
-         * NEXT reconnect to the right relay. */
+         * reconnect. Re-read the home node every iteration so a netmap
+         * update that changes the preferred region's host (or the
+         * node's address) steers the NEXT reconnect to the right relay.
+         * Host and generation are read together: a move that lands after
+         * this snapshot still differs from s_derp_conn_gen. */
         for (;;) {
             attempt++;
-            const char *host = s_derp_host;
-            ESP_LOGI(TAG, "derp supervisor: connect attempt #%u to %s "
+            tl_derp_addr_t node;
+            home_derp_get(&node, &s_derp_conn_gen);
+            char a[TL_IPV4_STRLEN] = "no address";
+            if (tl_ipv4_usable(node.ipv4)) tl_ipv4_str(node.ipv4, a);
+            ESP_LOGI(TAG, "derp supervisor: connect attempt #%u to %s (%s) "
                           "(heap_free=%u largest=%u)",
-                     attempt, host,
+                     attempt, node.host, a,
                      (unsigned)esp_get_free_heap_size(),
                      (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
-            s_derp_conn_gen = s_derp_host_gen;
-            esp_err_t cerr = derp_client_connect_login(&s_derp_sup, host,
-                                                       s_derp_port,
+            esp_err_t cerr = derp_client_connect_login(&s_derp_sup, node.host,
+                                                       node.port, node.ipv4,
                                                        s_keys.node_priv,
                                                        s_keys.node_pub);
             if (cerr == ESP_OK) {
@@ -931,8 +1350,19 @@ static void derp_supervised_task(void *arg)
                               "(after %u attempts)",
                          s_derp_sup.server_version, attempt);
                 attempt = 0;
+                /* A handshake still pending — a relay reconnect during a
+                 * rekey, or a boot whose login took longer than register
+                 * + netmap (1.3.4: every boot, the INIT went out ~2 s
+                 * before this login) — gets its INIT relayed now instead
+                 * of after REKEY_TIMEOUT (B7). Before the first netmap
+                 * there is none: a no-op — and since 1.3.7 a first netmap
+                 * that lands during this attempt holds its INIT until
+                 * here (relay_boot_join). */
+                wg_netif_handshake_kick(WG_NETIF_KICK_RELAY_UP);
+                relay_boot_done(true);
                 break;
             }
+            relay_boot_done(false);
             const uint32_t delay_ms = tl_backoff_ms(fail, base_ms, cap_ms,
                                                     esp_random());
             if (fail < 1000u) fail++;              /* saturate the counter */
@@ -952,8 +1382,8 @@ static void derp_supervised_task(void *arg)
             ESP_LOGW(TAG, "derp supervisor: server restarting — backoff");
         } else {
             ESP_LOGW(TAG, "derp supervisor: stream ended 0x%x — "
-                          "stats recv=%lu disco_pongs=%lu "
-                          "disco_pings_seen=%lu disco_cmms=%lu "
+                          "stats recv=%lu disco_pings_answered=%lu "
+                          "disco_pongs_seen=%lu disco_cmms=%lu "
                           "send_err=%lu keepalives=%lu wg_tx_drops=%lu",
                      err,
                      (unsigned long)stats.recv_packets,
@@ -988,6 +1418,7 @@ static void derp_supervised_task(void *arg)
 esp_err_t tinylink_relay_via_derp(const uint8_t *dst_node_pub,
                                   const uint8_t *packet,
                                   size_t len,
+                                  bool best_effort,
                                   void *user)
 {
     (void)user;  /* registered with user=NULL; supervisor lives in BSS */
@@ -999,68 +1430,77 @@ esp_err_t tinylink_relay_via_derp(const uint8_t *dst_node_pub,
      * when the supervisor isn't connected; we short-circuit ahead of
      * it here so the wg_netif TX worker can read the state in a
      * single field-load and skip the function-call cost on the hot
-     * path when DERP isn't usable. The .connected flag is set/cleared
-     * by the supervisor task under its own mutex; reads outside that
-     * mutex are racy in the strict sense but the racy window is
-     * harmless — at worst we attempt one extra send (which fails fast
-     * inside derp_client_send_packet's own state guard) or skip one
-     * send that was about to be accepted (which the next packet
-     * picks up). */
-    if (!s_derp_sup.connected) {
+     * path when DERP isn't usable. The flag is set by the supervisor at
+     * login and cleared by a close or a failed write (an atomic load
+     * here, derp_wlock.h); the window is harmless — at worst we attempt
+     * one extra send (which fails fast inside derp_client_send_packet's
+     * own state guard) or skip one send that was about to be accepted
+     * (which the next packet picks up). */
+    if (!derp_client_is_connected(&s_derp_sup)) {
         return ESP_ERR_INVALID_STATE;
     }
-    return derp_client_send_packet(&s_derp_sup, dst_node_pub, packet, len);
+    return best_effort
+        ? derp_client_try_send_packet(&s_derp_sup, dst_node_pub, packet, len)
+        : derp_client_send_packet(&s_derp_sup, dst_node_pub, packet, len);
 #else
-    (void)dst_node_pub; (void)packet; (void)len;
+    (void)dst_node_pub; (void)packet; (void)len; (void)best_effort;
     return ESP_ERR_NOT_SUPPORTED;
 #endif
 }
+
+#if CONFIG_TINYLINK_DERP_SUPERVISED
+/* wg_netif's relay state (wg_netif_set_relay_state_callback): an INIT is
+ * held behind a re-send only while the supervisor is connected. The same
+ * racy-but-harmless read of the flag as above. */
+static bool relay_connected(void *user)
+{
+    (void)user;
+    return derp_client_is_connected(&s_derp_sup);
+}
+#endif
 
 esp_err_t tinylink_derp_supervised_start(void)
 {
 #if CONFIG_TINYLINK_DERP_SUPERVISED
     if (!s_initialized) return ESP_ERR_INVALID_STATE;
-    /* s_derp_host is initialized from the Kconfig fallback at file
-     * scope and updated to the netmap-derived hostname for our
-     * advertised PreferredDERP region by long_poll_handler. */
-    const char *host = s_derp_host;
-    if (host == NULL || host[0] == '\0') {
+    /* An empty Kconfig host disables the relay, whatever NVS holds. The
+     * task dials s_home_derp: the NVS record or this host until a
+     * netmap names our PreferredDERP region's node (long_poll_handler). */
+    if (CONFIG_TINYLINK_DERP_SMOKE_HOST[0] == '\0') {
         ESP_LOGI(TAG, "derp supervisor: disabled (empty host)");
         return ESP_OK;
     }
+    tl_derp_addr_t node;
+    home_derp_get(&node, NULL);
+    const char *host = node.host;
 
-    /* Spawn the task. 10 KiB stack: sized from the soak-instrumentation
-     * dump (PR #97) which measured the lifetime peak at 4920 B used
-     * (out of the prior 12 KiB allocation) across the full handshake
-     * + recv-loop cycle to derp16b.tailscale.com on 2026-05-12. The
-     * dominant frame is the mbedtls handshake against the
-     * LE E8 → ISRG Root X2 P-384 cert chain plus ECDHE-RSA-AES128-
-     * GCM key agreement; the cert chain and suite are deterministic
-     * across reconnects, so the peak is structural rather than
-     * load-dependent. 10 KiB leaves 5 KiB margin (≈ 100 % over the
-     * measured peak), enough to absorb any small drift between
-     * IDF mbedtls versions without re-tightening here. Anything
-     * tighter than 10 KiB should be backed by a multi-hour soak
-     * that includes server-restart-driven reconnects, which the
-     * 100 s smoke did not exercise.
+    /* Spawn the task. 8 KiB stack (round 1.3.3, B18; 10 KiB before):
+     * tools/stack_worst.py puts the static worst case at 5 424 B — the
+     * TLS handshake's certificate verify through esp_crt_verify_callback
+     * into an RSA-PSS signature check (mbedtls_rsa_rsassa_pss_verify_ext
+     * → mpi_exp_mod), i.e. covering an RSA chain as well as the
+     * ECDSA one the measurements saw (PR #97: 4 920 B peak on
+     * 2026-05-12; 5 028 B over the 6-h 1.3.2 soak). C1-S's relayed-packet
+     * input on this task is shallower (5 024 B). 8 KiB = 2.8 KB over the
+     * static worst case.
      *
-     * This start function MUST be called pre-TLS-bringup (i.e.
-     * BEFORE tinylink_register / dataplane_start / long_poll_start in
-     * main.c::bringup) so the heap arena is still pristine when
-     * xTaskCreate looks for 10 KiB contiguous. The task body itself
-     * waits internally for the first netmap before doing any TLS
-     * work, so this re-ordering does not regress the previous
-     * "DERP handshake after long-poll netmap" invariant — it only
-     * separates `xTaskCreate-needs-pristine-heap` from
-     * `DERP-TLS-needs-netmap`. Without the re-order, xTaskCreate
-     * fails with ESP_ERR_NO_MEM after long-poll fragments the
-     * arena and ALL DERP-dependent features stay dead (observed
-     * across 3 soaks pre-PR). */
+     * Called before the first TLS handshake (main.c::bringup: ahead of
+     * tinylink_register), which since round 1.3.5 is also when the task
+     * connects — its handshake overlaps the register's (see
+     * derp_supervised_task). Spawning here also keeps the 8 KiB stack on
+     * a pristine heap: in the 2026-05 tree, spawned after the
+     * long-poll, xTaskCreate failed with ESP_ERR_NO_MEM in 3 soaks and
+     * every DERP-dependent feature stayed dead. */
+    /* Armed before the spawn: a netmap can only come later (the
+     * register follows this call), but the flag must not trail it. */
+    s_relay_boot = xEventGroupCreateStatic(&s_relay_boot_buf);
+    s_relay_boot_pending = true;
     BaseType_t ok = xTaskCreate(derp_supervised_task, "tinylink_derp",
-                                10240, NULL, tskIDLE_PRIORITY + 3, NULL);
+                                8192, NULL, tskIDLE_PRIORITY + 3, NULL);
     if (ok != pdPASS) {
+        s_relay_boot_pending = false;
         ESP_LOGE(TAG, "xTaskCreate(derp supervisor) failed — "
-                      "heap_free=%u largest=%u (need 10 KiB contiguous)",
+                      "heap_free=%u largest=%u (need 8 KiB contiguous)",
                  (unsigned)esp_get_free_heap_size(),
                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
         return ESP_ERR_NO_MEM;
@@ -1073,38 +1513,9 @@ esp_err_t tinylink_derp_supervised_start(void)
 #endif
 }
 
-#if CONFIG_TINYLINK_DERP_SUPERVISED
-/* Walk the netmap's DERP region table for the region matching our
- * advertised PreferredDERP and copy the first node's hostname into
- * s_derp_host. No-op if PreferredDERP isn't represented in the
- * parsed netmap (region_id mismatch or region has no nodes). The
- * supervisor task reads s_derp_host on every connect attempt so the
- * next reconnect picks up the change. */
-static void update_derp_host_from_netmap(const tl_netmap_t *nm)
-{
-    const int want = CONFIG_TINYLINK_PREFERRED_DERP;
-    if (want <= 0) return;
-    for (size_t i = 0; i < nm->n_derp_regions; i++) {
-        const tl_derp_region_t *r = &nm->derp_regions[i];
-        if (r->region_id != want || r->n_nodes == 0) continue;
-        const char *h = r->nodes[0].hostname;
-        if (h[0] == '\0') continue;
-        const uint16_t port = r->nodes[0].port;
-        if (strcmp(s_derp_host, h) == 0 && s_derp_port == port) return;  /* unchanged */
-        snprintf(s_derp_host, sizeof(s_derp_host), "%s", h);
-        s_derp_port = port;
-        s_derp_host_gen++;
-        ESP_LOGI(TAG, "derp host updated to region %d node: %s:%u (gen %u)",
-                 want, s_derp_host, port ? port : 443u,
-                 (unsigned)s_derp_host_gen);
-        return;
-    }
-}
-#endif
-
 /* Cache the latest netmap PEERS for path-stale active probing.
- * tl_peer_t[TL_MAX_PEERS] is ~1 KiB; the full tl_netmap_t is ~7.5 KiB
- * (derp_regions[28] dominates). Caching just the peers BSS keeps the
+ * tl_peer_t[TL_MAX_PEERS] is ~1 KiB; the full tl_netmap_t was ~7.5 KiB
+ * (derp_regions[28]; one region since 1.3.2). Caching just the peers BSS keeps the
  * total static-allocation footprint inside the DRAM budget WiFi init
  * needs contiguous (verified: caching the full netmap pushed boot
  * into vApplicationGetTimerTaskMemory pvPortMalloc-NULL asserts).
@@ -1130,76 +1541,731 @@ static void on_wg_path_stale(void *user)
     prepunch_pings_to_peers(s_last_peers, s_last_peers_count);
 }
 
-/* Merge one frame into the canonical peer table (M16, 2026-09):
- *   Peers          → replace;
- *   PeersChanged   → upsert by NodeKey (append while there is room);
- *   PeersRemoved   → delete by NodeID.
- * Returns true when the table changed. KeepAlive / patch-only frames
- * leave it alone — before this, every frame overwrote the table and a
- * KeepAlive emptied it, so the path-stale probe had no endpoints to
- * try for most of the stream's life. */
+/* Self Addresses from the latest frame that carried the self node. The
+ * data plane starts from this + the merged peer table, not from a single
+ * frame (headscale sends removals, DERPMap updates and endpoint patches
+ * as frames of their own). */
+static tl_cidr_t s_self_addrs[TL_MAX_PEER_ADDRESSES];
+static size_t    s_self_addrs_count;
+
+/* Set by long_poll_handler when control marks this node expired or
+ * deleted / when a frame carried a live (non-expired) self node;
+ * consumed by long_poll_task (same task — no lock). The rejection
+ * schedule only resets on the latter, so an expired node that keeps
+ * "registering" fine still backs off. */
+static bool s_self_expired;
+static bool s_self_live;
+
+/* Index of a peer in s_last_peers by NodeID (the stable handle; upstream
+ * keys its peer map by it), or by NodeKey when the ID is 0. */
+static size_t peer_index(uint64_t id, const uint8_t *node_pub)
+{
+    for (size_t j = 0; j < s_last_peers_count; j++) {
+        if (id != 0 ? s_last_peers[j].id == id
+                    : (node_pub != NULL &&
+                       memcmp(s_last_peers[j].node_pub, node_pub,
+                              TINYLINK_KEY_LEN) == 0)) {
+            return j;
+        }
+    }
+    return SIZE_MAX;
+}
+
+/* Merge one frame into the canonical peer table, in upstream's order
+ * (control/controlclient/map.go updatePeersStateFromResponse):
+ *   Peers             → replace; no other delta in the frame applies;
+ *   PeersRemoved      → delete by NodeID;
+ *   PeersChanged      → upsert by NodeID (append while there is room);
+ *   PeersChangedPatch → patch Key / DiscoKey / Endpoints / DERPRegion of
+ *                       a known NodeID in place (unknown IDs ignored).
+ * Returns true when the table changed. KeepAlive frames never get here.
+ * Patches used to be ignored (a Key/DiscoKey patch recycled the stream),
+ * so peer endpoint moves, re-logins and tailscaled restarts reported by
+ * headscale as patches never reached the data plane. */
 static bool merge_peers(const tl_netmap_t *nm)
 {
-    bool changed = false;
     if (nm->n_peers > 0 && !nm->peers_is_delta) {
         size_t n = nm->n_peers > TL_MAX_PEERS ? TL_MAX_PEERS : nm->n_peers;
         memcpy(s_last_peers, nm->peers, n * sizeof(tl_peer_t));
         s_last_peers_count = n;
-        changed = true;
-    } else if (nm->n_peers > 0) {
-        for (size_t i = 0; i < nm->n_peers; i++) {
-            const tl_peer_t *p = &nm->peers[i];
-            size_t j;
-            for (j = 0; j < s_last_peers_count; j++) {
-                if (memcmp(s_last_peers[j].node_pub, p->node_pub,
-                           TINYLINK_KEY_LEN) == 0) break;
-            }
-            if (j == s_last_peers_count) {
-                if (s_last_peers_count >= TL_MAX_PEERS) {
-                    ESP_LOGW(TAG, "peer table full (%d) — delta peer dropped",
-                             TL_MAX_PEERS);
-                    continue;
-                }
-                s_last_peers_count++;
-            }
-            s_last_peers[j] = *p;
-            changed = true;
-        }
+        return true;
     }
+    bool changed = false;
     for (size_t r = 0; r < nm->n_removed; r++) {
-        for (size_t j = 0; j < s_last_peers_count; j++) {
-            if (s_last_peers[j].id != nm->removed_ids[r]) continue;
-            ESP_LOGI(TAG, "peer removed from netmap: id=0x%08lx%08lx",
-                     (unsigned long)(s_last_peers[j].id >> 32),
-                     (unsigned long)(s_last_peers[j].id & 0xFFFFFFFFul));
-            for (size_t k = j + 1; k < s_last_peers_count; k++) {
-                s_last_peers[k - 1] = s_last_peers[k];
+        if (nm->removed_ids[r] == 0) continue;
+        size_t j = peer_index(nm->removed_ids[r], NULL);
+        if (j == SIZE_MAX) continue;
+        ESP_LOGI(TAG, "peer removed from netmap: id=0x%08lx%08lx",
+                 (unsigned long)(s_last_peers[j].id >> 32),
+                 (unsigned long)(s_last_peers[j].id & 0xFFFFFFFFul));
+        for (size_t k = j + 1; k < s_last_peers_count; k++) {
+            s_last_peers[k - 1] = s_last_peers[k];
+        }
+        s_last_peers_count--;
+        changed = true;
+    }
+    for (size_t i = 0; i < nm->n_peers; i++) {
+        const tl_peer_t *p = &nm->peers[i];
+        size_t j = peer_index(p->id, p->node_pub);
+        if (j == SIZE_MAX) {
+            if (s_last_peers_count >= TL_MAX_PEERS) {
+                ESP_LOGW(TAG, "peer table full (%d) — delta peer dropped",
+                         TL_MAX_PEERS);
+                continue;
             }
-            s_last_peers_count--;
+            j = s_last_peers_count++;
+        }
+        s_last_peers[j] = *p;
+        changed = true;
+    }
+    for (size_t i = 0; i < nm->n_patches; i++) {
+        const tl_peer_patch_t *pc = &nm->patches[i];
+        size_t j = peer_index(pc->id, NULL);
+        if (j == SIZE_MAX) continue;
+        tl_peer_t *t = &s_last_peers[j];
+        if (pc->has_key &&
+            memcmp(t->node_pub, pc->node_pub, TINYLINK_KEY_LEN) != 0) {
+            memcpy(t->node_pub, pc->node_pub, TINYLINK_KEY_LEN);
             changed = true;
-            break;
+        }
+        if (pc->has_disco &&
+            (!t->has_disco_pub ||
+             memcmp(t->disco_pub, pc->disco_pub, TINYLINK_KEY_LEN) != 0)) {
+            memcpy(t->disco_pub, pc->disco_pub, TINYLINK_KEY_LEN);
+            t->has_disco_pub = true;
+            changed = true;
+        }
+        if (pc->has_endpoints &&
+            (t->n_endpoints != pc->n_endpoints ||
+             memcmp(t->endpoints, pc->endpoints,
+                    pc->n_endpoints * sizeof(tl_endpoint_t)) != 0)) {
+            t->n_endpoints = pc->n_endpoints;
+            memcpy(t->endpoints, pc->endpoints, sizeof(t->endpoints));
+            changed = true;
+        }
+        if (pc->derp_region != 0 && t->home_derp != pc->derp_region) {
+            t->home_derp = pc->derp_region;
+            changed = true;
         }
     }
+    /* `changed` only when a value actually moved: each true costs a
+     * data-plane update + a prepunch round (one X25519 per endpoint). */
     return changed;
+}
+
+/* True when control says this node is expired or deleted: an explicit
+ * Expired, or a KeyExpiry not after now. time(NULL) is floored at the
+ * build epoch / last NTP time (tl_time.c), both ≤ real time, so an
+ * unsynced clock can report an expiry late but never early — and
+ * headscale's deleted-node marker (1970-01-01T00:00:01Z) is always in
+ * the past. */
+static bool self_node_expired(const tl_netmap_t *nm)
+{
+    if (!nm->have_self) return false;
+    if (nm->self_expired) return true;
+    return nm->self_key_expiry > 0 &&
+           nm->self_key_expiry <= (int64_t)time(NULL);
+}
+
+/* "a.b.c.d/nn" → network-order IPv4, 0 if not parseable. */
+static uint32_t cidr_host_v4(const tl_cidr_t *c)
+{
+    char host[16];
+    const char *slash = strchr(c->str, '/');
+    size_t n = slash ? (size_t)(slash - c->str) : strlen(c->str);
+    if (n >= sizeof(host)) return 0;
+    memcpy(host, c->str, n);
+    host[n] = '\0';
+    uint32_t v4_be = 0;
+    return inet_pton(AF_INET, host, &v4_be) == 1 ? v4_be : 0;
+}
+
+/* ---- Warm start (round 1.3.9, tl_warm.h) --------------------------------
+ *
+ * The data plane up from the previous boot's netmap, right after this
+ * boot's register, so the WireGuard handshake (direct to the cached
+ * endpoint, and via DERP) runs while the endpoint push and the map
+ * stream do. tl_warm.h has the record, why and when it is written, and
+ * every decision below (tl_warm_go, tl_warm_sm_*, tl_warm_rtc_*), which
+ * this file only drives, logs and acts on.
+ *
+ * Who runs what. The main task (tinylink_warm_start, after
+ * tinylink_long_poll_start, so the push is already out) brings the data
+ * plane up exactly as the first netmap would — relay_boot_join,
+ * wg_dataplane_start, telemetry_start, the prepunch — from s_self_addrs
+ * and s_last_peers seeded with the record (so the path-stale prepunch
+ * works too). The long-poll's first netmap shuts the gate first
+ * (warm_gate_shut): a warm start under way finishes before the handler
+ * touches anything, none starts after. From then on the long-poll task
+ * owns the tables, as in a cold boot.
+ *
+ * The first netmap replaces the seeded tables with its own and is held
+ * against the record (tl_warm_sm_netmap): what a cold start would run
+ * against — the peer the netmap's table gives tl_warm_target_index, our
+ * netmap address — must be what the session runs against. The same peer
+ * with another NodeKey, DiscoKey, endpoints or tailnet address is
+ * updated in place (wg_dataplane_update_peers). Another peer (or none),
+ * another self address, a netmap without peers or self address, a node
+ * control marks expired / deleted, the bound or a record SNTP shows too
+ * old: the record is erased and the device restarts into a cold boot
+ * (wg_dataplane_stop cannot be undone in place: the socket, and the STUN
+ * endpoint pushed for it, go with it — the self-address restart was
+ * already the way), with an RTC mark so that boot is cold even if the
+ * erase failed. A crash (or a hang the gate's cap ends) before the
+ * session settled — the netmap's changes applied and the next boot's
+ * record stored — is the RTC guard's (tl_warm_rtc_boot,
+ * tl_warm_sm_settle). One case stays apart: a target with no endpoint
+ * left keeps the warm session (via DERP), where a cold start would
+ * refuse to start — what a cold session does when its peer loses its
+ * endpoints. */
+
+/* Set once the long-poll's cold path has handled the first full netmap
+ * (a warm start's confirmation is the state machine's, tl_warm_sm_seen):
+ * until then the modem stays awake (app_wifi.c) and no STUN re-probe
+ * recycles the map stream. Read from any task (tinylink_netmap_seen). */
+static volatile bool     s_netmap_seen;
+/* Uptime second of the last control byte (tinylink_control_mark_alive),
+ * for the record's refresh. */
+static volatile uint32_t s_control_rx_s;
+
+#if CONFIG_TINYLINK_WARM_START
+
+/* NVS "warm_rec", mirrored: loaded by tinylink_init; on a warm boot also
+ * the record the session runs on until the first netmap. The main task
+ * (warm start) and the telemetry task (writes) use it under s_warm_mx;
+ * the long-poll task reads it only while the session is pending, when
+ * nothing writes it — no record is staged before the netmap confirms. */
+static tl_warm_nvs_t     s_warm_nvs;
+/* The warm start vs the first netmap (the gate), and an NVS write vs the
+ * erase before a restart. */
+static SemaphoreHandle_t s_warm_mx;
+static bool              s_warm_gate_shut;   /* under s_warm_mx: too late for a warm start */
+static bool              s_warm_nvs_shut;    /* under s_warm_mx: erased for a restart */
+static bool              s_warm_gate_lp;     /* long-poll task: it shut the gate */
+/* The state machine and the netmap's record for the next boot (long-poll
+ * → telemetry task): under s_warm_mux. */
+static portMUX_TYPE      s_warm_mux = portMUX_INITIALIZER_UNLOCKED;
+static tl_warm_sm_t      s_wsm;
+static tl_warm_rec_t     s_warm_stage;
+static bool              s_warm_staged;
+/* This boot's verdict from the RTC marks (tinylink_init). */
+static tl_warm_rtc_verdict_t s_warm_rtc_verdict;
+/* The crash guard and the restart mark (tl_warm.h). Written under
+ * s_warm_mux. */
+static RTC_NOINIT_ATTR tl_warm_rtc_t s_warm_rtc;
+
+_Static_assert(TL_WARM_RST_POWERON == ESP_RST_POWERON && TL_WARM_RST_SW == ESP_RST_SW,
+               "tl_warm.h reset-reason values drifted from esp_reset_reason_t");
+
+/* The long-poll waits at most this long for a warm start under way (the
+ * relay wait is ≤ RELAY_BOOT_WAIT_MS of it): the main task is not on the
+ * task WDT, and a warm start that hangs would hold the netmap forever. */
+#define WARM_GATE_MAX_MS 30000
+/* wg_rx's 8-KiB stack and the telemetry task's 4.5 KiB, contiguous, with
+ * room for a TLS handshake still under way; below it the netmap brings
+ * the data plane up, as before 1.3.9. */
+#define WARM_HEAP_FREE_MIN    32768u
+#define WARM_HEAP_LARGEST_MIN 16384u
+
+static tl_warm_tables_t warm_tables(void)
+{
+    return (tl_warm_tables_t){ s_self_addrs, &s_self_addrs_count,
+                               s_last_peers, &s_last_peers_count };
+}
+
+static uint32_t uptime_s(void)
+{
+    return (uint32_t)(esp_timer_get_time() / 1000000LL);
+}
+
+static esp_err_t warm_nvs_erase(void)
+{
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(TAI64N_NVS_NS, NVS_READWRITE, &h);
+    if (err == ESP_OK) {
+        err = nvs_erase_key(h, TL_WARM_KEY);
+        if (err == ESP_OK) {
+            err = nvs_commit(h);
+        } else if (err == ESP_ERR_NVS_NOT_FOUND) {
+            err = ESP_OK;
+        }
+        nvs_close(h);
+    }
+    return err;
+}
+
+static int warm_io_erase(void *ctx)
+{
+    (void)ctx;
+    return warm_nvs_erase() == ESP_OK ? 0 : -1;
+}
+
+static int warm_io_read(uint8_t *b, size_t *n, void *ctx)
+{
+    (void)ctx;
+    nvs_handle_t h;
+    if (nvs_open(TAI64N_NVS_NS, NVS_READONLY, &h) != ESP_OK) return 1;
+    const esp_err_t err = nvs_get_blob(h, TL_WARM_KEY, b, n);
+    nvs_close(h);
+    if (err == ESP_OK) return 0;
+    return err == ESP_ERR_NVS_INVALID_LENGTH ? -1 : 1;
+}
+
+/* tinylink_init (main task, before any other task uses it). The RTC
+ * marks are consumed here on every boot, whatever follows (tl_warm_load:
+ * after a crash the record is erased — an NVS erase on the boot path,
+ * rare — and not read). */
+static void warm_load(void)
+{
+    if (s_warm_mx == NULL) s_warm_mx = xSemaphoreCreateMutex();
+    const int rst = (int)esp_reset_reason();
+    const tl_warm_io_t io = { warm_io_erase, warm_io_read, NULL };
+    const tl_warm_load_t lr = tl_warm_load(&s_warm_rtc, rst, &s_warm_nvs, &io,
+                                           &s_warm_rtc_verdict);
+    if (lr == TL_WARM_LOAD_ERASED || lr == TL_WARM_LOAD_ERASE_FAILED) {
+        ESP_LOGW(TAG, "warm start: the last one ended in a reset (reason %d) before "
+                      "it settled — record %s%s", rst,
+                 lr == TL_WARM_LOAD_ERASED ? "erased" : "erase failed",
+                 s_warm_rtc_verdict == TL_WARM_RTC_OFF
+                     ? "; warm start off until a power cycle" : "");
+    } else if (lr == TL_WARM_LOAD_BAD) {
+        /* Another layout (or a damaged blob): no record; the first
+         * netmap's replaces it. */
+        ESP_LOGW(TAG, "warm start: the stored record is not one this firmware "
+                      "reads — ignored");
+    }
+}
+
+static int warm_nvs_write(const uint8_t *b, size_t n, const void *ctx)
+{
+    (void)ctx;
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(TAI64N_NVS_NS, NVS_READWRITE, &h);
+    if (err == ESP_OK) {
+        err = nvs_set_blob(h, TL_WARM_KEY, b, n);
+        if (err == ESP_OK) err = nvs_commit(h);
+        nvs_close(h);
+    }
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "warm start: record write failed: 0x%x", err);
+    }
+    return err == ESP_OK ? 0 : -1;
+}
+
+/* Erase the record and restart: the next boot is cold (the RTC mark
+ * holds even if the erase fails). The long-poll task — at its top level
+ * for a netmap's restart and the bound, from the stream callback for
+ * the gate's cap (`hung`: counted as a crash, tl_warm_rtc_hung; 3.2 KB
+ * static worst there) — or the telemetry task (the bound). Does not
+ * return. */
+static __attribute__((noinline, noreturn)) void warm_restart_now(bool hung)
+{
+    portENTER_CRITICAL(&s_warm_mux);
+    if (hung) {
+        tl_warm_rtc_hung(&s_warm_rtc);
+    } else {
+        tl_warm_rtc_restart(&s_warm_rtc);
+    }
+    portEXIT_CRITICAL(&s_warm_mux);
+    /* The mutex keeps a housekeeping write from landing after the erase;
+     * not given back — the restart follows. */
+    if (s_warm_mx != NULL) (void)xSemaphoreTake(s_warm_mx, pdMS_TO_TICKS(5000));
+    s_warm_nvs_shut = true;
+    const esp_err_t err = warm_nvs_erase();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "warm start: record erase failed: 0x%x — the next boot "
+                      "starts cold all the same (RTC mark)", err);
+    }
+    esp_restart();
+}
+
+/* Long-poll task, every netmap frame: the first shuts the gate — no warm
+ * start begins after it, one under way finishes first (priority
+ * inheritance lifts the main task; the relay wait is ≤ 1 s of it). Fed
+ * 1-s slices, at most WARM_GATE_MAX_MS: then the warm start is taken for
+ * hung, and the device restarts into a cold boot (a crash for the
+ * guard's count). */
+static void warm_gate_shut(void)
+{
+    if (s_warm_gate_lp || s_warm_mx == NULL) return;
+    s_warm_gate_lp = true;
+    for (unsigned waited = 0; xSemaphoreTake(s_warm_mx, pdMS_TO_TICKS(1000)) != pdTRUE;) {
+        tl_wdt_feed();
+        waited += 1000;
+        if (waited >= WARM_GATE_MAX_MS) {
+            ESP_LOGE(TAG, "warm start: still running after %u ms — restarting into a "
+                          "cold start", waited);
+            warm_restart_now(true);
+        }
+    }
+    s_warm_gate_shut = true;
+    xSemaphoreGive(s_warm_mx);
+}
+
+/* The record the netmap would give the next boot — our addresses and the
+ * peer wg_dataplane_start would pick from the table now (the next boot's
+ * best guess at the cold choice) — handed to the telemetry task's write.
+ * Long-poll task, after the data plane runs on a netmap. Not inlined:
+ * its ~180-B frame stays off long_poll_handler's, above
+ * wg_dataplane_start. A table it cannot represent (no endpoint on the
+ * target) leaves the last one staged. */
+static __attribute__((noinline)) void warm_stage(void)
+{
+    if (s_self_addrs_count == 0 || s_last_peers_count == 0) return;
+    const size_t ti = wg_dataplane_target_index(s_last_peers, s_last_peers_count);
+    tl_warm_rec_t r;
+    tl_warm_rec_build(s_self_addrs, s_self_addrs_count, &s_last_peers[ti],
+                      s_keys.node_pub, s_control_pub, &r);
+    if (!tl_warm_rec_storable(&r)) return;
+    portENTER_CRITICAL(&s_warm_mux);
+    s_warm_stage  = r;
+    s_warm_staged = true;
+    portEXIT_CRITICAL(&s_warm_mux);
+}
+
+static const char *peer_ip_str(const tl_peer_t *p)
+{
+    return p->n_addresses > 0 ? p->addresses[0].str : "(no address)";
+}
+
+/* Under s_warm_mx, the gate still open (main task). */
+static void warm_start_locked(void)
+{
+    const tl_warm_rec_t *r = &s_warm_nvs.rec;
+    const unsigned free0    = (unsigned)esp_get_free_heap_size();
+    const unsigned largest0 = (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT);
+    const tl_warm_go_in_t in = {
+        .rtc        = s_warm_rtc_verdict,
+        .have_rec   = s_warm_nvs.valid,
+        .keys_ok    = s_warm_nvs.valid && tl_warm_rec_for(r, s_keys.node_pub, s_control_pub),
+        .reg_reused = s_reg_no_auth,
+        .heap_ok    = free0 >= WARM_HEAP_FREE_MIN && largest0 >= WARM_HEAP_LARGEST_MIN,
+        .now_unix   = (int64_t)time(NULL),
+        .written    = r->written,
+    };
+    switch (tl_warm_go(&in)) {
+    case TL_WARM_GO:
+        break;
+    case TL_WARM_NO_RECORD:
+        ESP_LOGI(TAG, "warm start: no cached netmap — WireGuard waits for the netmap");
+        return;
+    case TL_WARM_SKIP_CRASH:
+        ESP_LOGW(TAG, "warm start: skipped — the last one ended in a reset; "
+                      "WireGuard waits for the netmap");
+        return;
+    case TL_WARM_SKIP_OFF:
+        ESP_LOGW(TAG, "warm start: off after %u failed attempts (a reset or a hang) — "
+                      "until a power cycle; WireGuard waits for the netmap",
+                 (unsigned)TL_WARM_RTC_MAX_CRASHES);
+        return;
+    case TL_WARM_SKIP_RESTART:
+        ESP_LOGI(TAG, "warm start: skipped once after a restart for a netmap change — "
+                      "WireGuard waits for the netmap");
+        return;
+    case TL_WARM_OTHER_KEYS:
+        ESP_LOGI(TAG, "warm start: the cached netmap is for other keys or another "
+                      "control plane — ignored");
+        return;
+    case TL_WARM_STALE:
+        ESP_LOGI(TAG, "warm start: the cached netmap is over %u days old — "
+                      "WireGuard waits for the netmap",
+                 (unsigned)(TL_WARM_MAX_AGE_S / 86400u));
+        return;
+    case TL_WARM_NEEDED_AUTH:
+        ESP_LOGI(TAG, "warm start: skipped — the register needed the auth key "
+                      "(a new or re-created node)");
+        return;
+    case TL_WARM_LOW_HEAP:
+        ESP_LOGW(TAG, "warm start: skipped — heap free %u, largest %u; WireGuard "
+                      "waits for the netmap", free0, largest0);
+        return;
+    }
+    tl_warm_tables_t t = warm_tables();
+    portENTER_CRITICAL(&s_warm_mux);
+    tl_warm_sm_begin(&s_wsm, &s_warm_rtc);
+    portEXIT_CRITICAL(&s_warm_mux);
+    /* The long-poll touches the tables only past the gate this task
+     * holds: seeded outside the spinlock. */
+    tl_warm_seed(r, &t);
+    /* The steps of the first netmap's bring-up (long_poll_handler), all
+     * of them: the first INIT waits for the relay as there. */
+    relay_boot_join();
+    esp_err_t err = wg_dataplane_start(&s_keys, s_self_addrs, s_self_addrs_count,
+                                       s_last_peers, s_last_peers_count);
+    portENTER_CRITICAL(&s_warm_mux);
+    tl_warm_sm_started(&s_wsm, &s_warm_rtc, &t, err == ESP_OK, uptime_s(), r->written);
+    portEXIT_CRITICAL(&s_warm_mux);
+    if (err != ESP_OK) {
+        /* wg_dataplane_start left wg_netif as after its init (socket,
+         * wg_tx, callbacks): the netmap's start is the first one. */
+        ESP_LOGW(TAG, "warm start: wg_dataplane_start failed: 0x%x (heap free %u, "
+                      "largest %u) — WireGuard waits for the netmap", err, free0, largest0);
+        return;
+    }
+    s_dataplane_started = true;
+    char age[64];
+    tl_warm_age_str(age, sizeof(age), (int64_t)time(NULL), tl_time_synced(), r->written);
+    ESP_LOGI(TAG, "warm start: WG up from the cached netmap (peer %s, %s; heap free "
+                  "%u→%u, largest %u→%u)",
+             peer_ip_str(&s_last_peers[0]), age, free0,
+             (unsigned)esp_get_free_heap_size(), largest0,
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
+    esp_err_t terr = telemetry_start();
+    if (terr != ESP_OK) {
+        ESP_LOGW(TAG, "telemetry_start failed: 0x%x — continuing", terr);
+    }
+    prepunch_pings_to_peers(s_last_peers, s_last_peers_count);
+}
+
+/* A netmap frame while the warm session waits (after the merge, or —
+ * expired / self address moved — before it): tl_warm_sm_netmap decides,
+ * this logs and acts. Not inlined: `now` and the log buffer stay off
+ * long_poll_handler's frame. */
+static __attribute__((noinline)) esp_err_t warm_netmap(const tl_netmap_t *nm, bool expired,
+                                                       bool self0_moved)
+{
+    tl_warm_rec_t now;
+    const tl_peer_t *t = NULL;
+    if (!expired && !self0_moved && s_self_addrs_count > 0 && s_last_peers_count > 0) {
+        t = &s_last_peers[wg_dataplane_target_index(s_last_peers, s_last_peers_count)];
+        tl_warm_rec_build(s_self_addrs, s_self_addrs_count, t, s_keys.node_pub,
+                          s_control_pub, &now);
+    }
+    const tl_warm_nm_t in = { .expired = expired, .have_self = nm->have_self,
+                              .self0_moved = self0_moved, .now = t != NULL ? &now : NULL };
+    unsigned why = 0;
+    portENTER_CRITICAL(&s_warm_mux);
+    const tl_warm_act_t act = tl_warm_sm_netmap(&s_wsm, &s_warm_nvs.rec, &in, &why);
+    portEXIT_CRITICAL(&s_warm_mux);
+    if (t != NULL) {
+        /* The cold path's line, for the boot timings. */
+        ESP_LOGI(TAG, "netmap (initial): self.id=0x%08lx%08lx peers=%u derp_regions=%u",
+                 (unsigned long)(nm->self_id >> 32),
+                 (unsigned long)(nm->self_id & 0xFFFFFFFFul),
+                 (unsigned)s_last_peers_count, (unsigned)nm->n_derp_regions);
+    }
+    char what[112];
+    switch (act) {
+    case TL_WARM_ACT_COLD:    /* not reached: the handler asks only while pending */
+    case TL_WARM_ACT_WAIT:
+    case TL_WARM_ACT_LATE:    /* the bound's restart is under way */
+        return ESP_OK;
+    case TL_WARM_ACT_RESTART:
+        if (why & TL_WARM_WHY_EXPIRED) {
+            ESP_LOGW(TAG, "control marks this node %s — the warm start goes: "
+                          "restarting into a cold start",
+                     nm->self_expired ? "expired/deleted" : "key-expired");
+        } else if (why & TL_WARM_WHY_EMPTY) {
+            ESP_LOGW(TAG, "netmap differs: %s — restarting into a cold start",
+                     s_self_addrs_count == 0 ? "no self address" : "no peers");
+        } else if (why & TL_WARM_D_PEER) {
+            const uint64_t id = s_warm_nvs.rec.peer.id;
+            bool listed = false;
+            for (size_t i = 0; i < s_last_peers_count && id != 0; i++) {
+                listed = listed || s_last_peers[i].id == id;
+            }
+            ESP_LOGW(TAG, "netmap differs: target peer %s (the cached one is %s) — "
+                          "restarting into a cold start",
+                     peer_ip_str(t), listed ? "not the pick" : "gone");
+        } else if (self0_moved) {
+            ESP_LOGW(TAG, "netmap differs: self address %s — restarting into a cold "
+                          "start", s_self_addrs[0].str);
+        } else {
+            ESP_LOGW(TAG, "netmap differs: %s — restarting into a cold start",
+                     tl_warm_diff_str(why & TL_WARM_RESTART, what, sizeof(what)));
+        }
+        return MAPREQ_STREAM_RECYCLE;
+    case TL_WARM_ACT_CONFIRM:
+        break;
+    }
+    if (why == 0) {
+        ESP_LOGI(TAG, "netmap confirms the warm start (peer %s)", peer_ip_str(t));
+    } else {
+        ESP_LOGI(TAG, "netmap differs: %s — updated (peer %s)",
+                 tl_warm_diff_str(why, what, sizeof(what)), peer_ip_str(t));
+    }
+    /* What the cold path's first netmap does after the start: the update
+     * applies keys, endpoints and the tailnet address; the prepunch goes
+     * to the whole table (the warm one had the cached peer only). The
+     * crash guard's mark stays until the housekeeping stored the record
+     * this stages (warm_persist): a fault in what follows costs the
+     * record, not a loop. */
+    esp_err_t err = wg_dataplane_update_peers(&s_keys, s_last_peers, s_last_peers_count);
+    prepunch_pings_to_peers(s_last_peers, s_last_peers_count);
+    warm_stage();
+    return err;
+}
+
+/* The pending session against the bound and the record's age (telemetry
+ * task, long-poll task); the long-poll's also runs a netmap's restart. */
+static __attribute__((noinline)) void warm_poll(bool long_poll)
+{
+    const bool    synced   = tl_time_synced();
+    const int64_t now_unix = (int64_t)time(NULL);
+    portENTER_CRITICAL(&s_warm_mux);
+    const int why = tl_warm_sm_poll(&s_wsm, long_poll, uptime_s(),
+                                    (uint32_t)CONFIG_TINYLINK_WARM_START_MAX_S,
+                                    synced, now_unix);
+    portEXIT_CRITICAL(&s_warm_mux);
+    if (why == 0) return;
+    if (why == TL_WARM_POLL_NETMAP) {
+        /* long_poll_handler logged what */
+    } else if (why == TL_WARM_BOUND_TIME) {
+        ESP_LOGW(TAG, "warm start: no netmap within %d s — erasing the record, "
+                      "restarting into a cold start", CONFIG_TINYLINK_WARM_START_MAX_S);
+    } else {
+        ESP_LOGW(TAG, "warm start: the cached netmap is over %u days old (clock "
+                      "synced) and no netmap came — erasing the record, restarting into "
+                      "a cold start", (unsigned)(TL_WARM_MAX_AGE_S / 86400u));
+    }
+    warm_restart_now(false);
+}
+
+/* The staged record → NVS, when tl_warm_store says so; then a confirmed
+ * warm session settles (tl_warm_sm_settle). Telemetry task. */
+static __attribute__((noinline)) void warm_persist(void)
+{
+    tl_warm_rec_t r;
+    portENTER_CRITICAL(&s_warm_mux);
+    const bool         have = s_warm_staged;
+    const tl_warm_sm_t sm   = s_wsm;
+    if (have) r = s_warm_stage;
+    portEXIT_CRITICAL(&s_warm_mux);
+    if (!have || s_warm_mx == NULL) return;
+    if (xSemaphoreTake(s_warm_mx, pdMS_TO_TICKS(1000)) != pdTRUE) return;   /* next time */
+    if (!s_warm_nvs_shut) {
+        const bool synced = tl_time_synced();
+        const uint32_t now = synced ? (uint32_t)time(NULL) : 0;
+        const int rc = tl_warm_store(&s_warm_nvs, &r, now, esp_timer_get_time(),
+                                     tl_warm_sm_fresh(&sm, uptime_s(), s_control_rx_s),
+                                     warm_nvs_write, NULL);
+        if (rc == 1) {
+            tl_cidr_t a = { "(no address)" };
+            if (r.peer.n_addr > 0) tl_warm_cidr_str(&r.peer.addr[0], &a);
+            ESP_LOGI(TAG, "warm start: record stored for the next boot (peer %s)", a.str);
+        }
+        portENTER_CRITICAL(&s_warm_mux);
+        (void)tl_warm_sm_settle(&s_wsm, &s_warm_rtc, rc);
+        portEXIT_CRITICAL(&s_warm_mux);
+    }
+    xSemaphoreGive(s_warm_mx);
+}
+
+#else
+static void warm_load(void) {}
+#endif /* CONFIG_TINYLINK_WARM_START */
+
+bool tinylink_netmap_seen(void)
+{
+#if CONFIG_TINYLINK_WARM_START
+    if (tl_warm_sm_seen(&s_wsm)) return true;   /* a byte: read unlocked */
+#endif
+    return s_netmap_seen;
+}
+
+void tinylink_warm_start(void)
+{
+#if CONFIG_TINYLINK_WARM_START
+    if (!s_initialized || s_warm_mx == NULL) return;
+    xSemaphoreTake(s_warm_mx, portMAX_DELAY);
+    if (!s_warm_gate_shut) {
+        s_warm_gate_shut = true;
+        warm_start_locked();
+    }
+    xSemaphoreGive(s_warm_mx);
+#endif
+}
+
+void tinylink_warm_persist_poll(void)
+{
+#if CONFIG_TINYLINK_WARM_START
+    warm_poll(false);
+    warm_persist();
+#endif
 }
 
 static esp_err_t long_poll_handler(const tl_netmap_t *nm, void *ctx)
 {
     (void)ctx;
+#if CONFIG_TINYLINK_WARM_START
+    warm_gate_shut();
+    tl_warm_tables_t wt = warm_tables();
+    portENTER_CRITICAL(&s_warm_mux);
+    /* The first frame empties the tables a warm start seeded; true while
+     * that session waits for its netmap (tl_warm_sm_frame). */
+    const bool warm = tl_warm_sm_frame(&s_wsm, &wt);
+    portEXIT_CRITICAL(&s_warm_mux);
+#endif
+    if (self_node_expired(nm)) {
+        /* headscale ≥0.29.4 answers a deleted node's stream with HTTP
+         * 200 + this frame and an expired node's with Expired set — no
+         * 4xx ever reaches the re-register path, and the bytes keep the
+         * wedge clock fed. Upstream clients go to NeedsLogin; we have the
+         * authkey, so long_poll_task re-registers. A warm session, which
+         * no netmap of this boot confirmed, goes: a cold boot would have
+         * no data plane before the re-register (round 1.3.9). */
+        s_self_expired = true;
+#if CONFIG_TINYLINK_WARM_START
+        if (warm) return warm_netmap(nm, true, false);
+#endif
+        ESP_LOGW(TAG, "control marks this node %s — leaving the stream to "
+                      "re-register",
+                 nm->self_expired ? "expired/deleted" : "key-expired");
+        return MAPREQ_STREAM_RECYCLE;
+    }
+    if (nm->have_self) s_self_live = true;
+    if (nm->have_self && nm->n_self_addresses > 0) {
+        memcpy(s_self_addrs, nm->self_addresses,
+               nm->n_self_addresses * sizeof(tl_cidr_t));
+        s_self_addrs_count = nm->n_self_addresses;
+        if (s_dataplane_started) {
+            /* A deleted-and-re-registered node can come back with a new
+             * tailnet address; the lwIP tunnel netif, the TSMP advert
+             * source and the peers' AllowedIPs for us would all disagree.
+             * Rare (admin deleted the node) — restart into the boot path,
+             * which brings everything up against the new address. So does
+             * a warm start's cached address that is no longer ours. */
+            const uint32_t now_v4 = cidr_host_v4(&s_self_addrs[0]);
+            if (now_v4 != 0 && now_v4 != wg_dataplane_self_v4()) {
+#if CONFIG_TINYLINK_WARM_START
+                if (warm) return warm_netmap(nm, false, true);
+                ESP_LOGW(TAG, "self address changed to %s — restarting to "
+                              "re-attach the tunnel", s_self_addrs[0].str);
+                /* The record holds the old address: erased first, at the
+                 * long-poll's top level (warm_restart_now). */
+                portENTER_CRITICAL(&s_warm_mux);
+                s_wsm.restart = true;
+                portEXIT_CRITICAL(&s_warm_mux);
+                return MAPREQ_STREAM_RECYCLE;
+#else
+                ESP_LOGW(TAG, "self address changed to %s — restarting to "
+                              "re-attach the tunnel", s_self_addrs[0].str);
+                esp_restart();
+#endif
+            }
+        }
+    }
     const bool peers_changed = merge_peers(nm);
-#if CONFIG_TINYLINK_DERP_SUPERVISED
-    update_derp_host_from_netmap(nm);
+    update_derp_host_from_netmap(nm);   /* STUN uses it without the supervisor too */
+#if CONFIG_TINYLINK_WARM_START
+    if (warm) return warm_netmap(nm, false, false);
 #endif
     if (!s_dataplane_started) {
+        if (s_self_addrs_count == 0 || s_last_peers_count == 0) {
+            return ESP_OK;   /* wait for self + peers (first full map) */
+        }
+        s_netmap_seen = true;
         /* Tailscale node ID is genuinely 64-bit (random server-assigned);
          * high/low hex split keeps it printable under NEWLIB_NANO_FORMAT
          * without dragging in full %llu. */
         ESP_LOGI(TAG, "netmap (initial): self.id=0x%08lx%08lx peers=%u derp_regions=%u",
                  (unsigned long)(nm->self_id >> 32),
                  (unsigned long)(nm->self_id & 0xFFFFFFFFul),
-                 (unsigned)nm->n_peers,
+                 (unsigned)s_last_peers_count,
                  (unsigned)nm->n_derp_regions);
-        esp_err_t err = wg_dataplane_start(&s_keys, nm);
+        relay_boot_join();
+        esp_err_t err = wg_dataplane_start(&s_keys, s_self_addrs, s_self_addrs_count,
+                                           s_last_peers, s_last_peers_count);
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "wg_dataplane_start failed: 0x%x", err);
             return err;
@@ -1217,26 +2283,38 @@ static esp_err_t long_poll_handler(const tl_netmap_t *nm, void *ctx)
          * to every peer endpoint advertised in the bootstrap netmap so a
          * cold-start `tailscale ping` from any peer has a fresh path
          * available without waiting for a DERP-relayed CMM round trip. */
-        prepunch_pings_to_peer_endpoints(nm);
+        prepunch_pings_to_peers(s_last_peers, s_last_peers_count);
+#if CONFIG_TINYLINK_WARM_START
+        portENTER_CRITICAL(&s_warm_mux);
+        tl_warm_sm_cold(&s_wsm);
+        portEXIT_CRITICAL(&s_warm_mux);
+        warm_stage();   /* the next boot's warm start */
+#endif
         return ESP_OK;
     }
-    ESP_LOGI(TAG, "netmap (update): peers=%u%s removed=%u derp_regions=%u table=%u",
+    ESP_LOGI(TAG, "netmap (update): peers=%u%s removed=%u patches=%u "
+                  "derp_regions=%u table=%u",
              (unsigned)nm->n_peers, nm->peers_is_delta ? " (delta)" : "",
-             (unsigned)nm->n_removed, (unsigned)nm->n_derp_regions,
-             (unsigned)s_last_peers_count);
-    /* Apply the merged table to the data plane (endpoint roam of the
-     * WG peer; a removed WG peer leaves the live session alone). */
-    esp_err_t err = ESP_OK;
-    if (peers_changed) {
-        err = wg_dataplane_update_peers(&s_keys, s_last_peers, s_last_peers_count);
+             (unsigned)nm->n_removed, (unsigned)nm->n_patches,
+             (unsigned)nm->n_derp_regions, (unsigned)s_last_peers_count);
+    if (!peers_changed) {
+#if CONFIG_TINYLINK_WARM_START
+        if (nm->have_self) warm_stage();
+#endif
+        return ESP_OK;
     }
-    /* Refresh NAT mappings on every netmap update too. Idle ages out
-     * mappings (typical UDP timeout 30-120 s); without a periodic punch
-     * the peer's first packet after silence finds a closed path and
-     * forces DERP fallback. Cheap to repeat — ~50-200 bytes per peer
-     * endpoint, fires only on non-KeepAlive netmaps (every minute or
-     * two on the Tailscale control plane). */
-    prepunch_pings_to_peer_endpoints(nm);
+    /* Apply the merged table to the data plane: endpoint roam, peer
+     * NodeKey/DiscoKey rotation and tailnet address of the WG peer (a
+     * removed WG peer leaves the live session alone). Then refresh NAT
+     * mappings towards the merged endpoints — idle ages them out
+     * (typical UDP timeout 30-120 s) and the peer's first packet after
+     * silence would find a closed path and fall back to DERP. ~50-200
+     * bytes per endpoint. */
+    esp_err_t err = wg_dataplane_update_peers(&s_keys, s_last_peers, s_last_peers_count);
+    prepunch_pings_to_peers(s_last_peers, s_last_peers_count);
+#if CONFIG_TINYLINK_WARM_START
+    warm_stage();
+#endif
     return err;
 }
 
@@ -1250,6 +2328,13 @@ static esp_err_t long_poll_handler(const tl_netmap_t *nm, void *ctx)
 #define LP_BACKOFF_BASE_MS 1000u
 #define LP_BACKOFF_CAP_MS  ((uint32_t)CONFIG_TINYLINK_REGISTER_RETRY_MS)
 #define LP_HEALTHY_MS      10000LL
+/* After such a stream the redial goes at once (round 1.3.8, C2), the
+ * backoff only from its failure on: upstream's mapRoutine resets its
+ * backoff with every netmap and then waits n² × 10 ms × [0.5, 1.5] —
+ * 5–15 ms — before the next poll; 0.75–1.25 s here was most of the
+ * 1.4 s from a stream's end to the next connect's handshake on the 1.3.7
+ * sensor (stream end 647.86 s → init sent 649.26 s). */
+#define LP_REDIAL_MS       10u
 
 /* Endpoint-push request flag, consumed by long_poll_task right after
  * each control (re)connect. Set from the STUN re-probe path (any task)
@@ -1267,11 +2352,89 @@ static int64_t s_control_last_rx_us;
 void tinylink_control_mark_alive(void)
 {
     s_control_last_rx_us = esp_timer_get_time();
+    s_control_rx_s = (uint32_t)(s_control_last_rx_us / 1000000LL);
 }
 
 /* Counters for the /stats snapshot. */
 static uint32_t s_stat_lp_reconnects;
 static uint32_t s_stat_ep_pushes;
+
+/* A push the server throttled (429 / 503), reset, or left unanswered
+ * while the map stream it rides with runs (round 1.3.7 review; one a
+ * GOAWAY refused goes with the reconnect, at once). Until
+ * 1.3.6 a failed push went again before the next stream, after the
+ * server's Retry-After; riding with the stream it would wait for the
+ * stream's end — hours on a healthy conn. So: one recycle of the stream
+ * after the server's wait (at least EP_PUSH_RETRY_MS), with the push held
+ * until then (a reconnect in between runs its stream without it). One
+ * per failure streak — a push the retry does not get through goes with
+ * the next stream, as does any other refusal (a server that rejects the
+ * lite update sees it once per reconnect); a 200 ends the streak. */
+#define EP_PUSH_RETRY_MS 30000u
+
+static esp_timer_handle_t s_ep_push_timer;   /* tinylink_long_poll_start */
+static volatile bool s_ep_push_waiting;      /* armed: the push is held */
+static bool s_ep_push_retried;               /* this streak had its recycle */
+static bool s_ep_push_resolved;              /* the stream's push has an outcome */
+
+static void ep_push_timer_cb(void *arg)
+{
+    (void)arg;
+    s_ep_push_waiting = false;
+    tinylink_endpoint_push_async();
+}
+
+/* mapreq_run_stream's on_push: long-poll task, mid-stream. */
+static void ep_push_done(int status, uint32_t wait_ms)
+{
+    s_ep_push_resolved = true;
+    if (status == 200) {
+        s_stat_ep_pushes++;
+        s_ep_push_retried = false;
+        uint8_t  ep_addr[4];
+        uint16_t ep_port = 0;
+        if (tinylink_get_public_endpoint(ep_addr, &ep_port)) {
+            ESP_LOGI(TAG, "endpoint push: pushed %u.%u.%u.%u:%u",
+                     ep_addr[0], ep_addr[1], ep_addr[2], ep_addr[3],
+                     (unsigned)ep_port);
+        }
+        return;
+    }
+    s_ep_push_pending = true;   /* owed — with the next stream at the latest */
+    if (status == MAPREQ_PUSH_GOAWAY) {
+        /* Not processed and the conn is ending: with the reconnect. */
+        ESP_LOGI(TAG, "endpoint push: again with the reconnect");
+        return;
+    }
+    const bool transient = status == 0 || status == 429 || status == 503;
+    const char *what = status > 0 ? "refused" : "reset or unanswered";
+    const uint32_t ms = wait_ms > EP_PUSH_RETRY_MS ? wait_ms : EP_PUSH_RETRY_MS;
+    if (transient && !s_ep_push_retried && s_ep_push_timer != NULL) {
+        s_ep_push_waiting = true;
+        if (esp_timer_start_once(s_ep_push_timer, (uint64_t)ms * 1000u) == ESP_OK) {
+            s_ep_push_retried = true;
+            ESP_LOGW(TAG, "endpoint push %s (HTTP %d) — again in %u ms (one "
+                          "stream recycle)", what, status, (unsigned)ms);
+            return;
+        }
+        s_ep_push_waiting = false;
+    }
+    ESP_LOGW(TAG, "endpoint push %s (HTTP %d) — again with the next stream",
+             what, status);
+}
+
+/* noinline: tools/stack_worst.py takes every function whose address the
+ * caller of esp_timer_create takes for a timer callback — inlined into
+ * tinylink_long_poll_start, that would be long_poll_task too. */
+static __attribute__((noinline)) void ep_push_timer_init(void)
+{
+    if (s_ep_push_timer != NULL) return;
+    const esp_timer_create_args_t ta = { .callback = ep_push_timer_cb,
+                                         .name = "ep_push" };
+    if (esp_timer_create(&ta, &s_ep_push_timer) != ESP_OK) {
+        s_ep_push_timer = NULL;   /* failed pushes go with the next stream */
+    }
+}
 
 static void long_poll_task(void *arg)
 {
@@ -1286,65 +2449,76 @@ static void long_poll_task(void *arg)
      * surfaces NeedsLogin to a human. A headless sensor has no human,
      * but it does have the authkey in NVS, so the equivalent recovery
      * is an in-place re-register (the exact path every boot exercises). */
-    uint32_t consec_4xx = 0;
+    uint32_t consec_rejected = 0;
     tinylink_control_mark_alive();  /* arm the wedge clock from task start */
     tl_wdt_subscribe();
     for (;;) {
         tl_wdt_feed();
-        int retry_after_s = 0;
-        int http_status   = 0;
+#if CONFIG_TINYLINK_WARM_START
+        /* The bound without the telemetry task (its start failed): a
+         * pending warm session no netmap confirms ends here too. */
+        warm_poll(true);
+#endif
+        uint32_t rate_limit_ms = 0;
+        int      http_status   = 0;
+        bool     redial_now    = false;
         esp_err_t err = ensure_control_conn();
-        if (err == ESP_OK && s_ep_push_pending) {
-            /* Endpoint push (Stream=false lite MapRequest) on the freshly
-             * connected s_conn, BEFORE the read-only Stream=true cycle
-             * claims it — the same sequence bringup runs at boot. This
-             * task has the stack the ts2021 path needs; the old dedicated
-             * ep_up task did not (see the "Endpoint push" section). */
-            s_ep_push_pending = false;
-            esp_err_t perr = mapreq_push_endpoints(&s_conn, &s_keys);
-            if (perr == ESP_OK) {
-                s_stat_ep_pushes++;
-                uint8_t  ep_addr[4];
-                uint16_t ep_port = 0;
-                if (tinylink_get_public_endpoint(ep_addr, &ep_port)) {
-                    ESP_LOGI(TAG, "endpoint push: pushed %u.%u.%u.%u:%u",
-                             ep_addr[0], ep_addr[1], ep_addr[2], ep_addr[3],
-                             (unsigned)ep_port);
-                }
-            } else {
-                /* Retry on the next connect; the loop's backoff below
-                 * paces it and a server Retry-After is honored like any
-                 * other map failure. */
-                s_ep_push_pending = true;
-                retry_after_s = s_conn.h2_retry_after_s;
-                http_status   = s_conn.h2_status;
-                ESP_LOGW(TAG, "endpoint push failed: 0x%x — retrying after "
-                              "reconnect", perr);
-                drop_control_conn();
-                err = perr;
-            }
-        }
         if (err == ESP_OK) {
+            /* Endpoint push (Stream=false lite MapRequest) on the freshly
+             * connected s_conn — since round 1.3.7 as a second HTTP/2
+             * stream in the same burst as the read-only Stream=true
+             * request, not a round trip before it (the boot's push is
+             * this one too). This task has the stack the ts2021 path
+             * needs; the old dedicated ep_up task did not (see the
+             * "Endpoint push" section). Taken now: a request raised
+             * during the stream is a new one (and recycles it). Held
+             * while a refused push waits for its retry (ep_push_done). */
+            const bool push = s_ep_push_pending && !s_ep_push_waiting;
+            if (push) s_ep_push_pending = false;
+            s_ep_push_resolved = false;
             const int64_t t0 = esp_timer_get_time();
-            err = mapreq_run_stream(&s_conn, &s_keys, long_poll_handler, NULL);
+            err = mapreq_run_stream(&s_conn, &s_keys, long_poll_handler, NULL,
+                                    push ? ep_push_done : NULL);
+#if CONFIG_TINYLINK_WARM_START
+            /* A netmap the warm session (or the tunnel's address) cannot
+             * follow in place (long_poll_handler logged what): erase the
+             * record, restart into a cold boot. */
+            warm_poll(true);
+#endif
             /* Stream ended: either the server closed it (idle / ping
-             * failure / restart) or our side errored. Capture any
-             * Retry-After hint from the response (mapreq.c parses it on
-             * 429/503) and the HTTP status before drop_control_conn
-             * clears the conn. */
-            retry_after_s = s_conn.h2_retry_after_s;
+             * failure / restart), our side errored, the push went
+             * unanswered within the one-shot deadline, or the handler
+             * left an expired-node frame. Capture the rate-limit wait and
+             * the HTTP status before drop_control_conn clears the conn. */
+            rate_limit_ms = control_rate_limit_ms();
             http_status   = s_conn.h2_status;
             const int64_t up_us = esp_timer_get_time() - t0;
-            if (s_ep_push_pending) {
+            if (s_ep_push_pending && s_conn.aborted) {
                 ESP_LOGI(TAG, "long-poll stream recycled for endpoint push "
                               "(0x%x) — reconnecting", err);
+            } else if (s_conn.resp_expired) {
+                /* ts2021 has the W line (round 1.3.8, C1) */
+                ESP_LOGI(TAG, "long-poll stream recycled (no response) — reconnecting");
             } else {
                 ESP_LOGW(TAG, "long-poll stream ended: 0x%x — reconnecting", err);
             }
+            if (push && !s_ep_push_resolved) {
+                /* Still unanswered when the stream ended or failed (its
+                 * deadline before the stream's answer, the conn lost):
+                 * again with the next connect's stream, as in 1.3.6. The
+                 * other outcomes are ep_push_done's. */
+                ESP_LOGW(TAG, "endpoint push unanswered — retrying with the "
+                              "next stream");
+                s_ep_push_pending = true;
+            }
             drop_control_conn();
             s_stat_lp_reconnects++;
-            /* The stream was a healthy working connection — recover fast. */
-            if (up_us >= LP_HEALTHY_MS * 1000LL) fail_attempt = 0;
+            /* The stream was a healthy working connection — recover fast:
+             * redial now, the backoff from base if that fails. */
+            if (up_us >= LP_HEALTHY_MS * 1000LL) {
+                fail_attempt = 0;
+                redial_now = true;
+            }
         } else {
             ESP_LOGW(TAG, "long-poll connect failed: 0x%x — backing off", err);
         }
@@ -1352,17 +2526,34 @@ static void long_poll_task(void *arg)
         const bool rejected_4xx = (err != ESP_OK &&
                                    http_status >= 400 && http_status < 500 &&
                                    http_status != 429);
-        if (rejected_4xx) {
-            if (consec_4xx < 1024u) consec_4xx++;
-            /* Power-of-two schedule (2, 4, 8, ... cycles) so a control
-             * plane that keeps rejecting us isn't hammered with one
-             * register per reconnect cycle, yet a transient server-side
-             * state loss recovers within a couple of cycles. */
-            if (consec_4xx >= 2u && (consec_4xx & (consec_4xx - 1u)) == 0u) {
-                ESP_LOGW(TAG, "map rejected %u consecutive times (HTTP %d) — "
-                              "re-registering with stored authkey",
-                         (unsigned)consec_4xx, http_status);
-                esp_err_t rr = tinylink_register();
+        const bool expired = s_self_expired;
+        const bool self_live = s_self_live;
+        s_self_expired = false;
+        s_self_live = false;
+        if (rejected_4xx || expired) {
+            consec_rejected++;   /* 32-bit: ~4 000 years of 30-s cycles */
+            /* Power-of-two schedule (1|2, 4, 8, ... 1024 cycles, then every
+             * 1024th) so a control plane that keeps rejecting us isn't
+             * hammered with one register per reconnect cycle, yet a
+             * transient server-side state loss recovers within a couple
+             * of cycles. (It used to saturate at 1024 — a power of two —
+             * and then re-register on every cycle.) A self node marked
+             * expired/deleted is definitive (headscale sends it once,
+             * then ends the stream) → re-register on the first; a bare
+             * 4xx may be transient → from the second. */
+            const bool due = (consec_rejected <= 1024u)
+                ? (consec_rejected & (consec_rejected - 1u)) == 0u
+                : (consec_rejected % 1024u) == 0u;
+            if (due && (expired || consec_rejected >= 2u)) {
+                if (expired) {
+                    ESP_LOGW(TAG, "node expired/deleted server-side — "
+                                  "re-registering with stored authkey");
+                } else {
+                    ESP_LOGW(TAG, "map rejected %u consecutive times (HTTP %d) — "
+                                  "re-registering with stored authkey",
+                             (unsigned)consec_rejected, http_status);
+                }
+                esp_err_t rr = register_node(true);
                 if (rr == ESP_OK) {
                     ESP_LOGI(TAG, "re-register OK — refreshing endpoints");
                     /* Stream=true is read-only server-side; make sure the
@@ -1370,14 +2561,23 @@ static void long_poll_task(void *arg)
                      * the long-poll task, so just flag it: the next
                      * ensure_control_conn below runs the push. */
                     s_ep_push_pending = true;
-                    consec_4xx = 0;
+                    /* consec_rejected is NOT reset here: only a stream that
+                     * delivers a live self node proves the re-register
+                     * worked (see s_self_live). */
                 } else {
                     ESP_LOGW(TAG, "re-register failed: 0x%x — map retry "
                                   "continues", rr);
+                    /* A throttled register paces the next cycle too. */
+                    if (s_last_register_wait_ms > rate_limit_ms) {
+                        rate_limit_ms = s_last_register_wait_ms;
+                    }
                 }
             }
-        } else {
-            consec_4xx = 0;
+        } else if (self_live || err == ESP_OK) {
+            /* A cycle that got a live self node (or ran a clean stream)
+             * ends the rejection streak; a bare transport failure in
+             * between neither extends nor ends it. */
+            consec_rejected = 0;
         }
 
 #if CONFIG_TINYLINK_CONTROL_WEDGE_RESTART_S > 0
@@ -1401,11 +2601,15 @@ static void long_poll_task(void *arg)
 #endif
 
         uint32_t delay_ms;
-        if (retry_after_s > 0) {
-            /* Server-directed delay overrides our backoff. */
-            delay_ms = (uint32_t)retry_after_s * 1000U;
-            ESP_LOGI(TAG, "long-poll: honoring server Retry-After=%d s",
-                     retry_after_s);
+        if (rate_limit_ms > 0) {
+            /* Rate limited (429, or 503 + Retry-After): the server's
+             * delay replaces our backoff, which — like upstream's — is
+             * neither advanced nor reset by it. */
+            delay_ms = rate_limit_ms;
+            ESP_LOGI(TAG, "long-poll: rate limited by control — waiting %u ms",
+                     (unsigned)delay_ms);
+        } else if (redial_now) {
+            delay_ms = tl_backoff_ms(0, LP_REDIAL_MS, LP_REDIAL_MS, esp_random());
         } else {
             delay_ms = tl_backoff_ms(fail_attempt, LP_BACKOFF_BASE_MS,
                                      LP_BACKOFF_CAP_MS, esp_random());
@@ -1418,42 +2622,41 @@ static void long_poll_task(void *arg)
 esp_err_t tinylink_long_poll_start(void)
 {
     if (!s_initialized) return ESP_ERR_INVALID_STATE;
-    /* 24 KiB stack — reverted from a 20 KiB trim attempt (#99) that was
-     * sized off a 100 s smoke measurement (peak 11 040 B = 45 % used).
+    /* The long-poll's first netmap spawns wg_rx: the boot STUN probe
+     * must be off the WG socket by then (a no-op after
+     * tinylink_dataplane_start, which joins it first). */
+    stun_boot_join();
+    /* 7 KiB stack (round 1.3.4, D4; 12 KiB since 1.3.3's B18, 24 KiB
+     * from #99's revert until then).
      *
-     * Extended 420 s soak with ~18 min device uptime captured the
-     * tinylink_lp lifetime peak at 20 004 B used — i.e. the 100 s
-     * smoke missed a path that fires only after extended operation.
-     * The 20 KiB trim left just 476 B (2.3 %) margin against that
-     * peak, dangerously close to overflow. Reverting to 24 KiB
-     * restores the original ~4.5 KiB (23 %) margin, which is what
-     * the historical author chose with "~14 KiB handshake estimate
-     * + safety" reasoning.
+     * History: a 20 KiB trim (#99, sized off a 100 s smoke that peaked
+     * at 11 040 B) met a 20 004-B lifetime peak ~18 min into a soak and
+     * was reverted; the path was never pinpointed and every later trim
+     * attempt was blocked on it. tools/stack_worst.py (round 1.3.3, static
+     * worst case per task from GCC's -fcallgraph-info=su, the blobs' and
+     * the ROM's disassembly, plus 368 B of fixed overhead) found it on
+     * that May build: 20 528 B static against 20 004 measured — the LP
+     * task's first ts2021 RE-connect (ts2021_connect's 9.9 KB frame →
+     * nghttp2_session_recv with a 4 KiB inbound buffer → the Noise record
+     * decrypt), which the boot smoke never ran on this task (boot connects
+     * on the main task). 92c09dd (connect reuses the idle h2_rx buffer)
+     * and 1.3.1's 512-B nghttp2 inbound buffer removed both frames. 1.3.3
+     * then had 7 856 B static (map stream → nghttp2 → the record
+     * decrypt's 4 144-B frame, `ct[4096]`), 7 284 B measured over the 6-h
+     * 1.3.2 soak (the tool is ≥ measured on every task of 1.3.2).
      *
-     * The path that bursts to 20 KiB has not been pinpointed in
-     * source — it fires in the first 13 min between boot and the
-     * follow-up soak's first stack-diag dump. Likely candidates:
-     *   - Long-poll stream-error + ts2021_connect RE-handshake after
-     *     heap has fragmented (mbedtls allocation patterns shift)
-     *   - mapresp_parse path on a NON-KeepAlive incremental update
-     *     not exercised by the original boot-time netmap
-     *   - Retry-After backoff + reconnect under unusual heap state
-     *
-     * Static body_buf (32 KiB) and static jsmntok_t toks[2500]
-     * (40 KiB) both live in BSS, so the heavy data structures stay
-     * off this task's stack. The 20 KiB jump must therefore come
-     * from a stack-local allocation pattern in mbedtls / esp_tls /
-     * the streaming parser itself.
-     *
-     * Trim retry policy: anything tighter than 24 KiB requires a
-     * multi-hour soak with stack-diag dumps every 60 s to validate
-     * the worst-case lifetime hwm across heap fragmentation states.
-     * The 100 s post-boot smoke pattern that worked for the other
-     * stack trims (DERP #98, stun_r #100, wg_tx #101, ep_up #102)
-     * is INSUFFICIENT for tasks that do TLS reconnects long after
-     * the initial boot path settles. */
+     * Today: D4 decrypts each record in place in h2_rx and seals sends
+     * there in ≤ 2 KiB records, so neither `ct` nor the 4 096-B send
+     * record is on any stack. Static worst case 4 864 B (1.3.4 with D1,
+     * D2, D4: map stream → long_poll_handler → wg_dataplane_start →
+     * netif / lwIP → the Wi-Fi TX path → a driver log); a reconnect's
+     * TLS handshake reaches 4 672 B, and the recursions the tool costs
+     * once stay under it at their bounds (jsmn_skip_d's 65 levels:
+     * 3 472 B; the ESP MPI multiply split, ≤ 2 levels deep: 4 832 B).
+     * 7 KiB = 2.3 KB over the static worst case. */
+    ep_push_timer_init();
     BaseType_t ok = xTaskCreate(long_poll_task, "tinylink_lp",
-                                24576, NULL, tskIDLE_PRIORITY + 4, NULL);
+                                7168, NULL, tskIDLE_PRIORITY + 4, NULL);
     if (ok != pdPASS) {
         ESP_LOGE(TAG, "xTaskCreate(long_poll) failed");
         return ESP_ERR_NO_MEM;
@@ -1461,20 +2664,9 @@ esp_err_t tinylink_long_poll_start(void)
     return ESP_OK;
 }
 
-esp_err_t tinylink_wait_dataplane_ms(uint32_t timeout_ms)
+bool tinylink_session_up(void)
 {
-    /* Cooperative poll: long-poll task runs at higher priority so it
-     * gets to do its handshake + first MapResponse without us blocking
-     * it. We just sleep in coarse 100 ms chunks until the flag flips. */
-    const uint32_t step_ms = 100;
-    uint32_t waited = 0;
-    while (!s_dataplane_started) {
-        if (waited >= timeout_ms) return ESP_ERR_TIMEOUT;
-        vTaskDelay(pdMS_TO_TICKS(step_ms));
-        tl_wdt_feed();
-        waited += step_ms;
-    }
-    return ESP_OK;
+    return wg_netif_is_up();
 }
 
 esp_err_t tinylink_time_start(void)
@@ -1484,13 +2676,52 @@ esp_err_t tinylink_time_start(void)
     return (err != ESP_OK) ? err : serr;
 }
 
+/* Boot counters (/stats, 1.3.2). RTC slow memory survives every reset
+ * but a power loss and is never cleared by the startup code; the record
+ * validates itself (tl_bootstat.h). Light sleep keeps RTC slow memory
+ * powered because it is in use (.rtc.force_slow already was). */
+static RTC_NOINIT_ATTR tl_bootstat_t s_bootstat;
+static bool                          s_bootstat_done;
+
+_Static_assert(TL_RST_PANIC == ESP_RST_PANIC && TL_RST_INT_WDT == ESP_RST_INT_WDT &&
+               TL_RST_TASK_WDT == ESP_RST_TASK_WDT && TL_RST_BROWNOUT == ESP_RST_BROWNOUT,
+               "tl_bootstat.h reset-reason values drifted from esp_reset_reason_t");
+
+void tinylink_bootstat_record(void)
+{
+    if (s_bootstat_done) return;
+    s_bootstat_done = true;
+    /* The warm-reset TLS sessions' boot sweep (round 1.3.8, tls_rtc.h)
+     * belongs here too, before anything can restart: a boot that is not
+     * a warm reset must scrub them now. Left to the first TLS connect, a
+     * cold boot that never got that far (no Wi-Fi: bringup fails, and 60 s
+     * later esp_restart) would hand them to a software-reset boot, which
+     * restores — a secret from before an RTC-timer restart, its age
+     * counted from that restart (review 138b). */
+    tls_resume_boot();
+    const bool kept = tl_bootstat_count(&s_bootstat, (int)esp_reset_reason());
+    ESP_LOGI(TAG, "boots=%u (brown-out %u, panic %u, task WDT %u, int WDT %u)%s",
+             (unsigned)s_bootstat.boots, (unsigned)s_bootstat.brownout,
+             (unsigned)s_bootstat.panic, (unsigned)s_bootstat.task_wdt,
+             (unsigned)s_bootstat.int_wdt,
+             kept ? "" : " — RTC record restarted");
+}
+
 void tinylink_get_stats(tinylink_stats_t *out)
 {
     if (out == NULL) return;
+    tinylink_bootstat_record();
     memset(out, 0, sizeof(*out));
     const int64_t now = esp_timer_get_time();
     out->uptime_s     = (uint32_t)(now / 1000000LL);
+    out->reset_reason = (int)esp_reset_reason();
+    out->boots          = s_bootstat.boots;
+    out->boots_brownout = s_bootstat.brownout;
+    out->boots_panic    = s_bootstat.panic;
+    out->boots_task_wdt = s_bootstat.task_wdt;
+    out->boots_int_wdt  = s_bootstat.int_wdt;
     out->heap_free    = (uint32_t)esp_get_free_heap_size();
+    out->heap_min     = (uint32_t)esp_get_minimum_free_heap_size();
     out->heap_largest = (uint32_t)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT);
     out->ntp_synced   = tl_time_synced();
     out->control_open = s_conn_open;
@@ -1499,8 +2730,11 @@ void tinylink_get_stats(tinylink_stats_t *out)
     out->control_reconnects = s_stat_lp_reconnects;
     out->endpoint_pushes    = s_stat_ep_pushes;
 #if CONFIG_TINYLINK_DERP_SUPERVISED
-    out->derp_connected = s_derp_sup.connected;
-    snprintf(out->derp_host, sizeof(out->derp_host), "%s", s_derp_host);
+    out->derp_connected = derp_client_is_connected(&s_derp_sup);
+    tl_derp_addr_t node;
+    home_derp_get(&node, NULL);
+    _Static_assert(sizeof(out->derp_host) == sizeof(node.host), "derp_host size");
+    memcpy(out->derp_host, node.host, sizeof(out->derp_host));
 #endif
     out->public_valid = tinylink_get_public_endpoint(out->public_v4, &out->public_port);
     wg_netif_stats_t ws;
@@ -1510,9 +2744,12 @@ void tinylink_get_stats(tinylink_stats_t *out)
     out->wg_cold_handshakes = ws.cold_handshakes;
     out->wg_rx_stale_events = ws.rx_stale_events;
     out->wg_roams           = ws.roams;
+    out->wg_disco_adverts   = ws.disco_adverts;
     out->wg_tx_drops        = (uint32_t)ws.tx_drops;
     out->wg_relayed_stale   = (uint32_t)ws.relayed_stale;
     out->wg_relay_errors    = (uint32_t)ws.relay_errors;
+    out->wg_path            = ws.path_mode;
+    out->wg_path_lapses     = ws.path_lapses;
     out->wg_last_rx_age_s   = ws.last_transport_recv_us > 0
         ? (uint32_t)((now - ws.last_transport_recv_us) / 1000000LL) : 0u;
 }
@@ -1542,12 +2779,14 @@ esp_err_t tinylink_wg_socket_init(void)
      * supervisor isn't yet connected, so registering this BEFORE
      * tinylink_derp_supervised_start has spawned the supervisor task
      * is safe — the TX worker will just continue with direct sendto.
-     * Once the supervisor's TLS handshake completes (post-netmap),
-     * the callback starts accepting WG transport frames and the TX
+     * Once the supervisor's login completes (at boot, alongside the
+     * register, since round 1.3.5), the callback starts accepting WG
+     * frames — the first INIT's DERP copy included — and the TX
      * worker switches transports when the path-stale watchdog or
      * sendto errno indicates direct UDP is broken. */
 #if CONFIG_TINYLINK_DERP_SUPERVISED
     wg_netif_set_relay_callback(tinylink_relay_via_derp, NULL);
+    wg_netif_set_relay_state_callback(relay_connected, NULL);
 #endif
 
     return ESP_OK;
@@ -1577,8 +2816,9 @@ esp_err_t tinylink_wg_socket_init(void)
  * (objdump of the release objects) and -fstack-usage.
  *
  * Now: the push runs on the long-poll task, on s_conn, right after the
- * (re)connect and before the stream starts — the exact sequence bringup
- * runs at boot (tinylink_dataplane_start). tinylink_endpoint_push_async()
+ * (re)connect — since round 1.3.7 as a second HTTP/2 stream in the same
+ * burst as the map stream (mapreq_run_stream; the boot's push is the
+ * first one). tinylink_endpoint_push_async()
  * records the request and kicks the long-poll out of its blocking
  * stream read (ts2021_abort_reads); the reconnect then follows the
  * normal healthy-stream backoff (~1 s), so a push lands within one 30 s
@@ -1589,20 +2829,71 @@ esp_err_t tinylink_wg_socket_init(void)
  * change (rare), in exchange for −12.6 KiB of BSS (stack + TCB), no
  * second Noise/TLS conn (−8.6 KiB peak stack, ~−12 KiB TLS heap
  * transient) and no overflow. Upstream sends its lite update over the
- * shared HTTP/2 client (controlclient.Auto.updateRoutine); tinylink's
- * h2_client is one stream per conn, so the recycle is the equivalent. */
+ * shared HTTP/2 client (controlclient.Auto.updateRoutine) while the
+ * poll runs; tinylink's opens its side stream only together with a map
+ * stream (the long-poll task sits in the stream's read loop), so a push
+ * after the boot still recycles the stream. */
 
 /* Signal that the public endpoint changed. Idempotent; callable from
- * any task (STUN re-probe task, event handlers). */
+ * any task (STUN re-probe on the telemetry task, event handlers). */
 static void tinylink_endpoint_push_async(void)
 {
     s_ep_push_pending = true;
-    if (s_conn_open) {
+    if (s_ep_push_waiting) {
+        /* A throttled push's retry is armed (ep_push_done): it recycles
+         * the stream when the server's wait is over, this one with it. */
+        ESP_LOGI(TAG, "endpoint push: queued — after the server's wait");
+    } else if (s_conn_open) {
         ESP_LOGI(TAG, "endpoint push: queued — recycling the map stream");
         ts2021_abort_reads();
     } else {
         ESP_LOGI(TAG, "endpoint push: queued — runs on the next control connect");
     }
+}
+
+/* Answer budget of one STUN probe (boot or re-probe). Generous — Google
+ * STUN answers the sensor in ~40 ms; a dead server costs this much. */
+#define STUN_PROBE_TIMEOUT_MS 3000
+
+/* Where a STUN probe goes (round 1.3.5): the home DERP node's STUN
+ * service (UDP 3478, tailcfg STUNPort) at the address the DERP map gave
+ * — no DNS, and the server netcheck itself asks — else
+ * CONFIG_TINYLINK_STUN_HOST, resolved: when no record has the address
+ * yet (the first boot with 1.3.5, a map without IPv4) or the last probe
+ * to the DERP node went unanswered (UDP 3478 filtered on the way?). An
+ * unanswered probe sends the next one to the other server and an answer
+ * keeps it, so both probes stay on one server — on a NAT whose mapping
+ * depends on the destination, switching servers would read as an
+ * endpoint change and push it (a control-stream recycle). The boot task
+ * and then the telemetry task use it; an abandoned boot probe can still
+ * be finishing during the first re-probe, which at worst sends one probe
+ * to the other server. */
+static volatile bool s_stun_use_kconfig;
+
+static esp_err_t stun_server_pick(struct sockaddr_in *out, bool *derp)
+{
+    tl_derp_addr_t node;
+    home_derp_get(&node, NULL);
+    uint8_t  ip[4];
+    uint16_t port = 0;
+    *derp = !s_stun_use_kconfig && tl_derp_addr_stun(&node, ip, &port);
+    if (*derp) {
+        memset(out, 0, sizeof(*out));
+        out->sin_family = AF_INET;
+        out->sin_port   = htons(port);
+        memcpy(&out->sin_addr.s_addr, ip, sizeof(ip));
+        return ESP_OK;
+    }
+    return stun_probe_resolve(CONFIG_TINYLINK_STUN_HOST,
+                              (uint16_t)CONFIG_TINYLINK_STUN_PORT, out);
+}
+
+static void stun_server_note(bool derp, bool answered)
+{
+    /* answered: stay on this server; unanswered: the other one next. A
+     * first boot thus stays on the Kconfig server after its boot probe
+     * answered, even once the netmap gives the DERP node's address. */
+    s_stun_use_kconfig = answered ? !derp : derp;
 }
 
 /* --- STUN reprobe via the live WG socket -------------------------------
@@ -1613,21 +2904,22 @@ static void tinylink_endpoint_push_async(void)
  * AddrPort the STUN server learns can't be advertised back to peers.
  *
  * Option B: split send/receive across the existing tasks.
- *   - The reprobe task `sendto`s the STUN binding request directly on
- *     g.sock (sendto is thread-safe in lwIP, no ownership transfer).
+ *   - The re-probe (telemetry task) `sendto`s the STUN binding request
+ *     directly on g.sock (sendto is thread-safe in lwIP, no ownership
+ *     transfer).
  *   - rx_task already classifies WG_DEMUX_STUN; we hook it via
  *     wg_netif_set_stun_callback() to a parser that matches the
  *     in-flight txid and signals a semaphore.
- *   - The reprobe task waits on that semaphore with a 3 s timeout.
+ *   - The re-probe waits on that semaphore with a 3 s timeout.
  *
  * No race: rx_task remains the only recvfrom-er. No data loss: rx_task
  * keeps dispatching DISCO/transport packets normally; STUN is just
  * routed to a new arm.
  *
- * The pending-probe slot (s_stun_pending) is single-writer (the reprobe
- * task) and single-reader (the rx_task callback runs on rx_task);
- * concurrent probes are not possible because the reprobe task takes
- * a mutex around the entire build/sendto/wait sequence. */
+ * The pending-probe slot (s_stun_pending) is single-writer (the re-probe
+ * on the telemetry task) and single-reader (the rx_task callback runs on
+ * rx_task); concurrent probes are not possible because the re-probe
+ * takes a mutex around the entire build/sendto/wait sequence. */
 static struct {
     SemaphoreHandle_t   mutex;        /* serializes concurrent reprobes */
     SemaphoreHandle_t   done_sem;     /* given by handler on txid match */
@@ -1644,25 +2936,14 @@ static void stun_response_handler(const uint8_t *buf, size_t len, void *user)
          * or a stray STUN frame. Drop. */
         return;
     }
-    uint8_t got_txid[STUN_TXID_LEN];
-    stun_addr_t addr;
-    int rc = stun_parse_response(buf, len, got_txid, &addr);
-    if (rc != 0) {
-        /* Malformed / not-success / no-mapped-addr — let it slide;
-         * the reprobe task will time out and try again next cycle. */
+    /* Malformed / not-success / no-mapped-addr, a stale probe's txid or
+     * a v6 answer: let it slide; the re-probe times out and tries again
+     * next cycle. */
+    if (stun_match_v4(buf, len, s_stun_pending.txid,
+                      s_stun_pending.result.addr_v4,
+                      &s_stun_pending.result.port) != 0) {
         return;
     }
-    if (memcmp(got_txid, s_stun_pending.txid, STUN_TXID_LEN) != 0) {
-        return;  /* response to a stale probe — ignore */
-    }
-    if (addr.is_v6) {
-        return;  /* v6 mapped — we asked for v4 */
-    }
-    s_stun_pending.result.addr_v4[0] = addr.addr[12];
-    s_stun_pending.result.addr_v4[1] = addr.addr[13];
-    s_stun_pending.result.addr_v4[2] = addr.addr[14];
-    s_stun_pending.result.addr_v4[3] = addr.addr[15];
-    s_stun_pending.result.port  = addr.port;
     s_stun_pending.result.valid = true;
     xSemaphoreGive(s_stun_pending.done_sem);
 }
@@ -1703,27 +2984,16 @@ static esp_err_t stun_reprobe_via_wg_socket(uint32_t timeout_ms,
         return ESP_ERR_NO_MEM;
     }
 
-    /* DNS-resolve the STUN server. lwIP getaddrinfo can block briefly
-     * — the reprobe task is the only caller and runs at IDLE+1, so a
-     * synchronous DNS lookup here is safe. */
-    struct addrinfo hints = {
-        .ai_family   = AF_INET,
-        .ai_socktype = SOCK_DGRAM,
-    };
-    char port_str[8];
-    snprintf(port_str, sizeof(port_str), "%u",
-             (unsigned)CONFIG_TINYLINK_STUN_PORT);
-    struct addrinfo *res = NULL;
-    if (getaddrinfo(CONFIG_TINYLINK_STUN_HOST, port_str, &hints, &res) != 0
-        || res == NULL) {
-        ESP_LOGW(TAG, "stun reprobe: DNS resolve failed for %s",
-                 CONFIG_TINYLINK_STUN_HOST);
-        if (res) freeaddrinfo(res);
+    /* The home DERP node's STUN, or the Kconfig server resolved (lwIP
+     * getaddrinfo can block — the re-probe on the telemetry task
+     * (IDLE+2) is the only caller, so a synchronous DNS lookup here is
+     * safe). */
+    struct sockaddr_in dest;
+    bool derp = false;
+    if (stun_server_pick(&dest, &derp) != ESP_OK) {
+        stun_server_note(false, false);
         return ESP_FAIL;
     }
-    struct sockaddr_in dest;
-    memcpy(&dest, res->ai_addr, sizeof(dest));
-    freeaddrinfo(res);
 
     /* Take the mutex for the whole build/send/wait sequence so a
      * second reprobe call can't smash the txid out from under us. */
@@ -1764,6 +3034,7 @@ static esp_err_t stun_reprobe_via_wg_socket(uint32_t timeout_ms,
     }
     s_stun_pending.in_flight = false;
     xSemaphoreGive(s_stun_pending.mutex);
+    stun_server_note(derp, err == ESP_OK);
     return err;
 }
 
@@ -1773,51 +3044,18 @@ esp_err_t tinylink_stun_probe(void)
      * global on success. This way a transient probe failure (DNS
      * blip, NAT dropping our send, etc.) does NOT wipe a previously
      * good endpoint — the next MapRequest keeps advertising the
-     * old-but-still-correct value. Boot-time initial probe also
-     * works the same way: s_stun_result is zero-initialized so
-     * .valid stays false until the first success.
-     *
-     * 3 s timeout is generous — Google STUN typically answers in
-     * <100 ms. Worst case adds 3 s of boot delay if the configured
-     * server is dead. */
+     * old-but-still-correct value. */
     stun_probe_result_t local = {0};
-    esp_err_t err;
-    int wg_sock = wg_netif_get_socket();
-    bool rx_running = wg_netif_rx_running();
 
-    if (wg_sock >= 0 && !rx_running) {
-        /* Boot-time path: probe via the WG socket so the public
-         * AddrPort we advertise lines up with the WG NAT mapping that
-         * keepalives keep pinned. Peers dialing this AddrPort actually
-         * reach our WG socket. */
-        err = stun_probe_run_on_socket(wg_sock,
-                                       CONFIG_TINYLINK_STUN_HOST,
-                                       (uint16_t)CONFIG_TINYLINK_STUN_PORT,
-                                       3000, &local);
-        if (err == ESP_OK && local.valid) {
-            if (s_stun_result.valid &&
-                (memcmp(s_stun_result.addr_v4, local.addr_v4, 4) != 0 ||
-                 s_stun_result.port != local.port)) {
-                ESP_LOGI(TAG, "stun: endpoint changed %u.%u.%u.%u:%u → %u.%u.%u.%u:%u",
-                         s_stun_result.addr_v4[0], s_stun_result.addr_v4[1],
-                         s_stun_result.addr_v4[2], s_stun_result.addr_v4[3],
-                         (unsigned)s_stun_result.port,
-                         local.addr_v4[0], local.addr_v4[1],
-                         local.addr_v4[2], local.addr_v4[3],
-                         (unsigned)local.port);
-            }
-            s_stun_result = local;
-        }
-        return err;
-    }
-
-    /* Re-probe path: RX task owns g.sock, so we send the STUN request
-     * via sendto (thread-safe in lwIP) and let rx_task dispatch the
-     * response back to us via the wg_netif_set_stun_callback hook.
-     * The result's source-port is now the WG socket's bound port, so
-     * a port change between boot and now can be propagated to the
-     * control plane. */
-    err = stun_reprobe_via_wg_socket(3000, &local);
+    /* Only through wg_rx: RX task owns g.sock, so we send the STUN
+     * request via sendto (thread-safe in lwIP) and let rx_task dispatch
+     * the response back to us via the wg_netif_set_stun_callback hook.
+     * The result's source-port is the WG socket's bound port, so a port
+     * change between boot and now can be propagated to the control
+     * plane. Before wg_rx exists the boot probe reads the socket itself
+     * (tinylink_stun_probe_start, stun_boot.h) and nothing else may. */
+    if (!wg_netif_rx_running()) return ESP_ERR_INVALID_STATE;
+    esp_err_t err = stun_reprobe_via_wg_socket(STUN_PROBE_TIMEOUT_MS, &local);
     if (err != ESP_OK || !local.valid) return err;
     ESP_LOGI(TAG, "stun re-probe ok via wg socket: %u.%u.%u.%u:%u",
              local.addr_v4[0], local.addr_v4[1],
@@ -1838,11 +3076,9 @@ esp_err_t tinylink_stun_probe(void)
                      local.addr_v4[2], local.addr_v4[3],
                      (unsigned)local.port);
             s_stun_result = local;
-            /* Push the new endpoint to the control plane. The push runs
-             * in the reprobe task's context (4 KiB stack — too small
-             * for a TLS handshake) so we spawn a one-shot task with
-             * adequate stack instead. Best-effort: a failed push just
-             * means the next reprobe will retry. */
+            /* Push the new endpoint to the control plane. Only flagged
+             * here: the push itself runs on the long-poll task after its
+             * next (re)connect (tinylink_endpoint_push_async). */
             tinylink_endpoint_push_async();
         }
     } else {
@@ -1862,30 +3098,45 @@ bool tinylink_get_public_endpoint(uint8_t addr_v4[4], uint16_t *port)
     return true;
 }
 
-/* ROAM-2: wake source for the reprobe task. Given by the periodic timeout
- * (the take below) OR immediately by the IP_EVENT_STA_GOT_IP handler when
- * the device's own L3 identity changes (WiFi (re)connect / DHCP renew).
- * Without this, a local network change left the STUN-learned public
- * AddrPort — and the endpoint advertised to peers — stale for up to
- * CONFIG_TINYLINK_STUN_REPROBE_MS (5 min). Mirrors magicsock's netmon
- * linkChange → Rebind+ReSTUN. */
-static SemaphoreHandle_t s_stun_reprobe_wake;
+/* Periodic STUN re-probe (since 1.3.2 on the telemetry task — telemetry.c
+ * calls tinylink_stun_reprobe_poll once per loop; it had its own 3 KiB
+ * task, "tinylink_stun_re", before). Armed by tinylink_stun_reprobe_start;
+ * the first re-probe is due one period later, because the boot probe
+ * (tinylink_stun_probe_start) ran just before — at once when it gave the
+ * endpoint push nothing (stun_boot_join). Volatile: the long-poll can
+ * spawn the telemetry task (first netmap) before main arms this, so the
+ * task may poll concurrently; due_us is stored before armed. */
+static volatile bool    s_stun_reprobe_armed;
+static volatile int64_t s_stun_reprobe_due_us;
+/* ROAM-2: set by the IP_EVENT_STA_GOT_IP handler when the device's own
+ * L3 identity changes (WiFi (re)connect / DHCP renew) so the next poll
+ * re-probes at once instead of at the period. Without it a local network
+ * change left the STUN-learned public AddrPort — and the endpoint
+ * advertised to peers — stale for up to CONFIG_TINYLINK_STUN_REPROBE_MS
+ * (5 min). Mirrors magicsock's netmon linkChange → Rebind+ReSTUN. */
+static volatile bool    s_stun_reprobe_now;
 
 static void stun_reprobe_on_got_ip(void *arg, esp_event_base_t base,
                                    int32_t id, void *data)
 {
     (void)arg; (void)base; (void)id;
-    /* Binary give coalesces: several GOT_IP events before the task runs
-     * collapse to a single immediate reprobe. */
-    if (s_stun_reprobe_wake != NULL) {
-        xSemaphoreGive(s_stun_reprobe_wake);
-    }
+    /* Several GOT_IP events before the poll runs collapse into one
+     * immediate re-probe. The kick wakes the telemetry task right away
+     * while it is not serving /stats (before the WG netif is up, or a
+     * build without it); a /stats select() takes it within one ≤ 5-s
+     * wait slice (≤ 6 s when a sample stretches it, telemetry.c). */
+    s_stun_reprobe_now = true;
+    telemetry_kick();
     /* A new L3 identity (DHCP handed us a different address after a
      * re-association) leaves the control and DERP TCP conns half-open:
      * their packets now leave from an address the servers never saw, so
      * nothing comes back and they only die on the 120-s idle budget.
-     * Recycle both right away (2026-09); the endpoint push that the
-     * re-probe queues rides the same reconnect. */
+     * Recycle both right away (2026-09). The endpoint push that the
+     * re-probe queues normally rides the same reconnect: the control
+     * read only sees the abort at its next 30-s SO_RCVTIMEO boundary,
+     * and the reconnect adds ~1 s backoff + the TLS/Noise handshake on
+     * top. If that boundary falls in the first second or so, the push
+     * costs one more recycle — still correct, just later. */
     const ip_event_got_ip_t *ev = (const ip_event_got_ip_t *)data;
     if (ev != NULL && ev->ip_changed) {
         ESP_LOGI(TAG, "ip changed — recycling control + DERP conns");
@@ -1896,105 +3147,51 @@ static void stun_reprobe_on_got_ip(void *arg, esp_event_base_t base,
     }
 }
 
-static void stun_reprobe_task(void *arg)
+int64_t tinylink_stun_reprobe_poll(int64_t now_us, int64_t early_us)
 {
-    (void)arg;
-    /* Sleep before the first iteration: the boot-time probe ran in
-     * tinylink_stun_probe() before this task was even spawned, so
-     * doing a second probe immediately would just burn bandwidth. The
-     * wait returns early (before the period elapses) when a local network
-     * change signals s_stun_reprobe_wake — re-discovering the public
-     * endpoint within one STUN RTT instead of up to one reprobe period. */
-    for (;;) {
-        if (s_stun_reprobe_wake != NULL) {
-            xSemaphoreTake(s_stun_reprobe_wake,
-                           pdMS_TO_TICKS(CONFIG_TINYLINK_STUN_REPROBE_MS));
-        } else {
-            vTaskDelay(pdMS_TO_TICKS(CONFIG_TINYLINK_STUN_REPROBE_MS));
-        }
-        esp_err_t err = tinylink_stun_probe();
-        if (err != ESP_OK) {
-            /* Don't escalate: the cached value (if any) is still in
-             * use. ESP_LOGD instead of W to avoid spamming the log
-             * when, e.g., the user briefly loses internet. */
-            ESP_LOGD(TAG, "stun re-probe transient failure: 0x%x", err);
-        }
+    if (!s_stun_reprobe_armed) return INT64_MAX;
+    /* Up to early_us ahead of time: the telemetry task is awake for a
+     * sample then (round 1.3.7, tlm_sched.h). */
+    if (!s_stun_reprobe_now && now_us + early_us < s_stun_reprobe_due_us) {
+        return s_stun_reprobe_due_us;
     }
-}
-
-/* Retry-spawn shape for stun_reprobe_task. Boot-time heap pressure
- * (TLS handshake transient + supervisor connect peak still settling)
- * can fail the initial xTaskCreate with ESP_ERR_NO_MEM, and the prior
- * handler logged "continuing static" and gave up — leaving the
- * boot-pushed endpoint permanently stale if the NAT later rebound,
- * which manifested as "direct connection not established" on the peer
- * side. The retry timer fires every 30 s and tries again; once spawn
- * succeeds the timer is one-shot-stopped and the task takes over. */
-#define STUN_RE_SPAWN_RETRY_US (30 * 1000 * 1000)
-
-static esp_timer_handle_t s_reprobe_retry_timer = NULL;
-
-static BaseType_t stun_reprobe_try_spawn(void)
-{
-    /* 3 KiB stack — sized from the 420 s soak instrumentation
-     * (PR #97 + #98 + #99) which captured the first actual
-     * stun_probe execution at t≈611 s post-boot and measured
-     * the lifetime peak at 1 808 B used. The probe path is
-     * DNS lookup (getaddrinfo) + sendto + recvfrom; no TLS or
-     * crypto. 3 KiB leaves 1 264 B margin (≈ 70 %) over peak,
-     * matching the safety ratio adopted for tinylink_derp (#98)
-     * and tinylink_lp (#99).
-     *
-     * The earlier 4 KiB budget was sized symmetrically with
-     * wg_rx (8 KiB) "same as the WG RX task" — but wg_rx does
-     * NaCl box open + sealed pong build on the RX path (DISCO
-     * direct handler), much heavier than this task's plain UDP
-     * probe. The 4 KiB never had a measurement behind it; the
-     * audit just inherited it from the WG sizing.
-     *
-     * Priority IDLE+1 unchanged — explicitly below the long-poll
-     * (IDLE+4) and the WG dataplane so neither gets preempted
-     * by a background probe. */
-    return xTaskCreate(stun_reprobe_task, "tinylink_stun_re",
-                       3072, NULL, tskIDLE_PRIORITY + 1, NULL);
-}
-
-static void stun_reprobe_retry_cb(void *arg)
-{
-    (void)arg;
-    if (stun_reprobe_try_spawn() == pdPASS) {
-        ESP_LOGI(TAG, "stun_reprobe spawn OK on retry "
-                      "(heap_free=%u largest=%u)",
-                 (unsigned)esp_get_free_heap_size(),
-                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
-        /* Timer is one-shot — do not rearm. */
-        return;
-    }
-    ESP_LOGW(TAG, "stun_reprobe spawn retry still failing "
-                  "(heap_free=%u largest=%u) — retry in %d s",
-             (unsigned)esp_get_free_heap_size(),
-             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT),
-             STUN_RE_SPAWN_RETRY_US / 1000000);
-    esp_err_t err = esp_timer_start_once(s_reprobe_retry_timer,
-                                         STUN_RE_SPAWN_RETRY_US);
+    /* A re-probe goes through wg_rx (tinylink_stun_probe), which the
+     * first netmap starts. A request before that — the boot probe's
+     * "push it later" (stun_boot_join), a GOT_IP — waits for it in 1-s
+     * steps instead of being spent on a refused probe and pushed a whole
+     * period out. Since round 1.3.9 a warm start runs wg_rx before the
+     * netmap: the wait is for the first netmap too, as in a cold boot —
+     * the push a new endpoint queues recycles the map stream, which would
+     * cut the first netmap's body (a new connect before it). */
+    if (!wg_netif_rx_running() || !tinylink_netmap_seen()) return now_us + 1000000LL;
+    s_stun_reprobe_now = false;
+    /* Blocks for one STUN round trip normally; worst case ≈ 24 s (lwIP
+     * DNS: 1+1+2+3 s × 3 servers, then the 3-s response wait) — inside
+     * the 60-s task-WDT budget with a feed on each side. */
+    tl_wdt_feed();
+    esp_err_t err = tinylink_stun_probe();
+    tl_wdt_feed();
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "esp_timer_start_once(retry) failed: 0x%x — giving up",
-                 err);
+        /* Don't escalate: the cached value (if any) is still in
+         * use. ESP_LOGD instead of W to avoid spamming the log
+         * when, e.g., the user briefly loses internet. */
+        ESP_LOGD(TAG, "stun re-probe transient failure: 0x%x", err);
     }
+    /* Next one a full period after this probe ended, like the old task's
+     * take-with-timeout loop. */
+    s_stun_reprobe_due_us = esp_timer_get_time() +
+                            (int64_t)CONFIG_TINYLINK_STUN_REPROBE_MS * 1000LL;
+    return s_stun_reprobe_due_us;
 }
 
 esp_err_t tinylink_stun_reprobe_start(void)
 {
-    /* ROAM-2: create the wake semaphore and subscribe to local IP changes
-     * before spawning, so the task can be signalled the moment it exists.
-     * The esp_event default loop is already created by app_wifi_start().
-     * Idempotent — guarded so a retry-timer respawn doesn't re-register. */
-    if (s_stun_reprobe_wake == NULL) {
-        s_stun_reprobe_wake = xSemaphoreCreateBinary();
-        if (s_stun_reprobe_wake == NULL) {
-            ESP_LOGE(TAG, "stun_reprobe: wake-sem alloc failed");
-            return ESP_ERR_NO_MEM;
-        }
+    /* ROAM-2: subscribe to local IP changes. The esp_event default loop
+     * is already created by app_wifi_start(). Idempotent. */
+    if (!s_stun_reprobe_armed) {
+        s_stun_reprobe_due_us = esp_timer_get_time() +
+                                (int64_t)CONFIG_TINYLINK_STUN_REPROBE_MS * 1000LL;
+        s_stun_reprobe_armed = true;
         esp_err_t eerr = esp_event_handler_instance_register(
             IP_EVENT, IP_EVENT_STA_GOT_IP, &stun_reprobe_on_got_ip, NULL, NULL);
         if (eerr != ESP_OK) {
@@ -2002,37 +3199,252 @@ esp_err_t tinylink_stun_reprobe_start(void)
                           "— falling back to periodic-only reprobe", eerr);
         }
     }
+    /* The probes run on the telemetry task, which exists in every build
+     * (with CONFIG_TINYLINK_TELEMETRY_ENABLE=n it only does this and the
+     * 60-s housekeeping). Spawn it now, where the re-probe task used to
+     * be spawned; a NO_MEM spawn is retried every 30 s inside, and
+     * ESP_OK means the re-probe loop *will* run. */
+    return telemetry_task_start();
+}
 
-    if (stun_reprobe_try_spawn() == pdPASS) return ESP_OK;
+/* --- Boot STUN probe, concurrent with the register (round 1.3.5) ------
+ *
+ * 1.3.4 probed on the main task between the WG socket bind and the
+ * register: got-ip → "public endpoint" took 0.04 / 0.34 / 2.10 / 7.09 s
+ * over four boots of the 1.3.4 reboot series, every millisecond of it
+ * ahead of the register. Only the endpoint push after the register uses
+ * the result, so the probe now runs on a short-lived task while the
+ * register runs (≥ 2.4 s on the sensor), and tinylink_dataplane_start
+ * waits at most STUN_BOOT_WAIT_MS for it. A later probe is abandoned and
+ * the push goes without an endpoint — the old probe-failure outcome —
+ * and the re-probe then runs as soon as wg_rx exists and pushes the
+ * endpoint through tinylink_endpoint_push_async (a control-stream
+ * recycle after the first netmap, off the boot path). A failed probe
+ * takes the same way: before 1.3.5 it left the endpoint unadvertised
+ * until the first periodic re-probe, 5 min later.
+ *
+ * Socket ownership is in stun_boot.h: until wg_rx exists the probe reads
+ * the WG socket itself, blocking only in select() and reading with
+ * MSG_DONTWAIT under s_stun_boot_mx, which the give-up takes too — so
+ * the give-up never waits on a blocked read, and from then on the probe
+ * neither reads nor publishes. */
 
-    /* Boot-time spawn failed. Schedule a retry via esp_timer (which
-     * runs on the system esp_timer task — no per-call xTaskCreate
-     * required, sidesteps the chicken-and-egg of "we have no heap to
-     * spawn the worker that watches for heap"). Returning ESP_OK
-     * tells the caller the re-probe loop *will* run; it just hasn't
-     * spawned yet. */
-    ESP_LOGW(TAG, "xTaskCreate(stun_reprobe) failed at boot "
-                  "(heap_free=%u largest=%u) — scheduling retry in %d s",
-             (unsigned)esp_get_free_heap_size(),
-             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT),
-             STUN_RE_SPAWN_RETRY_US / 1000000);
+/* After the register: how long the endpoint push waits for the probe.
+ * With the home DERP node's address cached (round 1.3.5, the normal
+ * boot) the probe needs no DNS: its request leaves right after the WG
+ * socket bind and the answer is one RTT away, while the register over
+ * :80 answers ~0.7 s after got-ip — so the probe has normally finished
+ * when this wait starts (no "waited" line). What 300 ms still covers: an
+ * answer to the 500-ms retransmission on a fast register, and a cold
+ * boot (no record yet: CONFIG_TINYLINK_STUN_HOST through DNS, which on
+ * the sensor's network lost answers in 12 of 30 boots — lwIP resends
+ * after 1, 2, 4, 7 s — and those probes are abandoned, as in 1.3.5
+ * before the cache). Raising it would only buy those tails back on the
+ * boot path. */
+#define STUN_BOOT_WAIT_MS  300
 
-    if (s_reprobe_retry_timer == NULL) {
-        const esp_timer_create_args_t targs = {
-            .callback = stun_reprobe_retry_cb,
-            .name     = "stun_re_retry",
-        };
-        esp_err_t terr = esp_timer_create(&targs, &s_reprobe_retry_timer);
-        if (terr != ESP_OK) {
-            ESP_LOGE(TAG, "esp_timer_create(retry) failed: 0x%x", terr);
-            return terr;
+/* One select() of the probe at most: how late an abandoned probe
+ * notices (it holds nothing meanwhile) and its task-WDT feed cadence. */
+#define STUN_BOOT_SLICE_MS 100
+
+/* Retransmissions of the boot request (RFC 5389 §7.2.1: RTO 500 ms,
+ * doubling) inside the STUN_PROBE_TIMEOUT_MS answer budget, same txid —
+ * a lost request or answer used to cost the whole budget and the
+ * endpoint (one send, then a 3-s wait). */
+static const uint16_t k_stun_boot_resend_ms[] = { 500, 1500 };
+
+/* getaddrinfo + the select / sendto / recvfrom exchange on a UDP-only
+ * task: tools/stack_worst.py puts the static worst case at 3 616 B
+ * (stun_boot_exchange's 432-B frame → sendto → UDP / IP → the Wi-Fi TX
+ * path → a driver log; the DNS lookup reaches 3 232 B). 5 KiB = 1.5 KB
+ * over it. The task lives for one probe — 0.04–3 s, up to ~27 s with
+ * dead DNS servers — and its stack goes back to the heap. */
+#define STUN_BOOT_TASK_STACK 5120
+
+static SemaphoreHandle_t s_stun_boot_mx;     /* s_stun_boot + the socket reads */
+static stun_boot_state_t s_stun_boot;        /* under s_stun_boot_mx once the task runs */
+static SemaphoreHandle_t s_stun_boot_done;   /* main task only: the joiner's handle */
+static bool              s_stun_boot_joined; /* main task only */
+
+/* Send the binding request (and its retransmissions) to `server` and
+ * read the WG socket for the answer while the probe is its reader.
+ * Publishes s_stun_result on a match. */
+static esp_err_t stun_boot_exchange(int sock, const struct sockaddr_in *server)
+{
+    uint8_t txid[STUN_TXID_LEN];
+    uint8_t req[STUN_REQUEST_LEN];
+    esp_fill_random(txid, sizeof(txid));
+    if (stun_build_request(req, txid) != STUN_REQUEST_LEN) return ESP_FAIL;
+
+    const size_t  n_resend = sizeof(k_stun_boot_resend_ms) / sizeof(k_stun_boot_resend_ms[0]);
+    const int64_t t0       = esp_timer_get_time();
+    const int64_t deadline = t0 + (int64_t)STUN_PROBE_TIMEOUT_MS * 1000LL;
+    size_t sends = 0;
+    /* An answer is 32–100 B; a bigger datagram is not ours anyway. */
+    uint8_t buf[256];
+    for (;;) {
+        const int64_t now = esp_timer_get_time();
+        if (now >= deadline) return ESP_ERR_TIMEOUT;
+        if (sends == 0 ||
+            (sends <= n_resend &&
+             now - t0 >= (int64_t)k_stun_boot_resend_ms[sends - 1] * 1000LL)) {
+            if (sendto(sock, req, sizeof(req), 0, (const struct sockaddr *)server,
+                       sizeof(*server)) != (ssize_t)sizeof(req)) {
+                ESP_LOGW(TAG, "stun probe: sendto errno=%d", errno);
+            }
+            sends++;
         }
+        int64_t wake = now + (int64_t)STUN_BOOT_SLICE_MS * 1000LL;
+        if (sends <= n_resend) {
+            const int64_t resend = t0 + (int64_t)k_stun_boot_resend_ms[sends - 1] * 1000LL;
+            if (resend < wake) wake = resend;
+        }
+        if (deadline < wake) wake = deadline;
+        struct timeval tv = { .tv_sec = 0, .tv_usec = (suseconds_t)(wake - now) };
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(sock, &rfds);
+        const int sel = select(sock + 1, &rfds, NULL, NULL, &tv);
+        tl_wdt_feed();
+        if (sel < 0) {
+            ESP_LOGW(TAG, "stun probe: select errno=%d", errno);
+            return ESP_FAIL;
+        }
+        if (sel == 0) continue;
+
+        bool reader, matched = false;
+        stun_probe_result_t r = { .valid = true };
+        xSemaphoreTake(s_stun_boot_mx, portMAX_DELAY);
+        reader = stun_boot_may_read(&s_stun_boot);
+        if (reader) {
+            const ssize_t n = recvfrom(sock, buf, sizeof(buf), MSG_DONTWAIT, NULL, NULL);
+            if (n > 0 && stun_match_v4(buf, (size_t)n, txid, r.addr_v4, &r.port) == 0 &&
+                stun_boot_publish(&s_stun_boot)) {
+                s_stun_result = r;
+                matched = true;
+            }
+        }
+        xSemaphoreGive(s_stun_boot_mx);
+        if (!reader) return ESP_ERR_TIMEOUT;   /* given up on; wg_rx may be next */
+        if (matched) {
+            ESP_LOGI("stun_probe", "public endpoint: %u.%u.%u.%u:%u (%u ms, %u sent)",
+                     r.addr_v4[0], r.addr_v4[1], r.addr_v4[2], r.addr_v4[3],
+                     (unsigned)r.port,
+                     (unsigned)((esp_timer_get_time() - t0) / 1000), (unsigned)sends);
+            return ESP_OK;
+        }
+        /* Anything else on the socket predates the netmap and wg_rx —
+         * nothing is configured to take it yet: dropped, as before. */
     }
-    esp_err_t terr = esp_timer_start_once(s_reprobe_retry_timer,
-                                          STUN_RE_SPAWN_RETRY_US);
-    if (terr != ESP_OK) {
-        ESP_LOGE(TAG, "esp_timer_start_once(retry) failed: 0x%x", terr);
-        return terr;
+}
+
+/* The probe: the server (the home DERP node's STUN at its cached
+ * address, else DNS — stun_server_pick), then the exchange while still
+ * wanted. Runs on the boot task, or inline on main if that could not be
+ * spawned. */
+static void stun_boot_run(SemaphoreHandle_t done)
+{
+    struct sockaddr_in server;
+    bool derp = false;
+    esp_err_t err = stun_server_pick(&server, &derp);
+    tl_wdt_feed();
+    if (derp) {
+        const uint8_t *ip = (const uint8_t *)&server.sin_addr.s_addr;
+        ESP_LOGI(TAG, "stun probe: home DERP node at %u.%u.%u.%u:%u (no DNS)",
+                 ip[0], ip[1], ip[2], ip[3], (unsigned)ntohs(server.sin_port));
+    }
+    if (err == ESP_OK) {
+        xSemaphoreTake(s_stun_boot_mx, portMAX_DELAY);
+        const bool mine = stun_boot_claim(&s_stun_boot);
+        xSemaphoreGive(s_stun_boot_mx);
+        err = mine ? stun_boot_exchange(wg_netif_get_socket(), &server)
+                   : ESP_ERR_TIMEOUT;
+    }
+    /* Abandoned counts as unanswered: the re-probe then asks the other
+     * server once wg_rx runs. */
+    stun_server_note(derp, err == ESP_OK);
+    xSemaphoreTake(s_stun_boot_mx, portMAX_DELAY);
+    const bool awaited = stun_boot_finish(&s_stun_boot);
+    xSemaphoreGive(s_stun_boot_mx);
+    if (!awaited) {
+        /* The push went without us (stun_boot_join logged it) and
+         * nobody takes the signal any more. */
+        vSemaphoreDelete(done);
+        return;
+    }
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "stun probe failed: 0x%x — continuing without endpoint", err);
+    }
+    xSemaphoreGive(done);
+}
+
+static void stun_boot_task(void *arg)
+{
+    tl_wdt_subscribe();
+    stun_boot_run((SemaphoreHandle_t)arg);
+    tl_wdt_unsubscribe();
+    vTaskDelete(NULL);
+}
+
+esp_err_t tinylink_stun_probe_start(void)
+{
+    if (!s_initialized || wg_netif_get_socket() < 0 || wg_netif_rx_running() ||
+        s_stun_boot != STUN_BOOT_IDLE) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (s_stun_boot_mx == NULL) s_stun_boot_mx = xSemaphoreCreateMutex();
+    SemaphoreHandle_t done = xSemaphoreCreateBinary();
+    if (s_stun_boot_mx == NULL || done == NULL) {
+        if (done != NULL) vSemaphoreDelete(done);
+        return ESP_ERR_NO_MEM;   /* no probe: the push goes without one */
+    }
+    s_stun_boot      = STUN_BOOT_RESOLVING;
+    s_stun_boot_done = done;
+    /* IDLE+2: above main (1), whose register TLS handshake would
+     * otherwise hold it off CPU0 while the DERP one (IDLE+3) has CPU1. */
+    if (xTaskCreate(stun_boot_task, "tinylink_stun", STUN_BOOT_TASK_STACK,
+                    done, tskIDLE_PRIORITY + 2, NULL) != pdPASS) {
+        ESP_LOGW(TAG, "stun probe: task spawn failed — probing inline");
+        stun_boot_run(done);   /* the 1.3.4 order; stun_boot_join finds it done */
     }
     return ESP_OK;
+}
+
+/* Called first by tinylink_dataplane_start (and again, a no-op, by
+ * tinylink_long_poll_start, the only way to wg_rx): once it returns the
+ * boot probe never reads the WG socket again. Main task only. */
+static void stun_boot_join(void)
+{
+    if (s_stun_boot_joined) return;
+    s_stun_boot_joined = true;
+    SemaphoreHandle_t done = s_stun_boot_done;
+    s_stun_boot_done = NULL;
+    if (done != NULL) {
+        const int64_t t0 = esp_timer_get_time();
+        bool finished = xSemaphoreTake(done, pdMS_TO_TICKS(STUN_BOOT_WAIT_MS)) == pdTRUE;
+        if (!finished) {
+            xSemaphoreTake(s_stun_boot_mx, portMAX_DELAY);
+            finished = stun_boot_give_up(&s_stun_boot);
+            xSemaphoreGive(s_stun_boot_mx);
+            /* Finished just now: its signal follows its finish at once. */
+            if (finished) (void)xSemaphoreTake(done, portMAX_DELAY);
+        }
+        const unsigned waited_ms = (unsigned)((esp_timer_get_time() - t0) / 1000);
+        if (finished) {
+            vSemaphoreDelete(done);
+            if (waited_ms > 0) {
+                ESP_LOGI(TAG, "dataplane_start: waited %u ms for the STUN probe",
+                         waited_ms);
+            }
+        } else {
+            /* The task frees `done` when it ends. */
+            ESP_LOGW(TAG, "stun probe: still running %u ms after the "
+                          "register — abandoned", waited_ms);
+        }
+    }
+    if (!s_stun_result.valid) {
+        s_stun_reprobe_now = true;
+        ESP_LOGI(TAG, "stun: no endpoint for the push — re-probing once the "
+                      "data plane is up");
+    }
 }

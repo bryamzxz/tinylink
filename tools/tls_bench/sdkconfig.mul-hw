@@ -1,0 +1,3 @@
+# Round 1.3.8 A/B: bignum multiplication on the RSA accelerator too (the
+# pre-1.3.8 behaviour of CONFIG_MBEDTLS_HARDWARE_MPI; default is software).
+CONFIG_TINYLINK_TLS_MPI_MUL_SW=n

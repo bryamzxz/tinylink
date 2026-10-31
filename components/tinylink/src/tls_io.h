@@ -9,6 +9,7 @@
 
 #pragma once
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <sys/types.h>   /* ssize_t */
@@ -65,6 +66,25 @@ int tls_io_read_full(tls_io_read_fn rd, void *ctx,
  * 0 = unlimited. */
 int tls_io_write_full(tls_io_write_fn wr, void *ctx,
                       const uint8_t *buf, size_t len, uint32_t max_idle);
+
+/* The same contract over a plain TCP socket (round 1.3.5: ts2021 on
+ * :80), so the *_full helpers above and every layer over them run
+ * unchanged without TLS. One recv() / send() per call on a blocking
+ * socket with SO_RCVTIMEO / SO_SNDTIMEO set:
+ *   > 0 : bytes read / written
+ *   = 0 : peer FIN (read only)
+ *   EAGAIN / EWOULDBLOCK (the timeout fired) or EINTR
+ *       : MBEDTLS_ERR_SSL_WANT_READ / _WANT_WRITE — one idle poll, so
+ *         max_idle counts SO_RCVTIMEO periods exactly as over esp_tls
+ *   any other error: -errno (lwIP's errno values are < 256, far from
+ *         the WANT_* codes and from the TLS_IO_ERR_* / caller codes). */
+ssize_t tls_io_sock_read(int fd, uint8_t *buf, size_t len);
+ssize_t tls_io_sock_write(int fd, const uint8_t *buf, size_t len);
+
+/* The IPv4 address a connected socket's peer has (getpeername; round
+ * 1.3.5: which control address a by-name connect reached). False for
+ * anything but a connected AF_INET socket. */
+bool tls_io_sock_peer_v4(int fd, uint8_t ip_v4[4]);
 
 #ifdef __cplusplus
 }

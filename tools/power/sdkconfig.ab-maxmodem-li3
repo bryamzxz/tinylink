@@ -1,0 +1,6 @@
+# A/B (round 1.3.7): steady-state WIFI_PS_MAX_MODEM with listen interval 3
+# instead of MIN_MODEM (main/Kconfig.projbuild has the trade-offs: a third
+# of the beacon wakes on a DTIM-1 AP, ≤ ~307 ms more inbound latency,
+# broadcast lost at skipped DTIMs).
+CONFIG_TINYLINK_WIFI_PS_MAX_MODEM=y
+CONFIG_TINYLINK_WIFI_LISTEN_INTERVAL=3

@@ -1,7 +1,8 @@
 # tinylink component
 
 The protocol implementation: control plane (ts2021 Noise IK over TLS,
-HTTP/2 via nghttp2, register + MapRequest long-poll), data plane
+HTTP/2 via the in-tree client `h2_core.c` / `hpack.c`, register +
+MapRequest long-poll), data plane
 (WireGuard on a single UDP socket, DISCO, STUN, DERP), the vendored
 constant-time crypto (`src/crypto/`), the lwIP raw-IP netif carrier and
 the TMP117 telemetry app.
@@ -12,7 +13,7 @@ the TMP117 telemetry app.
 | register / MapRequest / netmap| `register.c`, `mapreq.c`, `netmap.h`, `jsmn*.h`    | done (M1–M2, patch-refetch M13) |
 | WireGuard                     | `wg_proto.c`, `wg_handshake.c`, `wg_transport.c`, `wg_netif.c`, `wg_demux.c`, `wg_lwip.c` | done (M2, M6) |
 | DISCO / STUN / DERP           | `disco*.c`, `stun*.c`, `derp*.c`                   | done (M3–M5) |
-| crypto (BLAKE2s, ChaCha20-Poly1305, X25519-donna, Salsa20/NaCl box, HKDF) | `src/crypto/` | done, host-KAT'd |
+| crypto (BLAKE2s, ChaCha20-Poly1305, X25519 (fiat-crypto field, constant time), Salsa20/NaCl box, HKDF) | `src/crypto/` | done, host-KAT'd |
 | telemetry (TMP117 → JSON/UDP) | `tmp117.c`, `telemetry.c`                          | done (M3) |
 
 The public header is [`include/tinylink.h`](include/tinylink.h); the

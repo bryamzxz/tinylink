@@ -1,0 +1,24 @@
+# Round 1.3.8: TLS handshake crypto bench on boot (CONFIG_TINYLINK_BENCH_TLS,
+# components/tinylink/src/tinylink_bench_tls.c lists every line it prints).
+# It runs first thing in bringup(), before NVS and Wi-Fi (~1.5-3 s on the
+# chip), then the firmware boots normally. One image per configuration:
+#
+#   idf.py -B <dir> -D SDKCONFIG=<dir>/sdkconfig \
+#     -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;tools/tls_bench/sdkconfig.bench[;<A/B>]" build
+#
+#   <A/B> (none)   the 1.3.8 defaults: RSA first, in-tree X25519, bignum
+#                  multiplication in software, RSA exponentiation on the
+#                  accelerator
+#         sdkconfig.mul-hw   multiplication on the accelerator too (as up to 1.3.7)
+#         sdkconfig.mpi-off  no accelerator at all (RSA in software too)
+#         sdkconfig.win2 / win3 / win5, sdkconfig.nofp   ECC-only knobs (QEMU
+#                  instruction counts settle these; CHANGELOG 1.3.8)
+#
+# On the chip: flash the app partition, capture the boot (opening the port
+# resets the board) and keep the `bench-tls:` lines:
+#   python tools/serial_capture.py --port <port> --duration 30 --out <log>
+#   grep -a 'bench-tls:' <log>
+# On Espressif QEMU add sdkconfig.qemu (DIO flash) and run with
+# -icount shift=0: the printed µs are then thousands of instructions; the
+# RSA accelerator is emulated with no latency.
+CONFIG_TINYLINK_BENCH_TLS=y

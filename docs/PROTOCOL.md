@@ -22,10 +22,10 @@ honest. None of it is official Tailscale documentation — see the published
    App: TMP117 telemetry (UDP, JSON)         ← M3
    ────────────────────────────────────────
    MapResponse: JSON, LE32-framed stream     ← M2
-   HTTP/2 inside Noise (nghttp2)             ← M2
+   HTTP/2 inside Noise (in-tree, 1.3.4)      ← M2
    ────────────────────────────────────────
    /machine/register: HTTP/1.1 inside Noise  ← M1 (current)
-   ts2021: Noise IK + HTTP Upgrade in TLS    ← M1
+   ts2021: Noise IK + HTTP Upgrade, :80      ← M1 (TLS :443 fallback)
    ────────────────────────────────────────
    DISCO: NaCl-box on WG UDP socket          ← M3
    WireGuard data plane (droscy/esp_wireguard)← M2
@@ -38,29 +38,32 @@ honest. None of it is official Tailscale documentation — see the published
 | Primitive           | Used by             | Source              | Why                                |
 |---------------------|---------------------|---------------------|------------------------------------|
 | ChaCha20-Poly1305   | Noise IK, WG, DERP  | mbedTLS (HW-accel)  | ESP32 has accelerator; same impl   |
-| Curve25519 (X25519) | Noise IK, WG        | vendored placeholder | constant-time required (see below) |
+| Curve25519 (X25519) | Noise IK, WG        | vendored fiat-crypto | constant-time required (see below) |
 | BLAKE2s             | Noise IK            | vendored RFC 7693   | small, simple, no IDF builtin      |
 | HMAC-BLAKE2s + HKDF | Noise IK            | vendored            | Noise §4.3 KDF                     |
 | TLS 1.2/1.3         | ts2021, DERP        | mbedTLS             | already linked                     |
 | Salsa20 / XSalsa20  | NaCl-box (DISCO)    | vendored            | tiny dep                           |
 | Poly1305            | NaCl-box auth tag   | mbedTLS             | already linked                     |
 
-> The `curve25519.c` shipped today is **TweetNaCl-derived, not constant-time
-> donna**. It is *designed* to be constant-time but is not as carefully
-> audited as the canonical donna implementation. For production use, swap
-> with `trombik/esp_wireguard`'s `src/crypto/x25519.c`. See
+> X25519 is fiat-crypto's formally verified 32-bit Curve25519
+> (`crypto/curve25519_fiat32.c`, round 1.3.3) with a carry-free field
+> multiplication, so the Xtensa build has no secret-dependent branch;
+> the TweetNaCl-derived and then donna versions came before it. See
 > [`SECURITY-MODEL.md`](SECURITY-MODEL.md).
 
 ## ts2021 (M1)
 
-The control connection is TLS to `controlplane.tailscale.com`. The HTTP
+The control connection is plain TCP to `controlplane.tailscale.com:80`
+when the control key is pinned, else — and as the fallback on any :80
+failure — TLS to port 443 (round 1.3.5, as upstream `controlhttp`: the
+Noise IK handshake authenticates the server; SECURITY-MODEL.md). The HTTP
 request is `POST /ts2021` with `Upgrade: tailscale-control-protocol`,
 `Connection: upgrade`, and `Content-Length: 0`. The Noise IK initiation
 bytes do **not** travel in the request body — they ride in an
 `X-Tailscale-Handshake: <base64>` header, per
 `tailscale/control/controlhttp/client.go` and
 `controlhttpcommon.HandshakeHeaderName`. The server replies
-`101 Switching Protocols`, after which the same TLS connection carries
+`101 Switching Protocols`, after which the same connection carries
 controlbase frames.
 
 Two distinct frame layouts (see `tailscale/control/controlbase/messages.go`):
@@ -77,10 +80,10 @@ authenticated under the Noise transport keys. `maxMessageSize=4096`,
 giving a plaintext cap of `4096 − 3 − 16 = 4077`.
 
 The Noise IK prologue is the **string**
-`"Tailscale Control Protocol v138"` (prefix `"Tailscale Control Protocol v"`
+`"Tailscale Control Protocol v148"` (prefix `"Tailscale Control Protocol v"`
 + decimal protocol version, per `controlbase/handshake.go:protocolVersionPrologue`).
 The decimal suffix is `TINYLINK_CAPVER` (the single source of truth in
-`components/tinylink/include/tinylink.h`, currently `138`); `ts2021_client.c`
+`components/tinylink/include/tinylink.h`, currently `148`); `ts2021_client.c`
 builds the prologue with `snprintf(prologue, …, TS2021_PROLOGUE_PREFIX,
 TS2021_PROTOCOL_VERSION)` where `TS2021_PROTOCOL_VERSION = TINYLINK_CAPVER`,
 and writes the same value into the cleartext BE16 header of the initiation
@@ -90,12 +93,20 @@ note in this doc that called the prologue "the single byte `0x01`" was wrong;
 that byte appears in the cleartext init header, not in the Noise prologue.
 
 After the upgrade and the optional EarlyPayload, the inner protocol is
-**HTTP/2** (per `tailscale/control/ts2021/`). tinylink wraps
-`ts2021_send` / `ts2021_recv` with nghttp2 (espressif/nghttp managed
-component) in `components/tinylink/src/h2_client.c`. SETTINGS sent by
+**HTTP/2** (per `tailscale/control/ts2021/`). tinylink runs its own
+client over the ts2021 records: `components/tinylink/src/h2_core.c`
+(frames, flow control, the stream) + `hpack.c`, bound to the conn by
+`h2_client.c` (round 1.3.4; nghttp2 until then). Each received record is
+decrypted in place in the conn's 4 KiB record buffer and parsed there;
+requests are sealed in the same buffer and sent as records of ≤ 2 048 B
+(header + ciphertext), one TLS record each (D4). SETTINGS sent by
 the client disable HPACK dynamic-table indexing
 (`SETTINGS_HEADER_TABLE_SIZE = 0`) and server push
-(`SETTINGS_ENABLE_PUSH = 0`) for one-shot request semantics.
+(`SETTINGS_ENABLE_PUSH = 0`) for one-shot request semantics. Since 1.3.2
+the client preface + SETTINGS go out and the first request follows
+immediately, like the upstream Go client — the server's SETTINGS and its
+ACK of ours are processed by that request's receive loop (one RTT less
+per control connect than the old wait-for-ACK pump).
 
 After `read_msg2` the connection optionally carries an EarlyPayload
 sentinel — `"\xff\xff\xffTS"` (5 B magic) + `BE32 length` + JSON-encoded
@@ -120,8 +131,9 @@ The current upstream client reads the payload but no caller of
 `types/key/chal.go` are referenced only in tests). tinylink therefore
 **drains and discards** the EarlyPayload — it skips the magic, the `BE32`
 length, and that many JSON bytes (which themselves may span further
-records), leaving whatever follows as the HTTP/2 residual replayed to
-nghttp2. The `NodeKeyChallenge` is dropped on the floor.
+records), leaving whatever follows in the record buffer as the start of
+the HTTP/2 stream (no copy since 1.3.4, D5). The `NodeKeyChallenge` is
+dropped on the floor.
 
 ## /machine/register (M1)
 
@@ -129,14 +141,14 @@ JSON body, fields used today:
 
 | Field               | Notes                                              |
 |---------------------|----------------------------------------------------|
-| `Version`           | `TINYLINK_CAPVER` (currently `142` = Tailscale v1.102; was 138 until M15) — the Tailscale `CapabilityVersion`, same value as the ts2021 Noise prologue/header (`register.c` adds `cJSON_AddNumberToObject(root, "Version", TINYLINK_CAPVER)`). M1 hardcoded `1`, which sits below headscale's `earlyNoise` floor `MinSupportedCapabilityVersion` (`hscontrol/capver/capver_generated.go`; 113 in 2026-07, **115** as of 2026-09 — it tracks the latest 10 minor releases and keeps climbing) and aborts the `/ts2021` upgrade before any JSON is read. Since 2026-09 the legacy `GET /key?v=<n>` bootstrap sends the same value: headscale `5b6e1e17` gates `/key` on the same floor. Feature gating is keyed on `Hostinfo`, not `Version`. |
+| `Version`           | `TINYLINK_CAPVER` (currently `148` = Tailscale v1.104 since round 1.3.0; 142 in M15–M16, 138 before) — the Tailscale `CapabilityVersion`, same value as the ts2021 Noise prologue/header (`register_json.h` writes `"Version":<TINYLINK_CAPVER>`). M1 hardcoded `1`, which sits below headscale's `earlyNoise` floor `MinSupportedCapabilityVersion` (`hscontrol/capver/capver_generated.go`; 113 in 2026-07, 115 in 2026-09, **116** as of 2026-10 — it tracks the latest 10 minor releases and keeps climbing) and aborts the `/ts2021` upgrade before any JSON is read. Since 2026-09 the legacy `GET /key?v=<n>` bootstrap sends the same value: headscale `5b6e1e17` gates `/key` on the same floor. Feature gating is keyed on `Hostinfo`, not `Version`. |
 | `NodeKey`           | `"nodekey:" + 64-hex` of NodeKey public.           |
 | `OldNodeKey`        | `"nodekey:" + 64 zeros` on first registration.     |
 | `NLKey`             | `"nlpub:" + 64 zeros` for M1 (TKA disabled). Real Ed25519 NLPrivate generation lands in M7 hardening. The field has no `omitempty` upstream, so it must be present. |
 | `Hostinfo.OS`       | `"esp32"`.                                         |
 | `Hostinfo.Hostname` | from `CONFIG_TINYLINK_DEVICE_HOSTNAME`.            |
 | `Hostinfo.IPNVersion` | `TINYLINK_IPN_VERSION` (currently `"1.0.0-tinylink"`; derived from `TINYLINK_VERSION_{MAJOR,MINOR,PATCH}` in `components/tinylink/include/tinylink.h`). Tailscale parses the `MAJOR.MINOR.PATCH` prefix and labels the node `tsReleaseTrack=stable` when MINOR is even, `unstable` when odd (see `tailscale/version/prop.go::IsUnstableBuild`). |
-| `Auth.AuthKey`      | `tskey-auth-...` from NVS `tl_creds/auth_key`.     |
+| `Auth.AuthKey`      | `tskey-auth-...` from NVS `tl_creds/auth_key`. Since round 1.3.3 (B22) the whole `Auth` member is omitted (upstream `json:",omitempty"`) once control has authorized this machine + node key pair — recorded in NVS `tl_state/reg_keys` — the way a restarted tailscaled re-registers; control answers with the node's current state. Any refusal of that request (not authorized, `NodeKeyExpired`, error answer, 4xx/5xx other than 429/503) repeats it with the key on the same connection. The long-poll recovery ladder (node expired / deleted / map rejected) always sends the key. |
 | `Timestamp`         | RFC3339 from the device clock.                     |
 | `Expiry`            | `"0001-01-01T00:00:00Z"` (no expiry).              |
 | `Ephemeral`         | `false`.                                           |
@@ -203,7 +215,17 @@ conn tolerates at most `CONFIG_TINYLINK_STREAM_IDLE_TIMEOUT_S`
 (default 120 s ≈ two missed KeepAlives) of consecutive silence, then
 the stream is declared dead and the long-poll reconnects with a **full
 fresh Noise handshake** (never resumed), exponential-backoff-capped at
-30 s — same recovery shape as upstream `mapRoutine`. Persistent HTTP
+30 s — same recovery shape as upstream `mapRoutine`; after a stream
+that stayed up ≥ 10 s the redial goes at once (round 1.3.8, as
+upstream's 5–15 ms after a poll that delivered a netmap). Before its
+response headers the map stream has a shorter, first-response deadline
+(round 1.3.8): 15 s from the request, doubled after each expiry up to
+the idle budget, twice the last answer's time after an answer; an
+expiry recycles the conn without counting as a transport failure (the
+second in a row does). The first poll after a map stream the server
+ended cleanly gets the whole idle budget instead, its expiry counting
+as nothing; the polls after it the rules above. Every request carries upstream's `Ts-Lb:
+nodekey:<hex>` load-balancer hint (`tailcfg.LBHeader`). Persistent HTTP
 4xx (non-429) rejections additionally trigger an in-place re-register
 with the stored authkey (tinylink-specific: the headless equivalent of
 upstream's `NeedsLogin`), and one hour of *total* control silence is a

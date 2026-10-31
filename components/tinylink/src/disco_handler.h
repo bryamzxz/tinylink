@@ -16,8 +16,10 @@
 
 #pragma once
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 #include "disco.h"
 
@@ -73,19 +75,67 @@ size_t disco_handle_recv(uint8_t *out_reply, size_t out_cap,
                          uint8_t out_peer_disco_pub[DISCO_KEY_LEN],
                          uint8_t out_txid[DISCO_TXID_LEN]);
 
-/* Same as disco_handle_recv but uses a precomputed shared key for the
- * inbound open (skipping the per-frame X25519+HSalsa20). my_disco_priv
- * is still required for sealing the outbound Pong reply on the Ping
- * path. Caller is responsible for invalidating shared_k whenever the
- * peer DiscoKey or our disco_priv changes. */
+/* Same as disco_handle_recv but with a precomputed shared key
+ * K = nacl_box_compute_shared(peer_disco_pub, my_disco_priv) for both
+ * the inbound open and the sealed Pong reply — no X25519 + HSalsa20 per
+ * frame in either direction (the reply was a full nacl_box until round
+ * 1.3.2). A frame whose sender holds a different key fails the open, so
+ * the Pong always goes to the key K belongs to. Caller is responsible
+ * for keeping shared_k coherent with the peer DiscoKey and our
+ * disco_priv (wg_netif swaps both under one lock). */
 size_t disco_handle_recv_with_shared(uint8_t *out_reply, size_t out_cap,
                                      const uint8_t *frame, size_t frame_len,
                                      const uint8_t shared_k[DISCO_KEY_LEN],
-                                     const uint8_t my_disco_priv[DISCO_KEY_LEN],
                                      const uint8_t my_disco_pub[DISCO_KEY_LEN],
                                      disco_msg_type_t *out_type,
                                      uint8_t out_peer_disco_pub[DISCO_KEY_LEN],
                                      uint8_t out_txid[DISCO_TXID_LEN]);
+
+/* The active WG peer as a DISCO sender gate sees it (round 1.3.7, B2):
+ * its DiscoKey, and the NaCl box key K with it when one is cached
+ * (wg_netif keeps it; k_valid false for a low-order key). Holds a
+ * secret: scrub it after use. */
+typedef struct {
+    bool    has_pub;
+    bool    k_valid;
+    uint8_t pub[DISCO_KEY_LEN];
+    uint8_t k[DISCO_KEY_LEN];
+} disco_peer_key_t;
+
+/* The key a DISCO frame claiming to come from `peer` is opened with —
+ * read off the cleartext sender key, before any crypto:
+ *   DISCO_GATE_DROP  another sender (when the peer's key is known), or
+ *                    too short to name one;
+ *   DISCO_GATE_K     the peer, K cached: no X25519 for the open nor a
+ *                    reply;
+ *   DISCO_GATE_PRIV  the peer without a K, or no peer key known yet
+ *                    (permissive, as the direct path's gate): one X25519
+ *                    per box, as before 1.3.7. */
+typedef enum { DISCO_GATE_DROP, DISCO_GATE_K, DISCO_GATE_PRIV } disco_gate_t;
+
+static inline disco_gate_t disco_gate(const uint8_t *frame, size_t frame_len,
+                                      const disco_peer_key_t *peer)
+{
+    if (!peer->has_pub) return DISCO_GATE_PRIV;
+    if (frame_len < DISCO_MAGIC_LEN + DISCO_KEY_LEN) return DISCO_GATE_DROP;
+    if (memcmp(frame + DISCO_MAGIC_LEN, peer->pub, DISCO_KEY_LEN) != 0) {
+        return DISCO_GATE_DROP;
+    }
+    return peer->k_valid ? DISCO_GATE_K : DISCO_GATE_PRIV;
+}
+
+/* disco_handle_recv for a frame that has to come from `peer`: dropped
+ * unopened by the gate (returns 0, *gated true, *out_type untouched),
+ * else opened and answered with K or my_disco_priv as disco_gate says. */
+size_t disco_handle_recv_from_peer(uint8_t *out_reply, size_t out_cap,
+                                   const uint8_t *frame, size_t frame_len,
+                                   const disco_peer_key_t *peer,
+                                   const uint8_t my_disco_priv[DISCO_KEY_LEN],
+                                   const uint8_t my_disco_pub[DISCO_KEY_LEN],
+                                   disco_msg_type_t *out_type,
+                                   uint8_t out_peer_disco_pub[DISCO_KEY_LEN],
+                                   uint8_t out_txid[DISCO_TXID_LEN],
+                                   bool *gated);
 
 #ifdef __cplusplus
 }

@@ -28,6 +28,7 @@
 #include "disco.h"
 #include "disco_handler.h"
 #include "crypto/curve25519.h"
+#include "crypto/nacl_box.h"
 
 /* Deterministic xorshift random — same shape as test_disco.c. The
  * handler calls esp_fill_random for the Pong nonce; the seed here
@@ -309,8 +310,177 @@ static void test_bad_args(void) {
                           me_priv, me_pub, NULL, NULL, NULL) == 0);
 }
 
+/* ------------------------------------------------------------------ */
+/* Cached shared-K path (wg_rx direct DISCO, round 1.3.2 B10)          */
+/* ------------------------------------------------------------------ */
+
+/* disco_handle_recv_with_shared opens AND seals with the cached K: no
+ * X25519 at all on the direct-path ping. With the RNG at the same state
+ * (same Pong nonce) its reply must be byte-identical to the full path,
+ * which derives K per frame and seals through nacl_box. */
+static void test_shared_ping_to_pong(void) {
+    uint8_t me_priv[32], me_pub[32];
+    uint8_t peer_priv[32], peer_pub[32];
+    make_keypair("disco-shared-me",   me_priv,   me_pub);
+    make_keypair("disco-shared-peer", peer_priv, peer_pub);
+    uint8_t k[32];
+    fails += ok("shared/k", nacl_box_compute_shared(k, peer_pub, me_priv) == 0);
+
+    uint8_t txid[DISCO_TXID_LEN];
+    for (int i = 0; i < DISCO_TXID_LEN; i++) txid[i] = (uint8_t)(0x90 + i);
+    uint8_t wire[512];
+    size_t wire_len = make_ping_wire(wire, sizeof(wire), txid,
+                                     peer_priv, peer_pub, me_pub);
+
+    uint8_t full[DISCO_HANDLER_REPLY_MAX], shared[DISCO_HANDLER_REPLY_MAX];
+    const uint64_t seed = 0x0DDBA11CAFEF00DULL;
+    s_rng_state = seed;
+    size_t full_len = disco_handle_recv(full, sizeof(full), wire, wire_len,
+                                        me_priv, me_pub, NULL, NULL, NULL);
+    disco_msg_type_t got_type = (disco_msg_type_t)0xff;
+    uint8_t got_peer[DISCO_KEY_LEN] = {0};
+    uint8_t got_txid[DISCO_TXID_LEN] = {0};
+    s_rng_state = seed;
+    size_t shared_len = disco_handle_recv_with_shared(shared, sizeof(shared),
+                                                      wire, wire_len, k, me_pub,
+                                                      &got_type, got_peer, got_txid);
+    fails += ok("shared/reply-emitted", shared_len > 0 && shared_len == full_len);
+    fails += eq_bytes("shared/reply-identical-to-full-path", shared, full, full_len);
+    fails += ok("shared/type-ping", got_type == DISCO_TYPE_PING);
+    fails += eq_bytes("shared/peer-pub", got_peer, peer_pub, DISCO_KEY_LEN);
+    fails += eq_bytes("shared/txid", got_txid, txid, DISCO_TXID_LEN);
+
+    /* The peer opens it with its own private key (full X25519). */
+    uint8_t pt[256], sender[DISCO_KEY_LEN];
+    size_t pt_len = disco_open(pt, sizeof(pt), sender, shared, shared_len, peer_priv);
+    disco_msg_t parsed;
+    fails += ok("shared/peer-opens", pt_len > 0 &&
+                disco_parse(pt, pt_len, &parsed) == 0 &&
+                parsed.type == DISCO_TYPE_PONG);
+    fails += eq_bytes("shared/pong-sealed-by-us", sender, me_pub, DISCO_KEY_LEN);
+    fails += eq_bytes("shared/pong-txid", parsed.u.pong.txid, txid, DISCO_TXID_LEN);
+
+    /* Stale K (peer rotated its DiscoKey, cache not updated yet): the
+     * open fails, nothing is sealed. */
+    uint8_t other_priv[32], other_pub[32], k_other[32];
+    make_keypair("disco-shared-rotated", other_priv, other_pub);
+    nacl_box_compute_shared(k_other, other_pub, me_priv);
+    fails += ok("shared/stale-k-no-reply",
+                disco_handle_recv_with_shared(shared, sizeof(shared), wire, wire_len,
+                                              k_other, me_pub, NULL, NULL, NULL) == 0);
+
+    /* Tamper + bad args. */
+    wire[80] ^= 0x01;
+    fails += ok("shared/tampered-no-reply",
+                disco_handle_recv_with_shared(shared, sizeof(shared), wire, wire_len,
+                                              k, me_pub, NULL, NULL, NULL) == 0);
+    wire[80] ^= 0x01;
+    fails += ok("shared/null-k",
+                disco_handle_recv_with_shared(shared, sizeof(shared), wire, wire_len,
+                                              NULL, me_pub, NULL, NULL, NULL) == 0);
+    fails += ok("shared/cap-too-small",
+                disco_handle_recv_with_shared(shared, DISCO_HANDLER_REPLY_MAX - 1,
+                                              wire, wire_len, k, me_pub,
+                                              NULL, NULL, NULL) == 0);
+
+    /* disco_seal_with_shared == disco_seal for the same nonce. */
+    uint8_t inner[64], a[256], b[256], nonce[DISCO_NONCE_LEN];
+    for (int i = 0; i < DISCO_NONCE_LEN; i++) nonce[i] = (uint8_t)(0x60 + i);
+    disco_pong_t pong = {0};
+    memcpy(pong.txid, txid, DISCO_TXID_LEN);
+    size_t inner_len = disco_encode_pong(inner, sizeof(inner), &pong);
+    size_t la = disco_seal(a, sizeof(a), inner, inner_len, nonce,
+                           me_pub, peer_pub, me_priv);
+    size_t lb = disco_seal_with_shared(b, sizeof(b), inner, inner_len, nonce,
+                                       me_pub, k);
+    fails += ok("seal-shared/len", la > 0 && la == lb);
+    fails += eq_bytes("seal-shared/bytes", a, b, la);
+    fails += ok("seal-shared/cap", disco_seal_with_shared(b, la - 1, inner, inner_len,
+                                                          nonce, me_pub, k) == 0);
+}
+
+/* ------------------------------------------------------------------ */
+/* Round 1.3.7, B2: the sender gate before any crypto, K first         */
+/* ------------------------------------------------------------------ */
+
+static void test_from_peer_gate(void) {
+    uint8_t me_priv[32], me_pub[32], peer_priv[32], peer_pub[32], oth_priv[32], oth_pub[32];
+    make_keypair("disco-handler-me",   me_priv,   me_pub);
+    make_keypair("disco-handler-peer", peer_priv, peer_pub);
+    make_keypair("disco-handler-other", oth_priv, oth_pub);
+    uint8_t txid[DISCO_TXID_LEN];
+    for (int i = 0; i < DISCO_TXID_LEN; i++) txid[i] = (uint8_t)(0x70 + i);
+    uint8_t wire[512], wire_oth[512];
+    const size_t wl = make_ping_wire(wire, sizeof(wire), txid, peer_priv, peer_pub, me_pub);
+    const size_t wol = make_ping_wire(wire_oth, sizeof(wire_oth), txid, oth_priv, oth_pub, me_pub);
+
+    disco_peer_key_t peer;
+    memset(&peer, 0, sizeof(peer));
+    peer.has_pub = true;
+    memcpy(peer.pub, peer_pub, 32);
+    peer.k_valid = nacl_box_compute_shared(peer.k, peer_pub, me_priv) == 0;
+    fails += ok("gate/peer-k", disco_gate(wire, wl, &peer) == DISCO_GATE_K);
+    fails += ok("gate/other-drop", disco_gate(wire_oth, wol, &peer) == DISCO_GATE_DROP);
+    fails += ok("gate/short-drop", disco_gate(wire, DISCO_MAGIC_LEN + 31, &peer) == DISCO_GATE_DROP);
+    peer.k_valid = false;
+    fails += ok("gate/peer-no-k-priv", disco_gate(wire, wl, &peer) == DISCO_GATE_PRIV);
+    peer.k_valid = true;
+    disco_peer_key_t none;
+    memset(&none, 0, sizeof(none));
+    fails += ok("gate/no-peer-permissive", disco_gate(wire_oth, wol, &none) == DISCO_GATE_PRIV);
+
+    /* The peer's ping, K path: answered with no private key at all — a
+     * zero "priv" would make any X25519 here produce a wrong box. */
+    static const uint8_t zero_priv[32] = { 0 };
+    uint8_t reply[DISCO_HANDLER_REPLY_MAX];
+    disco_msg_type_t type = (disco_msg_type_t)0;
+    uint8_t got_pub[32] = { 0 }, got_txid[DISCO_TXID_LEN] = { 0 };
+    bool gated = true;
+    size_t rl = disco_handle_recv_from_peer(reply, sizeof(reply), wire, wl, &peer, zero_priv,
+                                            me_pub, &type, got_pub, got_txid, &gated);
+    uint8_t pt[256], sender[32];
+    size_t pl = disco_open(pt, sizeof(pt), sender, reply, rl, peer_priv);
+    disco_msg_t m;
+    fails += ok("frompeer/k-ping-answered",
+                rl > 0 && !gated && type == DISCO_TYPE_PING &&
+                memcmp(got_pub, peer_pub, 32) == 0 && memcmp(got_txid, txid, 12) == 0 &&
+                pl > 0 && disco_parse(pt, pl, &m) == 0 && m.type == DISCO_TYPE_PONG &&
+                memcmp(m.u.pong.txid, txid, 12) == 0 && memcmp(sender, me_pub, 32) == 0);
+
+    /* Another sender: dropped unopened, outputs untouched. */
+    type = (disco_msg_type_t)0x55;
+    rl = disco_handle_recv_from_peer(reply, sizeof(reply), wire_oth, wol, &peer, me_priv,
+                                     me_pub, &type, got_pub, got_txid, &gated);
+    fails += ok("frompeer/other-gated", rl == 0 && gated && type == (disco_msg_type_t)0x55);
+
+    /* No K (low-order key cache): the private key path, same answer. */
+    peer.k_valid = false;
+    rl = disco_handle_recv_from_peer(reply, sizeof(reply), wire, wl, &peer, me_priv,
+                                     me_pub, &type, got_pub, got_txid, &gated);
+    pl = disco_open(pt, sizeof(pt), sender, reply, rl, peer_priv);
+    fails += ok("frompeer/priv-ping-answered", rl > 0 && !gated && type == DISCO_TYPE_PING &&
+                pl > 0 && disco_parse(pt, pl, &m) == 0 && m.type == DISCO_TYPE_PONG);
+
+    /* No peer key yet: permissive, any sender opened with the private key. */
+    rl = disco_handle_recv_from_peer(reply, sizeof(reply), wire_oth, wol, &none, me_priv,
+                                     me_pub, &type, got_pub, got_txid, &gated);
+    fails += ok("frompeer/permissive", rl > 0 && !gated && memcmp(got_pub, oth_pub, 32) == 0);
+
+    /* Non-DISCO bytes: neither gated nor opened (relayed WireGuard). */
+    static const uint8_t wg[] = { 4, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8 };
+    type = (disco_msg_type_t)0;
+    rl = disco_handle_recv_from_peer(reply, sizeof(reply), wg, sizeof(wg), &peer, me_priv,
+                                     me_pub, &type, got_pub, got_txid, &gated);
+    fails += ok("frompeer/non-disco-passes", rl == 0 && !gated && type == 0);
+    fails += ok("frompeer/null-args",
+                disco_handle_recv_from_peer(reply, sizeof(reply), wire, wl, NULL, me_priv,
+                                            me_pub, &type, got_pub, got_txid, &gated) == 0);
+}
+
 int main(void) {
     test_ping_to_pong();
+    test_shared_ping_to_pong();
+    test_from_peer_gate();
     test_pong_no_reply();
     test_callmemaybe_no_reply();
     test_non_disco_bytes();

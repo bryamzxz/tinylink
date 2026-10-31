@@ -88,6 +88,13 @@ bool disco_prober_match_and_remove(const uint8_t txid[DISCO_TXID_LEN],
                                    uint32_t src_v4_be, uint16_t src_port,
                                    int64_t now_us)
 {
+    return disco_prober_take(txid, src_v4_be, src_port, now_us, NULL);
+}
+
+bool disco_prober_take(const uint8_t txid[DISCO_TXID_LEN],
+                       uint32_t src_v4_be, uint16_t src_port,
+                       int64_t now_us, int64_t *sent_us)
+{
     if (txid == NULL) return false;
 
     bool matched = false;
@@ -109,6 +116,7 @@ bool disco_prober_match_and_remove(const uint8_t txid[DISCO_TXID_LEN],
         /* Source matches. Check freshness. */
         if (s_table[i].sent_us >= expiry_threshold_us) {
             matched = true;
+            if (sent_us != NULL) *sent_us = s_table[i].sent_us;
         }
         /* Whether stale or fresh, remove the slot — the same probe
          * cannot legitimately match twice (the responder MUST generate

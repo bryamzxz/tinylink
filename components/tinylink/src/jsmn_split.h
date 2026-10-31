@@ -3,12 +3,16 @@
 //
 // Shallow JSON splitter: iterates the members of one object (or the
 // elements of one array) by byte range WITHOUT tokenizing their
-// contents. mapreq.c uses it to cut a MapResponse into its top-level
-// values (Node, Peers[i], DERPMap.Regions[id], PeersChangedPatch[i]) and
-// hands each one to jsmn separately, so the token table only has to
-// hold ONE peer / ONE region / the self node at a time instead of the
-// whole document: 2 500 tokens (40 KiB BSS, and a hard ceiling on the
-// tailnet size) → 640 tokens (10 KiB) with no ceiling at all.
+// contents. Since 2026-09 the MapResponse is cut into its top-level
+// values (Node, Peers[i], DERPMap.Regions[id], PeersChangedPatch[i]),
+// each handed to jsmn separately, so the token table only has to hold
+// ONE peer / ONE region / the self node at a time instead of the whole
+// document: 2 500 tokens (40 KiB BSS, and a hard ceiling on the tailnet
+// size) → 640 tokens (10 KiB) with no ceiling at all. Since 1.3.4 (D2)
+// mapreq.c does that cut on the stream with tl_jsplit_scan_* below
+// (the byte-at-a-time form of tl_jsplit_value) instead of on a whole
+// buffered document; json_helpers.c reads register / key bodies with
+// the iterators.
 //
 // Pure, header-only, host-tested (tools/test/test_jsmn_split.c). Not a
 // validator: it understands strings (with escapes), nesting and scalar
@@ -27,7 +31,7 @@ extern "C" {
 #endif
 
 #ifndef TL_JSPLIT_MAX_DEPTH
-#define TL_JSPLIT_MAX_DEPTH 64
+#define TL_JSPLIT_MAX_DEPTH 64   /* < 255: tl_jsplit_scan_t counts it in a byte */
 #endif
 
 typedef struct {
@@ -170,6 +174,74 @@ static inline bool tl_jsplit_key_is(const tl_jsplit_kv_t *kv, const char *name)
 static inline bool tl_jsplit_val_is_true(const tl_jsplit_kv_t *kv)
 {
     return kv->val_len == 4 && memcmp(kv->val, "true", 4) == 0;
+}
+
+/* ---- Byte-at-a-time form of tl_jsplit_value (round 1.3.4, D2) ----------
+ *
+ * For text that arrives in pieces (the MapResponse stream, mapreq.c): the
+ * same rules as tl_jsplit_value — strings with escapes, brackets counted
+ * without checking their kinds, TL_JSPLIT_MAX_DEPTH, a scalar runs to the
+ * next delimiter — fed one byte at a time, with no buffer. A value is
+ * complete exactly where tl_jsplit_value would end it (test_jsmn_split.c
+ * checks the two against each other). */
+
+typedef struct {
+    unsigned char depth;   /* open brackets (0: a string or scalar at the root) */
+    unsigned char mode;    /* TL_JSCAN_TEXT / _STR / _ESC / _SCALAR */
+} tl_jsplit_scan_t;
+
+enum { TL_JSCAN_TEXT, TL_JSCAN_STR, TL_JSCAN_ESC, TL_JSCAN_SCALAR };
+
+/* Results: the value goes on / `c` was its last byte / it ended just
+ * before `c` (a scalar's delimiter, which belongs to the container) /
+ * not a value (too deep, or a zero-length scalar). */
+enum { TL_JSCAN_MORE = 0, TL_JSCAN_END = 1, TL_JSCAN_END_BEFORE = 2, TL_JSCAN_ERR = -1 };
+
+static inline bool tl_jsplit_is_ws(char c)
+{
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r';
+}
+
+/* `c` = the value's first byte (callers skip whitespace before it). */
+static inline int tl_jsplit_scan_begin(tl_jsplit_scan_t *s, char c)
+{
+    s->depth = 0;
+    if (c == '"') { s->mode = TL_JSCAN_STR; return TL_JSCAN_MORE; }
+    if (c == '{' || c == '[') { s->depth = 1; s->mode = TL_JSCAN_TEXT; return TL_JSCAN_MORE; }
+    if (c == ',' || c == '}' || c == ']') return TL_JSCAN_ERR;   /* empty scalar */
+    s->mode = TL_JSCAN_SCALAR;
+    return TL_JSCAN_MORE;
+}
+
+/* Every following byte. A scalar still open when the text ends is
+ * complete there (tl_jsplit_value returns the end of the text). */
+static inline int tl_jsplit_scan_byte(tl_jsplit_scan_t *s, char c)
+{
+    switch (s->mode) {
+    case TL_JSCAN_SCALAR:
+        return (c == ',' || c == '}' || c == ']' || tl_jsplit_is_ws(c))
+                   ? TL_JSCAN_END_BEFORE : TL_JSCAN_MORE;
+    case TL_JSCAN_ESC:
+        s->mode = TL_JSCAN_STR;
+        return TL_JSCAN_MORE;
+    case TL_JSCAN_STR:
+        if (c == '\\') {
+            s->mode = TL_JSCAN_ESC;
+        } else if (c == '"') {
+            if (s->depth == 0) return TL_JSCAN_END;
+            s->mode = TL_JSCAN_TEXT;
+        }
+        return TL_JSCAN_MORE;
+    default:   /* TL_JSCAN_TEXT, inside brackets */
+        if (c == '"') {
+            s->mode = TL_JSCAN_STR;
+        } else if (c == '{' || c == '[') {
+            if (++s->depth > TL_JSPLIT_MAX_DEPTH) return TL_JSCAN_ERR;
+        } else if (c == '}' || c == ']') {
+            if (--s->depth == 0) return TL_JSCAN_END;
+        }
+        return TL_JSCAN_MORE;
+    }
 }
 
 #ifdef __cplusplus

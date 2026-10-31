@@ -34,8 +34,8 @@ int noise_hkdf2(const uint8_t ck[HKDF_BLAKE2S_HASHLEN],
                 uint8_t out1[HKDF_BLAKE2S_HASHLEN],
                 uint8_t out2[HKDF_BLAKE2S_HASHLEN]);
 
-/* Noise §4.3 HKDF — three outputs (used by some PSK patterns; included
- * for completeness, not strictly needed for IK). */
+/* Noise §4.3 HKDF — three outputs (WireGuard's IKpsk2 PSK mix; not
+ * used by IK). */
 int noise_hkdf3(const uint8_t ck[HKDF_BLAKE2S_HASHLEN],
                 const uint8_t *input, size_t input_len,
                 uint8_t out1[HKDF_BLAKE2S_HASHLEN],

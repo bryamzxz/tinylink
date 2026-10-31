@@ -84,19 +84,22 @@ static void init_ctx_with_nonce12(struct chacha20_ctx *ctx,
 
 /* RFC 8439 §2.6 poly1305_key_gen: take the first 32 bytes of the
  * ChaCha20 keystream at counter=0. After this call, ctx->state[12] is
- * 1, ready for plaintext encryption to start at counter=1 (per §2.8). */
+ * 1, ready for plaintext encryption to start at counter=1 (per §2.8).
+ * Keystream = 0 XOR keystream, generated in place: no zero table to read
+ * from flash .rodata (one cache miss per cold packet before 1.3.2), and
+ * otk[] is word-aligned, so the XOR stays on the l32i/s32i path. */
 static void poly1305_keygen(uint8_t otk[32], struct chacha20_ctx *ctx)
 {
-    /* Word-aligned so chacha20()'s XOR takes its l32i/s32i fast path
-     * (the caller's otk[] is declared aligned too). */
-    static const uint8_t __attribute__((aligned(4))) zeros[32] = {0};
-    chacha20(ctx, otk, zeros, 32);
+    memset(otk, 0, 32);
+    chacha20(ctx, otk, otk, 32);
 }
 
-/* Pad Poly1305 input to a 16-byte boundary by feeding zero bytes. */
+/* Pad Poly1305 input to a 16-byte boundary by feeding zero bytes. The
+ * table is in DRAM (TL_HOT_RODATA_ATTR), not flash, for the same reason
+ * as above. */
 static void poly1305_pad16(poly1305_context *p, size_t already_in_len)
 {
-    static const uint8_t __attribute__((aligned(4))) zeros[16] = {0};
+    static const TL_HOT_RODATA_ATTR uint8_t __attribute__((aligned(4))) zeros[16] = {0};
     size_t pad = (16 - (already_in_len % 16)) % 16;
     if (pad) {
         poly1305_update(p, zeros, pad);

@@ -1,9 +1,15 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Bryam (bryamzxz)
 
-#ifdef ESP_PLATFORM
+/* The host test (tools/test/test_derp_wlock.c) compiles this file over
+ * fakes of esp_tls, FreeRTOS and select(), with its own lock primitives
+ * (DERP_CLIENT_HOST_TEST). */
+#if defined(ESP_PLATFORM) || defined(DERP_CLIENT_HOST_TEST)
 
 #include "derp_client.h"
+
+#define DERP_WL_IMPL
+#include "derp_wlock.h"
 
 #include <string.h>
 #include <stdio.h>
@@ -12,14 +18,111 @@
 #include "tl_time.h"
 #include "esp_log.h"
 #include "esp_random.h"
+#include "lwip/sockets.h"
 #include "mbedtls/ssl.h"
 
+#include "esp_timer.h"
+#include "tl_addr.h"
+#include "tl_wdt.h"
 #include "tls_io.h"
+#include "tls_offer.h"
+#include "tls_resume.h"
 
 static const char *TAG = "derp_client";
 
+/* The write lock's waits (round 1.3.9, derp_wlock.h). A slice is how long
+ * anyone waits for it between two task-WDT feeds (60-s budget). The grace
+ * is what a close gives a writer to finish the frame it is in: lwIP takes
+ * a frame at once while its send buffer has room, so a writer still in
+ * one after a second waits for ACKs, on a conn being closed — the stream
+ * dead, our address changed, or a relay switch — and is cut. A cut frame
+ * is a failed one, which its sender handles as before (kept for the
+ * re-send, a refused INIT copy, the direct send). */
+#ifndef DERP_WL_SLICE_MS
+#define DERP_WL_SLICE_MS 1000u
+#endif
+#ifndef DERP_WL_GRACE_MS
+#define DERP_WL_GRACE_MS 1000u
+#endif
+/* The fed waits' total: twice what a stalled write holds the lock (4 ×
+ * 30 s). A wait past it is a lock never given back — no more feeds, one
+ * E line, and the 60-s task WDT resets the board, as before 1.3.9's
+ * slices, instead of leaving the relay hung for good. */
+#ifndef DERP_WL_FED_MAX_MS
+#define DERP_WL_FED_MAX_MS 240000u
+#endif
+
+#ifndef DERP_CLIENT_HOST_TEST
+static bool derp_wl_take(void *lock, uint32_t ms)
+{
+    return xSemaphoreTake((SemaphoreHandle_t)lock, pdMS_TO_TICKS(ms)) == pdTRUE;
+}
+
+static void derp_wl_give(void *lock)
+{
+    xSemaphoreGive((SemaphoreHandle_t)lock);
+}
+
+static void derp_wl_feed(void)
+{
+    tl_wdt_feed();
+}
+
+/* shutdown(SHUT_RDWR) on the conn's socket: with LWIP_NETCONN_FULLDUPLEX
+ * (ESP-IDF's lwipopts.h) lwIP aborts a send blocked on it with ERR_CLSD
+ * and wakes a blocked recv; later I/O fails at once. The fd stays
+ * allocated until esp_tls_conn_destroy closes it, so it cannot be reused
+ * meanwhile. Same TCP close as that close() would do (tcp_close: a FIN
+ * after the queued data, an RST with unread data). */
+static void derp_wl_cut(void *io)
+{
+    int fd = -1;
+    if (esp_tls_get_conn_sockfd((esp_tls_t *)io, &fd) == ESP_OK && fd >= 0) {
+        (void)shutdown(fd, SHUT_RDWR);
+    }
+}
+
+static __attribute__((noinline)) void derp_wl_overdue(uint32_t waited_ms)
+{
+    ESP_LOGE(TAG, "DERP write lock held over %u s: no more WDT feeds for it",
+             (unsigned)(waited_ms / 1000));
+}
+#endif /* !DERP_CLIENT_HOST_TEST */
+
+/* select() for the writability check; the host test's fake conns answer. */
+#ifndef DERP_SELECT
+#define DERP_SELECT select
+#endif
+
+/* TLS session of the last DERP connect (round 1.3.5, D9; tls_resume.h),
+ * for a reconnect to the same relay: one per firmware — the supervisor
+ * (or, with SUPERVISED=n, the boot smoke) is the only DERP client. A
+ * different host (home region change) is a full handshake. derp16b
+ * resumed 5/5 from the host (one address, TTL 600 s). */
+static tls_resume_slot_t s_resume;
+
+/* The relay that refused the ECDHE-RSA offer (round 1.3.8, tls_offer.h);
+ * same single-client rule as s_resume. */
+static tls_offer_memo_t s_offer;
+
+/* The login's NaCl box key for the last server key (round 1.3.7, B2;
+ * derp.h): one X25519 for the first login to a server key — ClientInfo
+ * and ServerInfo share it — and none for a reconnect to it (it was two
+ * per login). Same single-client rule as s_resume. */
+static derp_login_key_t  s_login_key;
+static bool              s_login_key_reused;   /* for the login line */
+
 /* Same budget as ts2021 — covers cert chain verify + ECDSA. */
 #define DERP_TLS_TIMEOUT_MS 30000
+
+/* A dial by the DERP map's address (round 1.3.5, tl_addr.h): esp-tls
+ * applies timeout_ms to the TCP connect and to every handshake read, and
+ * the socket stays at it through the login, one poll per read, so the
+ * attempt gets 3 s per step — one lost SYN at lwIP's 1.5-s RTO, as
+ * ts2021's :80 budget — and a stale address costs at most that per step
+ * before the name is resolved. Once logged in, the socket goes to the
+ * stream's DERP_TLS_TIMEOUT_MS polls. */
+#define DERP_ADDR_TIMEOUT_MS 3000
 
 /* Liveness budget, same shape as ts2021_client.c: consecutive silent
  * SO_RCVTIMEO polls tolerated before the DERP stream is declared dead.
@@ -58,11 +161,20 @@ static ssize_t derp_tls_read(void *ctx, uint8_t *buf, size_t len) {
     if (c->abort_reads) return DERP_ERR_READ_ABORTED;
     return esp_tls_conn_read(c->tls, buf, len);
 }
+/* A frame's writes, lock held (write_frame_locked): each poll first asks
+ * whether the conn is closing — a writer that a close's cut did not wake
+ * (shutdown refused) stops at its next SO_SNDTIMEO poll, ≤ 30 s. */
+static ssize_t derp_tls_write(void *ctx, const uint8_t *buf, size_t len) {
+    derp_client_t *c = (derp_client_t *)ctx;
+    if (!derp_wl_may_write(&c->wl)) return DERP_ERR_WRITE_ABORTED;
+    return esp_tls_conn_write(c->tls, (const void *)buf, len);
+}
 
-static esp_err_t tls_read_full(esp_tls_t *tls, uint8_t *buf, size_t need)
+/* The login's reads and writes: `idle` silent socket polls each at most
+ * (1 at the DERP map's address, DERP_MAX_IDLE_POLLS by name). */
+static esp_err_t tls_read_full(esp_tls_t *tls, uint8_t *buf, size_t need, uint32_t idle)
 {
-    int rc = tls_io_read_full(derp_tls_read_raw, tls, buf, need,
-                              DERP_MAX_IDLE_POLLS);
+    int rc = tls_io_read_full(derp_tls_read_raw, tls, buf, need, idle);
     if (rc != 0) {
         if (rc == TLS_IO_ERR_IDLE_TIMEOUT) {
             ESP_LOGW(TAG, "DERP stream silent past %d s — declaring dead",
@@ -75,10 +187,10 @@ static esp_err_t tls_read_full(esp_tls_t *tls, uint8_t *buf, size_t need)
     return ESP_OK;
 }
 
-static esp_err_t tls_write_full(esp_tls_t *tls, const uint8_t *buf, size_t len)
+static esp_err_t tls_write_full(esp_tls_t *tls, const uint8_t *buf, size_t len,
+                                uint32_t idle)
 {
-    int rc = tls_io_write_full(derp_tls_write_raw, tls, buf, len,
-                               DERP_MAX_IDLE_POLLS);
+    int rc = tls_io_write_full(derp_tls_write_raw, tls, buf, len, idle);
     if (rc != 0) {
         ESP_LOGE(TAG, "tls_write_full failed: %d", rc);
         return ESP_FAIL;
@@ -86,12 +198,91 @@ static esp_err_t tls_write_full(esp_tls_t *tls, const uint8_t *buf, size_t len)
     return ESP_OK;
 }
 
+/* TCP_NODELAY on the DERP conn (round 1.3.2, B8), same reasoning as
+ * ts2021_client.c: every write is a whole frame and relayed packets are
+ * latency-bound, so Nagle (holding a frame until the previous segment is
+ * ACKed) only ever added an RTT. Set after the TLS handshake; a failure
+ * only costs latency. */
+static void set_tcp_nodelay(esp_tls_t *tls)
+{
+    int fd = -1;
+    int one = 1;
+    if (esp_tls_get_conn_sockfd(tls, &fd) != ESP_OK || fd < 0 ||
+        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one)) != 0) {
+        ESP_LOGW(TAG, "TCP_NODELAY not set (fd=%d)", fd);
+    }
+}
+
+/* SO_RCVTIMEO / SO_SNDTIMEO back to the stream's 30-s polls after a
+ * login made with DERP_ADDR_TIMEOUT_MS: left at 3 s, the idle budget
+ * (DERP_MAX_IDLE_POLLS polls) would declare the stream dead after 12 s
+ * between server keepalives. */
+static bool set_stream_timeouts(esp_tls_t *tls)
+{
+    int fd = -1;
+    struct timeval tv = { .tv_sec = DERP_TLS_TIMEOUT_MS / 1000, .tv_usec = 0 };
+    return esp_tls_get_conn_sockfd(tls, &fd) == ESP_OK && fd >= 0 &&
+           setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) == 0 &&
+           setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) == 0;
+}
+
+/* One TLS connect into out->tls: to `ip` with the certificate checked
+ * against `host` — esp-tls hands cfg.common_name to
+ * mbedtls_ssl_set_hostname, i.e. the SNI and the name verification
+ * (esp_tls_mbedtls.c set_client_config), and an IP literal never reaches
+ * lwIP's resolver (dns_gethostbyname_addrtype returns it as is) — or to
+ * `host` through esp-tls's resolver (ip NULL). The TLS session is offered
+ * and kept by host:port either way: it belongs to the name the
+ * certificate proved, and a server at another address that does not
+ * hold its ticket key answers with a full, verified handshake. On false
+ * the caller closes `out`. */
+static int dial_tls(esp_tls_t *tls, const esp_tls_cfg_t *cfg, const char *host,
+                    uint16_t port, const uint8_t *ip)
+{
+    if (ip != NULL) {
+        char a[TL_IPV4_STRLEN];
+        tl_ipv4_str(ip, a);
+        return esp_tls_conn_new_sync(a, (int)strlen(a), port, cfg, tls);
+    }
+    char url[160];
+    snprintf(url, sizeof(url), "https://%s:%u", host, (unsigned)port);
+    return esp_tls_conn_http_new_sync(url, cfg, tls);
+}
+
+static bool open_tls(derp_client_t *out, const char *host, uint16_t port,
+                     const uint8_t *ip, tls_resume_result_t *res, tls_offer_t *offer)
+{
+    esp_tls_cfg_t cfg = {
+        .crt_bundle_attach = tl_crt_bundle_attach,
+        .timeout_ms        = ip != NULL ? DERP_ADDR_TIMEOUT_MS : DERP_TLS_TIMEOUT_MS,
+        .common_name       = host,
+    };
+    tls_resume_entry_t *offered = tls_resume_take(&s_resume, host, port);
+    tls_resume_offer(&cfg, offered);
+    *offer = tls_offer_apply(&cfg, &s_offer, host, port);
+
+    out->tls = esp_tls_init();
+    int rc = -1;
+    if (out->tls == NULL) {
+        ESP_LOGE(TAG, "esp_tls_init failed");
+    } else {
+        rc = dial_tls(out->tls, &cfg, host, port, ip);
+        if (rc != 1 && tls_offer_fallback(*offer, &out->tls, &cfg, host, port)) {
+            *offer = TLS_OFFER_FULL;
+            rc = dial_tls(out->tls, &cfg, host, port, ip);
+            tls_offer_note(&s_offer, host, port, rc == 1);
+        }
+    }
+    *res = tls_resume_keep(&s_resume, offered, rc == 1 ? out->tls : NULL, host, port);
+    return rc == 1;
+}
+
 /* Read the HTTP/1.1 upgrade response one byte at a time until the
  * "\r\n\r\n" terminator. Same shape as ts2021_client.c's
  * read_upgrade_response — DERP servers return a real 101 (no fast-
  * start path on this code path), so we wait for full headers. */
 static esp_err_t read_upgrade_response(esp_tls_t *tls,
-                                       uint8_t *buf, size_t buf_size)
+                                       uint8_t *buf, size_t buf_size, uint32_t max_idle)
 {
     size_t   total = 0;
     uint32_t idle  = 0;
@@ -101,9 +292,9 @@ static esp_err_t read_upgrade_response(esp_tls_t *tls,
             r == MBEDTLS_ERR_SSL_WANT_WRITE) {
             /* Bounded like the frame reader — a server that accepts
              * TLS but never answers the upgrade must not hang us. */
-            if (++idle >= DERP_MAX_IDLE_POLLS) {
-                ESP_LOGE(TAG, "no 101 response within %d s — giving up",
-                         CONFIG_TINYLINK_STREAM_IDLE_TIMEOUT_S);
+            if (++idle >= max_idle) {
+                ESP_LOGE(TAG, "no 101 response within %u polls — giving up",
+                         (unsigned)max_idle);
                 return ESP_FAIL;
             }
             continue;
@@ -136,10 +327,10 @@ static esp_err_t read_upgrade_response(esp_tls_t *tls,
 static esp_err_t read_one_frame(esp_tls_t *tls,
                                 derp_frame_type_t *type,
                                 uint8_t *payload, size_t pcap,
-                                size_t *plen_out)
+                                size_t *plen_out, uint32_t idle)
 {
     uint8_t hdr[DERP_FRAME_HDR_LEN];
-    if (tls_read_full(tls, hdr, sizeof(hdr)) != ESP_OK) return ESP_FAIL;
+    if (tls_read_full(tls, hdr, sizeof(hdr), idle) != ESP_OK) return ESP_FAIL;
 
     uint32_t plen;
     if (derp_read_frame_header(hdr, sizeof(hdr), type, &plen) != 0) {
@@ -151,14 +342,149 @@ static esp_err_t read_one_frame(esp_tls_t *tls,
         return ESP_ERR_INVALID_SIZE;
     }
     if (plen > 0) {
-        if (tls_read_full(tls, payload, plen) != ESP_OK) return ESP_FAIL;
+        if (tls_read_full(tls, payload, plen, idle) != ESP_OK) return ESP_FAIL;
     }
     *plen_out = plen;
     return ESP_OK;
 }
 
+/* The DERP login on an open TLS conn: HTTP upgrade, ServerKey,
+ * ClientInfo, ServerInfo. On failure the caller closes `out`. */
+static esp_err_t login(derp_client_t *out, const char *server_host, uint32_t idle,
+                       const uint8_t client_priv[DERP_KEY_LEN],
+                       const uint8_t client_pub[DERP_KEY_LEN])
+{
+    /* Build and send: GET /derp HTTP/1.1 + Upgrade: DERP. The Host
+     * header MUST match the SNI / cert host we just dialed. */
+    char req[256];
+    int n = snprintf(req, sizeof(req),
+        "GET /derp HTTP/1.1\r\n"
+        "Host: %s\r\n"
+        "Upgrade: DERP\r\n"
+        "Connection: Upgrade\r\n"
+        "User-Agent: tinylink/0.1\r\n"
+        "\r\n",
+        server_host);
+    if (n <= 0 || n >= (int)sizeof(req)) return ESP_ERR_INVALID_SIZE;
+    if (tls_write_full(out->tls, (const uint8_t *)req, (size_t)n, idle) != ESP_OK) {
+        return ESP_FAIL;
+    }
+
+    /* Read the 101 response. */
+    uint8_t up_resp[DERP_LOGIN_BUF_LEN];
+    if (read_upgrade_response(out->tls, up_resp, sizeof(up_resp), idle) != ESP_OK) {
+        return ESP_FAIL;
+    }
+    ESP_LOGI(TAG, "got HTTP 101, entering DERP frame mode");
+
+    /* Frame 1: server → client FrameServerKey. */
+    derp_frame_type_t ftype;
+    uint8_t  payload[DERP_LOGIN_BUF_LEN];
+    size_t   plen = 0;
+    if (read_one_frame(out->tls, &ftype, payload, sizeof(payload), &plen, idle) != ESP_OK) {
+        return ESP_FAIL;
+    }
+    if (ftype != DERP_FRAME_SERVER_KEY) {
+        ESP_LOGE(TAG, "expected ServerKey, got 0x%02x", (unsigned)ftype);
+        return ESP_FAIL;
+    }
+    if (derp_parse_server_key(payload, plen, out->server_pub) != 0) {
+        ESP_LOGE(TAG, "ServerKey parse failed (plen=%u)", (unsigned)plen);
+        return ESP_FAIL;
+    }
+
+    /* Frame 2: client → server FrameClientInfo. */
+    bool computed = false;
+    if (derp_login_key(&s_login_key, client_pub, client_priv, out->server_pub,
+                       &computed) != 0) {
+        ESP_LOGE(TAG, "ServerKey is a low-order point");
+        return ESP_FAIL;
+    }
+    s_login_key_reused = !computed;
+    uint8_t nonce[DERP_NONCE_LEN];
+    esp_fill_random(nonce, sizeof(nonce));
+
+    /* Header(5) + payload(32+24+16+32) = 5 + 104 = 109 B. */
+    uint8_t ci_buf[5 + 32 + 24 + 16 + 64];
+    size_t ci_payload_len = derp_build_client_info_k(
+        ci_buf + DERP_FRAME_HDR_LEN, sizeof(ci_buf) - DERP_FRAME_HDR_LEN,
+        client_pub, s_login_key.k, nonce);
+    if (ci_payload_len == 0) {
+        ESP_LOGE(TAG, "client_info build failed");
+        return ESP_FAIL;
+    }
+    derp_write_frame_header(ci_buf, DERP_FRAME_CLIENT_INFO,
+                            (uint32_t)ci_payload_len);
+    if (tls_write_full(out->tls, ci_buf,
+                       DERP_FRAME_HDR_LEN + ci_payload_len, idle) != ESP_OK) {
+        return ESP_FAIL;
+    }
+
+    /* Frame 3: server → client FrameServerInfo. */
+    if (read_one_frame(out->tls, &ftype, payload, sizeof(payload), &plen, idle) != ESP_OK) {
+        return ESP_FAIL;
+    }
+    if (ftype != DERP_FRAME_SERVER_INFO) {
+        ESP_LOGE(TAG, "expected ServerInfo, got 0x%02x", (unsigned)ftype);
+        return ESP_FAIL;
+    }
+    if (derp_parse_server_info_k(payload, plen, s_login_key.k,
+                                 &out->server_version) != 0) {
+        /* A box under the server's own key that does not open: keep no
+         * key from this server. */
+        derp_login_key_forget(&s_login_key);
+        ESP_LOGE(TAG, "ServerInfo decrypt/parse failed");
+        return ESP_FAIL;
+    }
+    return ESP_OK;
+}
+
+/* One attempt, at `ip` or by name (NULL): TLS, then the login. On
+ * failure `out` is closed. */
+static esp_err_t connect_on(derp_client_t *out, const char *server_host, uint16_t port,
+                            const uint8_t *ip, int64_t t0,
+                            const uint8_t client_priv[DERP_KEY_LEN],
+                            const uint8_t client_pub[DERP_KEY_LEN])
+{
+    tls_resume_result_t res = TLS_RESUME_NONE;
+    tls_offer_t offer = TLS_OFFER_FULL;
+    char via[TL_IPV4_STRLEN + 3] = "by name";
+    if (ip != NULL) {
+        char a[TL_IPV4_STRLEN];
+        tl_ipv4_str(ip, a);
+        snprintf(via, sizeof(via), "at %s", a);
+    }
+    if (!open_tls(out, server_host, port, ip, &res, &offer)) {
+        if (ip == NULL) {
+            ESP_LOGE(TAG, "TLS connect to %s:%u failed", server_host, (unsigned)port);
+        }
+        derp_client_close(out);
+        return ESP_FAIL;
+    }
+    set_tcp_nodelay(out->tls);
+    ESP_LOGI(TAG, "TLS up to %s:%u %s (%s handshake, %s offer, %u ms), sending HTTP upgrade",
+             server_host, (unsigned)port, via,
+             res == TLS_RESUME_RESUMED ? "resumed" : "full", tls_offer_str(offer),
+             (unsigned)((esp_timer_get_time() - t0) / 1000));
+    esp_err_t err = login(out, server_host, ip != NULL ? 1 : DERP_MAX_IDLE_POLLS,
+                          client_priv, client_pub);
+    if (err == ESP_OK && ip != NULL && !set_stream_timeouts(out->tls)) {
+        ESP_LOGW(TAG, "stream socket timeouts not set");
+        err = ESP_FAIL;
+    }
+    if (err != ESP_OK) {
+        derp_client_close(out);
+        return err;
+    }
+    derp_wl_set_up(&out->wl);
+    ESP_LOGI(TAG, "DERP login OK: server version=%d (box key %s)",
+             out->server_version, s_login_key_reused ? "reused" : "new");
+    return ESP_OK;
+}
+
 esp_err_t derp_client_connect_login(derp_client_t *out,
                                     const char *server_host, uint16_t port,
+                                    const uint8_t server_v4[4],
                                     const uint8_t client_priv[DERP_KEY_LEN],
                                     const uint8_t client_pub[DERP_KEY_LEN])
 {
@@ -174,133 +500,47 @@ esp_err_t derp_client_connect_login(derp_client_t *out,
     /* The write lock outlives individual connections: it is created on
      * the first connect of a (zero-initialised) derp_client_t and never
      * deleted (see derp_client_close), so a concurrent sender blocked on
-     * it can never wake up on a freed semaphore. Preserve it across the
-     * per-connect reset. Callers must zero the struct before the first
-     * connect (static storage or `= {0}`). */
-    SemaphoreHandle_t lock = out->write_lock;
-    memset(out, 0, sizeof(*out));
-    out->write_lock = lock;
+     * it can never wake up on a freed semaphore. `wl` is never rewritten
+     * here but through derp_wlock.h — a sender may be reading it (round
+     * 1.3.9: until then a memset of the whole struct zeroed the lock
+     * handle for an instant) — and the per-connect state is reset field
+     * by field (tx_stage needs none). Callers must zero the struct before
+     * the first connect (static storage or `= {0}`). */
+    derp_wl_new_conn(&out->wl);
+    out->tls            = NULL;
+    out->server_version = 0;
+    out->abort_reads    = false;
+    memset(out->server_pub, 0, sizeof(out->server_pub));
 
-    char url[160];
-    snprintf(url, sizeof(url), "https://%s:%u", server_host, (unsigned)port);
-
-    esp_tls_cfg_t cfg = {
-        .crt_bundle_attach = tl_crt_bundle_attach,
-        .timeout_ms        = DERP_TLS_TIMEOUT_MS,
-    };
-
-    if (out->write_lock == NULL) {
-        out->write_lock = xSemaphoreCreateMutex();
+    if (out->wl.lock == NULL) {
+        out->wl.lock = xSemaphoreCreateMutex();
     }
-    if (out->write_lock == NULL) {
-        ESP_LOGE(TAG, "write_lock create failed");
+    if (out->wl.lock == NULL) {
+        ESP_LOGE(TAG, "write lock create failed");
         return ESP_ERR_NO_MEM;
     }
 
-    out->tls = esp_tls_init();
-    if (out->tls == NULL) {
-        ESP_LOGE(TAG, "esp_tls_init failed");
-        derp_client_close(out);
-        return ESP_FAIL;
+    /* The DERP map's address first (round 1.3.5): no DNS on the boot
+     * path, where 1.3.5's lookups lost answers and the connect took
+     * 1.79–6.36 s. Any failure there — refused, the 3-s budget, a
+     * certificate that is not server_host's, a server there that does
+     * not complete the DERP login — falls back to the name in this same
+     * call, so a stale address costs one short attempt. */
+    const int64_t t0 = esp_timer_get_time();
+    esp_err_t err = ESP_FAIL;
+    if (server_v4 != NULL && tl_ipv4_usable(server_v4)) {
+        err = connect_on(out, server_host, port, server_v4, t0, client_priv, client_pub);
+        if (err != ESP_OK) {
+            char a[TL_IPV4_STRLEN];
+            tl_ipv4_str(server_v4, a);
+            ESP_LOGW(TAG, "DERP to %s at %s:%u failed (0x%x) — resolving the name",
+                     server_host, a, (unsigned)port, err);
+        }
     }
-
-    int rc = esp_tls_conn_http_new_sync(url, &cfg, out->tls);
-    if (rc != 1) {
-        ESP_LOGE(TAG, "TLS connect to %s:%u failed", server_host, (unsigned)port);
-        derp_client_close(out);
-        return ESP_FAIL;
+    if (err != ESP_OK) {
+        err = connect_on(out, server_host, port, NULL, t0, client_priv, client_pub);
     }
-    ESP_LOGI(TAG, "TLS up to %s:%u, sending HTTP upgrade", server_host, (unsigned)port);
-
-    /* Build and send: GET /derp HTTP/1.1 + Upgrade: DERP. The Host
-     * header MUST match the SNI / cert host we just dialed. */
-    char req[256];
-    int n = snprintf(req, sizeof(req),
-        "GET /derp HTTP/1.1\r\n"
-        "Host: %s\r\n"
-        "Upgrade: DERP\r\n"
-        "Connection: Upgrade\r\n"
-        "User-Agent: tinylink/0.1\r\n"
-        "\r\n",
-        server_host);
-    if (n <= 0 || n >= (int)sizeof(req)) {
-        derp_client_close(out);
-        return ESP_ERR_INVALID_SIZE;
-    }
-    if (tls_write_full(out->tls, (const uint8_t *)req, (size_t)n) != ESP_OK) {
-        derp_client_close(out);
-        return ESP_FAIL;
-    }
-
-    /* Read the 101 response. */
-    uint8_t up_resp[DERP_LOGIN_BUF_LEN];
-    if (read_upgrade_response(out->tls, up_resp, sizeof(up_resp)) != ESP_OK) {
-        derp_client_close(out);
-        return ESP_FAIL;
-    }
-    ESP_LOGI(TAG, "got HTTP 101, entering DERP frame mode");
-
-    /* Frame 1: server → client FrameServerKey. */
-    derp_frame_type_t ftype;
-    uint8_t  payload[DERP_LOGIN_BUF_LEN];
-    size_t   plen = 0;
-    if (read_one_frame(out->tls, &ftype, payload, sizeof(payload), &plen) != ESP_OK) {
-        derp_client_close(out);
-        return ESP_FAIL;
-    }
-    if (ftype != DERP_FRAME_SERVER_KEY) {
-        ESP_LOGE(TAG, "expected ServerKey, got 0x%02x", (unsigned)ftype);
-        derp_client_close(out);
-        return ESP_FAIL;
-    }
-    if (derp_parse_server_key(payload, plen, out->server_pub) != 0) {
-        ESP_LOGE(TAG, "ServerKey parse failed (plen=%u)", (unsigned)plen);
-        derp_client_close(out);
-        return ESP_FAIL;
-    }
-
-    /* Frame 2: client → server FrameClientInfo. */
-    uint8_t nonce[DERP_NONCE_LEN];
-    esp_fill_random(nonce, sizeof(nonce));
-
-    /* Header(5) + payload(32+24+16+32) = 5 + 104 = 109 B. */
-    uint8_t ci_buf[5 + 32 + 24 + 16 + 64];
-    size_t ci_payload_len = derp_build_client_info(
-        ci_buf + DERP_FRAME_HDR_LEN, sizeof(ci_buf) - DERP_FRAME_HDR_LEN,
-        client_pub, client_priv, out->server_pub, nonce);
-    if (ci_payload_len == 0) {
-        ESP_LOGE(TAG, "client_info build failed");
-        derp_client_close(out);
-        return ESP_FAIL;
-    }
-    derp_write_frame_header(ci_buf, DERP_FRAME_CLIENT_INFO,
-                            (uint32_t)ci_payload_len);
-    if (tls_write_full(out->tls, ci_buf,
-                       DERP_FRAME_HDR_LEN + ci_payload_len) != ESP_OK) {
-        derp_client_close(out);
-        return ESP_FAIL;
-    }
-
-    /* Frame 3: server → client FrameServerInfo. */
-    if (read_one_frame(out->tls, &ftype, payload, sizeof(payload), &plen) != ESP_OK) {
-        derp_client_close(out);
-        return ESP_FAIL;
-    }
-    if (ftype != DERP_FRAME_SERVER_INFO) {
-        ESP_LOGE(TAG, "expected ServerInfo, got 0x%02x", (unsigned)ftype);
-        derp_client_close(out);
-        return ESP_FAIL;
-    }
-    if (derp_parse_server_info(payload, plen, client_priv, out->server_pub,
-                               &out->server_version) != 0) {
-        ESP_LOGE(TAG, "ServerInfo decrypt/parse failed");
-        derp_client_close(out);
-        return ESP_FAIL;
-    }
-
-    out->connected = true;
-    ESP_LOGI(TAG, "DERP login OK: server version=%d", out->server_version);
-    return ESP_OK;
+    return err;
 }
 
 void derp_client_close(derp_client_t *c)
@@ -313,59 +553,157 @@ void derp_client_close(derp_client_t *c)
      * esp_tls_conn_write or blocked on xSemaphoreTake — a use-after-free
      * of c->tls and a wait on a deleted semaphore. Now:
      *   1. drop `connected` first, so the relay's unlocked fast-path
-     *      check stops admitting new sends;
+     *      check stops admitting new sends, and a sender waiting for the
+     *      lock gives up;
      *   2. take the write lock, so a sender already past its check
-     *      finishes (or fails) its frame before the TLS context goes;
+     *      finishes (or fails) its frame before the TLS context goes —
+     *      within DERP_WL_GRACE_MS, or it is cut (round 1.3.9: a waiting
+     *      write on a stalled conn held the lock up to 4 × 30 s while
+     *      this task, unfed, waited on it with portMAX_DELAY — the 60-s
+     *      task WDT reset the board; derp_wlock.h);
      *   3. destroy TLS under the lock and NULL it, so a sender that
-     *      wins the lock afterwards sees c->tls == NULL and bails;
-     *   4. never delete the lock — it is created once per client. */
-    c->connected = false;
-    if (c->write_lock != NULL) {
-        xSemaphoreTake(c->write_lock, portMAX_DELAY);
+     *      wins the lock afterwards sees the conn gone and bails;
+     *   4. never delete the lock — it is created once per client.
+     * Only this client's connecting task (the supervisor) closes, so
+     * c->tls is read here without the lock. */
+    if (c->wl.lock == NULL) {   /* never connected: the lock create failed */
+        __atomic_store_n(&c->wl.connected, false, __ATOMIC_RELEASE);
+        return;
     }
+    const int64_t t0 = esp_timer_get_time();
+    const bool cut = derp_wl_close_lock(&c->wl, c->tls, DERP_WL_GRACE_MS,
+                                        DERP_WL_SLICE_MS, DERP_WL_FED_MAX_MS);
     if (c->tls != NULL) {
         esp_tls_conn_destroy(c->tls);
         c->tls = NULL;
     }
-    if (c->write_lock != NULL) {
-        xSemaphoreGive(c->write_lock);
+    derp_wl_give(c->wl.lock);
+    if (cut) {
+        ESP_LOGW(TAG, "DERP close: a write still held the conn after %u ms — cut, "
+                      "the lock free after %u ms",
+                 (unsigned)DERP_WL_GRACE_MS,
+                 (unsigned)((esp_timer_get_time() - t0) / 1000));
     }
 }
 
-/* Atomic-frame writer used both by the recv loop's pongs (via
- * derp_run_loop) and the public derp_client_send_packet. Holds
- * c->write_lock across header + payload so concurrent senders cannot
- * interleave and corrupt the wire framing. */
+/* Write one frame: header, then `key` (DERP_KEY_LEN bytes, NULL = none),
+ * then `payload`. Caller holds the write lock for a conn that takes
+ * frames (derp_wl_acquire: DERP_WL_HELD, so c->tls is set). Up to
+ * DERP_TX_STAGE_MAX of key + payload the frame is assembled in
+ * c->tx_stage and leaves as one write (one TLS record); anything bigger
+ * — nothing tinylink sends today — as separate writes, still atomic on
+ * the wire because the lock is held. Every write call first checks that
+ * the conn is not closing (derp_tls_write). */
+static int write_frame_locked(derp_client_t *c, derp_frame_type_t type,
+                              const uint8_t *key,
+                              const uint8_t *payload, size_t plen)
+{
+    const size_t klen = (key != NULL) ? DERP_KEY_LEN : 0;
+    const size_t body = klen + plen;
+    if (body <= DERP_TX_STAGE_MAX) {
+        uint8_t *f = c->tx_stage;
+        derp_write_frame_header(f, type, (uint32_t)body);
+        if (klen > 0) memcpy(f + DERP_FRAME_HDR_LEN, key, klen);
+        if (plen > 0) memcpy(f + DERP_FRAME_HDR_LEN + klen, payload, plen);
+        return tls_io_write_full(derp_tls_write, c, f,
+                                 DERP_FRAME_HDR_LEN + body,
+                                 DERP_MAX_IDLE_POLLS);
+    }
+    uint8_t hdr[DERP_FRAME_HDR_LEN];
+    derp_write_frame_header(hdr, type, (uint32_t)body);
+    int rc = tls_io_write_full(derp_tls_write, c, hdr, sizeof(hdr),
+                               DERP_MAX_IDLE_POLLS);
+    if (rc == 0 && klen > 0) {
+        rc = tls_io_write_full(derp_tls_write, c, key, klen,
+                               DERP_MAX_IDLE_POLLS);
+    }
+    if (rc == 0 && plen > 0) {
+        rc = tls_io_write_full(derp_tls_write, c, payload, plen,
+                               DERP_MAX_IDLE_POLLS);
+    }
+    return rc;
+}
+
+/* A frame's write failed, lock held (round 1.3.9, derp_wlock.h): it may
+ * have left part of a TLS record on the stream, and mbedtls would flush
+ * that record's tail on the next write and report the next frame as
+ * written. Until 1.3.9 the conn stayed up — the next waiting write sat
+ * out another 4 × 30 s, and one that got through was reported sent but
+ * never went. Now the conn takes no more frames (the relay reads as down)
+ * and the reader leaves at its next poll (≤ 30 s), so the supervisor
+ * closes and reconnects. Nothing to do when a close cut the frame — the
+ * close does the rest. Not inlined: the log line's frame stays off the
+ * write's chain. */
+static __attribute__((noinline)) void frame_failed_locked(derp_client_t *c, int rc)
+{
+    if (!derp_wl_write_failed(&c->wl)) return;
+    c->abort_reads = true;
+    ESP_LOGW(TAG, "DERP write failed (%s0x%x) — no more frames on this conn, "
+                  "reconnecting", rc < 0 ? "-" : "", (unsigned)(rc < 0 ? -rc : rc));
+}
+
+/* True when the conn's socket can take a frame without blocking: lwIP's
+ * select() marks a TCP socket writable only above TCP_SNDLOWAT free
+ * send-buffer bytes (≈ 2.9 KB here), more than one DERP frame + TLS
+ * record (≤ ~1.6 KB). Caller holds the write lock. */
+static bool socket_writable_now(derp_client_t *c)
+{
+    int fd = -1;
+    if (esp_tls_get_conn_sockfd(c->tls, &fd) != ESP_OK || fd < 0) return false;
+    fd_set wfds;
+    FD_ZERO(&wfds);
+    FD_SET(fd, &wfds);
+    struct timeval tv = { 0, 0 };
+    return DERP_SELECT(fd + 1, NULL, &wfds, NULL, &tv) == 1;
+}
+
+/* One frame on the conn the caller found up: the write lock — waited for
+ * in slices that feed the task WDT (the other writer may sit in a stalled
+ * write for 4 × 30 s), or one try with no_wait — re-validated against
+ * that conn (a close or a reconnect since ends the wait; derp_wlock.h),
+ * the writability check of a try, the frame, and a failure closing the
+ * conn to frames. Held across the whole frame, so the recv loop's pongs
+ * and the relay never interleave on the wire. */
+static esp_err_t send_frame(derp_client_t *c, derp_frame_type_t type,
+                            const uint8_t *key, const uint8_t *payload,
+                            size_t plen, bool no_wait)
+{
+    uint32_t gen;
+    if (c->wl.lock == NULL || !derp_wl_admits(&c->wl, &gen)) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    switch (derp_wl_acquire(&c->wl, gen, no_wait, DERP_WL_SLICE_MS, DERP_WL_FED_MAX_MS)) {
+    case DERP_WL_HELD:
+        break;
+    case DERP_WL_BUSY:
+        return ESP_ERR_TIMEOUT;
+    default:
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (no_wait && !socket_writable_now(c)) {
+        derp_wl_give(c->wl.lock);
+        return ESP_ERR_TIMEOUT;
+    }
+    const int rc = write_frame_locked(c, type, key, payload, plen);
+    if (rc != 0) frame_failed_locked(c, rc);
+    derp_wl_give(c->wl.lock);
+    return (rc == 0) ? ESP_OK : ESP_FAIL;
+}
+
+/* The recv loop's pongs (via derp_run_loop). */
 static int derp_send_frame_locked(void *ctx, derp_frame_type_t type,
                                   const uint8_t *payload, size_t plen)
 {
     derp_client_t *c = (derp_client_t *)ctx;
-    if (c == NULL || c->tls == NULL) return -1;
-    if (plen > 0xffffffffU) return -1;
-
-    uint8_t hdr[DERP_FRAME_HDR_LEN];
-    derp_write_frame_header(hdr, type, (uint32_t)plen);
-
-    xSemaphoreTake(c->write_lock, portMAX_DELAY);
-    if (c->tls == NULL) {           /* closed while we waited for the lock */
-        xSemaphoreGive(c->write_lock);
-        return -1;
-    }
-    int rc = tls_io_write_full(derp_tls_write_raw, c->tls, hdr, sizeof(hdr),
-                               DERP_MAX_IDLE_POLLS);
-    if (rc == 0 && plen > 0) {
-        rc = tls_io_write_full(derp_tls_write_raw, c->tls, payload, plen,
-                               DERP_MAX_IDLE_POLLS);
-    }
-    xSemaphoreGive(c->write_lock);
-    return rc;
+    if (c == NULL || plen > 0xffffffffU) return -1;
+    return send_frame(c, type, NULL, payload, plen, false) == ESP_OK ? 0 : -1;
 }
 
 esp_err_t derp_client_run(derp_client_t *c,
                           uint8_t *frame_buf, size_t frame_cap,
                           derp_event_cb_t cb, void *cb_ctx)
 {
-    if (c == NULL || c->tls == NULL || !c->connected || frame_buf == NULL) {
+    if (c == NULL || c->tls == NULL || !derp_wl_up(&c->wl) || frame_buf == NULL) {
         return ESP_ERR_INVALID_STATE;
     }
     int rc = derp_run_loop(derp_tls_read, derp_send_frame_locked, c,
@@ -378,45 +716,32 @@ esp_err_t derp_client_run(derp_client_t *c,
     }
 }
 
-esp_err_t derp_client_send_packet(derp_client_t *c,
-                                  const uint8_t dst_pub[DERP_KEY_LEN],
-                                  const uint8_t *packet, size_t plen)
+static esp_err_t send_packet(derp_client_t *c,
+                             const uint8_t dst_pub[DERP_KEY_LEN],
+                             const uint8_t *packet, size_t plen,
+                             bool no_wait)
 {
-    if (c == NULL || c->tls == NULL || !c->connected || c->write_lock == NULL) {
-        return ESP_ERR_INVALID_STATE;
-    }
+    if (c == NULL || !derp_client_is_connected(c)) return ESP_ERR_INVALID_STATE;
     if (dst_pub == NULL || (plen > 0 && packet == NULL)) {
         return ESP_ERR_INVALID_ARG;
     }
     if (plen > DERP_MAX_PACKET) return ESP_ERR_INVALID_SIZE;
-
-    /* FrameSendPacket payload = dstPub[32] || packet[plen]. We hold
-     * the write lock across all three writes (header, dst_pub, packet)
-     * so the recv loop's pongs cannot land between chunks. */
-    const size_t total_payload = DERP_KEY_LEN + plen;
-    uint8_t hdr[DERP_FRAME_HDR_LEN];
-    derp_write_frame_header(hdr, DERP_FRAME_SEND_PACKET,
-                            (uint32_t)total_payload);
-
-    xSemaphoreTake(c->write_lock, portMAX_DELAY);
-    /* Re-validate under the lock: derp_client_close may have torn the
-     * connection down between the unlocked pre-check above and here. */
-    if (c->tls == NULL || !c->connected) {
-        xSemaphoreGive(c->write_lock);
-        return ESP_ERR_INVALID_STATE;
-    }
-    int rc = tls_io_write_full(derp_tls_write_raw, c->tls, hdr, sizeof(hdr),
-                               DERP_MAX_IDLE_POLLS);
-    if (rc == 0) {
-        rc = tls_io_write_full(derp_tls_write_raw, c->tls, dst_pub,
-                               DERP_KEY_LEN, DERP_MAX_IDLE_POLLS);
-    }
-    if (rc == 0 && plen > 0) {
-        rc = tls_io_write_full(derp_tls_write_raw, c->tls, packet, plen,
-                               DERP_MAX_IDLE_POLLS);
-    }
-    xSemaphoreGive(c->write_lock);
-    return (rc == 0) ? ESP_OK : ESP_FAIL;
+    /* FrameSendPacket payload = dstPub[32] || packet[plen]. */
+    return send_frame(c, DERP_FRAME_SEND_PACKET, dst_pub, packet, plen, no_wait);
 }
 
-#endif /* ESP_PLATFORM */
+esp_err_t derp_client_send_packet(derp_client_t *c,
+                                  const uint8_t dst_pub[DERP_KEY_LEN],
+                                  const uint8_t *packet, size_t plen)
+{
+    return send_packet(c, dst_pub, packet, plen, false);
+}
+
+esp_err_t derp_client_try_send_packet(derp_client_t *c,
+                                      const uint8_t dst_pub[DERP_KEY_LEN],
+                                      const uint8_t *packet, size_t plen)
+{
+    return send_packet(c, dst_pub, packet, plen, true);
+}
+
+#endif /* ESP_PLATFORM || DERP_CLIENT_HOST_TEST */

@@ -7,6 +7,2788 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-10-30
+
+The first tagged release: it covers the 1.3.x optimization rounds
+(1.3.0–1.3.9) below and everything before them, which was never tagged.
+
+### Optimization round 1.3.9 — ships as 1.4.0 (in progress, branch `feat/opt-1.3.9`)
+
+The last round of the 1.3.x line: the firmware reports **1.4.0**, the
+last release of this work line. What is left is in `docs/BACKLOG.md`.
+Image 745 840 (1.3.8) → **758 336 B**; host suite 2 318 → **2 733 OK**
+(CI floor 2 733, `make -O`), ASan + UBSan clean, 0 warnings. Two
+independent reviews of the warm start (no high; one medium each, fixed).
+
+#### Hardware (1.4.0 candidate `a030d5c`)
+
+- **TCP receive A/B** (36 boots, before the warm start): in the boot
+  section below — SACK adopted, the window kept.
+- **Interim `d953f55`** (no warm start, 45 min): 0 resets, 0 E lines,
+  0 RX-stale, 24 rekeys; `tx seq=0` 10 ms after `session up`, no boot
+  `sendto failed` (the telemetry hold).
+- **First boot after the flash** (cold): `warm start: no cached netmap`,
+  netmap at 3.80 s (body 968 ms, no stall), session up 3.99 s, `tx
+  seq=0` 90 ms later; `warm start: record stored for the next boot` at
+  60 s.
+- **Warm boots** (7): the warm start fired 60–220 ms after the register
+  every time and the netmap confirmed it every time (no `netmap
+  differs`, no restart). got-ip → session up median **1.55 s**, mean
+  2.34 s (cold, 18 boots of the A/B: median 2.17–2.20 s, mean
+  2.49–2.74 s). In 4 of 7 the peer answered the early INIT in
+  100–590 ms (session up 0.96–1.55 s after got-ip); in 3 of 7 only
+  3.4–4.4 s after our endpoint push, together with its call-me-maybe —
+  the peer's side, the window a cold INIT (after the netmap) hits in
+  2 of 36 boots; there the held first sample timed out (`sendto failed`
+  after 2 s). The fixed local UDP port in `docs/BACKLOG.md` targets it.
+  Heap at the warm start 160 416 → 149 944 B free, largest block
+  110 592 B unchanged.
+- **Soak (`a030d5c`, 6 h 05 min):** 0 resets / panics / WDT /
+  brown-outs; the 3 E lines are a boot-connection FIN from tailscale.com
+  at 40 s (reconnected over :443, netmap 3.4 s later). The collector went
+  through its ISP failover and back during the run, its backup link at
+  26 ms–4.9 s RTT (pong median 499 ms, p90 4.0 s): 10 endpoint roams,
+  each following one of its endpoint changes (191.89.x:9201 →
+  181.61.x:41641 / 41642 / 1031 → 191.89.x:60523 at ~290 min), 59
+  lapses, 18 dead / 3 undelivered verdicts and 27 DERP re-sends of
+  unproven frames. Over the failover's worst stretch (57–66 min) the
+  collector answered DISCO but none of ~70 INITs for 9 min 15 s (105
+  samples lost, the session up again by itself; `docs/BACKLOG.md`).
+  Outside the failover window: 194 rekeys, 7 rekey retries, 3 RX-stale,
+  0 lost samples. The home NAT remapped the sensor's port once (STUN
+  re-probe → endpoint push → reconnect, netmap in 3.2 s). 4 279
+  telemetry samples sent. heap_free min **148 848 B**, largest block
+  110 592 B; stack lows (B free) `tinylink_lp` 3 952 of 7 168,
+  `tinylink_derp` 4 724 of 8 192, `wg_rx` 3 880 of 8 192, `wg_tx` 2 588
+  of 5 120, `tinylink_tlm` 2 516 of 4 608, `esp_timer` 3 024 of 4 608.
+  Firmware sources after `a030d5c` changed only for the neutral defaults
+  (the sensor's `sdkconfig.local` gives the same `sdkconfig`).
+
+#### Warm start: WireGuard up before the netmap (`feat/r139-warm`)
+
+The 1.3.8 sensor's boot, ms since reset: got-ip 1 620, control conn up
+2 040, DERP login 2 180, `/machine/register` 200 at 2 230, endpoint push
+200 at 2 430, map stream headers at 2 620, netmap (initial) complete at
+3 600–7 740 (its ~26 KB body alone 0.7–6.2 s), then `wg_dataplane_start`
+and `session up` ~100–200 ms later: WireGuard waited for the whole
+control path. What it takes from the netmap is small and was in the
+previous boot's: our tailnet address(es) and the one target peer —
+NodeID, NodeKey, DiscoKey, endpoints, tailnet addresses (our keys,
+DiscoKey included, are in NVS). Image 746 848 → **756 272 B (+9 424**,
+of which +2 320 the first review's fixes, +368 the second's); static
+DRAM 58 684 → 59 020 B (+336, `.bss`: the NVS mirror 160 B, the staged
+record 144 B), IRAM ±0, RTC slow +12 B (the crash guard). Host suite
+2 452 → **2 682 OK** (CI floor 2 682; counted serially — `make -j`
+without `-O` interleaves output and loses a line now and then), ASan +
+UBSan clean, 0 warnings. Static
+worst cases unchanged (`main` 5 440 → 5 424, the rest equal; frame sums
+in docs/ARCHITECTURE.md). Not yet on the sensor.
+
+- **The record** (`tl_warm.h`, NVS `tl_state` / `warm_rec`): versioned
+  binary, 108–141 B — the write time, 8-byte tags of our NodeKey and of
+  the control key (a record written under other keys or for another
+  control plane is ignored), our addresses, the peer's NodeID, NodeKey,
+  DiscoKey, addresses and endpoints as IPv4 + prefix / port. The decode
+  is strict (length for the counts, counts, flags, no 0/8, 127/8,
+  224/3, no port 0): another layout or a damaged blob is no record, not
+  a misparse. The strings `wg_dataplane_start` parses are re-made in
+  Go's canonical form — the netmap's — so a warm start passes it byte
+  for byte what the cold start passed from the same netmap. HomeDERP is
+  not kept: nothing on the data plane reads it (the relay is our home
+  region, DERP routes by NodeKey).
+- **Written** by the telemetry task's 60-s housekeeping only, from what
+  the long-poll staged after each netmap (our addresses + the peer
+  `wg_dataplane_target_index` picks from the table now — the next boot's
+  best guess at the cold choice), compared before writing, the
+  timestamp aside: a change of peer, NodeKey, a tailnet address or our
+  addresses at the next housekeeping, endpoints or DiscoKey alone at most
+  once an hour after the boot's first write — the next boot's netmap
+  update takes those in place anyway, and an endpoint list churning
+  every minute costs 24 writes a day, not 1 440. The write time is the
+  last confirmation: an unchanged record is rewritten at most once a day
+  with a synced clock, and only while it is current — this boot's
+  netmap handled, control heard within 10 min. Expected: one write at
+  the first boot, then a few a week plus the daily refresh (the 1.3.5
+  soak: 10 netmap updates and one endpoint change of the session's peer
+  in 2.7 h).
+- **The warm start** (`tinylink_warm_start`, main task, right after
+  `tinylink_long_poll_start` — the long-poll at IDLE+4 sends the push
+  first and the main task runs while it waits): only after a register
+  that sent no auth key (control answered for the node it knows with
+  these keys; one that needed the key may be a new node), with a record
+  for these keys that a netmap confirmed within 30 days (a record
+  written with the clock unsynced has no age and is taken), not right
+  after a restart out of one, not after a reset during one (below), and
+  with heap free ≥ 32 KiB and a largest block ≥ 16 KiB (both in its log
+  line, before → after). The same
+  steps as the first netmap's bring-up: `relay_boot_join` (the first
+  INIT still waits ≤ 1 s for the DERP login), `wg_dataplane_start` from
+  `s_self_addrs` / `s_last_peers` seeded with the record (the path-stale
+  prepunch works on them), `telemetry_start`, the prepunch to the cached
+  peer. The long-poll's first netmap shuts the gate (a mutex): a warm
+  start under way finishes first, none begins after; the long-poll waits
+  for it at most 30 s, fed to the WDT, then restarts cold (counted as a
+  crash, below: a warm start that hangs every time is switched off). A
+  failed
+  `wg_dataplane_start` (the wg_rx task or the lwIP netif not created)
+  leaves wg_netif as after its init (`wg_netif_abort_start`: the socket,
+  wg_tx and every callback stay), and the netmap's start is the first.
+- **Crash guard** (RTC no-init, checksummed): a warm attempt is marked
+  before `relay_boot_join` and cleared when its start fails or once it
+  settled — the netmap confirmed it, its changes were applied to the
+  live session (`wg_dataplane_update_peers`, the full prepunch, the
+  staging: a sequence no cold boot runs at boot) and the next
+  housekeeping's store pass wrote the corrected record or found nothing
+  due (`tl_warm_sm_settle`, from `warm_persist`, ≤ ~60 s after the
+  netmap). A boot that finds the mark after any reset but a software one
+  (panic, task / interrupt WDT, brown-out) erases the record and starts
+  cold, so a fault in that update path costs the stale record and one
+  cold boot, not a loop on the same diff. Settling clears the count;
+  after two failures (crash or hang) the warm start stays off until a
+  power cycle (power-on clears RTC memory, so it clears the guard). A
+  netmap whose target cannot be stored (no endpoint) never settles: a
+  later non-software reset of that run counts too.
+- **The first netmap converges to a cold start's state**
+  (`warm_netmap`, its verdict from `tl_warm_sm_netmap`). It replaces the
+  seeded tables (an omitted `Peers`
+  is an empty table, as cold), logs `netmap (initial)` as before, and
+  compares what a cold start would run against — the netmap's pick, our
+  netmap address — with the record (`tl_warm_diff`):
+  - same peer, new NodeKey / DiscoKey / endpoints / tailnet address:
+    `wg_dataplane_update_peers`, as any update (cold handshake on a new
+    NodeKey, endpoint roam, DISCO keys), then the prepunch to the whole
+    table (the cold path's initial one);
+  - **new: a peer's tailnet address change is applied** (it was ignored
+    for the rest of a run, cold sessions too): the TSMP advert's
+    destination moves (`wg_netif_update_peer_tailnet`) and the advert
+    goes again if the session is up;
+  - another target peer, the cached one gone, another self address, a
+    full netmap without peers or self address, a node control marks
+    expired / deleted, or no netmap within
+    `CONFIG_TINYLINK_WARM_START_MAX_S`: the record is erased and the
+    device restarts into a cold boot — `wg_dataplane_stop` cannot be
+    undone in place (the socket goes, and the STUN endpoint pushed for
+    it), the way the self-address restart already went. Erase and
+    restart run at the long-poll's top level, not under the stream
+    callback. An RTC no-init mark makes the next boot cold even if the
+    erase fails, so neither an unerasable record nor a target choice that
+    flips with the STUN result between boots can loop: each such case
+    costs one extra boot. The self-address restart of a cold session now
+    erases the record first too.
+  - a peer entry without a DiscoKey clears the session's (a cached one
+    must not outlive the netmap): DISCO then runs as a cold start from
+    that netmap runs it — no DiscoKey gate, permissive, as for a peer
+    that never had one. This applies to cold sessions too (a full peer
+    entry without `DiscoKey`; patches keep it);
+  - Left as it is: a target with no endpoint keeps the warm session (via
+    DERP) where a cold start would refuse to start — what a cold session
+    does when its peer loses its endpoints.
+- **What else a warm boot changes**: modem sleep waits for the session
+  *and* the first netmap (`tinylink_netmap_seen`; still capped by the
+  awake cap) — on a warm boot the session is up mid-download and the
+  3-beacon listen interval stretched the netmap body out, and with it
+  the trust window. The boot STUN re-probe waits for the first netmap
+  too: wg_rx runs early on a warm boot, and the re-probe's endpoint push
+  recycled the first map stream mid-body. A netmap's endpoint list now
+  replaces the live endpoint unless that one is still listed or proven
+  by a pong (`wg_netif_live_path_proven`): a session alive via DERP
+  alone no longer keeps a dead cached endpoint. **This changes cold
+  sessions too**: one alive only via DERP now loses an unlisted live
+  endpoint to control's list (before, any live session kept it). The
+  bound is checked by the long-poll loop as well (after each stream and
+  each pass), so a warm session no netmap confirms ends even without a
+  telemetry task. While wg_netif is IDLE after a failed start, wg_rx
+  drops direct DISCO (with the zeroed peer the gate was permissive).
+- **Trade-off** (Kconfig help, docs/SECURITY-MODEL.md "Warm start"):
+  until the netmap the device trusts the previous boot's binding — this
+  NodeKey is the peer at that address — from an authenticated netmap,
+  possibly old. A peer key rotated or revoked since is still dialled, and
+  whoever holds the old private key can answer via DERP and receive
+  telemetry until the netmap: normally seconds, at most
+  `CONFIG_TINYLINK_WARM_START_MAX_S` (default 600 s, three times the
+  longest netmap gap seen, 181 s in 1.3.7; checked by the 60-s
+  housekeeping, so up to a minute more). The cached DiscoKey is trusted
+  the same way: its holder gets DISCO pings answered, its CallMeMaybe
+  endpoints punched and can move the endpoint with a pong (frames stay
+  encrypted to the session). No reachable control plane, no register,
+  no warm start.
+  Upstream tailscaled keeps its last netmap through a control outage
+  within a run, as tinylink after its first netmap. No packet filter is
+  skipped (none is enforced). `CONFIG_TINYLINK_WARM_START` default y, to
+  be confirmed with the owner.
+- **Test (`test_warm`, +230):** the decisions live in `tl_warm.h` as a
+  pure state machine `tinylink.c` drives one call per event — the go
+  verdict (`tl_warm_go`), seeding and the first frame's table reset,
+  the netmap verdict, settling, the bound and age (both tasks' poll),
+  the RTC guard, the boot's load behind an I/O seam (`tl_warm_load`:
+  reset reason, erase and not read after a crash), netmap-seen and the
+  refresh's freshness, the target pick `wg_dataplane.c` runs, the
+  DiscoKey, peer-address and register rules — tested over boot
+  sequences on a fake NVS (crash before settle → erased and counted,
+  settle then crash → not counted, a settle clears the count, two
+  failures → off until a power-on, hangs too, restart mark → one cold
+  boot); 52 mutants of those rules (the reset of the seeded flag
+  dropped, the warm dispatch moved, the crash count kept at settle, a
+  settle on a failed write or a cold session, the hang not counted, the
+  record read after a crash, the reset reason ignored, off-by-ones in
+  the pick and the freshness, the long-poll's restart dropped) all fail
+  it. Not reachable from the host: the glue's call sites themselves
+  (the handler's dispatch to `warm_netmap`, the `warm_poll` calls, the
+  `esp_reset_reason()` argument). Also the text forms (accepted and refused),
+  the netmap → record → `wg_dataplane_start` inputs round trip for every
+  target of a three-peer table, all 48 count shapes encoded and decoded,
+  every truncation, each refused count / flag / address / port, 20 000
+  mutations and 20 000 random blobs (what decodes re-encodes to its own
+  bytes), each field's diff bit, NodeID 0 matched by NodeKey, the restart
+  set, the write policy over a fake NVS across reboots (first write,
+  unchanged, soft held an hour, hard at once, an unreadable layout
+  replaced, a failing NVS tried once per change, a day of minute-by-
+  minute endpoint churn: 24 writes; the daily refresh only while
+  current), the age text, the bound.
+- On the sensor, first boot after the flash: `warm start: no cached
+  netmap — WireGuard waits for the netmap`, the usual cold boot, then
+  ~60 s later `warm start: record stored for the next boot (peer
+  100.x.y.z/32)`. Every boot after it: `node registered`, `warm start:
+  WG up from the cached netmap (peer 100.x.y.z/32, cached ≥ N min ago,
+  clock not synced; heap free A→B, largest C→D)` (exact age once SNTP
+  synced before the line) a few ms after the `WG bringup` line, `session
+  up` 0.1–0.3 s later — around
+  the endpoint push's answer, ~2.4–2.6 s after reset with the DERP login
+  done (expected 1.2–5.4 s earlier than 1.3.8) — telemetry `tx seq=0`
+  right after, then `netmap (initial)` and `netmap confirms the warm
+  start (peer …)` or `netmap differs: peer DiscoKey — updated (peer …)`
+  (a peer tailscaled restart). A W `netmap differs: … — restarting into
+  a cold start` should be rare, followed by one cold boot (`warm start:
+  no cached netmap`). No second `WG bringup` on a warm boot. `modem
+  sleep (MAX_MODEM) on after N ms awake` comes after `netmap confirms`
+  on a warm boot (`— no netmap yet` if the cap hit first), the boot STUN
+  re-probe after the netmap. After a panic / WDT reset during a warm
+  start (until the first housekeeping after its netmap): W `warm start:
+  the last one ended in a reset (reason N) before it settled — record
+  erased`, then a cold boot; after two failures `warm start: off after
+  2 failed attempts (a reset or a hang) — until a power cycle; …`.
+
+#### Neutral defaults, a deployment's values in `sdkconfig.local`
+
+`CONFIG_TINYLINK_DEVICE_HOSTNAME` defaulted to the production sensor's
+hostname and `CONFIG_TINYLINK_TELEMETRY_DEST` to its collector's tailnet
+address. They now default to `tinylink` and empty (no samples, no
+/stats, a W line saying so; the device still joins the tailnet), and a
+git-ignored `sdkconfig.local` next to `sdkconfig.defaults`
+(`sdkconfig.local.example`) carries a deployment's values. The root
+`CMakeLists.txt` appends it last, after `sdkconfig.defaults` and any
+`-D SDKCONFIG_DEFAULTS` list. With the sensor's `sdkconfig.local` the
+generated `sdkconfig` is identical to the one before the change, and
+the image the same size (758 336 B). The neutral build is 755 056 B.
+
+#### The first telemetry sample of a boot
+
+Every 1.3.x boot log has `telemetry: sendto failed: errno=-1` right
+after the netmap: `telemetry_start` runs when the WireGuard netif comes
+up, the session one handshake later (80–200 ms in the 1.3.7–1.3.8 boot
+logs), and the first sample went out in between — `send_plaintext`
+refuses frames until the session is up — and was lost. A due sample now
+waits for the session (`tlm_hold`, `tlm_sched.h`): re-checked every
+100 ms, at most 2 s past its instant, after which a session still down
+(the cold-handshake fallback) gets the old behaviour. The grid keeps its
+instants. Host suite +5 checks (`hold/*` in `test_tlm_sched`). On the
+sensor: no `sendto failed` at boot; `tx seq=0` a few ms after `session
+up`.
+
+#### DERP close vs the task watchdog (`feat/r139-derp`)
+
+A reviewer's finding, confirmed by reading the code, not seen on the
+sensor: the DERP write lock was waited for with `portMAX_DELAY` by tasks
+subscribed to the 60-s task WDT, while the other writer could hold it
+for 4 × 30 s. The supervisor (`tinylink_derp`) closes after its stream
+read gives up — 4 silent 30-s polls, or the next poll after a GOT_IP
+with a new address — fed last by that poll's `tls_io` hook, then waits
+in `derp_client_close` for the lock; wg_tx in a waiting write on the
+same stalled conn (a RELAY-mode frame, the re-send, since 1.3.8 a held
+INIT copy, a frame whose sendto failed) holds it until its own 4 polls
+of `SO_SNDTIMEO` end, feeding only itself. The close outlives the budget
+whenever that write began blocking more than 60 s after the last byte
+the supervisor received — in an uplink outage with the Wi-Fi up, RELAY
+mode at one frame per sample fills lwIP's send queue (16 segments,
+5 760 B) a minute or two after the stall, sooner behind a re-send — and
+the board resets (`PANIC=y`). The same wait sat in the supervisor's
+pongs (`derp_send_frame_locked`) and DISCO pongs behind wg_tx, and in
+wg_tx behind those. Image 745 840 → **746 848 B (+1 008)**; static
+DRAM 58 676 → 58 684 B (+8), IRAM ±0. Host suite 2 318 → **2 447 OK**
+(CI floor 2 447), ASan + UBSan clean, 0 warnings; the new test
+TSan-clean on 1, 2 and 16 CPUs. Static worst cases unchanged: `wg_tx`
+3 440 / 5 120, `tinylink_derp` 5 248 / 8 192. Not yet on the sensor.
+
+- **Every wait for the lock feeds (`derp_wlock.h`).** Writers wait in
+  1-s slices with a feed after each and leave without the lock, as
+  refused, once the conn they set out for is closing or replaced (a
+  connect count: a frame that waited behind a dying write never lands on
+  the next conn). `connected` is the writers' abort flag: a frame's
+  write stops at its next poll once a close began. The close drops it,
+  gives a writer mid-frame 1 s to end it, then cuts the socket
+  (`shutdown(SHUT_RDWR)`: with `LWIP_NETCONN_FULLDUPLEX` lwIP fails a
+  blocked send at once with `ERR_CLSD`; the fd stays allocated until the
+  destroy, the TCP close is the one `close()` would do) and takes the
+  lock in fed slices — always: the TLS context is still freed under it.
+  A refused shutdown leaves the writer to its next poll (≤ 30 s). The
+  feeds stop after 240 s of waiting in total (`DERP_WL_FED_MAX_MS`, twice
+  a stalled write's hold) with one E line: a lock never given back — a
+  leak — ends in the task WDT's reset, not in a relay hung for good. A cut
+  frame is a failed one, which its sender handles as before (kept for
+  the re-send, a refused INIT copy, the direct send). `connect_login` no
+  longer memsets the struct, which zeroed the lock handle for an instant
+  under a sender; the flag and the count are atomics.
+- **A failed write closes the conn to frames.** It may leave part of a
+  TLS record on the stream, and mbedtls flushes that record's tail on
+  the next write and reports the new frame as written
+  (`ssl_write_real`, `out_left != 0`). Until now the conn stayed up: the
+  next waiting write sat out another 4 × 30 s, and one that got through
+  was reported sent and never went (a relayed sample lost, or the held
+  INIT behind a failed re-send frame left to its 5-s retry). Now the
+  conn takes no more frames (the relay reads as down, so INITs go as in
+  1.3.7) and the reader leaves at its next poll (`abort_reads`), then
+  the supervisor reconnects; the login kick re-sends first. No shutdown
+  from wg_tx: lwIP's TCP close and the Wi-Fi TX under it would run on
+  its 5-KiB stack (+288 B static worst).
+- **Ordering, as 1.3.8 relies on it:** a frame reported sent is whole on
+  the conn it was written to; nothing is written after a cut or failed
+  frame on that conn; a frame never moves to the next conn while
+  waiting. Unchanged (pre-existing): a relay call that starts after a new
+  login completed goes on the new conn — between two wg_tx queue items,
+  past the backoff and a full TLS login; the stress below, reconnecting
+  in ≤ 1 ms, saw it once in ~60 rounds.
+- **The other lock users:** the smoke and `connect_on`'s failure closes
+  run with no writer admitted (one take); `tinylink.c` reads the flag
+  through `derp_client_is_connected`. The pong and relay writes share
+  one `send_frame`. `tools/stack_worst.py` knows `derp_tls_write` and
+  the re-send's relay site (`tx_rescue`, unresolved and costed 0 B
+  before): the re-send's path 3 008 → 2 992 B, a relayed frame 2 912 →
+  2 896, the pong 3 104 → 3 152, the DISCO pong 4 336 → 4 320, the close
+  3 696 → 3 760.
+- **Test (`test_derp_wlock`, +129):** `derp_client.c` itself, built on
+  the host over fakes of esp_tls, FreeRTOS and `select()` with a
+  scripted DERP login (`derp_client_connect_login` for real), pthreads
+  for the lock primitives; the fake conn keeps mbedtls's write semantics
+  (a record copied once and flushed across calls, WANT_WRITE after a
+  poll, the tail-flush above), and every thread counts its waits and
+  feeds. Forced: a close against a writer whose poll never ends here
+  (cut after the grace, fed, done in ms), a refused shutdown (one poll,
+  not four), no writer (one take), a writer done within the grace (not
+  cut), a waiter behind a stalled holder (fed each slice, leaves
+  unwritten), a waiter that leaves within a slice while the holder still
+  writes, one that wins the lock after the close began (refused though
+  the count matches), one parked while its conn is replaced (refused by
+  the count with the next conn up), a failed relayed write and a failed
+  pong (the next frame refused, the reader told; under 1.3.8's rule
+  reported sent and absent from the wire), a best-effort copy on a
+  socket that cannot take it, the cap (writer and close: one overdue,
+  no feeds after, done once the lock comes back). Seeded stress, 60
+  rounds of closes, reconnects, stalls and refused shutdowns at random
+  instants: no use after free, no frame reported sent that is not whole
+  on its conn, none twice or elsewhere, per-writer order, every lock
+  wait fed and bounded, none overdue. Mutants that fail it: 11 of the
+  protocol (no cut, no count check, HELD on the count alone, no feed in
+  either wait, no abort flag, no closed exit while waiting, no count
+  bump, no cap, an unbounded close wait, a failed write leaving the conn
+  up) and 8 of `derp_client.c` (no `frame_failed_locked` call, no
+  `abort_reads`, no writability check, no abort in the adapter, raw
+  writes, the old memset, a close that frees nothing or takes no lock).
+- On the sensor, a close that had to cut a writer logs `DERP close: a
+  write still held the conn after 1000 ms — cut, the lock free after N
+  ms` (N ≈ 1 000), usually with esp-tls's `write error :-0x004E:` from
+  the cut write; a write that failed on its own `DERP write failed
+  (-0x10000) — no more frames on this conn, reconnecting`, then
+  `derp supervisor: stream ended 0xffffffff` within 30 s and a reconnect;
+  a lock never given back `DERP write lock held over 240 s: no more WDT
+  feeds for it`, then a task-WDT reset. None in a healthy run; no
+  `task_wdt` reset after a DERP stall.
+- **Review.** An independent review found no high or medium item (lock
+  order, the shutdown on IDF 5.5.6, fd reuse, use after free, writes
+  after a close, the feeds and the ordering checked). Lows, fixed: no
+  test forced a waiter winning the lock between the close's first step
+  and its take (a mutant granting on the count alone passed); the test
+  re-implemented `derp_client.c`'s glue, so deleting the failure call,
+  the `abort_reads` set or the writability check failed nothing — it now
+  builds the real file; the fed waits had no total bound; two comments
+  still named `write_lock`.
+- **Residual (pre-existing, every TLS writer):** one `esp_tls_conn_write`
+  can span two 30-s sends — a partial one, then one that moves nothing —
+  so a holder's own feeds can be ~61 s apart. lwIP's 16-segment queue
+  limit binds before the 5 760-B buffer at the sensor's frame sizes,
+  which makes the partial send unlikely; not addressed here.
+
+#### Boot: the initial netmap's body, timed; TCP receive-side A/B (`feat/r139-boot`)
+
+Measured on 1.3.8 (sensor series): the map stream's HEADERS come one
+RTT after the request (`map stream answered: HTTP 200 in` ~180 ms), the
+~26 KB initial netmap (`stream peak: body=25962`) 720, 730, 790, 840,
+920, 980, 2 000, 2 500, 3 820, 5 120, 6 230 ms after them — on the path
+reset → WireGuard up, the WG handshake starts right after the netmap.
+Two readings fit and nothing logged told them apart. The transport:
+lwIP's receive window is 5 760 B (4 × MSS 1 440), so 26 KB takes 5
+flights, 4 RTTs = 720 ms behind the HEADERS — the floor; a segment lost
+from a flight of ≤ 4 seldom draws the 3 duplicate ACKs of a fast
+retransmit, and without SACK (`LWIP_TCP_SACK_OUT` is off) Linux has no
+tail-loss probe or RACK for the conn, so the server waits out its RTO
+(srtt + ≥ 200 ms, doubling) — the tail. Or the server: HEADERS at once,
+the body when the netmap is computed. (Our HTTP/2 windows, 64 KiB, are
+not in it.) Image 746 848 → **747 840 B (+992)**; static DRAM 58 684 →
+58 732 B (+48), IRAM ±0. Host suite 2 447 → **2 498 OK** (CI floor
+2 498), ASan + UBSan clean, 0 warnings. Static worst cases unchanged
+(`tinylink_lp` 5 232 / 7 168, `main` 5 440 / 8 192, the rest as
+before). Not yet on the sensor.
+
+- **One `map body:` line per map stream (always on).** When the stream's
+  first MapResponse is complete — mapreq's framing, before its handler
+  runs; at boot the initial netmap, on a reconnect the full one again:
+  `h2: map body: 25962 B in 2000 ms after HEADERS (first DATA +10 ms,
+  9 reads, waits 1890 ms, longest 1100 ms at 11 KB, stalls > 350 ms:
+  1 = 1100 ms, busy 100 ms)`. *first DATA*: HEADERS → the end of the read
+  that brought the first body byte (the server's share); *reads*: Noise
+  records from the HEADERS' one on; *waits*: time blocked in those reads
+  after the first DATA (the transport's share); *longest*, and the DATA
+  bytes in before it; *stalls*: waits over twice the request → HEADERS
+  time, clamped to 300–1 000 ms — past any window-limited wait (≤ 1 RTT)
+  and at an RTO's scale — their number and sum; *busy*: our own time
+  between reads (HTTP/2, the JSON split and parse). in = first DATA +
+  waits + busy, exactly. A stream that ends first logs `map body:
+  incomplete, N B in …` (N: DATA bytes; the end has its own line).
+  `h2_client.c` times each record read while armed (two esp_timer reads)
+  and the stream's DATA; the counters are `tl_bodystat.h` (48 B of BSS,
+  no heap, no per-read logging); armed by a 200 only — an error body is
+  no MapResponse. One log call for both variants (a call each was
+  432 B more).
+- **No lwIP counters.** lwIP 2.1's `tcp_pcb` keeps no receive-side loss
+  count. Its out-of-order queue is empty again the moment the
+  retransmission fills the hole, so sampling it between record reads
+  (safe under the core lock, `LWIP_TCPIP_CORE_LOCKING=y`) would see a
+  loss only by chance; the one drop counter (`TCP_STATS`, `tcp.drop`) is
+  global and needs `LWIP_STATS`; counting out-of-order and duplicate
+  segments per pcb takes a `LWIP_HOOK_TCP_INPACKET_PCB` on every segment
+  in tcpip_thread, through a hook header compiled into the lwip
+  component. The stall pattern and the A/B below answer the question
+  without them.
+- **A/B fragments (`tools/power/`, stacked after `sdkconfig.defaults`,
+  measured at boot).** `ab-tcp-sack`: SACK only — losses recovered in
+  ~1 RTT, the floor unchanged; +1 072 B flash, 32 B heap per TCP pcb.
+  `ab-tcp-wnd8`: window 11 520 B, RECVMBOX 10 (IDF's WND/MSS + 2; a full
+  mailbox makes lwIP drop the next data segment unACKed — a loss of its
+  own), OOSEQ 5 (IDF's DYNAMIC_RX / (TCP conns + 1)), SACK — 3 flights,
+  ~2 RTTs. `ab-tcp-wnd12`: 17 280 B, RECVMBOX 14, OOSEQ 8, SACK, Wi-Fi
+  dynamic RX buffers 16 → 24 — 2 flights, ~1 RTT (the first is the
+  server's initial cwnd, 10 segments; a bigger window gains nothing more
+  on this body). The window is credit, not memory, but it is every TCP
+  socket's (lwIP has no per-socket window), and each segment unread or
+  out of order holds a Wi-Fi dynamic RX buffer (~1.6 KB) until its task
+  reads it: worst case, control and DERP both full and unread, 12.8 KB
+  of heap today, 25.6 KB with wnd8, 38.4 KB with wnd12 (heap_free min
+  157 KB over the 1.3.6 soak); wnd12's one full window plus the 6-frame
+  AMPDU reorder window is 18 buffers, over the driver's 16, hence 24 (a
+  cap: buffers are allocated per received frame). Mailbox slots: 4 B
+  each per TCP socket. Images, all from `4918106`: default 747 840 B,
+  sack 748 912, wnd8 748 928, wnd12 748 944; each build's sdkconfig
+  checked for the values.
+- **Reading the boots.** Window-limited (the fast boots): first DATA
+  ≈ 0, ~8 reads, waits ≈ 4 RTTs, longest ≈ 1 RTT, no stall. Server:
+  first DATA ≈ in − the floor, no stall — no fragment changes first DATA.
+  Transport: first DATA ≈ 0, stalls ≥ 1, their sum ≈ in − the floor,
+  each ≥ 2 RTTs and roughly doubling when several (RTO backoff) — then
+  `ab-tcp-sack` shortens them. busy in the hundreds of ms would be our
+  own parse, neither. A bigger window shows as in falling to ~2 RTTs
+  (wnd8) / ~1 RTT (wnd12) on the stall-free boots.
+- **On the sensor** (36 boots, 3 rounds × 4 images × 3 boots, images
+  interleaved, `ab139tcp_*`): every slow body was transport — first DATA
+  +1–6 ms in all 36, busy 14–15 ms; the slow ones had one stall of
+  2.4–3.4 s, none a late first byte (not the server). Body median / mean
+  (ms) and stalls: default 830 / 1 180, 1 of 9 (3 401 ms at 12 KB); sack
+  950 / 909, 0 of 9; wnd8 440 / 1 020, 2 of 9 (2 741, 2 914 at 20 KB);
+  wnd12 480 / 933, 2 of 9 (2 655, 2 377 at 24 KB; the second with a DERP
+  TCP connect timing out at the same moment). The window halves the
+  median, but its stalls sit at the body's tail, three of four on the
+  first boot after a flash (a reboot seconds after the last) and were
+  followed by `prepunch sendto: errno=12` — Wi-Fi TX buffers full —
+  which the default window never showed there (0 of 3). Adopted: SACK
+  (`sdkconfig.defaults`); the window stays 4 × MSS — with the warm start
+  the netmap is off the WireGuard path, so its median matters less than
+  its tail.
+
+### Optimization round 1.3.8 — TLS handshake, WireGuard silence, stalled polls, PSK (in progress, branch `feat/opt-1.3.8`)
+
+Four parallel tracks on top of 1.3.7 plus a register retry ladder;
+independent reviews: three passes on the data plane (a medium finding
+each time — wireguard-go's responder keypair rules, DERP down mid-
+rescue, DERP's non-blocking write — all fixed and re-checked), two on
+the control and TLS tracks (low findings, fixed), one on the PSK (none).
+Image 731 952 → **745 840 B (+13 888)**; host suite 2 092 → **2 318
+OK** (CI floor 2 318), ASan + UBSan clean, 0 warnings. Hardware section
+at the end of this entry.
+
+- **Register retries on a ladder** (`main.c`): a failed register was
+  retried after a fixed `CONFIG_TINYLINK_REGISTER_RETRY_MS` (30 s); one
+  series boot lost both TCP conns for ~20 s right after the association
+  and waited until 44 s for the retry. Now `tl_backoff_ms` from 2 s
+  (±25 %) up to that value; a rate-limit answer still waits what
+  control asks.
+
+#### Data plane (`feat/r138-dp`)
+
+What the 1.3.6 soak (3.5 h) showed about WireGuard silence: 25 doubts
+(the direct path answers DISCO, the peer's WireGuard has been silent for
+a 12-s window), two of which ran into the RX-stale rekey 13 s after the
+doubt, 30 s after the peer's last packet (`seen direct=0 derp=0`). In one
+nothing came until that rekey's response, ~130 ms after its INIT — the
+1.3.5 failure, a session only an INIT revives; in the other (doubt 10) a
+keepalive under the old keys, answering our first frame sent both ways,
+arrived 30 ms after the INIT and before its response (the 1.3.6 entry
+credits both to the rekey). The rest were a lost frame or keepalive,
+settled by the peer's own WireGuard 1.3–8.0 s after the lapse. And with
+only our direct WireGuard toward the peer dropped, the first episode lost
+the frames older than the 40-s re-send window (1.3.6 "Known gap"). Image
+731 952 → **734 352 B (+2 400)**; static DRAM 58 116 → 58 228 B (+112), IRAM
+±0, ~500 B more heap in use (rescue ring 8 → 10 slots). Host suite 2 092 →
+**2 147 OK** (CI floor 2 147), ASan + UBSan clean, 0 warnings. Static worst
+cases unchanged: `wg_rx` 5 728 / 8 192, `wg_tx` 3 440 / 5 120 (`start_rekey`
+and `tx_rescue` +16 B each, off the deepest chains). Not yet on the
+sensor. All numbers below are from the keypair-aware simulation, with
+our DERP send queue modelled (see the review); "host test" numbers are
+what `test_wg_path` prints, the others from sweeps of the same code.
+
+- **D1 — a doubt is tested at once with a handshake (`WG_PATH_ACT_TEST`).**
+  The pong that puts the path in doubt owes a test; the RX task's timer
+  pass, which runs right after the pong, starts a make-before-break
+  rekey (`rekey init sent (… doubt test)`), direct and via DERP, the
+  current session carrying our data until the response. One INIT in
+  flight only — never while a handshake is pending (a responder that
+  gets a second INIT keeps only the second session, see
+  `WG_INIT_FRESH_AFTER_MS`), never within REKEY_TIMEOUT of the last
+  (whitepaper §6.1) — else the pending one's response does the same;
+  once per silent streak (after a silence no doubt is tested again until
+  a transport packet from the peer). The response is a WireGuard packet
+  from the peer and settles the doubt as a keepalive does: the first doubt
+  since a direct proof back to DIRECT, the second UNDELIVERED — the INIT
+  went both ways, so it proves the session, not our direct path. A broken
+  session is replaced by it. Simulated (100 random instants, the peer's
+  session dead until an INIT, DISCO alive): **the session is back 12.3–13.0
+  s after the first unanswered frame (1.3.7: 25.2–27.9 s), 16.4 s on
+  average / 17.9 s at most after the peer's last packet (1.3.7: 29.9 /
+  30.6 s)**, frames sealed with the dead keys 2.1 on average (1.3.7: 5.0).
+  Cost, healthy path with random WireGuard loss, 6 h, 20 runs each against
+  the same rules without the test: **+6 / +12.5 / +27 / +42 handshakes on
+  195** at 0.5 / 1 / 2 / 3 % (~14 / 26 / 55 / 86 doubts; a doubt's
+  handshake also moves the next proactive one 110 s on; each ~25 ms of
+  CPU, the INIT, the response and the two adverts); 2 % is a doubt every
+  ~6.5 min, the soak's rate was one per 8.4 min. A doubt now ends within
+  a round trip, so fewer frames go both ways during one: DERP copies 21 /
+  44 / 91 / 148 → 1.6 / 3.0 / 17 / 46, frames re-sent 0.8 / 6 / 26 / 58 →
+  15 / 30 / 82 / 138 (mostly ahead of a DERP-only test, below; the peer's
+  replay window drops those it has; data frames via DERP in all still
+  fewer), frames lost to the random loss 21.7 / 41.4 / 80.5 / 115.6 →
+  21.4 / 41.0 / 78.4 / 113.3, and the RX-stale rekeys the loss caused
+  (0.25 / 0.70 / 1.80 / 3.85, each after 30 s of silence) are gone.
+  UNDELIVERED under random loss 0.05 / 0.60 / 2.65 / 6.05 → 0.3 / 0.6 /
+  3.5 / 8.75 (a second doubt before a direct proof is now settled in a
+  round trip; each costs 10–20 s of DERP only and a re-send). With our
+  direct WireGuard dropped for an hour (host test): 0 lost, 47 tests (1
+  behind a re-send), 79 handshakes (1.3.7: 69, 18 of them RX-stale), 0
+  forced rekeys, re-tests still backed off to one a minute.
+- **No INIT costs a frame still to re-send (`wg_path_init_route`,
+  `wg_rescue_init_risk`).** wireguard-go as responder
+  (`BeginSymmetricSession`) parks the new keypair as `next` and deletes
+  `previous`; a re-sent frame sealed under a deleted keypair is dropped.
+  Each ring slot records the keypair it was sealed under, and the ring
+  the keypairs it re-sent in the last 5 s (`WG_RESCUE_TRANSIT_MS`, from
+  when the re-send's last frame left: maybe still on the DERP stream).
+  While a pending or just re-sent frame is under the keypair an INIT
+  would delete (our previous once a packet of the peer under the current
+  one confirms it, else the current one too), every INIT of a live
+  session, new or re-sent, whatever started it — the doubt's test,
+  SILENT, the proactive and RX-stale rekeys, the 5-s retry, a fresh INIT
+  at a path event, the re-sends at a DERP login, a CallMeMaybe, link-up
+  or a pong — goes via DERP only, behind a re-send of the pending frames
+  on the same TCP stream, with the waiting write the re-send uses
+  (`build_and_send_init` and `init_resend` both ask; `… via DERP behind a
+  re-send` in their log lines). The login kick re-sends first, and its
+  INIT copy, fresh or not, waits too. Only while DERP is connected (a new
+  `wg_netif_set_relay_state_callback`, the supervisor's flag): with it
+  down the INIT goes as in 1.3.7. And for one attempt (`WG_PATH_INIT_HOLD_MS`
+  = REKEY_TIMEOUT from the first INIT held, DERP up all along): the retry
+  of an unanswered held INIT goes both ways. A cold handshake goes as
+  before (no session carries data). 2.3 / 4.5 / 11 / 18 of the 13 / 26 /
+  54 / 85 tests above went behind a re-send. Known gap, 2 000 random
+  block instants: the test sent as it comes loses 6 157 frames (3.1 per
+  episode, 1.3.7: 2.3); held, **0**. With our DERP also down 3 / 8 / 20 s
+  within the episode (host test, 500 instants, each seeded on its own):
+  holding only the test (81134de) loses 59 / 166 / 403; now **1 / 3 / 22**,
+  every one pushed out of the full ring by the outage, none to a deleted
+  keypair (2 000 instants: 194 / 636 / 1 575 → 0 / 2 / 60). DERP down for
+  good and the peer's keys lost 1 ms after a proactive rekey's response
+  (before it confirmed ours): back 12.6 s mean, 13.0 s max, as without any
+  hold (fee2336, holding regardless: 72 s, the rekey given up). Withholding
+  the test instead leaves a third of the WG-silent breaks to the RX-stale
+  rekey (34 of 100 in the host test; 1 000 instants: 111 breaks over 14 s
+  after the first unanswered frame, up to 28.0 s); held, recovery is
+  unchanged (12.6 s mean, 13.1 s max, none over 14 s). `wg_path_rekey_gate`
+  keeps the timing rules (no session, one INIT in flight, REKEY_TIMEOUT
+  since the last); both pure functions are what `wg_netif.c` and the
+  simulation call.
+- **Rejected: an in-tunnel probe.** An empty keepalive is never answered
+  (wireguard-go arms its passive keepalive only for packets with a
+  payload). A TSMP ping is answered by tailscaled without a new session,
+  but into a session only an INIT revives it goes unanswered: that
+  failure would need a probe timeout and then the INIT anyway, 1–2 s
+  later, to save ~25 ms of X25519 per doubt (about seven an hour), and it
+  depends on the peer being tailscaled. Also rejected: the doubt's INIT
+  direct only (its answer would prove our direct path) — a lost INIT
+  (1–2 % on the sensor's Wi-Fi) would read as UNDELIVERED, and the
+  attempt-to-path bookkeeping is new state; not counting a handshake
+  response that lands between a lapse and its pong (it proves only the
+  session) — no difference in any simulation once the advert's timing was
+  faithful, so `wg_path.h` keeps the 1.3.6 rule.
+- **D2 — the rescue ring ages by the last proof of delivery
+  (`wg_path_rescue_from`, `WG_PATH_RESCUE_MAX_MS`).** A keepalive that
+  proves the direct path answers a frame the peer received
+  KEEPALIVE_TIMEOUT before sending it, plus a round trip and our wake
+  (MAX_MODEM at a 3-beacon listen interval: up to ~307 ms): frames sent
+  12 s (`WG_PATH_ANSWER_MS`) before it got through, those after stay in
+  the ring until re-sent or proven — 180 s at most (REJECT_AFTER_TIME: an
+  older frame can never be accepted), 10 slots (2 000 random block
+  instants: 8 lose 59 frames, 9 lose 19, 10 none); a frame whose DERP
+  copy or re-send was refused stays until sent, whatever a later proof
+  covers; a pong, a keepalive within a window of a DERP copy or one
+  ending a doubt prove nothing. Our TSMP advert no longer takes a slot (not application data;
+  with D1's extra handshakes it pushed out a lost sample). The known gap,
+  first episode with only our direct WireGuard toward the peer dropped
+  (direct → doubt → direct → lapse → doubt → UNDELIVERED, up to 9
+  direct-only samples): **1.3.7's rules lose 2.3 on average (4 596
+  frames in 2 000 random block instants); now 0** (host test: 500
+  instants, 0 lost; the test sent as it comes: 1 582).
+  `re-sent via DERP the N direct-only frames sent since the last one
+  proven delivered, X s ago (rescued: M)`.
+- **The simulation now models wg_netif's handshakes**: one INIT in
+  flight, REKEY_TIMEOUT retries replacing it (an answer to a replaced
+  INIT dropped), the proactive rekey 110 s after the last completed one
+  (was every 110 s whatever happened), RX-stale only with no rekey in
+  flight, the fallback to a cold handshake after 12 unanswered attempts
+  (data refused), INIT loss, our advert sent after the response (sent at
+  the same instant, a lapse on it equalled `peer_wg_us` and its pong
+  confirmed instead of doubting), and the real rescue ring. Since the
+  review, also the peer's keypair slots (`previous` / `current` / `next`,
+  the responder's deletions, `next` promoted by our first packet under
+  it, which sends the peer's advert; the peer sends under `current`
+  only, and drops a replayed INIT), our single receive session
+  (`wg_netif` keeps one: a peer packet under another keypair is dropped),
+  the DERP stream's order, and loss as ground truth (every frame followed
+  to delivery under a keypair the peer holds, an end-of-run drain). Since
+  the second pass, also our DERP connection down (the relay refusing,
+  what the peer relays to us lost) and its login kick, and the INIT
+  re-sends a pong makes; since the third, lwIP's send queue toward DERP
+  (a best-effort write refused while 8 segments are unacknowledged). Every
+  scenario prints the 1.3.7 behaviour beside it (the test action
+  ignored).
+- **Finding (pre-existing, not fixed): WireGuard dropped on the direct
+  path both ways with DISCO passing**, the peer keeping its direct path:
+  the peer gets what goes via DERP and answers on the blocked path, so no
+  handshake completes; the first rekey (1.3.8 the doubt's test, 1.3.7
+  the silence's or RX-stale's) gives up after 12 attempts and the cold
+  handshake refuses data — the tunnel is down while the block lasts
+  (706 of ~720 frames in the simulated hour, 1.3.7: 701). The old simulation sent INITs
+  without retries and showed no loss. Only the peer's path choice can fix
+  it; the old keys would carry our frames via DERP at most until
+  REJECT_AFTER_TIME anyway.
+- On the sensor, a doubt should read `… answers DISCO (rtt N ms), but no
+  WireGuard packet from the peer for 12.x s — via DERP too until one
+  comes, testing the session with a handshake (doubt N)`, then `rekey
+  init sent (attempt 1, …, doubt test)` (or `doubt test, via DERP behind
+  a re-send` after a `re-sent via DERP …` line), `session rekeyed` 50–400 ms
+  later and `direct path re-confirmed (WireGuard from the peer, 0.x s off
+  direct)`; no `RX stale` within 30 s of a doubt; `session rekeyed` up by
+  about the doubts (minus the proactive ones they move); free heap ~500 B
+  lower. `wg_netif_get_stats` gains `doubt_rekeys`.
+- **Review.** An independent review found one medium and two low items.
+  Medium: D1 undid D2 — the doubt's INIT made the peer delete the keypair
+  that sealed frames still to re-send, which the old simulation, without
+  keypairs, could not see (3.1 frames lost per known-gap episode, more
+  than 1.3.7's 2.3); fixed by re-sending them first and sending that
+  INIT via DERP behind them (above), chosen over withholding the test,
+  which kept the loss but gave back a third of the WG-silent recovery.
+  Low: a direct keepalive's proof covered frames sent up to 10 s before
+  its arrival, a round trip and our wake after the frame it answers, so
+  one sent 150 ms after that frame, then lost, was never re-sent — the
+  cutoff is now 12 s; and a frame held while DERP refused
+  its re-send could fall behind a later proof's cutoff — now kept until
+  sent. Low: the one-INIT rule in `wg_netif.c` had no host test — now
+  `wg_path_rekey_gate`, shared with the simulation, which also models our
+  single receive session. Tests: `proof/margin`, `rescue/refused-owed`,
+  `rescue/owed-past-proof`, `risk/*` (9), `gate/*`,
+  `sim/known-gap-keypairs`. A second pass found that the fix held only
+  the test: with DERP reconnecting, the login kick's INIT, the 5-s retry
+  and a pong's re-send still went direct ahead of the owed re-send (the
+  reviewer's simulation: 39 / 120 / 390 re-sent frames dropped in 500
+  episodes at 3 / 8 / 20 s down), and a frame just handed to DERP was
+  invisible to the check — every INIT now asks one decision
+  (`wg_path_init_route`, tests `route/*`, `transit/*`,
+  `sim/derp-down-*`). It also noted that "no relay, no test" cannot
+  happen on the device (the relay callback is always registered; the
+  ring keeps frames only with one): that branch is gone. A third pass
+  modelled lwIP's send queue: a held INIT's only copy went as a
+  best-effort write and was refused behind a re-send of 8 frames (9 of 32
+  held WG-silent tests, recovery up to 17.8 s; the login kick's fresh INIT
+  the same, until the rekey gave up), and with DERP down for good the
+  hold starved the handshake until the cold fallback (~72 s) — held
+  copies now take the waiting write, the hold needs DERP connected and
+  lasts one attempt, the transit window starts when the re-send's last
+  frame left (tests `route/relay-down-any`, `route/hold-*`,
+  `transit/from-last-write`, `sim/derp-down-no-starving`). fee2336's
+  message quoted a 2 000-instant sweep as the host test's numbers; the
+  test now seeds each trial on its own and checks what is lost, not how
+  much.
+
+#### Control plane (`feat/r138-ctl`)
+
+What a stalled map poll cost on the 1.3.7 sensor: after tailscale.com
+ended a map stream cleanly, the reconnect's streaming MapRequest got no
+answer at all and sat out the stream's 4 × 30-s budget (`control stream
+silent past 120 s — declaring dead`, twice), the conn after it its
+netmap 26 / 55 s after the request — 152 / 181 s without a netmap.
+Image 731 952 → **733 168 B (+1 216)**; static DRAM 58 116 → 58 212 B
+(+96), IRAM ±0. Host suite 2 092 → **2 142 OK** (CI floor 2 142),
+ASan + UBSan clean, 0 warnings. `tools/stack_worst.py`: `tinylink_lp`
+5 168 → 5 232 / 7 168 (the seventh request header in
+`h2_drive_request`'s frame, the buffered-bytes check under a write),
+`main` 5 424 → 5 440 / 8 192, the rest unchanged. Not yet on the
+sensor.
+
+- **C1 — the map stream's first-response deadline.** Every first
+  response in the 1.3.0–1.3.7 captures (`~/tinylink-backups`, 111 conns
+  with a stream request; the first `stream peak` after it — headscale
+  sends the headers with that frame, its first Write, and tailscale.com
+  cannot send them later): the 104 that did not follow a clean server
+  end (91 boots, 13 reconnects — 9 after a FIN) came 0.86–11.43 s
+  after the request, median 1.19 s, 90 % within 5.06 s; all 5 after a
+  clean end (`/machine/map stream closed cleanly`) were slow — 59 s
+  (1.3.5), 104 / 108 s (1.2.0, M16 soak), twice nothing within 120 s
+  (1.3.7, then 26 / 55 s on the next conn): 61–181 s from the end to a
+  netmap. Upstream has no shorter deadline: its 120-s watchdog "also
+  covers the initial request (effectively the pre-body and initial-body
+  read timeouts)" (`direct.go`). Now the response headers must arrive
+  within **15 s** of the request (3.6 s over the slowest ordinary
+  answer; `TS2021_RESP_TIMEOUT_MS`): `ts2021_response_deadline` runs on
+  the one-shot deadline's 2-s polls, counted from the request, and
+  `h2_io_on_status` ends it before any DATA reaches the stream
+  callback; after the headers the stream budget only, unchanged. An
+  expiry recycles the conn — one W line, no E line: `resp_expired`, not
+  `io_failed`. The next stream gets twice as long, up to the stream
+  budget (15, 30, 60, 120 s: at the top a poll has the 120 s 1.3.7
+  gave every poll); after an answer, twice that
+  answer's time, at least 15 s — a server that answers in 20 s gets
+  40 s next time instead of a cut at every reconnect. With the push
+  riding along (B1, default off), a push that closes before the stream
+  answers hands the conn to the stream's deadline, counted from the
+  burst. The first poll after a clean server end is the exception
+  (Review below): it keeps the 120 s 1.3.7 gave it. Logs:
+  `ts2021: control stream: no response within 15000 ms — recycling the
+  conn` (W), `long-poll stream recycled (no response) — reconnecting`
+  (I); every stream `h2: map stream answered: HTTP 200 in N ms` (I) —
+  against the `stream peak` line it shows whether tailscale.com sends
+  its headers ahead of the netmap, which the frames above cannot.
+  `req_idle` 8 → 16 bits (a 3 600-s budget is 1 800 polls). Tests:
+  `test_ts2021` +11 (expiry, counted from the request, write side,
+  disarm, the :80 / address rules after one and two expiries),
+  `test_h2_interop` +11 against nghttp2 (silent server and the back-off
+  to the cap, reset by an answer and the reconnect, headers 1 µs before
+  / after the deadline, a body long after the headers, the B1
+  hand-over); a reconnect probe (clean end, two unanswered conns, an
+  answered one, each EarlyPayload split) 33 / 33.
+- **C2 — a recycle is not a :80 failure; a repeated one is** (outside
+  the first poll after a clean server end, whose expiry never is). The
+  1.3.5 rule (a :80 conn that fails within 120 s of its handshake sends
+  the next dial to :443 — tailscale#13597, upstream's "recent noise
+  dial") and the cached-address rule (a young conn there that fails →
+  the next dial resolves the name) both read `io_failed`. A first
+  expiry does not set it: the :80 transport carried the Noise
+  handshake, the EarlyPayload and the server's HTTP/2 preface; both
+  stalls followed a clean end on :80 conns that had worked for 230 /
+  646 s, and the :443 conn after them was as slow (26 / 55 s) — the
+  server, not the port; and :443 costs a full TLS handshake (2.4–3.0 s
+  against 0.37–0.77 s on :80 on the sensor, 3.7 KB more heap) on every
+  recycle. From the second expiry in a row `h2_post_json_stream` marks
+  the conn failed, so a stall that persists also tries :443 and a fresh
+  DNS answer — the hedge against a :80 middlebox that passes the
+  upgrade and then blackholes, which 1.3.7 had only through the 120-s
+  silence.
+- **C2 — redial at once after a healthy stream.** A stream up ≥ 10 s
+  reset the long-poll backoff to its 1-s base, so every reconnect still
+  waited 0.75–1.25 s: most of the 1.4 s from a stream's end to the next
+  Noise init on the sensor (647.86 → 649.26 s). Upstream resets its
+  backoff with every netmap and waits n² × 10 ms × [0.5, 1.5] — 5–15 ms
+  — before the next poll. Now 7–12 ms (`LP_REDIAL_MS`) after such a
+  stream — a server end, a FIN, a first-response recycle, a push
+  recycle; a failure of that redial waits from the base as before.
+- **C2 — `Ts-Lb` load-balancer hint.** Upstream adds `Ts-Lb:
+  nodekey:<hex>` (`tailcfg.LBHeader`) to register, map and every other
+  Noise request since 2024-03 (`ts2021.AddLBHeader`), so tailscale.com's
+  reverse proxy can route a request to the node's backend without
+  reading its body; tinylink never sent it. Not a security input
+  ("strictly denormalized redundant data as an optimization"); headscale
+  ignores it. Set from the node key at each control connect
+  (`h2_client_set_lb`), +80 B per HEADERS. Whether it changes how fast
+  tailscale.com answers a reconnect's poll cannot be measured from here;
+  it removes one difference from the official client on the path that
+  stalled. Tests: `test_h2_interop` +3.
+- **C2 — analysed, not changed.** *A fresh conn for the long-poll*
+  (the 1.3.3 experiment for the boot-connection FIN): it was to tell
+  "the conn that carried the register" from "the first map session
+  after a (re)connect". The 1.3.7 soak already does: its FIN at
+  1 166 s hit the :443 conn from 774 s — a reconnect's conn that never
+  carried a register, the first one served after the stall, 392 s into
+  its session. The variant would cost every boot one more connect
+  (+0.4–0.6 s to the netmap) to show that again; a FIN costs the
+  control stream ~2 s now (redial at once, :80, netmap ~1.2 s), the
+  data plane nothing. Not built. *The same conn for the next poll after
+  a clean end* (upstream's HTTP/2 pool would reuse it): one :80 connect
+  (0.4–0.8 s) against a 61–181-s wait on the server's side. *The :80
+  early-drop rule on a FIN* (1.3.5 series boot 10: FIN at 27 s → :443,
+  +1.8 s): kept — it is the #13597 hedge, and upstream's rule is wider
+  (any dial within 2 min of the last).
+- **Review.** An independent review found one demonstrated defect and
+  one design risk, both fixed. With the push riding along (B1, default
+  off), a push that closed after the stream's own deadline had passed
+  armed it in the past, and the next read failed before reading the
+  stream's 200 already received behind the push's answer — recycled as
+  "no response", the second time with the :443 / DNS escalation; the
+  first-response deadline now is not past while received bytes wait
+  unread (`ts2021_rx_ready`, the 1.3.7 rule for the push; the one-shot
+  deadline keeps no such grace), the review's demo is a host test. And
+  every poll after a clean server end had been slow on the server's
+  side, so cutting those at 15 / 30 s and then dialing :443 would have
+  only resubmitted them (59 s → ~105 s, 104 s → ~210 s): the poll after
+  a map stream the server ended (END_STREAM after its 200) gets the
+  stream budget — 120 s; 60 s would have cut three of the five answers,
+  the 59-s one by 1 s — and its expiry moves neither the ladder, the
+  streak nor the conn's failure accounting (`map stream after a clean
+  server end: 120000 ms for its answer`, I); boots, FINs, errors and
+  recycles keep 15 s. So on the two 1.3.7 stalls the change from 1.3.7
+  is the redial at once and no :443 detour on the first conn; the 15-s
+  deadline is for polls that stall without such an end. The "second
+  expiry in a row → :443" rule is now tested end to end
+  (`test_ts2021_e2e`: `h2_post_json_stream` on conns `ts2021_connect`
+  dials, through `ts2021_close`). Tests: `test_h2_interop` +10,
+  `test_ts2021` +1, `test_ts2021_e2e` 7; image +176 B. A second pass
+  found the patience outliving that poll — cleared only by an answer,
+  so a server that completes the handshake and never answers got 120-s
+  polls forever and the :443 / re-resolve escalation never engaged (as
+  in 1.3.7, but against the design): now it covers the one poll after
+  the end, whatever ends it (an expiry, a FIN, an error, a recycle);
+  then the ladder, its second expiry escalating. An endpoint push that
+  runs out of its one-shot deadline ahead of that poll (push first, the
+  default) or riding with it (B1, where the push's deadline governs the
+  conn until the stream answers, as in 1.3.7) is not counted as a
+  transport failure either — the server's delay — and takes the
+  patience with it. The reviewer's demos are host tests:
+  `test_h2_interop` +4 (one poll then the ladder, a FIN in it, the push
+  ahead of it and with it), `test_ts2021_e2e` +3 (a FIN or a recycle
+  ends it; the ladder after it to :443); image +32 B.
+
+#### Wi-Fi (`feat/r138-wifi`)
+
+With the 1.3.7 channel hint, STA start → auth is ~180 ms on the sensor,
+~170 ms of it the driver's PBKDF2 on the passphrase (1.3.7 W4: 32.98 M
+instructions, 161–169 ms at 240 MHz, on the Wi-Fi task between the scan
+match and the auth frame). Image 731 952 → **738 192 B (+6 240)**; static
+DRAM +176 B (.bss), IRAM ±0; with the option off 732 016 B (+64, the
+credential scrubs). Host suite 2 092 → **2 120 OK** (CI floor 2 120),
+ASan + UBSan clean, 0 warnings; QEMU crypto job: every suite, 133 OK
+lines. Static worst cases: new `wifi_psk` 1 408 / 2 048 B, every other
+task unchanged. Not yet on the sensor.
+
+- **W4b — the PSK derived on CPU 1 (`main/wifi_psk.h`,
+  `CONFIG_TINYLINK_WIFI_EARLY_PSK`, default y).** `app_wifi_start` reads
+  the credentials first (before esp_netif, the event loop and
+  `esp_wifi_init`; they came after) and starts `wifi_psk`, pinned to CPU 1
+  (priority 5, 2-KB stack, exits): PBKDF2-HMAC-SHA1(passphrase, SSID,
+  4096, 32) with the HMAC pad states computed once and every loop block —
+  a 20-B digest after a pad block — through an unrolled SHA-1 with the
+  constant message words folded in (one 3.9-KB copy): 23.8 M instructions
+  against the IDF's 32.98 M (rolled, 61.3 M), ≈ 115–120 ms at 240 MHz at
+  the 1.3.7 CPIs (DFS only starts after got-ip). The STA_START handler
+  waits for it (≤ 200 ms), writes the 64 lowercase hex digits into the
+  station config (`esp_wifi_get_config` / `set_config`, which keeps the
+  channel hint) and connects. In the driver, wpa.c `wpa_set_passphrase`
+  derives only when the profile's PMK is stale
+  (`esp_wifi_sta_get_reset_nvs_pmk_internal`): a password of
+  `os_strlen` 64 goes through `hexstr2bin` into the profile PMK, anything
+  else through `pbkdf2_sha1` (crypto_mbedtls.c → fastpbkdf2 on the
+  ESP32), and both continue with the same
+  `esp_wifi_sta_update_ap_info_internal` — so with WIFI_STORAGE_RAM the
+  hex path stores what the passphrase path did, nothing on flash. The
+  blob's station set_config has no hex check (its "password convert fail"
+  is the SoftAP's) and keeps 64 bytes plus a terminator
+  (`wifi_nvs_validate_sta_password`). Its PMK cache, keyed by SSID +
+  password string, then holds the hex form, so the 1.3.7 re-apply stays a
+  cache hit. Late, refused (a passphrase under 8 or of 64 characters, an
+  SSID of 0 or over 32 B — the driver's business as before), the task not
+  created or set_config failing: the passphrase config set before
+  `esp_wifi_start` stays and the driver derives. `tl_psk_publish` /
+  `tl_psk_claim` give the result one owner; the side that loses scrubs.
+  Scrubbed: `app_wifi_start`'s passphrase buffer and station config, the
+  task's copy, the PMK, the hex digits, the config in `psk_set_config`,
+  and the task's stack frames (a 768-B burn below `psk_task` before it
+  exits — the stack goes back to the heap as is). Not with WPA3-SAE (the
+  commit needs the passphrase; the option depends on
+  `!ESP_WIFI_ENABLE_WPA3_SAE`, off here) nor on a unicore build. The
+  config sits in `psk_set_config`'s own frame, so the sys_evt path under
+  the log call (2 304-B stack) grows by 32 B only.
+- **Verification.** `test_wifi_psk` (28 cases): IEEE 802.11-2020 J.4.1
+  (3), RFC 6070 (c = 4096), OpenSSL edge vectors (63-B passphrase with 32
+  NUL bytes of SSID, 0xff bytes with a 1-B SSID, an 8-B passphrase), a
+  byte-oriented reference PBKDF2 on 30 random length pairs, both
+  compressions against FIPS 180 and the reference, bounds, the hex digits
+  back through hostap's `hexstr2bin`, the hand-off. On the target
+  (`tools/qemu_crypto`, CI): the same suite, plus `psk_qemu.c` —
+  `tl_psk_derive` against the IDF's own `pbkdf2_sha1`, what wpa.c calls,
+  on 36 random passphrase / SSID pairs: byte-identical.
+
+Expected: STA start → auth ~180 → ~40–50 ms on every boot (−130–140 ms,
+got-ip the same): with the credentials read ~270–290 ms after reset the
+PSK is ready at ~390–410 ms, STA start comes at ~377 ms, so the handler
+waits ~15–35 ms, then the hinted scan (~10 ms) and the auth frame.
+Nothing else on STA start → auth is worth 30 ms: the hinted scan is
+10 ms in 13 of 17 boots (60–100 ms in the rest, the AP's probe response;
+a shorter active dwell risks missing it), and PHY calibration (~60 ms,
+before STA start) is now under the derivation, which sets the pace from
+there (auth ≈ max(STA start, PSK ready) + scan). What the series must
+show: `app_wifi: STA start, connecting`, then `wifi psk: derived on CPU 1
+in N ms, waited W ms — PSK to the driver, no PBKDF2 at the auth` (N ≈
+115–125, W ≈ 0–40), `init -> auth` ~10 ms after that line (~180 ms after
+STA start in 1.3.7), got-ip; never `wifi psk: not derived after …` or
+`esp_wifi_set_config failed`. A wrong PSK would read as a reason-15 4-way
+timeout on every attempt and no got-ip — the option off restores the
+driver's derivation.
+
+#### TLS handshake (`feat/r138-tls`)
+
+The DERP TLS full handshake was on the boot's critical path: on the
+1.3.7 boots the DERP login landed at got-ip +1.8–2.2 s, the netmap at
++1.7 s, so half the boots' first WireGuard INIT waited for DERP. In the
+logs a full handshake took 1.72 s: 1.15 s from the connect attempt to
+`Certificate validated` (two ~60-ms round trips plus the chain verify),
+0.57 s from there to `TLS up` (one round trip plus the ServerKeyExchange
+verify and both ECDHE halves). Image 731 952 → **735 680 B (+3 728)**;
+static DRAM 58 116 → 58 292 B (+176), IRAM ±0, RTC slow +1 156 B. Host
+suite 2 092 → **2 185 OK** (CI floor 2 185), ASan + UBSan clean, 0
+warnings. Static stack worst cases unchanged (`tinylink_derp` 5 248 /
+8 192, `tinylink_lp` 5 168 / 7 168); the DERP connect subtree 4 400 →
+4 352 B, `ts2021_connect` 4 832 unchanged. Not yet on the sensor.
+
+- **T1 — what a full handshake verifies.** `openssl s_client`,
+  2026-10-30, derp16b and controlplane alike. To mbedTLS's default offer
+  (ECDHE-ECDSA suites listed) both serve leaf P-256 ← YE2 / YE1 (P-384) ←
+  Root YE (P-384) ← ISRG Root X2 (P-384, cross-signed by X1, RSA-4096),
+  plus on DERP the Ed25519 `derpkey…` meta certificate (skipped by
+  mbedTLS: unknown signature algorithm), ServerKeyExchange
+  ecdsa_secp256r1_sha256, ECDHE X25519. mbedTLS walks the served chain
+  to its top (the bundle callback only anchors the last link), so the
+  client does three P-384 ECDSA verifies, one RSA-4096 (X2 ← X1 from the
+  bundle), one P-256 (the ServerKeyExchange) and two X25519. Cost per
+  primitive from `CONFIG_TINYLINK_BENCH_TLS` on Espressif QEMU with
+  `-icount shift=0` (k-instructions; the in-tree X25519's 2 436 matches
+  the 2.43 M of 1.3.3, i.e. 12.55 ms on the chip, CPI 1.24; the RSA unit
+  is emulated with zero latency), 1.3.7 configuration → 1.3.8:
+  P-384 verify 38 079 → 47 317 (software multiplication, below); P-256
+  verify 20 722 → 21 325; RSA-2048 verify 899 → 580; RSA-4096 4 213 →
+  2 620; whole ECDSA chain through the bundle 118 789; whole RSA chain
+  9 749 → 6 188; X25519 keygen + shared 9 014 + 9 021 (mbedTLS) → 2 436 +
+  2 437 (in-tree); ECDHE P-256 4 722 + 13 440, P-384 8 064 + 24 586. The
+  client's handshake crypto (chain parse + verify, ServerKeyExchange,
+  ECDHE): **157.7 M → 11.7 M instructions (−93 %)**, ≈ 0.81 s → 60 ms at
+  CPI 1.24 plus the RSA unit's own time; on the chip the 1.3.7 path took
+  ≈ 1.5 s, so the unit's latency was ≈ 0.5 s of it.
+- **ECDHE-RSA offered first (`src/tls_offer.{c,h}`,
+  `CONFIG_TINYLINK_TLS_RSA_FIRST=y`).** Both servers pick their
+  certificate from the ClientHello (Go autocert's supportsECDSA): with no
+  ECDHE-ECDSA suite listed they serve leaf RSA-2048 ← YR2 (RSA-2048) ←
+  Root YR (RSA-4096) ← ISRG Root X1 (in the common bundle) and sign the
+  ServerKeyExchange rsa_pkcs1_sha256; ECDHE stays X25519, records
+  AES-128-GCM. The DERP and control (:443) connects offer
+  TLS_ECDHE_RSA_WITH_AES_{128,256}_GCM only: four RSA public-exponent
+  operations instead of four ECDSA verifies. The TOFU `/key` fetch keeps
+  the full mbedTLS offer: its TLS is all that vouches for the control key
+  it pins, and it runs once per pin, so it is not narrowed for speed —
+  controlplane answers that offer with its ECDSA chain (P-256 leaf, ~1.5
+  s once). The offer still lists the RSA suites, so a server may answer
+  with an RSA chain, verified against the bundle all the same: "ECDSA-
+  capable", not "P-256 enforced" (review). A handshake failure
+  on the RSA offer (an ECDSA-only server, a chain the bundle does not
+  anchor — esp-tls `ESP_ERR_MBEDTLS_SSL_HANDSHAKE_FAILED`, not a TCP
+  failure or a timeout) redials at once with the full mbedTLS offer and
+  no session — unless the verdict is a certificate for another name; a
+  success there makes that host:port take the full offer directly for 6
+  h. A saved session is offered under the suite family it was made in.
+  Log: `TLS up to … (full handshake, RSA offer, N ms)`. **Security:** the
+  chain is verified in full by the same code against the same bundle
+  (names, dates, CA and key-usage bits, path length, the bundle anchor);
+  forward secrecy and record protection are unchanged (X25519,
+  AES-128-GCM). The server is authenticated by RSA-2048 (≈ 112-bit,
+  NIST SP 800-57: acceptable through 2030) instead of P-256 (≈ 128-bit),
+  the strength Let's Encrypt issues for RSA; both chains end at ISRG
+  roots. An attacker can only force the full offer (by failing the RSA
+  handshake), which is the pre-1.3.8 behaviour. The ts2021 traffic on
+  :443 is Noise IK inside (pinned key), DERP's login is a NaCl box to the
+  server key: TLS is the outer layer of both. No pinning.
+- **X25519 on the in-tree Curve25519 (`src/tls_x25519.c`,
+  `CONFIG_TINYLINK_TLS_X25519_INTREE=y`).** The link wraps
+  `mbedtls_ecp_mul_restartable` (`-Wl,--wrap`; ecdh.c's two calls go to
+  the wrapper, ecp.c's internal ones keep the original) and diverts
+  Curve25519 to the constant-time fiat32 code: same argument checks
+  (`mbedtls_ecp_check_privkey` / `_pubkey`), same R = (X, Z = 1), an
+  all-zero result an error. −13.2 M instructions per full handshake
+  (−19.9 M against software multiplication). The bench checks both
+  halves (d·9, d·Q) against mbedTLS's ladder: 16/16 equal. +240 B.
+- **Bignum multiplication in software, RSA exponentiation on the
+  accelerator (`CONFIG_TINYLINK_TLS_MPI_MUL_SW=y`, `mbedtls_user_config.h`
+  undefines `MBEDTLS_MPI_MUL_MPI_ALT`).** With `HARDWARE_MPI` alone every
+  multiplication goes to the RSA unit padded to ≥ 512 bits, with a lock,
+  a clock enable + reset and DPORT copies per call. On the RSA path the
+  R² mod N of each fresh key (a long division) multiplies the 4096-bit
+  modulus by one limb per step — two padded 2048-bit unit multiplications
+  each: RSA chain 9 749 → 6 188 k-instructions before the unit's latency
+  is even counted. The ECDSA fallback path goes 38 → 47 M per P-384 in
+  instructions but sheds the unit's per-call latency; the on-chip bench
+  decides it (`tools/tls_bench/sdkconfig.mul-hw`). `HARDWARE_MPI=n`
+  (D10's A/B) is rejected: RSA chain 48.9 M (software exponentiation).
+- **Measured and left alone.** `MBEDTLS_ECP_WINDOW_SIZE`
+  (`CONFIG_TINYLINK_TLS_ECP_WINDOW`, A/B knob, default 4): P-384 verify
+  w=2 +11 %, w=3 +2.8 %, w=5..7 −0.3 % for +3.5 KB transient heap (5.8 →
+  9.2 KB); P-256 never goes past 4. `ECP_FIXED_POINT_OPTIM` off: P-384
+  +45 %, P-256 +41 %, −5.6 KB — kept for the fallback path and P-256/384
+  ECDHE. Group order: both servers already take X25519 first. Signature
+  algorithm order: the ServerKeyExchange algorithm follows the
+  certificate's key, only the certificate choice moves it (above).
+- **TLS sessions across warm resets (`src/tls_rtc.h`, `tls_resume.c`,
+  `CONFIG_TINYLINK_TLS_RESUME_RTC=y`).** Every kept session is also
+  serialized by mbedTLS (`mbedtls_ssl_session_save`: master secret,
+  ticket, suite, server-certificate digest, behind a version /
+  configuration header `mbedtls_ssl_session_load` checks) into one of two
+  572-B records in RTC slow memory; the first connect to that host:port
+  after a software, panic, interrupt-WDT or task-WDT reset resumes (157
+  ms on the sensor, 1.3.6 soak) instead of a full handshake. Same bounds
+  as the RAM copy: host:port, 24 h of master-secret age counted on the
+  RTC timer (which runs through those resets), a failed connect clears
+  it, plus an FNV checksum against garbage, a refusal when the RTC timer
+  reads earlier than the record's last write, and one restore per record
+  per boot. Any other boot, and expired or garbage records, are zeroed by
+  a sweep first thing in every boot (`tinylink_bootstat_record`, before
+  anything can restart). Log: `tls_resume: TLS
+  session for … from RTC memory (master secret N s old)`. +2 272 B
+  (mbedTLS's session (de)serializer). **NVS rejected:** NVS is not
+  encrypted here; a TLS 1.2 master secret at rest there would let anyone
+  holding the board decrypt every recorded connection resumed from it
+  for up to 24 h (resumption has no fresh ECDHE), every keep would be a
+  flash write (a sector erase stalls both CPUs 70–500 ms), and after the
+  RSA offer a cold boot's full handshake costs ~0.1 s more than a resumed
+  one.
+- **Review (independent, no medium / high findings; all fixed).** (1) Low,
+  demonstrated on the host: esp_clk restarts the RTC timer from 0 when
+  its calibration register reads 0 (an RTC-domain reset — the
+  bootloader's RTC WDT stage, a brown-out, maybe EN) while RTC slow
+  memory can survive, so a session made 23 h earlier restored as "2 s
+  old" and was offered 46 h after its handshake. Now the record carries
+  its last-write time (refused when the RTC timer reads earlier), only
+  the four warm reset reasons restore, and a master secret older than
+  the RTC time is not saved instead of clamped (`test_tls_rtc`, 53
+  checks). (2) The full-offer retry fired on every handshake failure,
+  including a certificate for another name (a stale cached address, an
+  impostor): no retry when the RSA attempt's verify result — read from
+  the SSL context, since esp-tls's own capture needs the peer certificate
+  this build does not keep — has `BADCERT_CN_MISMATCH`; an alert, an
+  unanchored, expired or policy-failing RSA chain still retries (separate
+  certificates, renewals and hierarchy). (3) Expired records kept their
+  master secret until looked up and an overwrite left the previous
+  ticket's tail: the boot sweep, and a seal zeroes the tail. (4) `/key`
+  back on the full offer (above). A second pass: (5) Low, demonstrated:
+  the sweep ran in `tinylink_init`, after Wi-Fi; a cold boot without
+  Wi-Fi restarts from bringup 60 s later — a software reset, i.e. warm —
+  so a record last written before an RTC-timer restart, once the new
+  timer had run past that write, came back (a 23-h secret as "80 s
+  old"). The sweep now runs first thing in every boot
+  (`tinylink_bootstat_record`); suite test
+  `glue_cold_boot_then_sw_restart_not_restored`. (6) The `/key` wording
+  above: the full offer is ECDSA-capable, not P-256-enforced.
+- **Rejected after the RSA offer.** Anchoring the ECDSA chain at the
+  served X2 (bundle name + key) to skip its X1 cross-sign: one RSA-4096,
+  2.9 M instructions, ECDSA path only. Memoizing verified signatures
+  (digests of key, hash and signature, in RAM / RTC / NVS — semantically
+  pure): would save the chain verify after the first handshake, 6.2 M
+  instructions now — not worth a flash writer. A faster P-256 (p256-m)
+  for the ServerKeyExchange: moot with an RSA one.
+- **Boot bench `CONFIG_TINYLINK_BENCH_TLS` (default n,
+  `src/tinylink_bench_tls.c`, `tools/tls_bench/`).** Runs first thing in
+  bringup(), before NVS and Wi-Fi, then the firmware boots as usual:
+  single verifies from the served certificates (P-384, P-256, RSA-2048,
+  RSA-4096 ×2, each key parsed fresh), each whole chain through the
+  bundle callback, ECDHE X25519 (in-tree and mbedTLS, cross-checked),
+  P-256, P-384, best of 3, heap peak per operation, stack high-water
+  mark; `bench-tls:` lines (the source lists them). One image per
+  configuration (`sdkconfig.bench` + `sdkconfig.mul-hw` / `mpi-off` /
+  `win*` / `nofp`; `sdkconfig.qemu` for the emulator). Vectors:
+  `tools/tls_bench/gen_vectors.py`, public data only.
+- Expected on the sensor: a full DERP handshake ≈ 3 round trips + ~0.1 s
+  (was 1.45–4.19 s), the boot's DERP login at ≈ got-ip +0.5 s (ahead of
+  the netmap), the same on every reconnect that cannot resume.
+
+#### Hardware (deployed sensor, app partition only)
+
+The 1.3.6 `ota_0` backup from round 1.3.7 stays the rollback image.
+
+- **TLS bench on the chip** (`CONFIG_TINYLINK_BENCH_TLS`, one image per
+  accelerator setting; µs): handshake CPU (chain parse + verify,
+  ServerKeyExchange verify, ECDHE) **ECDSA chain 976 265, RSA chain
+  65 948** with the 1.3.8 defaults (RSA exponentiation on the
+  accelerator, multiplication in software); multiplication on the
+  accelerator too (as up to 1.3.7): 1 063 998 / 143 402; no accelerator:
+  1 064 244 / 318 497. Per step (defaults): ECDSA P-384 verify 268 336,
+  P-256 125 853; RSA-2048 3 632, RSA-4096 15 191–16 683; X25519 in-tree
+  12 478 per operation against mbedTLS's 72 018–79 874 (16 / 16
+  results equal); P-256 ECDHE 30 541 + 82 327, P-384 59 734 + 180 357.
+  With 1.3.7's ECDSA chain and mbedTLS X25519 a full handshake cost
+  ~1.18 s of CPU; now 66 ms.
+- **Smoke (`9ba76cf`):** `wifi psk: derived on CPU 1 in 139 ms, waited 4
+  ms`, `init -> auth` at 0.44 s; `TLS up to derp16b.tailscale.com:443
+  … (full handshake, RSA offer, 391 ms)` (1.3.7: ~1.7 s), DERP login at
+  got-ip + 0.57 s — before the register; `h2: map stream answered:
+  HTTP 200 in 183 ms`. That boot's map stream then got no keep-alive
+  for 120 s after its netmap and was declared dead (reconnect answered
+  in 276 ms, keep-alives normal) — not seen again in the series.
+- **8 × 3 min (`9ba76cf`):** register without Auth 8 / 8, 0 crashes,
+  keep-alives on every stream, heap ~157 KB. `init -> auth` at 0.42 s
+  every boot (PSK derived in 117 ms, waited 17–25 ms); got-ip 1.63 s
+  (no comeback), 3.61–3.65 s (the AP's 2-s handshake) or 4.65–4.67 s
+  (its 4-way timeout + the immediate retry); DERP login at got-ip +
+  0.56–0.86 s (1.3.7: +1.8–2.2 s), so WG up now follows the netmap
+  (got-ip + 1.69–1.99 s, server side) at +1.90–2.18 s. Reset → WG up
+  median ~6.6 s (3.8–8.7). One boot lost both TCP conns for ~20 s right
+  after the association and came up at 52 s on the fixed 30-s register
+  retry — the ladder above.
+- **Soak (`24f1d14`, 161 min, cut to flash 1.3.9):** 0 resets / panics
+  / WDT / brown-outs, **0 RX-stale**, 0 roams; first boot got-ip 1.62 s,
+  netmap 7.74 s (its 26 KB body took 5.1 s after the HEADERS — round
+  1.3.9 times it), WG up 7.89 s. 90 rekeys (one needed a retry, answered
+  in 70 ms). Path selection: 4 lapses — three doubts settled by the
+  peer's WireGuard 0.1–0.6 s after the doubt handshake, one undelivered
+  (the peer answered only DERP copies; 9 frames re-sent via DERP behind
+  the doubt INIT, direct re-confirmed by a pong 20.2 s later), 0 dead.
+  One long-poll end: the boot connection's FIN at 397 s (the known
+  tailscale.com pattern), reconnect in 0.78 s, netmap 3 s later; the
+  3 E lines are that end. Telemetry 1 940 samples, the only failure the
+  boot's first (fixed in 1.3.9). heap_free min **154 892 B**, largest
+  block 110 592 B; stack lows (B free) `tinylink_lp` 4 264 of 7 168,
+  `tinylink_derp` 4 724 of 8 192, `wg_rx` 3 988 of 8 192, `wg_tx`
+  2 760 of 5 120, `tinylink_tlm` 2 616 of 4 608, `esp_timer` 3 032 of
+  4 608.
+
+### Optimization round 1.3.7 — Wi-Fi association, boot control path, steady-state power (branch `feat/opt-1.3.7`)
+
+Three parallel tracks on top of 1.3.6, reviewed independently twice
+(all findings low, all fixed), then measured on the sensor; two
+defaults changed after the hardware runs (steady-state power below, the
+endpoint-push pipelining under B1). Image 725 536 → **731 952 B
+(+6 416)**; host suite 1 791 → **2 092 OK** (CI floor 2 092), ASan +
+UBSan clean, 0 warnings. On the sensor (hardware section at the end of
+this entry): reset → WG session up median **7.1 s** over a 10-boot
+series of hardware resets (1.3.6: 9.3 s), 4.1 s with no stale
+association on the AP; light sleep 81.4 → 89.8 % of the time with the
+new modem-sleep default.
+
+#### Wi-Fi association (`feat/r137-wifi`)
+
+Wi-Fi was 60–80 % of the boot. Over 68 captured boots of 1.3.1–1.3.6
+(all hardware resets — the serial DTR pulse; `boots=1 … RTC record
+restarted` every time): STA start 0.37–0.43 s; the connect scan walked
+channels 1..11 at ~110 ms each before the AP answered on 11 (+1.21–1.30
+s); 140–170 ms more to the auth frame; every association refused once
+(`comeback time 1100 (TUs)`: the AP still held the old PMF association,
++1.13 s); then the 4-way handshake took 10–30 ms (16 boots), exactly 2.0 s
+(30) or died at exactly 3.0 s with reason 15 (22), the retry adding a
+0.40–0.63 s backoff, a 2.28–2.29-s rescan and a 10–40 ms handshake.
+got-ip 3.02–3.15 / 5.00–5.39 / 8.75–9.23 s after reset (medians 3.05 /
+5.05 / 8.88), DHCP 110–420 ms of it (median 130). Image 725 536 →
+**727 840 B (+2 304)**; static DRAM 57 644 → 57 700 B (+56), IRAM ±0,
+RTC slow +16 B; the diagnostic build (below) 731 152 B. Host suite 1 791
+→ **1 846 OK** (CI floor 1 846), ASan + UBSan clean, 0 warnings. Static
+worst cases: `esp_timer` 3 248 → 3 328 / 4 608 (the station config on the
+re-apply path), `tinylink_tlm` 3 712 / 4 608 unchanged (the NVS write
+from the hook is not its deepest path), the rest unchanged. Not yet on
+the sensor.
+
+- **W1 — the last AP's channel first (`main/wifi_hint.h`).** The channel
+  of the last AP joined, bound to a hash of the SSID: an RTC no-init copy
+  written at every connect (software / panic / WDT resets) and NVS
+  `tl_state/wifi_ap` (6 B) written only when it differs — from the 60-s
+  housekeeping (`tinylink_set_persist_hook`, new) and, while the node is
+  not registered yet (no telemetry task), from main's register retry loop
+  after each wait; a day of housekeeping, 100 reboots, or 100 reconnects
+  across a mesh's nodes on one channel: 0 flash writes in the tests. At start
+  `sta.channel` = the record: the driver scans that channel first, then
+  1..N without it (IDF wifi.rst), and WIFI_FAST_SCAN ends at the first
+  match — a moved AP costs one extra dwell (~110 ms), never a lock-out.
+  `bssid_set` stays off — no gain on the hinted channel, and a replaced AP
+  would turn every attempt into NO_AP_FOUND after a full scan — so no
+  BSSID is kept at all;
+  `failure_retry_cnt` / `sort_method` need WIFI_ALL_CHANNEL_SCAN (a full
+  scan every time). Any failed attempt drops the hint (scan 1..N) until
+  the next connect, which rewrites the record whatever channel it
+  landed on; a lost working link keeps it. Logs: `wifi hint: channel N
+  first (RTC | NVS record)`, `wifi hint: AP on channel N — in RTC now…`,
+  `wifi hint: channel N stored`. Expected −1.2 s on every cold boot (scan
+  1.21 s → one dwell) and on every reconnect.
+- **W2 — the 2-s / 3-s handshake, and an immediate retry.** The 3.0-s
+  failure is raised locally (`run -> init (0xf00)`: reason 15, no frame;
+  an AP deauth reads 0xfc0) at exactly 3.000 s after `assoc -> run`; the
+  blob's own handshake timers (1 / 10 / 30 s by its log strings) report
+  204 (IDF wifi.rst), so the one source that fits is wpa.c's deauth on the
+  4th M1 (MAX_EAPOL_RETRIES 3, its `wpa_printf` compiled out). Then the AP
+  re-sends M1 every second and does not take our M2 for 0, 1, 2 or ≥ 3
+  periods after the comeback — its old PMF association (likely a stale
+  pairwise key) not yet gone. Nothing in the station config changes that
+  (PMF, auth threshold and power save left alone); the diagnostic build
+  below confirms or kills the hypothesis. What the station did next cost 3 s: the driver blacklists the
+  BSSID (libnet80211 `cnx_add_to_blacklist`), so after the backoff the
+  rescan saw the AP at once (its FT-PSK line came first), walked every
+  channel for 2.29 s and only then took it anyway ("no ap found, connect
+  to ap in blacklist") — and finished the handshake in 10–40 ms in 22 of
+  22 boots. Now the first 4-way timeout (15 / 204) of a failure streak is
+  retried at once, record or not, the config re-applied
+  (`wifi_set_config_process` calls `cnx_clear_blacklist` first thing; its
+  PMK cache, keyed by SSID + passphrase, should spare a second PBKDF2; a
+  failed re-apply stays pending for the next attempt), the hint kept: the
+  scan found the AP, the handshake is what failed. One per streak; a
+  second failure takes the old ladder without the hint; a wrong
+  passphrase costs one extra attempt per streak. `disconnected (reason
+  15), retry now — 4-way timeout after association: config re-applied,
+  channel 11 first (0 = 1..N)`. Expected on the 32 %
+  of hard resets that hit it: got-ip ~4.8 s (8.9 s); if the AP is still
+  not ready ~3 s after the comeback, ~0.6 s worse than before.
+- **`CONFIG_TINYLINK_WIFI_DIAG` (default n, out of the default image).**
+  Links the supplicant's EAPOL path through `-Wl,--wrap` (`wpa_sm_rx_eapol`,
+  `wpa_ether_send`, `eapol_txcb`, `esp_wifi_internal_issue_disconnect`):
+  every M1 / M3 handed to wpa.c with its replay counter, ANonce byte and
+  wpa.c's verdict, every M2 / M4 sent and whether the AP ACKed it, a
+  supplicant-raised disconnect, plus connect / disconnect (reason, RSSI) /
+  retry / got-ip — into a 64-entry ring on the Wi-Fi task, printed as
+  `wifi_diag: t=<ms> …` from the event handler at each disconnect and at
+  got-ip. `CONFIG_TINYLINK_WIFI_DIAG_SNIFF` adds promiscuous capture of
+  the frames addressed to the station until got-ip: auth / (re)assoc
+  response status, the AP's (protected) SA Query, deauth / disassoc
+  reasons, every unprotected EAPOL frame on the air (MAC retries
+  included) and protected data frames before our keys exist (a M1
+  encrypted with a stale key). Reading it: the AP ignoring our M2 shows as
+  `rx M1 rc=1…4` one second apart, each followed by `tx M2` and `txdone M2
+  … ok`, then `rx M3` (the 2-s boots) or `supplicant disconnect, reason
+  15` (the 3-s ones); a lost or late M1 as a first `rx M1` ~2 s after
+  `assoc -> run`, with the sniffer's `air M1` / `air protected data`
+  before it (dropped / stale key) or nothing (sent late).
+- **W3 — DHCP INIT-REBOOT (`CONFIG_LWIP_DHCP_RESTORE_LAST_IP`).** The
+  last bound address is re-requested (REQUEST / ACK) instead of DISCOVER /
+  OFFER / REQUEST / ACK, at boot and at every re-association (esp_netif
+  stops the client on each disconnect). Flash is written only on change:
+  esp_netif stores at each bind whose address differs from its last one
+  and `nvs_set_u32` skips an equal value (nvs_storage.cpp writeItem →
+  cmpItem; `nvs_commit` is a no-op). A NAK falls back to DISCOVER at once;
+  a server without our lease must stay silent (RFC 2131 §4.3.2), costing
+  the two REBOOTING tries (1 + 2 s). Nothing else in the client waits
+  (ARP / ACD checks already off since 1.3.1, no start delay). Expected
+  ~−60 ms of the 130-ms median. Makes `idf-patches/0001–0002`
+  load-bearing: on a stock v5.5.6 the WG netif's `netif_set_addr` reaches
+  `dhcp_ip_addr_store` with no DHCP data.
+- **W4 — PMK cache in RTC: rejected.** The driver derives the PMK at every
+  boot (WIFI_STORAGE_RAM keeps the credentials off `nvs.net80211`), on
+  the Wi-Fi task between the scan match and the auth frame: 4096 × 2
+  HMAC-SHA1 in software (fastpbkdf2 forces SW SHA on the ESP32), 32.98 M
+  instructions under QEMU `-icount` — at the CPI of the same build's
+  ChaCha20 (1.17) and X25519 (1.23) against the 1.3.3 on-chip bench,
+  **161–169 ms at 240 MHz**, i.e. the whole observed 140–170-ms gap. An
+  RTC copy only survives software / panic / WDT resets, of which the 68
+  boots had none (and those resets skip the comeback anyway); flash is
+  out. Not done but measured as the next step: deriving the PMK on CPU 1
+  from app start, in parallel with Wi-Fi init (~60 ms) and the hinted
+  scan, and handing the driver the 64-hex PSK — ~−100 ms on every boot,
+  at the cost of an IDF-internal `pbkdf2_sha1` call and the hex-PSK path.
+
+- **Review.** An independent review found four low items, two
+  demonstrated: with one SSID on one channel across several BSSIDs (a
+  mesh), every reconnect to another node was an NVS write (100 reconnects
+  → 100 writes for one hint change) — the record now holds the channel
+  only (blob v2, 6 B; the BSSID had no reader with `bssid_set` off); and
+  the immediate retry also fired with no record, against the header's
+  comment — kept (the blacklist and the backoff cost the same either way)
+  and documented. Also fixed: the hint reached NVS only from the telemetry
+  task, which starts once registered (now also from the register retry
+  loop), and a failed config re-apply dropped its blacklist clear. Each
+  is a suite test (`store/mesh-nodes-one-channel-one-write`,
+  `retry/no-record-immediate-too-1..N`,
+  `config/failed-reapply-stays-pending`).
+
+Expected on the hardware-reset series: got-ip ~1.8 / 3.8 / 4.8 s for the
+three handshake outcomes (3.05 / 5.05 / 8.88), mean ~3.6 s (5.8 s, −37 %);
+after a software restart (no comeback) ~0.7 s. What the series must
+show: `wifi hint: channel 11 first (NVS record)` from the second boot on,
+`init -> auth` ~0.55 s after reset (1.76 s), the immediate retry's `init
+-> auth` within ~50 ms of its `disconnected (reason 15)` line (~170 ms if
+the re-applied config cost a PBKDF2), and no `wifi hint: channel …
+stored` once the record is in NVS.
+
+#### Steady-state power (`feat/r137-power`)
+
+The sensor idles between a sample every 5 s, a rekey every ~111 s and
+the servers' keep-alives, under tickless idle + light sleep (DFS 240/80)
+and `MIN_MODEM`. There is no power meter on it, so the proxies are time
+in light sleep and light-sleep exits per second: this round adds a
+diagnostic that measures them, removes the telemetry task's surplus
+wakes, and prepares the knobs to A/B. Image 725 536 → **725 936 B
+(+400)**, IRAM and static DRAM ±0. Host suite 1 791 → **1 916 OK** (CI
+floor 1 916), ASan + UBSan clean, 0 warnings. `tinylink_tlm` static
+worst case 3 712 → 3 728 / 4 608 (also with the diagnostic on). Not
+yet on the sensor.
+
+- **Finding: under auto light sleep the RTOS tick runs 1.25–1.47 %
+  ahead of esp_timer.** Log time against the capture's wall clock:
+  22 189 s in 21 900 (1.3.5 soak), 21 897 in 21 600 (1.3.3), 15 920 in
+  15 689 (1.3.2); the 60-s stack diag lands every 60.75 s of log time.
+  `vApplicationSleep` (esp_pm/pm_impl.c) steps the tick count by the
+  whole ticks slept and then forces one more tick, every sleep. So log
+  timestamps overstate time by that much, tick-counted waits
+  (`vTaskDelay`, `SO_RCVTIMEO`, lwIP's timers, whose clock is the tick)
+  are that much shorter, and a tick-counted wait for an esp_timer
+  deadline ends ~1.3 % early. WireGuard, path and telemetry deadlines
+  are esp_timer and keep their length.
+- **Telemetry: one light-sleep exit per sample, was ~2.15.** Its 5-s
+  wait ended ~50–65 ms before the sample's esp_timer deadline (the
+  drift above, net of lwIP select's round-up), found nothing due and
+  slept again for the rest; the 60-s housekeeping and the 5-min STUN
+  re-probe each kept their own phase and paid the same twice.
+  `tlm_sched.h`: samples on a fixed grid (5.000 s apart; 5.01–5.02 s
+  before; a grid instant reached late — a STUN probe blocked through
+  it — is dropped rather than sent ms after the late one, the grid
+  starts at the first sample), a wake within 1/16 of the period (≤ 1 s)
+  of the sample's
+  instant is the sample's, a sample due just past the 5-s `/stats`
+  slice replaces it (a drift-shortened slice otherwise crept earlier
+  every period until one cost a wake), and the housekeeping and the
+  re-probe run at the last sample wake before they are due — ≤ one
+  period early, never late, the housekeeping still every 60 s on
+  average. Without sampling they keep their deadlines and take a wake
+  ≤ 1 s early. `tinylink_stun_reprobe_poll` gains the early window.
+  Replayed with the loop's code and lwIP's tick rounding:
+  **1 546–1 554 → 721 wakes per hour** at 1.25–1.47 % drift (789 → 720
+  without drift), −0.23 wakes/s. `test_tlm_sched` (61). The `/stats`
+  slice that bounds a GOT_IP re-probe can now stretch to 6 s.
+- **Wakeup audit, steady state** (estimates from the code and the soak
+  rhythm; the diagnostic below measures them), wakes/s 1.3.6 → 1.3.7:
+  Wi-Fi beacons under `MIN_MODEM` 9.8 at DTIM 1 / 3.3 at DTIM 3 (the
+  AP's setting) → same; lwIP's TCP timer, 250 ms while any TCP conn is
+  open — control and DERP always are — 4 → 4; lwIP's ARP + DHCP coarse
+  timers (both 1 s, started in the same tick and phase-locked; the
+  gratuitous ARP every 60 s runs inside) 1 → 1; telemetry 0.4 → 0.2;
+  housekeeping 0.033 → 0; STUN re-probe 0.007 → 0; `wg_rx`'s 5-s RX
+  cap ~0.1 → ~0.1 and the peer's passive keepalive ~0.1 → ~0.1 (both
+  needed: the cap bounds how late `wg_rx` sees a deadline `wg_tx` or the
+  long-poll moved, the keepalive is 1.3.6's path proof); control and
+  DERP server keep-alives + the 30-s poll after each ~0.07 → same;
+  rekeys ~0.027, call-me-maybe ~0.02, SNTP 1/h → same; `wg_tx` (rides
+  the sample; its 10-s WDT pace only fires without frames), the
+  firmware's esp_timers (`wifi_ps` stopped at `MIN_MODEM`,
+  `wifi_reconn` / `tlm_retry` unarmed), the task WDT (hardware) and the
+  FreeRTOS tick (suppressed while asleep) add none. Total ≈ 15.5 →
+  15.3 (DTIM 1) / 9.0 → 8.8 (DTIM 3): what is left is the AP's beacon
+  rate and lwIP's TCP timer, both A/B items below.
+- **`CONFIG_TINYLINK_POWER_DIAG` (default n,
+  `tools/power/sdkconfig.power-diag`).** Three lines after every 60-s
+  stack diag (the first dump only arms it): `pwr diag: dt=… sleep=…%
+  lslp=… rate=…/s tmr=… rtos=… early=… short=… tick_drift=±… ms` —
+  light-sleep residency and count, split by what ended each sleep, an
+  esp_timer alarm (in steady state the Wi-Fi driver's beacon timers;
+  the ESP32 has no Wi-Fi wake source) or a FreeRTOS timeout (tasks,
+  lwIP) — the hardware cause register says TIMER for both; `pwr diag:
+  slen ms<30/110/260/520/1100/5100/inf tmr=…/… rtos=…/…` (bins that
+  separate a DTIM-1 / DTIM-3 beacon, the 250-ms TCP and 1-s ARP timers,
+  the 5-s waits); `pwr diag: cpu busy=…% tiT=… wifi=… …` (run time per
+  task, % of one core, IDLE tasks left out). From IDF's light-sleep
+  callbacks (`CONFIG_PM_LIGHT_SLEEP_CALLBACKS`) and FreeRTOS run-time
+  stats, both selected. `esp_pm_dump_locks` / `esp_timer_dump`
+  (`PM_PROFILING`, `ESP_TIMER_PROFILING`) are not used: they print with
+  `%lld`, which the ROM's newlib-nano printf cannot format, and full
+  printf needs more stack on tasks with ~1 KB free (`wifi`). Cost:
+  +2 784 B image, +72 B IRAM, +1 128 B static DRAM, ~100 B heap. No
+  extra wake (it rides the 60-s dump); per sleep two 32-B callbacks
+  inside `vApplicationSleep` (one esp_timer list read; the PM subtracts
+  the enter callback's time from the sleep), one esp_timer read per
+  context switch, three log lines a minute. Run time is matched by task
+  number, not handle (a recreated `wg_rx` can reuse the address).
+  `test_pwr_diag` (64).
+- **A/B fragments, prepared, not decided (`tools/power/`, stack after
+  `sdkconfig.power-diag`).** Sizes against the default image:
+  `ab-wifi-active20` (`ESP_WIFI_SLP_DEFAULT_MIN_ACTIVE_TIME` 50 → 20 ms:
+  the radio stays in RX that long after every frame; ~0.36 frames/s ×
+  50 ms ≈ 1.8 % RX duty at 95–112 mA today; a later reply waits at the
+  AP ≤ one DTIM; ±0 B) — likely the largest; `ab-maxmodem-li3`
+  (`MAX_MODEM`, listen interval 3, new Kconfig: a third of the beacon
+  wakes on a DTIM-1 AP, ≤ ~307 ms more inbound latency, broadcast at
+  skipped DTIMs lost — covered by the 60-s gratuitous ARP; the interval
+  goes into the association request; ±0 B); `ab-tcp-tmr500` (TCP timer
+  500 ms, −2 wakes/s; delayed ACK ≤ 500 ms, initial RTO set to 1–2 s
+  from 1.0–1.5 s; boot-series A/B needed; ±0 B); `ab-pm-iram`
+  (`PM_SLP_IRAM_OPT` + `PM_RTOS_IDLE_OPT`, ~330 µs less awake per sleep
+  per the Kconfig help; they select no Wi-Fi option —
+  `ESP_WIFI_SLP_IRAM_OPT`, the one that broke association here, selects
+  them, not the reverse; +464 B image, **+5 176 B IRAM** (40 869 free),
+  +1 008 B static DRAM); `ab-cpu160` (160 MHz boot and DFS max:
+  `configure_pm` now takes `CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ`; 80 and 160
+  share the 320-MHz PLL, so DFS steps stop retuning it; CPU-bound work
+  ×1.5 — X25519 ~13 → ~20 ms, AEAD ~390 → ~590 µs per MTU; ±0 B);
+  `ab-idle2` (light sleep from 2 idle ticks; ±0 B); `ab-txpower13`
+  (13 dBm cap; the radio transmits < 0.1 % of the time, so it moves the
+  TX peak, not the average — the module's table has 379 mA peak for 11b
+  at 19.5 dBm, 258 mA for MCS7 at 13 dBm; ±0 B).
+- Rejected: `LWIP_DHCP_COARSE_TIMER_SECS` 1 → 10 (shares ARP's wake: 0
+  saved, T0 ±9 s); longer control / DERP polls (−0.017/s against the
+  60-s WDT margin); a longer `wg_rx` cap (needs a wake path into a
+  `recvfrom`-blocked task, e.g. eventfd + `select`, on the data plane
+  under soak) and drift compensation in `wg_recv_timeout_ms` (one extra
+  ~50-ms wake per RX deadline, ~0.009/s); gratuitous ARP off (keeps the
+  router's entry fresh, inside ARP's own wake);
+  `PM_LIGHTSLEEP_RTC_OSC_CAL_INTERVAL` > 1 (10 RC cycles ≈ 67 µs per
+  sleep against RC drift); the per-sample log line at DEBUG (soak greps).
+- **Review.** An independent review (and a 20 000-case randomised
+  replay of the loop: periods 0.5–600 s, 0–3 % drift, 100 / 1 000 Hz,
+  kicks, STUN blocks to 24 s) found no spin, WDT or lateness path; fixed:
+  a sample reached late was followed by the next one 10–72 ms later, the
+  grid started at boot (a 600-s period's second sample came 560 s after
+  the first), a recreated task could read as a counter wrap in the cpu
+  line, a half-registered callback pair blocked arming for good, two
+  "≤ 5 s" comments. Left: the stack-diag snapshot shared with the
+  wedge-restart dump (pre-existing; only the dump before `esp_restart`).
+
+#### Boot control path (`feat/r137-boot`)
+
+got-ip → WG session up on the 1.3.6 boots: control conn up 0.42–0.66 s
+(TCP + Noise IK on :80), register, then the endpoint push and the
+streaming MapRequest as two more serial round trips, netmap → first
+INIT 50 ms, with 14 X25519 (~12.5 ms each at 240 MHz, 1.3.3 bench) on
+that path and the DERP login (TLS full handshake 1.45–1.76 s, 3.3 and
+4.2 s outliers) running beside it. Image 725 536 → **730 128 B
+(+4 592)**; static DRAM 57 644 → 58 060 B (+416), IRAM ±0. Host suite
+1 791 → **1 912 OK** (CI floor 1 912), ASan + UBSan clean, 0 warnings.
+Static worst cases (`tools/stack_worst.py`, fixed below): `tinylink_lp`
+5 136 → 5 168 / 7 168, `main` 5 312 → 5 424 / 8 192, `tinylink_derp`
+5 152 → 5 248 / 8 192, `wg_rx` 5 648 → 5 728 / 8 192, the rest
+unchanged. X25519 in a boot up to the first CallMeMaybe (4 peers, 3
+endpoints each, one CMM): 33 → **18**; on the got-ip → session-up
+path 14 → **7**. Expected got-ip → netmap −0.26–0.29 s, → first INIT
+−0.27–0.30 s; session up gains the same unless the DERP login comes
+later (half the projected boots: then the login bounds it). Not yet on
+the sensor.
+
+- **B1 — the endpoint push rides with the map stream.** The push
+  (Stream=false + OmitPeers=true lite update: at capver ≥ 68 a
+  Stream=true MapRequest is read-only, headscale's
+  handleEndpointUpdate takes the same path) took 0.18–0.21 s on the
+  1.3.6 boots before the stream request even left. It now goes as a
+  second HTTP/2 stream in the same burst as the map stream, on the
+  lower ID — upstream's updateRoutine runs its lite updates beside the
+  poll the same way; the server sees the same two requests in the same
+  order. `h2c_request_pair` (`h2_core.c`): a side stream parsed and
+  checked like the main one (status, content-length, windows,
+  RST_STREAM, GOAWAY) but kept off the `h2_io_on_*` hooks; it goes
+  whole or not at all (a small window falls back to push-then-stream).
+  The conn is under the push's one-shot deadline until the map stream
+  answers; a push unanswered when the stream ends goes again with the
+  next connect's stream (refusals and late answers: Review below).
+  `tinylink_dataplane_start` no longer touches the wire. Log:
+  `endpoint push: HTTP 200 (with the map stream)`. Tests: `test_h2_core`
+  +31, `test_h2_interop` +12 (nghttp2's server: answered first /
+  mid-stream / never, RST, 429, the deadline and its doubling).
+  **Off by default after the hardware runs** (`CONFIG_TINYLINK_CONTROL_PUSH_PIPELINE`,
+  default n): against tailscale.com the map stream of both such boot
+  connections was later ended cleanly by the server (h2 END_STREAM at
+  229 s and 645 s; with the push first a clean end came once in ~30
+  boot connections of 1.3.5–1.3.6 and twice mid-soak on 1.2.0), and the
+  next poll got no answer for 120 s, the one after it its netmap 26–55 s
+  late (~1.3 s normally; 59–112 s after the earlier clean ends too). A host probe of the
+  reconnect (`h2_client` / `h2_core` / `ts2021_client` against nghttp2,
+  55 checks) found no client fault, so the server is reacting to the
+  pair; the push goes first again and the stream after it on the same
+  connection (the sequential path above), −0.2 s of the boot given back.
+- **B2 — Noise DH while Wi-Fi associates.** `tinylink_preload` (main.c,
+  between `app_wifi_start` and `app_wifi_wait_connected`: RF on, so
+  `esp_fill_random` is a TRNG) derives the three public keys (3 X25519,
+  ~40 ms after got-ip before) and, with a pinned control key, runs
+  `ts2021_precompute`: ss for the boot and one ephemeral + es for the
+  first handshake (`noise_ik_precompute`, `noise_ik_write_msg1_pre`;
+  same msg1 bytes). Expected −~75 ms got-ip → control conn up; every
+  later control connect −1 X25519 (ss kept, keyed by both public keys,
+  scrubbed on change; the ephemeral used once, scrubbed when taken).
+  Log: `sent init in X-Tailscale-Handshake (101 bytes, DH ahead: ss +
+  e)`. Tests: `test_noise_ik` +10, `test_ts2021` +6.
+- **B2 — the first INIT before the DISCO box key.** `wg_netif_start`
+  computed the peer's DISCO K (1 X25519) ahead of the INIT; now after
+  it, before wg_rx exists. netmap → `handshake init sent` 50 → ~37 ms.
+- **B2 — DERP box key once.** The login sealed ClientInfo and opened
+  ServerInfo with K derived twice from the same keys: once now
+  (`derp_login_key`), kept for a reconnect to the same server key
+  (none then), scrubbed on change, low-order key or a ServerInfo that
+  does not open. −12.5 ms per boot login, −25 ms per reconnect. Log:
+  `DERP login OK: server version=2 (box key new|reused)`. Tests:
+  `test_derp` +12.
+- **B2 — relayed DISCO gated before any X25519; one K per peer.**
+  Relayed DISCO was opened with our private key, then checked against
+  the active peer's DiscoKey: one X25519 per frame from any DERP client
+  that knows our NodeKey, two for a PING. The sender key is read off
+  the cleartext header first (`disco_gate`); the peer's frames use the
+  K wg_netif caches. A CallMeMaybe cost 2 + n X25519 (~60 ms of the
+  DERP task; 59 in 30 min of the 1.3.6 soak), now none; the netmap
+  prepunch 12 → 3 (one per peer, none for the active one, ~110 ms of
+  the long-poll task after the first netmap). K copies scrubbed after
+  use. Tests: `test_disco_handler` +11.
+- **B3 — the first INIT waits for the DERP login in flight (≤ 1 s).**
+  An INIT that reaches the peer before our DERP login is answered via
+  DERP into a relay not up yet, and the copy re-queued at the login is
+  the same INIT, a TAI64N replay: 1.3.5 boots with the login ≥ 0.21 s
+  after the INIT came up 1.2–2.2 s after the netmap (8 of 21; two far
+  later), the others 0.16–0.54 s but one. 1.3.6 had the login first by
+  40–390 ms, a margin the earlier netmap eats in two of six boots. The
+  first netmap now waits (static event group) for the outcome of the
+  supervisor's first connect attempt; a failed attempt, later netmaps
+  and reconnects never wait. Log: `first INIT waited N ms for the DERP
+  login`.
+- **B3 — analysed, not changed.** TLS session tickets: esp-tls v5.5.6
+  stores the session after the handshake and offers it on the next
+  connect (`tls_resume.c`, `test_tls_resume`); on the sensor a DERP
+  reconnect in the 1.3.6 soak resumed in 157 ms against 1.45–1.76 s for
+  a full handshake. Control uses :80 at boot (no TLS). The DERP full
+  handshake is the boot's next critical item: derp16b's chain is an
+  ECDSA P-256 leaf under three P-384 signatures (YE2, Root YE, ISRG
+  Root X2) plus the P-256 ServerKeyExchange, all software ECC. Options left for a later round, each with a cost:
+  mbedTLS ECC speed options (image / DRAM), a pinned intermediate
+  (needs a security review), a session kept across reboots in RTC RAM.
+- **`tools/stack_worst.py`: entries sharing a prefix.** Two variant
+  entries with the same prefix shared one node and the second replaced
+  the first's target: the long-poll's one-shot variant analysed only
+  the push. 1.3.6's `tinylink_lp` worst case is 5 136 B (the register's
+  reconnect), not 4 960. Rule for the push callback added.
+- **Review.** An independent review found one demonstrated defect and
+  three suspected ones in B1, all fixed. A server advertising
+  SETTINGS_MAX_CONCURRENT_STREAMS 1 got two streams and refused the map
+  stream on every reconnect, so it never ran; the engine now records
+  the limit and a pair under 2 sends nothing (`H2C_ERR_STREAMS`) and
+  takes the push-then-stream fallback on the same conn — a limit learned
+  after a burst is remembered until a reboot. The push's 10-s deadline
+  also covered the map stream, so a push answered late (52 s once on
+  the sensor) dropped a working conn after the netmap; from the
+  stream's final response on, the conn has the stream's budget and a
+  push past its deadline is cancelled (RST_STREAM CANCEL, the next
+  deadline doubled) while the stream goes on. A push throttled or reset
+  mid-stream waited for the stream's end, Retry-After ignored; it now
+  gets one stream recycle after max(the server's wait from the push's
+  own Retry-After, 30 s) per failure streak. The pair's rollback
+  reported "session intact" after a failed send of its control frames.
+  The review's demo is a host test; test_h2_core +16, test_h2_interop
+  +10. Image +1 488 B, static DRAM +16 B. A second pass found the
+  cancel too eager: a push whose final 200 was in (body pending) was
+  cancelled and doubled the next deadline, and one whose answer already
+  sat received but unread behind a long stream callback was cancelled
+  as unanswered — a needless recycle and a second push; now only a push
+  without its final response, with nothing left to read
+  (`ts2021_rx_ready`), is cancelled, and a push refused by a GOAWAY
+  goes with the reconnect instead of after 30 s. Its tests (test_h2_core
+  +9, test_h2_interop +4) fail without the fixes; image +400 B.
+
+#### Hardware (deployed sensor, app partition only; the 1.3.6 `ota_0` + `otadata` read back to `~/tinylink-backups/` first)
+
+Backup valid (1.3.6 `gf7d95e1`, image checksum and hash OK; otadata seq
+1, CRC OK). Images: `078ebae` with `CONFIG_TINYLINK_WIFI_DIAG` (series),
+`078ebae` + `CONFIG_TINYLINK_POWER_DIAG` and the A/B fragments (power),
+`bef0eb5` and `694876a` (soaks).
+
+- **Smoke + 10 × 2 min, EAPOL diagnostic on (all hardware resets):**
+  register without Auth 10 / 10, 0 E lines, 0 crashes, heap ~157.1 KB.
+  `wifi hint: channel 11 first (NVS record)` from the second boot on:
+  `init -> auth` at 0.56–0.65 s (1.77 s). Every boot still had the PMF
+  comeback (+1.13 s), and the diagnostic showed what follows it: the AP
+  re-sends M1 at 1-s intervals and ignores our first M2s (each one
+  ACKed at the MAC layer), then sends M3 after the third M2 (5 boots,
+  got-ip 3.73–3.76 s) or a fourth M1 that makes the supplicant give up
+  (reason 15; 5 boots) — the immediate retry was associated and
+  through the 4-way handshake 30–60 ms later (got-ip 4.79–4.92 s, ~8.9
+  s on 1.3.6). AP behaviour, not ours; software restarts deauth first
+  and never see it. Got-ip → WG up 1.9–2.4 s (one boot 4.35 s: the peer
+  answered the second INIT). **Reset → WG up median 7.1 s (5.70–8.11),
+  1.3.6 9.3 s (7.3–11.1).**
+- **Power A/B** (`CONFIG_TINYLINK_POWER_DIAG`, 8 min per variant, first
+  interval dropped; light sleep % of the time): 1.3.7 as built 81.4 %
+  (10.5 light-sleep exits / s, CPU busy 1.8 %, of it the Wi-Fi task
+  1.45 %); **MAX_MODEM at listen interval 3: 89.8 %** (6.6 / s, Wi-Fi
+  task 0.59 %); **2 idle ticks before sleep: 84.7 %**; 20-ms Wi-Fi
+  minimum active time 83.7 %; 500-ms TCP timer 83.3 %; 160 MHz 83.0 %
+  (CPU busy up); PM_SLP_IRAM_OPT + RTOS_IDLE_OPT 81.3 % (+5 KB IRAM).
+  The first two became the defaults (`bef0eb5`), the rest were not
+  taken (within the run-to-run spread of ~1 %, or a cost).
+- **Endpoint-push pipelining (B1) on tailscale.com:** both boot
+  connections that carried the push beside the map stream (the A/B run
+  and the first soak, `bef0eb5`) had the map stream ended cleanly by the
+  server (229 s, 645 s); the next poll got no answer for 120 s and the
+  one after it its netmap 26–55 s late. A host probe of the reconnect
+  found no client fault; B1 went behind
+  `CONFIG_TINYLINK_CONTROL_PUSH_PIPELINE` (default n, `694876a`). Clean
+  ends with the push first are rare (once in ~30 boot connections of
+  1.3.5–1.3.6, twice mid-soak on 1.2.0), each followed by a slow poll
+  too — round 1.3.8 looks at that.
+- **Soak (`694876a`, 152 min, cut to flash 1.3.8):** 0 resets / panics
+  / WDT / brown-outs, 0 E lines, **0 long-poll stream ends**; first boot
+  got-ip 1.75 s and WG up 4.1 s after reset (no comeback: the previous
+  boot had ended cleanly); 80 rekeys (4 needed a retry); path selection
+  6 doubts, all settled by the peer's WireGuard, 0 undelivered / dead,
+  0 roams; one RX-stale with the direct path answering DISCO and the
+  peer's WireGuard silent on both paths (the 1.3.5–1.3.6 pattern; the
+  rekey ended it in ~60 ms — round 1.3.8's doubt handshake targets it).
+  heap_free min **157 412 B**, largest block 110 592 B; stack lows (B
+  free) `tinylink_lp` 4 308 of 7 168, `tinylink_derp` 4 592 of 8 192,
+  `wg_rx` 4 084 of 8 192, `wg_tx` 2 852 of 5 120, `tinylink_tlm` 2 620
+  of 4 608, `esp_timer` 3 032 of 4 608.
+
+### Optimization round 1.3.6 — data-plane path selection (in progress, branch `feat/opt-1.3.6`)
+
+What the 1.3.5 hardware runs showed about the direct path: any
+authenticated datagram on the UDP socket "confirmed" it and stopped the
+DERP copies, though a peer→us packet proves nothing about our sends;
+the failover to DERP waited for the 30-s RX-stale watchdog (42 RX-stale
+events in 47 min while the collector sat behind a worse WAN link, ~30 s
+of telemetry each); and with the peer's two working endpoints on one
+address the sensor roamed on every pong (41 roams in 2 h; one such
+double roam was followed by a 30-s WireGuard blackout). Image 716 688 →
+**725 536 B (+8 848)**; static DRAM 57 412 → 57 644 B (+232), IRAM ±0,
+~1.9 KB more heap in use (the re-send ring). Host suite 1 592 → **1 791 OK** (CI
+floor 1 791), ASan + UBSan clean, 0 warnings. Static worst cases: `wg_rx`
+5 648 / 8 192, `wg_tx` 3 440 / 5 120, `tinylink_tlm` 3 712 / 4 608,
+`tinylink_derp` 5 152 / 8 192. Hardware section at the end of this entry.
+
+- **Path selection by proof (`wg_path.h`).** Direct-only only after a
+  pong to our own ping, kept by the peer's passive keepalives (it
+  answers data it received within KEEPALIVE_TIMEOUT 10 s; 12-s window);
+  a lapse sends direct + DERP with one ping; no pong in 5 s → DERP only,
+  endpoints re-probed 10 → 60 s. Passive evidence instead of upstream's
+  3-s heartbeat + 6.5-s trust (~40 packets a minute): no extra packets
+  in steady state, the failover lands ~12–27 s after a break instead of
+  30 s + the rekey. Above a ~22-s telemetry period (Kconfig allows 600 s)
+  every sample goes direct + DERP with one ping / pong, as upstream's
+  trust expiry does; the default 5-s period is unaffected.
+- **A lapse answered by DISCO but not by WireGuard is a doubt**, still
+  sent both ways, until any WireGuard packet from the peer: one lost
+  keepalive or frame costs a few frames sent both ways and no rekey (0
+  forced rekeys per simulated 6 h at 0.5–2 % loss). Two silent windows →
+  DERP only + make-before-break rekey (24–29 s after the first
+  unanswered frame — no faster than the RX-stale rekey; going under
+  ~16 s without false rekeys needs an in-tunnel probe such as a TSMP
+  ping, not done); WireGuard answering only our DERP copies twice
+  ("undelivered") → DERP only without a rekey, direct re-tests backed
+  off to one a minute (a simulated hour with our direct WireGuard
+  dropped: 0 rekeys, 134 pings). A keepalive proves the direct path only
+  if no frame went via DERP in the 12 s before it.
+- **A confirmed lapse re-sends via DERP the direct-only frames of the
+  last 40 s (≤ 8, `wg_rescue.h`)**, including those whose DERP copy was
+  refused; kept while DERP is down and re-queued at the next login. The
+  peer's replay window drops the copies it already has. 0 frames lost
+  in 200 simulated breaks (3–5 per break on 1.3.5).
+- **No endpoint flapping.** A valid endpoint moves only for a clearly
+  better pong of the same round (upstream's betterAddr scoring, > 15
+  points and ≥ 25 ms, +20 for private addresses); WireGuard packets from
+  another source don't roam it.
+- **Handshake re-sends:** a pong refreshes a pending INIT only when it
+  changed the path and the INIT is ≥ 2.5 s old (was 1 s); a late answer
+  to a replaced INIT is logged once and dropped (keeping the old
+  initiation's keys was rejected: wireguard-go drops the first session
+  when the second INIT lands). The DISCO prober hands back a matched
+  ping's send time, so pongs carry an RTT.
+- One log line per path transition (`direct path unconfirmed …`,
+  `… re-confirmed (pong …)`, doubt / silent / undelivered / dead);
+  `/stats` gains `wg.path` and `wg.lapses` (893 of 896 B worst case).
+- **Review.** An independent review of the first cut found three real
+  defects, each demonstrated: one lost packet on a healthy path was
+  taken as WireGuard silence (forced rekey + DERP only + probe round +
+  8 duplicate re-sends; 9 / 21 / 47 rekeys per 6 h at 0.5 / 1 / 2 %
+  loss), `wg_rx` spun at the tick rate after a late wake in DERP-only
+  mode, and the one-rekey-per-streak rule could be reset by a keepalive
+  answering our DERP copies (120 rekeys / h with WireGuard us→peer
+  dropped on direct only); plus two pings per endpoint change and
+  re-send frames lost while DERP was down. All fixed; each demo is now a
+  host test that fails on the first cut, and a deadline fuzzer (597 055
+  ticks up to 500 ms late, every mode) never saw a deadline at or before
+  `now`. A second pass found no stuck or black-hole state. Known gap:
+  with only our direct WireGuard toward the peer blocked, the first
+  episode loses 3–6 frames older than the 40-s re-send window (later
+  episodes lose none).
+
+#### Hardware (deployed sensor, app partition only; the 1.3.5 `ota_0` + `otadata` read back to `~/tinylink-backups/` first)
+
+Backup byte-identical to the flashed 1.3.5 (`b497bde`), otadata seq 1 /
+CRC OK; flashed `827c1b9` (reports `gf7d95e1`, the pre-rewrite hash).
+
+- **Smoke (180 s) + 5 × 2 min:** register without Auth 6 / 6, 0 E lines,
+  0 crashes; WG up 1.94–2.41 s after got-ip (4.14 s once, the netmap
+  3.7 s after the request, server side); heap 159 064 B free, largest
+  block 110 592 B.
+- **Soak (`827c1b9`, 211 min; a 28-min first run ended when the capture
+  host rebooted, the second was cut to flash 1.3.7):** 0 resets /
+  panics / WDT / brown-outs; 112 rekeys (16 needed a REKEY_TIMEOUT
+  retry), 2 486 telemetry packets. Path selection: 30 lapses of the
+  direct path — 25 doubts settled by the peer's own WireGuard 1.3–13.1 s
+  later (no rekey), 2 "undelivered" (DERP only, direct re-confirmed by a
+  pong 23–33 s later), 3 "dead" (no pong in 5 s → DERP only,
+  re-confirmed 5.1–45.5 s later); 33 direct-only frames re-sent via
+  DERP; **1 endpoint roam** (the peer's restart; 149 in 6 h on 1.3.5).
+  **3 RX-stale:** two with the direct path answering DISCO and nothing
+  from the peer's WireGuard on either path (`seen direct=0 derp=0`),
+  over within ~130 ms of the forced rekey's INIT (in the second a packet
+  under the old keys arrived 30 ms after the INIT, before its response)
+  — the 1.3.5 soak's post-rekey silences, which path selection cannot
+  see; the third the peer's
+  nightly restart at 02:00 (DERP `peer-gone`, the peer back with a new
+  DiscoKey 48 s later, session up 6.3 s after that, on the 5-s INIT
+  retry). One WAN event at 00:12: the DERP server's stream ended (TLS
+  read error) and the reconnect **resumed the TLS session in 157 ms** —
+  the first resumption seen on the sensor (full handshakes 1.45–4.19 s);
+  the control stream went silent for 120 s and reconnected; heap dipped
+  to 142 540 B for that minute, 158.9 KB otherwise, largest block
+  110 592 B throughout. Stack lows (B free): `tinylink_lp` 4 412 of
+  7 168, `tinylink_derp` 4 616 of 8 192, `wg_rx` 3 980 of 8 192, `wg_tx`
+  2 780 of 5 120, `tinylink_tlm` 2 628 of 4 608, `esp_timer` 3 024 of
+  4 608.
+
+### Optimization round 1.3.5 — boot and reconnect latency (in progress, branch `feat/opt-1.3.5`)
+
+The rest of round D's latency items (D9, D10, a D11 slice), built in three
+parallel branches — control transport (`feat/r135-ctl`), bringup order
+(`feat/r135-boot`) and DNS (`feat/r135-dns`, added after the first
+hardware series) — on top of 1.3.4. The 1.3.4 boot spent got-ip → WG
+session up 6.7 s in the smoke and 6.0–20.3 s over the 10-boot series: a
+serial STUN probe (0.04–7.09 s), the control TLS handshake (2.4–3 s), a
+DERP connect that waited for the netmap, and DNS answers lost in 12 of
+30 boots. Image 707 088 → **716 688 B (+9 600)**; static DRAM 57 140 →
+57 412 B (+272), IRAM ±0. Host suite 1 330 → **1 592 OK** (CI floor
+1 592), ASan + UBSan clean, 0 warnings. `tools/stack_worst.py` static
+worst cases: `main` 5 312 / 8 192, `tinylink_lp` 4 960 / 7 168,
+`tinylink_derp` 5 136 / 8 192, `tinylink_stun` (new) 3 648 / 5 120.
+Hardware section at the end of this entry.
+
+#### Control transport (`feat/r135-ctl`)
+
+- **D10a — ts2021 over plain HTTP :80, TLS :443 as the fallback.** As
+  upstream `controlhttp`: `POST /ts2021` to `controlplane:80` first,
+  since Noise IK authenticates the server by its pinned key, and TLS
+  :443 inside the same connect on any :80 failure (refused, the 3-s
+  connect / answer budget, a reverse-proxy redirect, a fake 101, a
+  forged or other-key msg2, an error frame); a :80 failure that :443
+  then gets past keeps the rest of the boot on :443 (RAM). Only with a
+  key pinned before the boot (NVS pin or compile-in fallback; a TOFU
+  boot and `/key` stay on TLS), the default control port 443 and
+  `CONFIG_TINYLINK_CONTROL_PLAIN_HTTP` (new, default y). A key rotation
+  fails both ports as it failed :443 before (no re-fetch); a :80 conn
+  that fails within 120 s of its handshake sends the next dial to :443
+  (upstream's tailscale#13597 workaround). The connection is not up
+  until the first transport record (the EarlyPayload) has been
+  decrypted with the handshake's keys. One line per connect:
+  `control conn up on :80 (plain HTTP, Noise IK) in N ms`. From a
+  desktop the whole :80 connect + Noise took 340–380 ms against
+  tailscale.com (the firmware's `ts2021_client.c`, a throwaway machine
+  key). `tls_io_sock_read/_write`: the esp_tls read/write contract over
+  a plain socket. Tests: `test_ts2021` +50 (`d10_*`), `test_tls_io` +16.
+- **D9 — TLS 1.2 session resumption (control :443, DERP).**
+  `CONFIG_MBEDTLS_CLIENT_SSL_SESSION_TICKETS` /
+  `CONFIG_ESP_TLS_CLIENT_SESSION_TICKETS` on (off since 2026-05; the
+  sdkconfig.defaults history rewritten for ~159 KB free / 110 KB
+  largest block). `tls_resume.c`: one session per server, RAM only,
+  never offered to another host:port, dropped after a failed connect
+  and 24 h after its full handshake. A resumed reconnect skips chain
+  verify + ECDHE; a rejected ticket is a full, verified handshake. Both
+  servers resume TLS 1.2 tickets (openssl, mbedTLS 3.6.7 `ssl_client2`,
+  2026-10-29); controlplane's ticket keys are per address (8 A records,
+  TTL 60 s — resumed 3/3 on the issuing address, 0/7 on the others),
+  derp16b resumed 5/5, still after 300 s. Logs: `(TLS, session resumed
+  | full handshake)`, `derp_client: TLS up to … (resumed | full
+  handshake, N ms)`. `test_tls_resume` (19). The soak re-tests the
+  2026-05 DYNAMIC_BUFFER + tickets suspicion.
+
+#### Bringup order (`feat/r135-boot`)
+
+- **D11 slice — STUN probe off the boot critical path.** The boot probe
+  ran on the main task ahead of the register (got-ip → "public
+  endpoint" 0.04–7.09 s over the 1.3.4 series). `tinylink_stun_probe_start()`
+  now runs it on a short-lived `tinylink_stun` task (5 KiB, IDLE+2)
+  while the register runs; `tinylink_dataplane_start` waits ≤ 300 ms
+  for it. A later probe is abandoned and the push goes without an
+  endpoint (the old failure outcome); the re-probe runs once wg_rx
+  exists and pushes the endpoint through the async path (one
+  control-stream recycle after the first netmap). A failed probe now
+  does the same instead of waiting 5 min. Until wg_rx exists the probe
+  reads the WG socket itself, blocking only in `select()` and reading
+  `MSG_DONTWAIT` under a mutex the give-up also takes (`stun_boot.h`):
+  after the give-up it never reads or publishes. The request is
+  retransmitted at 500 / 1 500 ms inside the 3-s budget (was one send);
+  an early re-probe request waits for wg_rx instead of reading the
+  socket itself. `stun_match_v4()` is shared by both probes. Tests:
+  `test_stun_boot` (every probe / waiter interleaving), `stun_match_v4`
+  vectors.
+- **D10 slice — DERP connects at boot.** The supervisor waited for the
+  first netmap before its TLS connect; its login landed ~1.8 s after
+  the netmap, so the first WG INIT had no relay and the session came up
+  on attempt 2, ~1.9 s after the netmap, every boot. It now connects
+  alongside the register, so the first INIT's DERP copy (B7) is
+  answered. The wait's 2026-05 reasons are gone (~11 KiB free then,
+  ~159 KB / 110 KB largest now; PreferredDERP is compiled in and the
+  Kconfig host is the netmap's node of it; a different node still moves
+  the supervisor at the next DERP frame). Before the first netmap,
+  relayed DISCO is dropped unopened; `wg_netif_start` writes the peer
+  config under `g.lock`. `tinylink_wait_dataplane_ms` removed.
+
+#### DNS and request deadlines (`feat/r135-dns`)
+
+- **DNS off the boot path — servers at their last-known address.** The
+  sensor's lookups lost answers in 12 of 30 boots (lwIP resends after
+  1, 2, 4, 7 s), on the control, DERP and STUN names. The DERP map's
+  node `IPv4` / `STUNPort` are parsed (`tl_derp_node_t`); the home node
+  and the last good control address are kept in NVS `tl_state`
+  (`derp_node`, `ctl_addr`; `tl_addr.h`, written on change only, from
+  the 60-s housekeeping). The DERP supervisor dials the node's address
+  and the boot / re-probe STUN goes to its STUN service (UDP 3478) —
+  `CONFIG_TINYLINK_STUN_HOST` stays the fallback; the control connect
+  dials its last address first, for 10 min after the boot or the
+  by-name conn that reached it. The server is authenticated as by name
+  (Noise IK on :80; on :443 / DERP the chain against the host name via
+  esp-tls `common_name` → SNI + hostname check; TLS sessions keyed by
+  name); any failure at the address — 3 s per step up to Noise msg2 /
+  the DERP login — is retried by name in the same connect, never turns
+  :80 off, and a conn there that fails within 120 s sends the next dial
+  to the name. Logs: `address cache: …`, `stun probe: home DERP node at
+  a.b.c.d:3478 (no DNS)`, `control conn up on :80 (…) at a.b.c.d
+  (cached | resolved)`, `TLS up to <host>:443 at a.b.c.d`. Tests:
+  `test_addr` (48), `test_ts2021` +44 (`dns_*`), `test_mapresp` +19,
+  `test_tls_io` +3.
+- **One-shot control requests get a deadline.** Register and the
+  endpoint push had the stream's 4 × 30-s budget — one sensor boot sat
+  52 s in a push. Now 10 s in 2-s polls (`TS2021_REQ_TIMEOUT_MS`), one W
+  line `control request: no answer within N ms — dropping the conn`, an
+  io failure (a :80 conn → next dial on :443); doubled after each expiry
+  up to 120 s and reset by an answer, so a slow control plane is waited
+  out. The map stream is not under it. A boot push that got no answer
+  is retried by the long-poll before the stream. A requested recycle
+  logs one I line (no E from h2 / mapreq / register). Tests:
+  `test_ts2021` `deadline_*`, `test_h2_interop` +4.
+- SNTP stays at got-ip: lwIP already delays its start 0–5 s at random,
+  and a later start would leave the boot TLS handshakes date-unchecked.
+
+#### Fixes
+
+- **HTTP/2: a 1xx's Retry-After no longer carries over to the final
+  response** (`h2_io_on_status` clears it with each `:status`). Found by
+  an independent review of the in-tree client against Go's x/net/http2
+  server (`ServeConn` with `-tags http2legacy`, net/http h2c, python-h2;
+  ~1.6 GB through Go with random Noise record cuts, 80 000 real Go HPACK
+  blocks at random splits, ~29 M libFuzzer runs under ASan + UBSan — no
+  other defect that Go or headscale can trigger). `test_h2_interop`'s
+  103 now carries a Retry-After.
+- `tools/stack_worst.py`: `esp_timer` budget 6 144 → 4 608 (B18's
+  value), derp 10 → 8 KiB, wg_tx 7 → 5 KiB in its task table.
+
+#### Hardware (deployed sensor, app partition only; `ota_0` + `otadata` read back to `~/tinylink-backups/` before each flash)
+
+Two images: `9a54b88` (ctl + boot branches) and `b497bde` (+ DNS);
+(hashes after the pre-push history rewrite that took the peer's public
+address out of a `test_mapresp.c` fixture — the flashed images still
+report the old ones: 1.3.4 `g26b589d` = `2c22a8b`, 1.3.5 `g817c484` =
+`9a54b88`, `g6dc9d83` = `b497bde`, 1.3.6 `gf7d95e1` = `827c1b9`);
+each backup byte-identical to the image it replaced, otadata seq 1 /
+CRC OK. Times below are from got-ip (the AP's association after a
+serial reset took 3–9 s and is not ours).
+
+- **`9a54b88` smoke + 10 × 5 min:** register without Auth 10 / 10;
+  control conn on :80 in 440–590 ms (1.57 s behind a DNS retry), register
+  0.66–1.94 s (1.3.4 series 2.62–11.49 s, median 4.7); with DNS
+  answering at once WG up **2.04 s** (1.3.4 median 8.7 s). It also
+  showed what was left: DNS answers lost on the now-parallel lookups
+  (STUN abandoned once, DERP TLS 1.8–6.4 s), one endpoint push that sat
+  52 s on the control conn (→ the request deadline), and three ~3.5-s
+  stalls on both TCP conns at once right after association (the AP; in
+  1.3.4 the netmap showed the same +1 / +3 s steps). Two boot-connection
+  FINs: one on :80 at 230 s → reconnect on :80 in 1.8 s (3.3 s over TLS
+  on 1.3.4); one at 27 s → the "< 120 s" rule sent the next dial to
+  :443 (TLS, 2.35 s), as designed. From ~15:07 to ~16:12 the peer
+  answered from another public address (a different WAN link on its
+  side): DERP `peer-gone`, unanswered handshakes, direct paths dying —
+  the RX-drop counters showed `seen direct=0 derp=0` every time, nothing
+  dropped on the sensor; it recovered by itself each time.
+- **`b497bde` (+ DNS), first boot (nothing stored):** everything by
+  name; `address cache: … stored` once at 64 s. Warm boots: STUN to the
+  home DERP node (`stun probe: home DERP node at …:3478 (no DNS)`),
+  control and DERP at the stored addresses. **10 × 2 min:** register
+  without Auth 10 / 10, 0 crashes, 0 E lines, no NVS write after the
+  first; medians register **0.70 s**, DERP login **2.2 s**, netmap
+  **2.4 s**, WG up ~4 s (boots 3–10; the peer was still settling in
+  boots 1–2); 19 / 20 connects at the stored address, one DERP attempt
+  failed there during an association stall and went by name (+2.7 s).
+  Heap 161 100–161 380 B free (158 968 on 1.3.4).
+- **Soak (`b497bde`, 370 min):** 0 resets / panics / WDT / brown-outs,
+  0 E lines; **0 long-poll stream ends** (no boot-connection FIN this
+  time); 198 rekeys (22 needed a REKEY_TIMEOUT retry), 2 RX-stale — both
+  with the healthy peer, 30–47 s of WireGuard silence right after a
+  rekey / double roam between the peer's two endpoints (`seen direct=0
+  derp=0`, nothing dropped), fixed by the rekey in 60 ms (→ round
+  1.3.6); 149 roams (the two endpoints, every pong round); DERP logged in
+  twice (the server closed the stream at 3 h 34; reconnect at the stored
+  address, full handshake 2.0 s — the server likely restarted, so the
+  ticket was not honoured; resumption is still unobserved on the
+  sensor), 0 DERP errors; 73 STUN re-probes, 4 368 telemetry packets; no
+  NVS write (the stored addresses did not change). **heap_free min /
+  last 160 548 / 160 564 B, largest block 110 592 B throughout** (93 604
+  / 77 824 on 1.3.3). Stack lows (B free): `tinylink_lp` 4 368 of 7 168,
+  `tinylink_derp` 4 532 of 8 192, `wg_rx` 4 116 of 8 192, `wg_tx` 2 904
+  of 5 120, `tinylink_tlm` 2 636 of 4 608, `esp_timer` 3 032 of 4 608.
+
+### Optimization round D 1.3.4 (in progress, branch `feat/opt-1.3.4`)
+
+Round D of `docs/rounds/2026-10-optimization-list.md` (memory), built in
+two parallel branches — control transport (`feat/r134-ctl`) and map
+parsing (`feat/r134-map`) — on top of 1.3.3. Image 763 328 → **707 088 B
+(−56 240 B; −252 161 B / −26.3 % since 1.3.0)**; static DRAM
+95 516 → 57 140 B (−38 376 B); static IRAM +10 240 B (NOLOAD token
+table); no nghttp2 session per connect; `tinylink_lp` 12 → 7 KiB and the
+main task 24 → 8 KiB of stack. Host suite 1 006 → **1 330 OK** (CI floor
+1 330; CI now installs libnghttp2 as the HTTP/2 interop peer), ASan +
+UBSan clean, 0 warnings. On the sensor: smoke + 10-boot series
+(hardware section); the 6-h soak runs on 1.3.5, which contains all of it.
+
+#### Control transport (`feat/r134-ctl`)
+
+- **D5 — no `rx_residual` copy.** `consume_early_payload` leaves the
+  first HTTP/2 bytes in the conn's `h2_rx` record buffer and the HTTP/2
+  layer reads them by offset, instead of copying them into a second
+  4 077-B buffer; bytes that matched the EarlyPayload magic on a stream
+  without one are put back in front. `h2_rx` grows to 4 096 B. Static
+  DRAM −4 064 B; `test_ts2021` (window by offset, put-back across
+  records, worst-case window, 2 000-case record-segmentation fuzz).
+- **D1 — in-tree HTTP/2 client replaces nghttp2.** `h2_core.c` (frames,
+  flow control, one stream at a time) and `hpack.c` (literal encoder,
+  streaming decoder, canonical Huffman over 282 B of tables) behind the
+  unchanged `h2_client.h`; no heap — the engine lives in `ts2021_conn_t`,
+  received records are parsed where they lie, requests are built in the
+  record buffer. On the wire: the same preface, SETTINGS
+  (HEADER_TABLE_SIZE 0, ENABLE_PUSH 0) and header list; literal without
+  indexing with raw values instead of never-indexed + Huffman (+17–19 B
+  per HEADERS); preface + SETTINGS in one Noise record and HEADERS + DATA
+  in one (register + endpoint push: 7 records → 3); the server's
+  SETTINGS ACKed on arrival. Behaviour changes: a 1xx is followed by the
+  final status; no DATA reaches the stream callback after it stops; a
+  connection-level protocol error returns `ESP_FAIL`. The nghttp2
+  component and `CONFIG_ESP_NGHTTP2_INBOUND_BUFFER_LENGTH` are gone.
+  Image −57 104 B (nghttp2 59 946 B, the new client 9 564 B), static DRAM
+  +368 B, no 10–14 KiB nghttp2 session per connect. Tests: RFC 7541
+  C.1–C.6, codec / flow-control / malformed-frame tests and fuzz,
+  `test_h2_interop` / `test_h2_ref` — nghttp2's server in memory against
+  the new client and the 1.3.3 nghttp2 client on the same scenarios.
+- **D4 — records decrypted and sealed in place.** Each received record
+  is decrypted in place in `h2_rx` (was a 4 096-B `ct` stack array);
+  requests are sealed there in records of ≤ 2 048 B, one TLS record each
+  at `MBEDTLS_SSL_OUT_CONTENT_LEN` (was a 4 096-B `rec` stack array).
+  `tools/stack_worst.py`: `tinylink_lp` static worst case 7 856 →
+  4 864 B (a reconnect's TLS handshake 4 672 B) → stack **12 → 7 KiB**;
+  main task 8 272 → 5 312 B → **24 → 8 KiB** (+16 KiB of heap during
+  bringup); `app_main` logs `main stack: hwm=` since the 60-s stack diag
+  never sees main. Image +176 B.
+
+#### Map parsing (`feat/r134-map`)
+
+- **Fix found on the way: token walks bounded by the token count.**
+  jsmn (non-strict) counts an object member without its colon
+  (`{"NodeID"02,…}`) as two children; the key/value walkers never looked
+  at the token count, so such an element read stale tokens of an earlier
+  sub-parse and, with a full table, past its end (1.3.3: ASan
+  global-buffer-overflow in `tok_eq`). Reachable only from the
+  authenticated control plane. `jsmn_tree_ok` (`jsmn_skip.h`) checks the
+  tree iteratively, bounded by the count and the depth cap; `sub_parse`
+  refuses a tree it rejects like a jsmn error. +228 B.
+- **D2 — MapResponse split on the stream: 32 → 8 KiB.**
+  `mapresp_stream_feed` takes the DATA bytes cut anywhere (the LE32
+  length prefix included), follows the top object byte by byte, scans
+  past every member tinylink does not read, and copies only the element
+  being collected — the self `Node`, one `Peers` / `PeersChanged` /
+  `PeersRemoved` / `PeersChangedPatch` entry, one `DERPMap.Regions`
+  value — into an 8 KiB element buffer for the unchanged element
+  parsers. Same results as the 1.3.3 whole-body parser for any input
+  whose elements fit (kept as `tools/test/ref/mapresp_133.c`; 100 random
+  chunkings from 1 B, every two-chunk cut, every truncation + resync,
+  40 000 random edits). An element over 8 KiB is skipped with an error
+  log (an oversized patch forces a full-map refetch); the frame cap is
+  now a 4 MiB desync guard. The sensor's largest element is the
+  179-token self node (~3.2 KB in a real-shaped fixture, 2.6×
+  headroom); `stream peak: … elem=E (cap=8192)` reports it. Static DRAM
+  −24 440 B, image +784 B.
+- **D6 — jsmn token table in IRAM.** The 640-token table (10 KiB) moves
+  to IDF's NOLOAD `.iram.bss`. IRAM takes 32-bit loads / stores only;
+  `tools/iram_access_check.py` proves on the object code that every
+  access to the table is 32-bit (8 functions in `mapreq.c`, all
+  `l32i` / `s32i`) and runs after every component build, failing it on a
+  finding — its fixture `tools/iram_check_neg.c` plants 8 violations,
+  all caught, including `(type & 0xff) == 4`, which GCC compiles to an
+  `l8ui`. Static DRAM −10 240 B.
+
+#### Review
+
+An independent review ran the firmware's HTTP/2 stack (`h2_client.c` →
+`h2_core.c` / `hpack.c` → `ts2021_client.c`, real Noise records cut at
+random sizes) against Go's x/net/http2 `ServeConn` (`-tags
+http2legacy`, tailscale.com's path), net/http h2c (headscale's) and
+python-h2 (padding, PRIORITY, unknown frame types, PINGs): ~1.6 GB
+through Go byte-exact with both windows staying in 12.7 K…65 535,
+request bodies up to 250 KB, 80 000 real Go HPACK blocks at random
+splits, all 256 Huffman symbols, GOAWAY / RST_STREAM / 1xx / trailers /
+CONTINUATION, ~29 M libFuzzer runs under ASan + UBSan (whole vs
+byte-split input, flow-control invariants at every frame). Nothing that
+Go or headscale can trigger; four minor deviations only a non-Go server
+reaches (a 1xx's Retry-After carried to the final response — fixed in
+1.3.5; a graceful GOAWAY covering our stream still returns at once, as
+with nghttp2; a table-size update > 0 before our SETTINGS is a
+COMPRESSION_ERROR; how much of an over-long body reaches the caller
+depends on record cuts).
+
+#### Hardware (deployed sensor, app partition only; the 1.3.3 `ota_0` + `otadata` read back to `~/tinylink-backups/` first)
+
+Backup byte-identical to the flashed 1.3.3 (`b58273f`), otadata seq 1 /
+CRC OK; flashed `2c22a8b`.
+
+- **Smoke** (180 s): `register … (known node, no auth)`; **heap_free
+  158 968 B (94 884 on 1.3.3, +64 KB), largest block 110 592 B
+  (77 824)** — the static DRAM above, no nghttp2 session, and the two
+  smaller stacks; `main stack: hwm=4260 B free of 8192`; `stream peak:
+  body=25923 elem=2825 (cap=8192)`, `mapresp peak: tokens=179/640`;
+  netmap 1.04 s after the stream request; no stream / decrypt /
+  protocol / IRAM / stack error. Stack use (B of alloc): `tinylink_lp`
+  2 708 / 7 168 (7 280 / 12 288 on 1.3.3), `tinylink_derp` 4 108 /
+  8 192, `wg_tx` 2 216 / 5 120, `esp_timer` 1 576 / 4 608, `wg_rx`
+  3 612 / 8 192.
+- **Reboot series, 10 × 5 min:** register without Auth 10 / 10, 0
+  RX-stale, 0 crashes, heap min 158 748 B; WG up 15.0–25.3 s after
+  reset (Wi-Fi association 3–9 s; the serial STUN probe 0.04–7.09 s;
+  netmap 1.06–11.11 s after the stream request, server side). Two
+  boot-connection FINs (236 s, 77 s; the known 1.3.x pattern) — both
+  reconnects ran the in-tree client's TLS + Noise + HTTP/2 path on the
+  7-KiB long-poll stack: `tinylink_lp` 3 444 B used (static worst case
+  4 864), netmap 4.7 s after the drop, heap unchanged.
+
+### Optimization round 1.3.3 (in progress, branch `feat/opt-1.3.3`)
+
+- **B22 — a known node registers without Auth.** A restarted tailscaled
+  sends `RegisterRequest` with `Auth` nil (`json:",omitempty"`) and
+  control answers with the node's current state (headscale
+  `handleRegister`: Auth nil + zero Expiry + node not expired → returned
+  unmodified). tinylink sent the auth key on every boot, so every boot
+  ran a full auth-key login server-side — a node-record write and change
+  notification — on the same connection that then pushes endpoints and
+  opens the map stream. That is the prime suspect for the 1.3.2 soak's
+  early stream FIN (3 of 8 boots at 47 / 115 / 244 s, mid keep-alive,
+  only ever on that first connection); a reboot series on 1.3.2 vs 1.3.3
+  tests it (result in the hardware section: the FIN stays — B22 is
+  still worth it for not sending the key). Now NVS `tl_state/reg_keys` (machine_pub ‖ node_pub, written
+  only when the verdict changes) records that control authorized these
+  keys; while it matches, register sends no `Auth` and the auth key is
+  not even read out of NVS. Any refusal of that request — not authorized,
+  `NodeKeyExpired`, an error or malformed answer, a 4xx/5xx other than
+  429/503 — repeats it with the key on the same connection and clears
+  the record; a throttle or a lost answer changes nothing. The long-poll
+  recovery ladder (node expired / deleted / map rejected) still always
+  sends the key. Side effect: revoking the auth key after the first
+  registration (docs/SECURITY-MODEL.md) is now really free. The deployed
+  node has key expiry disabled, which is why a months-old auth key never
+  mattered. Image +720 B; host suite 881 → **899 OK** (CI floor 899):
+  no-Auth body KAT, exact-fit / one-short, and the fallback table.
+
+#### Data plane (`feat/r133-dp`)
+
+- **C2 — RX and TX AEAD outside `g.lock`.** Until 1.3.2 `g.lock` was
+  held across every transport AEAD (~400 µs per MTU), so a decrypt
+  (wg_rx / DERP task) and an encrypt (tiT / telemetry) never ran on both
+  cores at once. Each direction now works on a ticket holding a copy of
+  the key taken under the lock: TX reserves the counter together with
+  the send key of the same keypair, then seals unlocked; RX copies the
+  receive key and the keypair generation after the replay pre-check,
+  opens unlocked, and commits under the lock. The commit refuses a
+  ticket whose keypair was replaced or scrubbed in between, re-checks
+  the window (the DERP and direct copies of one packet can now be in
+  flight together), then records the counter. S1 holds, no AEAD reads
+  key bytes a rekey or stop may rewrite, and a packet straddling a
+  rekey is dropped (`keypair replaced during decrypt`). The window
+  update clears whole bytes (an 8 191-counter jump: 2.3 → 0.15 MTU
+  AEADs). Image +632 B; +77 host checks, including a pthread test of the
+  lock protocol with the races forced at fixed points (TSan-clean on 1,
+  2 and 16 CPUs).
+- **C1, intermediate steps — decrypt into the lwIP pbuf, core-locked
+  `ip_input`.** The AEAD writes the plaintext straight into the pbuf
+  lwIP receives (was: a 1 536-B stack buffer, a memcpy and a scrub), and
+  `wg_rx_inject` runs `ip_input` under `LOCK_TCPIP_CORE()` in the
+  decrypting task instead of posting to tiT (core locking was already
+  on). Per inbound packet, passes over the payload 4 → 2 and task hops
+  3 → 2; no tiT message alloc, no ERR_MEM on a full mbox. The direct-path
+  note and endpoint roaming now happen before delivery, since replies are
+  built on the same task. `handle_transport` frame 1 616 → 96 B. Lock
+  order is now `hs_lock` → lwIP core lock → `g.lock`. Image +120 B. The
+  full C1 (raw `udp_recv` endpoint in tiT, wg_tx removed) is deferred: it
+  would put the RX AEAD under the core lock with the TX encrypt, undoing
+  C2, and needs C7 and an unaligned-fast AEAD first.
+- **Fixes found on the way:** the tunnel netif is brought up under the
+  lwIP core lock (`netifapi_*`; pre-existing, every boot);
+  `wg_netif_stop` wipes the handshake and DISCO state under their locks
+  (pre-existing, bringup-failure path). +104 B.
+- **C10 — task layout analysed, not changed:** recommendation is wg_rx
+  at IDLE+5 pinned to CPU1 and wg_tx at IDLE+5, together with a flood
+  budget in wg_rx (without it a pinned priority-5 task can starve IDLE1
+  into a watchdog reboot).
+
+#### Crypto (`feat/r133-crypto`)
+
+- **C4 — ChaCha20 in pair-wise rounds with a fused feed-forward XOR.**
+  The 20 rounds run on 16 scalar locals, two quarter-rounds in lockstep
+  (one `ssai` per step, a bare `src` per rotate); aligned full blocks
+  write `out = in ^ (rounds + state)` straight from the registers
+  instead of storing the keystream, re-reading it and copying the state
+  in with a ROM memcpy. Measured on the firmware's compiled code
+  (instruction-level simulation): double round 141 → 130 instructions
+  (spills 34 → 15), `chacha20()` over 1 500 B 43 289 → 35 412 (−18 %),
+  AEAD encrypt per MTU 73 833 → 65 691 (−11 %), frame 240 → 208 B; same
+  instruction trace and addresses for any key and plaintext. IRAM
+  +852 B (two inlined copies of the rounds). Tests: RFC 8439 §2.3.2 /
+  A.1 / A.2 at all alignments and in place, HChaCha20, 5 000 random
+  trials against the 1.3.2 code (`tools/test/ref/chacha20_132.c`).
+- **C6 — constant-time X25519 (closes S3).** Donna's int64 limb sums
+  compiled on the LX6 to 162 `bgeu` carry branches, executed 342 266
+  times per scalarmult. Replaced by fiat-crypto's verified 32-bit
+  Curve25519 (Linux `curve25519-fiat32.c`, taken under MIT) with
+  `fe_mul` / `fe_sqr` / `fe_mul121666` rewritten carry-free: each
+  product split at bit 28 into two 32-bit column accumulators (`mull`,
+  `muluh`, `src`, `and`, `add`, `add` in one asm statement). 3.51 M →
+  2.43 M instructions per scalarmult (−31 %, ~14 ms est. vs 20 ms); no
+  data-dependent branch or address left (static listing + identical
+  traces for any scalar and point); frame 2.7 → 0.85 KiB; flash −1.4 KB.
+  Tests: `test_x25519` (RFC 7748 iterated 1 / 1 000, 1 000 000 on
+  demand; 4 000 cross-checks against donna, kept as the host-only
+  oracle; the field operations against an independent mod-p reference
+  at their bounds; low-order rejection).
+- **C9 — BLAKE2s / Salsa20 with one SAR write per step; KDF3 reuses its
+  extract.** BLAKE2s compression 2 051 → 1 656 instructions (−19 %),
+  Salsa20 20 rounds 1 904 → 1 413 (−26 %); `noise_hkdf3` 20 → 16
+  compressions (one per WireGuard handshake), KDF2 / KDF3 −17 % / −33 %
+  instructions. Outputs pinned against Python hashlib / hmac. Image
+  −1.2 KB.
+- The boot bench (`CONFIG_TINYLINK_BENCH_AEAD`) gains an X25519 KAT,
+  time per scalarmult and a CCOUNT spread probe, and its AEAD KAT now
+  covers the aligned and unaligned paths.
+- **Verification beyond the host suite.** An independent read-only
+  review ran the compiled firmware code through its own Xtensa
+  interpreter: asm vs C fallback bit-identical on 40 000 field cases,
+  the accumulator bounds re-derived (worst case L ≤ 1.375·2^31,
+  H ≤ 1.246·2^30; nothing overflows below ~4.5·2^w) and asserted on
+  27.6 M field operations of 3 000 ladders, KDF3 equal to WireGuard's
+  Kdf3 on 3 000 random inputs, 8 of 9 deliberately injected carry bugs
+  caught (the ninth is unreachable). Its three low findings: the
+  SECURITY-MODEL scrub claim was too strong (fixed: compiler spills
+  remain, no scalar bits), a ChaCha20 call leaves key words in its
+  callee frame (pre-existing, documented), and nothing in the tree ran
+  the SAR-dependent asm — fixed by:
+- **`tools/qemu_crypto` + CI job `qemu-crypto`.** The crypto suites
+  built for the ESP32 with the firmware's -O2 islands and run on
+  Espressif's QEMU (`-machine esp32`, `idf_tools.py install
+  qemu-xtensa`): ChaCha20, ChaCha20-Poly1305, Poly1305, BLAKE2s, HKDF,
+  NaCl box, plus the field operations asm vs the C fallback (both built
+  for the LX6) bit for bit on 200 000 inputs at the loose bounds,
+  X25519 asm vs C vs donna on 3 000 pairs (u ≥ p, u = p, small u,
+  all-ones scalars) and RFC 7748 iterated 1 / 1 000 — all pass, ~2 min
+  in QEMU. It is the first check of the asm on an ISA implementation
+  nobody on this project wrote.
+
+#### Stacks (`feat/r133-stack`, B18)
+
+- **`tools/stack_worst.py` — static worst-case stack per task.** Builds
+  the call graph from GCC's `-fcallgraph-info=su` (frames = the `entry
+  a1, N` immediates), the precompiled blobs' and libc's disassembly with
+  relocations (2 900 Wi-Fi blob indirect calls resolved through the
+  `g_wifi_osi_funcs` table) and the ROM ELF; hand-resolved indirect calls
+  (nghttp2 / esp_tls / mbedTLS / wg_netif / lwIP netif callbacks);
+  bounded recursion; runtime-infeasible edges cut with a stated reason;
+  +368 B fixed overhead (alignment, coprocessor area, one interrupt
+  frame, canary). Validated: static ≥ measured on all seven tasks of
+  1.3.2, and on the May build that overflowed it gives 20 528 B against
+  the 20 004 B measured. **Verdict on the `tinylink_lp` 20 KB burst:**
+  the LP task's first ts2021 re-connect (9.9 KB `ts2021_connect` frame
+  → `nghttp2_session_recv` with a 4 KiB inbound buffer → record
+  decrypt), never seen by the boot smoke because boot connects on the
+  main task; removed by `92c09dd` and 1.3.1's 512-B nghttp2 buffer. No
+  task's static worst case exceeds its allocation.
+- **B18 — trims from the static worst case** (static / measured over
+  the 6-h 1.3.2 soak → new size): `tinylink_lp` 7 856 / 7 284 B →
+  24 → **12 KiB**; `tinylink_derp` 5 424 / 5 028 B (an RSA-PSS chain
+  verify covered too) → 10 → **8 KiB**; `wg_tx` 3 200 / 2 380 B → 7 →
+  **5 KiB**; `esp_timer` 3 248 / 1 580 B → 6 → **4.5 KiB**. Kept:
+  `wg_rx` (C1-S / C6 changed its paths — re-measure on 1.3.3 first),
+  `tinylink_tlm` (688 B over its static worst case), tiT. **−17.5 KiB of
+  heap**; `TL_DIAG_MAX_TASKS` 32 → 20 (−432 B BSS). Next cut found:
+  the Noise record buffers `ct[4096]` / `rec[4096]` on the LP stack
+  (~4 KB) and `rx_task`'s `buf[1536]`.
+
+- **RX drops by cause at RX-stale** (observability, found on the
+  sensor): transport packets seen per path and refused per cause (old
+  keypair index, other index, replay, tag, C2 commit race, pbuf) since
+  the last good decrypt, printed with the current / previous receiver
+  index when the 30-s watchdog fires — so a silent window says whether
+  nothing arrived or what was dropped. +464 B.
+
+Round 1.3.3: image 763 792 (B22) → **763 328 B** (`b58273f`); host
+suite 899 → **1 006 OK** (CI floor 1 006), ASan + UBSan clean,
+0 warnings; QEMU crypto run clean.
+
+#### Hardware (deployed sensor, app partition only; the 1.3.2 `ota_0` + `otadata` read back to `~/tinylink-backups/` first)
+
+The `ota_0` read failed twice at 460 800 baud ("serial data stream
+stopped") and went through at 230 400; the backup matches the flashed
+1.3.2 image byte for byte, otadata seq 1 / CRC OK. Flashed a bench build
+first, then 1.3.3 (`85a3b55`, then `b58273f` with the RX-drop counters).
+
+- **Bench on the silicon** (`CONFIG_TINYLINK_BENCH_AEAD`): ChaCha20-
+  Poly1305 RFC 8439 KAT OK (aligned and unaligned), **326.5 µs per
+  1 500-B packet (~385 µs on 1.3.2, −15 %)**, raw ChaCha20 173.6 µs /
+  1 500 B; X25519 RFC 7748 KAT OK — the fiat32 asm on real LX6 silicon —
+  **12.55 ms per scalarmult (~20 ms with donna, −37 %)**; the timing
+  probe's per-input minima spread 2 831 cycles over 8 inputs (0.09 % of
+  2.98 M, about one tick interrupt — no sign of data-dependent timing;
+  same-input jitter up to 153 k cycles is interrupts).
+- **Smoke** (180 s): `register … (known node, no auth)` →
+  `MachineAuthorized=true` — tailscale.com takes a register without Auth
+  for the known node; **heap_free 94 884 B (76 588 on 1.3.2, +18.3 KB),
+  largest block 77 824 B (59 392)**; the B18 stacks within the static
+  prediction (`tinylink_lp` 7 268 used of 12 288, static 7 856;
+  `tinylink_derp` 4 068 / 8 192; `wg_tx` 2 212 / 5 120; `esp_timer`
+  1 572 / 4 608; `wg_rx` 3 696 — 5 380 on 1.3.2, the C6 frame).
+- **Reboot series, 10 × 5 min:** register without Auth in 10 / 10 boots
+  (0.21 s after the Noise handshake), 0 early stream FINs in the first
+  300 s (3 of 8 boots on 1.3.0–1.3.2, at 47 / 115 / 244 s) — **but the
+  6-h soak's boot connection still got one at 352 s, after a register
+  without Auth: B22 does not remove the FIN** (the series windows were
+  too short to see a later one). What holds across every capture: the
+  FIN only ever hits the boot connection (register + push + netmap),
+  never a later one, mid keep-alive, at a random 47–352 s; it costs one
+  3.7-s reconnect. Leading guess: tailscale.com moving the first map
+  session after a node (re)connects; telling that from "the connection
+  that carried the register" needs a variant that opens a fresh
+  connection for the long-poll — deferred. WG up 1.9–2.3 s after the netmap except two boots where
+  the peer answered only the 4th / 2nd INIT (peer-side propagation of
+  the new boot's endpoint; the sensor retried on schedule); 20 rekeys,
+  0 RX-stale, 0 E-level lines, 0 crashes, heap min 94 404 B. Netmap
+  arrival after the stream request 1.1–5.1 s (server side, as before).
+- **Post-rekey silences:** the smoke and the first series boot each had
+  one (a rekey completes, then no decrypt for 30 s, RX-stale, re-keyed
+  at once) — the same pattern as 1.3.2's 03:13 event. All three fell
+  between 03:13 and 03:26, across two firmware versions, and none in the
+  20 rekeys after 03:32: an environmental window (the collector after
+  its 02:00 reboot, or the path), not a 1.3.3 regression. The RX-drop
+  counters above were added to name the cause next time.
+- **Soak (`b58273f`, 365 min):** 0 resets / panics / WDT / brown-outs;
+  195 rekeys, 0 RX-stale (the RX-drop counters never fired), 17 rekeys
+  needed a REKEY_TIMEOUT retry (three needed 3–4 INITs, all within the
+  180-s session lifetime — lossy direct path in the morning; candidate:
+  copy rekey INITs to DERP from the 2nd attempt, as B7 does for the
+  cold handshake); 4 306 telemetry packets, 72 STUN re-probes, DERP
+  logged in once with 0 errors; one stream FIN on the boot connection
+  at 352 s (above). **heap_free min / last 93 604 / 94 668 B (75 024 /
+  76 588 on 1.3.2), largest block never below 77 824 B (59 392).**
+  Stack lows (B free): `tinylink_lp` 4 992 of 12 288, `tinylink_derp`
+  4 032 of 8 192, `wg_tx` 2 900 of 5 120, `esp_timer` 3 028 of 4 608,
+  `wg_rx` 4 392 of 8 192, `tinylink_tlm` 2 632, `tiT` 2 776 — all within
+  `stack_worst.py`'s static bounds. Side note: the device's uptime ran
+  1.3 % ahead of the host clock (21 761 s against 21 473 s) — light
+  sleep re-bases esp_timer on the internal RC slow clock; harmless
+  (protocol timers 1.3 % early, wall time from NTP).
+
+### Optimization round B 1.3.2 (2026-10-28, branch `feat/opt-1.3.2`)
+
+Round B of `docs/rounds/2026-10-optimization-list.md` — the code items,
+built in four parallel branches (control plane, crypto, data plane,
+system), merged, then reviewed as a whole. Image **826 768 → 762 535 B
+(−64 233 B; −196 714 B / −20.5 % since 1.3.0)**; static DRAM 108 220 →
+95 884 B (−12.3 KB); IRAM 73 867 → 73 935 B. Host suite 633 → **881 OK,
+0 FAIL** (CI floor 881), ASan + UBSan clean, 0 compiler warnings.
+Flashed to the deployed sensor (three smokes, two fixes found there —
+B7b, B7c); hardware section at the end of this entry. B18 (stack trims
+from soak data) is left for after the 1.3.2 soak.
+
+#### Control plane (`feat/r132-ctl`, −42.1 KB)
+
+- **B1 — no esp_http_client** (−21.9 KB): the TOFU `GET /key` runs on
+  esp_tls like ts2021 / DERP, with a host-tested HTTP/1.1 response
+  parser (`tl_http1.h`: Content-Length, chunked, read-to-EOF). Same
+  timeouts, Host header, capver query, status handling and body cap;
+  redirects are no longer followed (neither tailscale.com nor headscale
+  redirects `/key`). `esp_http_client` and `tcp_transport` excluded.
+  Only runs without an NVS pin — not exercised on the deployed sensor.
+- **B2 — no cJSON** (−5.0 KB): RegisterRequest built with snprintf + a
+  JSON-escaping writer, responses read with jsmn; byte-identical to
+  cJSON's output (goldens + 50 000-case fuzz). `json` excluded.
+- **B3 — float printf/scanf stubs** (−15.4 KB): the audit found one
+  linked float format, an ESP-MESH debug line in the Wi-Fi blob (mesh
+  unused); the stubs print `?` and fail soft.
+- **B8 — TCP_NODELAY** on the control and DERP sockets; one TLS write
+  per DERP frame and per Noise record (was 3 writes → Nagle waited an
+  RTT per relayed packet). New 1.5 KB static DERP send buffer.
+- **B9** — the first HTTP/2 request goes out without waiting for the
+  server's SETTINGS ACK (−1 RTT per control connect).
+- **B15 — one shared 33 KiB control buffer** (`ctrl_buf.h`, −5.1 KB
+  static; the 32 KiB MapResponse cap is kept): register request /
+  response, the stream request and the netmap body never overlap; a
+  claim guard logs `control buffer busy` if they ever would. The
+  register request (it carries the auth key) is scrubbed after sending.
+- Frames: `register_emit` 2 432 → 288 B, `mapreq_push_endpoints`
+  1 344 → 64 B, `ts2021_connect` 1 712 → 688 B.
+
+#### Crypto (`feat/r132-crypto`, −25.0 KB)
+
+- **B4** — ts2021 Noise records and the NaCl box run on the in-tree IRAM
+  ChaCha20-Poly1305 / Poly1305 (Noise nonce: 4 zero bytes + 64-bit
+  **big-endian** counter); mbedTLS ChaCha20 / Poly1305 off. Byte
+  identity proved against an independent OpenSSL generator and the old
+  mbedTLS path (`test_noise_ik`, RFC 8439 vectors). Side effect: TLS
+  now negotiates **ECDHE-ECDSA-AES128-GCM-SHA256** (hardware AES) — in
+  1.3.1 it was ECDHE-ECDSA-CHACHA20-POLY1305 in software, contrary to
+  the old comments (verified with IDF's mbedTLS 3.6.7 against
+  controlplane and derp16b); key exchange X25519 in both.
+- **B5** — `mbedtls_user_config.h` (repo root, build-wide, project-
+  relative): ARIA, CFB / OFB, three paddings and PKCS#12 out; XTS stays
+  (nvs_flash compiles its encrypted-partition code), PKCS#5 stays (WPA2
+  passphrase). Applied to all 170 TUs that include mbedTLS headers.
+- **B6** — -O2 per source: mbedcrypto bignum / bignum_core / ecp /
+  ecp_curves, MPI glue and the AES-GCM record path (≈ 99 % of a
+  profiled handshake); tinylink crypto, WG data plane + handshake,
+  DISCO, DERP, keys, TMP117; everything else -Os.
+- **B12** — `chacha20_init` and the zero pad out of flash; in-tree IRAM
+  `tl_secure_zero` (memset + compiler barrier) replaces the flash-
+  resident mbedTLS zeroize and the remaining plain-memset secret
+  scrubs.
+
+#### Data plane (`feat/r132-dp`, +3.1 KB flash, −2.9 KB static)
+
+- **B7 — the first WG INIT is no longer lost**: while a handshake is
+  pending the *same* INIT bytes are re-sent on DERP login (via DERP), on
+  CallMeMaybe (direct + DERP while no direct path is confirmed) and on a
+  matched pong; new INITs are copied via DERP until a direct path is
+  verified. Copies are not new attempts (the peer drops duplicates as
+  replays — wireguard-go / magicsock behaviour); the old pong
+  "fast INIT" that built a new INIT 500 ms apart is gone. RX/TX waits
+  run to the next timer deadline. Expected WG-up − netmap ≈ 2.0–2.3 s
+  (was 5.4 s).
+- **B7b (found on the sensor, first 1.3.2 smoke)** — re-sending the same
+  INIT did not help at boot: the first INIT reaches the peer, which
+  answers via DERP before our DERP login (dropped) and direct to our
+  previous NAT mapping (the router hands out a new port per boot), and
+  every later copy of that INIT is a TAI64N replay to the peer — only
+  the REKEY_TIMEOUT retry got through (INIT 8.1 s, copies 9.8 s / 11.2 s
+  unanswered, new INIT 13.0 s answered in 70 ms). On DERP login and on a
+  solicited pong, an INIT older than 1 s is now replaced by a new one;
+  CallMeMaybe and link-up still re-send the same bytes.
+- **B7c** — the first retry of a cold handshake burst is 2 s instead of
+  REKEY_TIMEOUT (second 1.3.2 smoke: DERP took 6 s to log in and the
+  prepunch pongs came back 0.3 s after the INIT, so neither B7 nor B7b
+  could fire; by 2 s the prepunch has validated the direct path and a
+  new INIT is answered directly). Later retries and rekeys keep 5 s.
+- **B10** — the direct-path DISCO pong is sealed with the cached shared
+  key: ~20 ms → ~50 µs per ping; deepest direct-DISCO wg_rx chain
+  5 696 → ~3 250 B.
+- **B11** — static-static DH and both mac1 keys computed once per
+  identity (recomputed on peer / local key or PSK change): −20 ms per
+  INIT / rekey; INIT bytes pinned to the from-scratch path in a test.
+- **B13** — `wg_lwip_linkoutput` frame 1 568 → 32 B (chained pbufs, rare
+  with `LWIP_NETIF_TX_SINGLE_PBUF`, go through a noinline `pbuf_clone`
+  path under the core lock): tiT ICMP-reply chain ≈ 2 590 → 1 040 B.
+- **B14** — TX queue is a 4-slot ring of indices (same capacity and
+  drop semantics): −2 × 1.5 KB copies per packet, −3.1 KB static.
+- **B21** — one clock read per loop, WDT feed ≤ 1/s, idle wakes ≈ 3/s →
+  0.3/s, demux switch on the first byte (also closes a 1-in-2³² chance
+  per handshake of misrouting a session to the STUN handler), public
+  nonce built with word stores.
+
+#### System (`feat/r132-sys`, −5.9 KB static, ≈ +9 KB heap expected)
+
+- **B16** — only the PreferredDERP region of the DERPMap is stored,
+  matched on RegionID (never position): 28 → 1 region, −6 KB BSS.
+- **B17** — the STUN re-probe task is folded into the telemetry task
+  (−3.5 KB heap); with telemetry disabled the task still runs the
+  re-probe, stack diag and time floor.
+- **B19** — `/stats` gains `heap_min` and `"boots":{total, brownout,
+  panic, task_wdt, int_wdt}` (RTC no-init record with magic + FNV
+  check; restarts at zero after a power loss). The reply buffer is
+  768 → 896 B (worst case 862 B, host-tested).
+- **B20** — the NVS time floor is written once a sync lands ≥ 1 day past
+  the stored value (daily in steady state; still immediate after a
+  long power-off). Fewer 4 KB erases that stall both CPUs.
+
+#### Integration review — fixed before flashing
+
+An independent review of the merged diff (cross-branch interactions,
+lock graph, per-task worst-case stacks from the objdump frames) found
+no crash or deadlock; confirmed the B4 nonce, B5 on every mbedTLS TU,
+B9 against both x/net `http2.Server` front ends, the B15 claim order
+and that B7 never builds INITs faster than REKEY_TIMEOUT. Fixed:
+- **B7 × B8: a half-open DERP conn could stall all TX for up to
+  120 s.** B7 relays while the direct path may be fine (INIT copies,
+  dual send), and a relay write blocks under the DERP write lock for up
+  to 4 × 30 s of send timeouts — with wg_tx sending one item at a time,
+  direct traffic queued behind it. Redundant copies now go through
+  `derp_client_try_send_packet`: lock with a zero timeout and a
+  zero-timeout `select()` (lwIP reports writable only above
+  TCP_SNDLOWAT ≈ 2.9 KB free, more than a frame needs), else declined.
+  The relay callback gained a `best_effort` flag; the RX-stale and
+  sendto-errno relays still wait.
+- The first INIT in `wg_netif_start` is built under `hs_lock` (a late
+  first netmap lets the DERP supervisor's B7 kicks read `g.init_msg`
+  concurrently).
+- The ENETUNREACH backdate of `last_transport_recv_us` in
+  `send_to_peer` takes `g.lock` (it now also runs on the DERP task).
+Worst-case stack use per task after the merge (frames + 512 B
+overhead): wg_rx 73 % (uncached DISCO → donna), tinylink_tlm ≈ 70 %
+(/stats → sendto → encrypt; STUN 2.5 KiB, NVS write 1.3 KiB), tiT 61 %,
+tinylink_derp 54 %, wg_tx 39 %, tinylink_lp / main 31 %.
+
+#### Hardware (deployed sensor, app partition only; the 1.3.1 `ota_0` + `otadata` read back to `~/tinylink-backups/` first)
+
+Three 180-s smokes at 500 kbaud, each `boots:1 panics:0 wdt:0`, 0 E-level
+lines outside the events below; final image `c1db6c5` (763 072 B).
+- **`5daec1e`**: TLS now AES-128-GCM, `derp_regions=1`, the boot line
+  `boots=1 (brown-out 0, panic 0, task WDT 0, int WDT 0) — RTC record
+  restarted`, **heap_free 62 7xx → 76 7xx B (+14 KB), largest block
+  51 200 → 59 392 B**. But WG still came up 5.1 s after the netmap:
+  INIT 8.1 s, its DERP copy at DERP login 9.8 s and a direct copy on a
+  pong 11.2 s unanswered, the REKEY_TIMEOUT retry answered in 70 ms →
+  B7b.
+- **`f303bab`** (B7b): DERP took 6 s to log in (after the session was
+  up) and the prepunch pongs came 0.3 s after the INIT, so B7b could not
+  fire — WG up 5.2 s after the netmap → B7c.
+- **`c1db6c5`** (B7c): INIT 14.03 s, DERP login 15.78 s, `handshake init
+  sent (attempt 2, …, fresh: DERP relay up)` 15.82 s, **session up
+  15.89 s — WG-up − netmap 1.94 s (5.2–5.4 s in 1.2.0–1.3.1)**. This
+  boot's netmap came 8 s after the stream request (server side: the
+  long-poll reuses the register conn, no TLS in between; 1.1–1.8 s in
+  the other boots). One server-side TCP FIN on the long-poll at 120.6 s
+  (no GOAWAY, as in the first 1.3.0 smoke), reconnected and re-parsed
+  in 5 s.
+Stack HWMs (B free), 1.3.1 → 1.3.2: `wg_rx` 2 084 → 2 808,
+`tinylink_tlm` 940–1 084 → 2 836 (now also runs STUN), `tiT` 2 768 →
+3 000, `wg_tx` 5 628 → 4 948, `tinylink_derp` 5 172 → 5 292,
+`tinylink_lp` 16 584 → 17 300, `wifi` 1 008 → 1 016; `tinylink_stun_re`
+and its 3 KiB stack are gone.
+
+**Soak (`c1db6c5`, 265 min, stopped early to flash 1.3.3):** 0 resets /
+panics / WDT / brown-outs, 143 rekeys (two needed a REKEY_TIMEOUT retry —
+a lost INIT or response), 3 128 telemetry packets, 52 STUN re-probes,
+DERP logged in once with 0 errors, heap_free min / last 75 024 / 76 588 B,
+largest block never below 59 392 B. Stack lows (B free): `wg_rx` 2 444
+(the 02:00 event below — a new peer DiscoKey means an uncached DISCO
+X25519 on wg_rx, donna's 2.7-KB frame), `tinylink_tlm` 2 608, `tiT`
+2 776, `wg_tx` 4 788, `tinylink_derp` 5 212, `tinylink_lp` 17 292,
+`esp_timer` 4 564. Events:
+- one server-side TCP FIN on the long-poll at 253 s — the boot connection
+  that carried register + push + netmap, as in 3 of 8 boots of 1.3.0–1.3.2
+  (47 / 115 / 244 s, mid keep-alive, never on a later connection); every
+  boot re-sent the auth key, so B22 (1.3.3) tests that hypothesis;
+- the collector's nightly 02:00 reboot (a 24/7 server on general-purpose
+  hardware at ~2 400 m): DERP `peer-gone`, RX-stale forced rekey at
+  +30.3 s, the peer's new DiscoKey at +44.5 s, endpoint roam + `session
+  rekeyed` + direct path at +50.8 s — **outage 50.8 s, 6.2 s after the
+  peer was back** (`peer_restart.py`, kept per version from now on);
+- at 03:13 a direct-path loss right after a normal rekey (no peer
+  restart): the peer sent call-me-maybe twice, RX-stale at +30 s, re-keyed
+  5 s later — 35 s without inbound. Seen once in the 1.3.1 soak too.
+  Upstream re-validates the path every few seconds and falls back to
+  DERP after ~6.5 s without a pong; candidate for a later round.
+
+### Optimization round A 1.3.1 (2026-10-28, branch `feat/opt-1.3.1`)
+
+Round A of `docs/rounds/2026-10-optimization-list.md` — the Kconfig /
+one-liner items, every claim re-checked against the IDF v5.5.6 source,
+then an independent review (its findings are folded in below). Image
+**959 249 → 826 768 B (−132 481 B, −13.8 %)**; static IRAM 78 767 →
+73 867 B; static DRAM 108 952 → 108 220 B. Host suite 633 OK / 0 FAIL,
+0 compiler warnings, partition table byte-identical (app-only flash).
+Flashed to the deployed sensor: boot to WG session **16.6 → 13.6 s**,
+hardware section at the end of this entry.
+
+- **-Os globally, -O2 where packets flow.** `COMPILER_OPTIMIZATION_SIZE`
+  replaces IDF's -Og; tinylink, main and mbedcrypto stay -O2, and lwIP
+  `inet_chksum.c` / `pbuf.c` / `udp.c` / `ip4.c` plus FreeRTOS
+  `queue.c` become per-source -O2 islands (top-level `CMakeLists.txt`).
+- **Common-CA certificate bundle** (43 roots: ISRG X1/X2, GTS R1–R4,
+  DigiCert, GlobalSign, Amazon, USERTrust…) instead of the full Mozilla
+  list. Live chains re-checked: controlplane leaf → YE1 → Root YE → ISRG
+  X2 (cross-signed by X1), derp* the same via YE2. A self-hosted control
+  server under a root outside that set now fails closed; build with
+  `CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL=y` for it. Closes
+  owner item G.
+- mbedTLS: PEM parsing and the extended / compressed EC key forms off
+  (DER bundle, no client key); **ECP fixed-point tables on** (−0.45…0.6 s
+  per full TLS handshake, +5.6 KB).
+- **Log V2**, no colours, static log levels (`LOG_TAG_LEVEL_IMPL_NONE`).
+  V2's call chain is ≈ 150–200 B deeper, so `tinylink_tlm` 4 096 → 4 608 B
+  and the Wi-Fi driver task +512 B (M16 soak lows: 452 / 584 B free).
+- **DHCP ARP probe really off** — the old `LWIP_DHCP_DOES_ARP_CHECK=n`
+  set a choice member and was ignored; 2 × 500 ms per DHCP bind.
+- `nghttp2_session_recv` inbound buffer 4 096 → 512 B (−3.6 KB of
+  long-poll stack; `recv_cb` serves it from the decrypted record).
+- **No FreeRTOS software timers** (no xTimer anywhere; "Tmr Svc" task
+  gone) and **no run-time stats** (an esp_timer read per context switch).
+- **Brown-out detector level 0 (2.43 V) → 6 (2.77 V ±0.05)**: the lowest
+  level that stays above the flash's 2.7 V minimum across its tolerance.
+  IDF's XMC brown-out reset only covers vendor 0x20; this flash is 0x46.
+- **Console at 500 000 baud** (was 115 200; `idf.py monitor` and
+  `tools/serial_capture.py` follow). 921 600 is unreachable with PM on
+  (REF_TICK 1 MHz → ≈ 941 k).
+- **Wi-Fi awake for the boot exchange**: `WIFI_PS_NONE` until the WG
+  session is up (an `esp_timer` in `app_wifi.c` switches to
+  `MIN_MODEM`, at the latest 60 s after Wi-Fi start) instead of every
+  inbound burst waiting for a DTIM beacon. New `tinylink_session_up()`.
+- **Reset reason** in the boot log (`reset: brown-out, 9`) and in
+  `/stats` (`"reset_reason"`) — the ROM's own line is unreadable at the
+  new console rate.
+- CMake now warns when `sdkconfig` predates 1.3.1: an existing sdkconfig
+  keeps its old choice selections over `sdkconfig.defaults`. **Delete
+  the checkout's `sdkconfig` once** when moving to this release.
+- Not done: errata RTC-126 workaround (A7) — IDF's hidden
+  `ESP_SLEEP_RTC_BUS_ISO_WORKAROUND` already keeps RTC_PERIPH on in
+  light sleep; `docs/esp32/REFERENCE.md` corrected.
+- Comment fixes in `sdkconfig.defaults` (TLS 1.2 only, ECDHE-ECDSA suite,
+  current LE chain, Camellia gone / ARIA still linked, printf float,
+  partition offsets, a no-op `SSL_MAX_CONTENT_LEN` line removed).
+
+#### Hardware (deployed sensor, app partition only; the 1.3.0 `ota_0` + `otadata` read back to `~/tinylink-backups/` first)
+
+`build_r131/tinylink.bin` (commit `e16ecf5`, 826 816 B) → 0x20000,
+hash verified; `otadata` untouched (seq 1 → `ota_0`). 180-s smoke at
+500 000 baud: `boots:1 panics:0 wdt:0 stream_ended:0`, boot line
+`tinylink 1.3.1 starting on sensor-cali (reset: power-on, 1)`, 0 E-level
+lines, only the usual warnings. Boot milestones against the 1.3.0
+smoke:
+
+| milestone | 1.3.0 | 1.3.1 |
+|---|---:|---:|
+| got IP (DHCP ARP probe gone, modem awake) | 4.4 s | 3.0 s |
+| register 200 | 8.8 s | 6.4 s |
+| initial netmap | 11.2 s | 8.2 s |
+| DERP login | 13.6 s | 10.0 s |
+| WG session up | 16.6 s | 13.6 s |
+
+Modem sleep switched on 13.5 s after Wi-Fi start (right after session
+up). The remaining ≈ 5 s before session up is the lost first INIT
+(round B). heap_free 60 324 → 62 692 B, largest block 47 104 → 51 200 B.
+Stack HWMs (B free): `tinylink_lp` 13 488 → 17 308 (nghttp2 buffer),
+`tinylink_tlm` 572 → 1 084 (same 3 524 B used — its peak is not a log
+call), `wifi` 616 → 1 008 (+120 B used under Log V2: the +512 was
+needed), `esp_timer` 5 292 → 4 572, `wg_rx` 2 052 → 2 084, `tiT`
+2 848 → 2 768. 6-h soak running.
+
+### Upstream sync round 1.3.0 (2026-10-28, branch `feat/upstream-sync-2026-10`)
+
+Inputs: a two-sided upstream audit — tailscale `31d8badb3..f7c1b8e52`
+(329 commits, v1.105.0-pre, `CurrentCapabilityVersion` 145 → 149) and
+headscale `89fa72e0..2d220b2e` (330 commits, 0.29.6,
+`MinSupportedCapabilityVersion` 115 → **116**, capver table up to 148) —
+plus the owner's decisions: capver **148**, firmware **1.3.0** (1.3.x is
+the work line, 1.4.0 the next stable), ESP-IDF **v5.5.6**. Every
+finding, decision and constraint is kept in
+`docs/rounds/2026-10-upstream-sync.md`. Host suite **633 strict OK, 0
+FAIL** (+63), ASan + UBSan clean. Image 946 037 → 959 249 B (+6 056 B
+from IDF 5.5.6, +7 156 B from the round's code incl. the review fixes and
+the S1/S2 security fixes); BSS 93 048 → 94 320 B (+128 IDF, +1 144
+code). Compiler warnings: 0. Flashed to the deployed sensor (app
+partition only) after owner approval: 180-s smoke + 30-min soak clean,
+hardware section at the end of this entry.
+
+#### 1 — Capver 148 (= Tailscale v1.104), every step honoured
+
+The owner's rule: only claim a capver that maps to an even-minor (stable)
+release; 149 is a sentinel on the odd 1.105-pre line and is not claimed.
+143 (control drops conn25 attrs below it), 145 (macOS quad-100), 146
+(`debug-conn-reject`: a local aggregator, nothing to enforce) and 148
+(`Node.StableTailnetID`) need no client behaviour. Peers gate on a
+remote's capver only at ≥ 121 (relay) and ≥ 26 (DNS proxy); headscale
+only checks its floor. The two that do need behaviour:
+
+- **144 — TSMP disco-key advertisement.** `tsmp.h` builds the 53-byte
+  packet upstream marshals (`net/packet` `IP4Header` +
+  `TSMPDiscoKeyAdvertisement`: IHL 5, TTL 64, proto 99, `'a'` + raw
+  disco key, RFC 1071 checksum); `wg_netif.c::send_disco_advert` sends it
+  through the tunnel after every accepted handshake response — cold or
+  rekey, direct or DERP-relayed — which is every new keypair for an
+  initiator-only node (wireguard-go `receive.go` → magicsock). Src/dst
+  are the self / peer tailnet /32s (new `wg_netif_peer_config` fields);
+  skipped without a peer DiscoKey. Being the first transport packet
+  under the new keys it also makes the peer confirm them at once after a
+  rekey. `/stats` gained `wg.disco_adverts`. Inbound adverts are still
+  dropped before lwIP (applying them is deferred: control's DiscoKey
+  patches now reach the data plane within seconds anyway).
+- **147 — Retry-After, upstream's exact rules** (`direct.go`
+  `isRateLimitedResponse` + `parseRateLimitError`, `auto.go`
+  `waitRetryAfter`): rate-limited iff 429, or 503 with a non-empty
+  Retry-After; the value is Atoi-clean seconds or an IMF-fixdate (only
+  once NTP is synced); ≤ 0, > 1 h or junk → uniform 5–10 s; capped at
+  5 min; the backoff is neither advanced nor reset while waiting; scope
+  `/machine/register` + `/machine/map`. Before: `10abc` parsed as 10,
+  > 300 clamped to 300 instead of 5–10 s, a 503 without the header was
+  treated like a rate limit, an HTTP-date was ignored, and a throttled
+  in-loop re-register did not pace the next cycle. `tl_date.h` (new,
+  libc-free) holds the IMF-fixdate and RFC 3339 parsers. Public API:
+  `tinylink_last_retry_after_s()` → `tinylink_last_rate_limit_ms()`.
+
+#### 2 — headscale delta frames (real bugs the current server triggers)
+
+- **Deleted / expired node never recovered (HIGH).** Since 0.29.4
+  headscale answers a deleted node's `Stream=true` map with **HTTP 200**
+  and one frame — `{"Node":{"Key","KeyExpiry":"1970-01-01T00:00:01Z",
+  "Expired":true},"Debug":…}` — then ends the stream (`noise.go`,
+  juanfont/headscale#3410); an expired node keeps streaming with
+  `Expired` set. No 4xx ever reached the M13 re-register path and every
+  byte fed the wedge clock: an endless ~30-s reconnect loop until power
+  cycle. `parse_node_obj` now reads `Expired` and `KeyExpiry`; an expired
+  self (explicit, or KeyExpiry ≤ `time(NULL)`, which is never ahead of
+  real time) ends the stream (`MAPREQ_STREAM_RECYCLE`) and re-registers
+  on the first frame (a bare 4xx still waits for the second). A node that
+  comes back with a new tailnet address restarts into the boot path.
+  Re-registering after delete/expiry needs a reusable or tagged key
+  (PROVISIONING.md).
+- **Peer key rotation never reached the data plane (HIGH).** The session
+  peer was matched by its boot NodeKey and wg_netif had no key setter:
+  after every peer tailscaled restart (a new DiscoKey each start) the
+  DISCO pre-filter and the relayed-DISCO gate dropped everything from the
+  peer until our reboot, and a peer re-login left WireGuard dead. The
+  "recycle the stream on a Key/DiscoKey patch" refetch (M13) fetched the
+  keys — and then nothing applied them. Now: the peer table is keyed by
+  NodeID and merged in upstream's order (`map.go`: `Peers` replace and
+  stop; else `PeersRemoved` → `PeersChanged` → `PeersChangedPatch`);
+  patches apply Key / DiscoKey / Endpoints / DERPRegion in place (headscale
+  sends endpoint moves only as patches since 59f3ff12); the data plane
+  tracks its peer by NodeID; `wg_netif_update_peer_keys()` swaps the
+  DiscoKey + NaCl shared key under the locks (X25519 runs first, in the
+  long-poll task — `curve25519_donna` alone is a 2.7 KiB frame wg_rx
+  cannot absorb) and restarts the session with a cold handshake on a new
+  static key. DISCO readers snapshot the key under `g.lock`.
+- **Removal-only and DERPMap-only frames were dropped as KeepAlives**
+  (`!have_self && n_peers == 0`); headscale sends both alone. Any frame
+  with self, peers, removals, patches or a DERPMap is now dispatched.
+- **Combined frames** (headscale 7a2335dc folds a tick into one response:
+  `PeersChanged` for A + a patch for B) lost B's patch; fixed by the
+  above. Delta lists over the per-frame caps (`TL_MAX_PEER_PATCHES` 4,
+  `TL_MAX_PEERS_REMOVED` 8) now recycle the stream for a full map instead
+  of applying part of a delta.
+- `wg_dataplane_start` takes the merged table (self addresses + peers)
+  instead of one frame; dead `wg_dataplane_update_peer()` removed.
+
+#### 2b — Independent review of the round (fixed before any flash)
+
+- **Irrelevant patches recycled the stream**: every PeerChange counted
+  against the 4-slot cap, incl. headscale's per-peer `Online` /
+  `LastSeen` patches folded per tick — two or three peers reconnecting
+  together forced a TLS + Noise reconnect + full map. Only entries with
+  Key / DiscoKey / Endpoints / DERPRegion are kept now (duplicates by
+  NodeID folded), and the table counts as changed only when a value
+  actually moved (each change costs a prepunch round of X25519s).
+- **Expired node could re-register every cycle forever** (control
+  accepts the register but keeps the key expired): `NodeKeyExpired` in
+  the RegisterResponse is now a failure (upstream rotates the key;
+  tinylink doesn't yet — disable key expiry for the node or re-auth),
+  and the rejection streak only resets after a stream delivers a live
+  self node, so the 1, 2, 4… schedule holds. The streak no longer
+  saturates at 1024 (a power of two → re-register on every cycle after
+  ~8.5 h); past 1024 it fires every 1024th cycle.
+- **A control endpoint patch could override a working roamed endpoint**
+  (endpoint-dependent NAT: the live target is the peer's real source
+  port). Kept when it is still advertised or a packet authenticated
+  within the RX-stale window; the stale probe + pong roam move it when
+  the path dies. Endpoint is applied before keys, so a re-login's
+  cold-handshake INIT goes to the new address.
+- Unlocked reads of the peer static key (DERP relay destination, inject
+  source check) now snapshot under `g.lock` — only when relaying.
+
+#### 3 — ESP-IDF v5.5.4 → v5.5.6, tooling, docs
+
+- **IDF v5.5.6** (2026-10-16; Wi-Fi supplicant security fixes; same
+  toolchain). Both `idf-patches/` still apply and are still needed; the
+  crt-bundle verify callback `tl_time.c` relies on and the mbedTLS
+  `_ALT` hooks are unchanged. v6.x rejected for now (mbedTLS 4 / PSA
+  drops `mbedtls_chachapoly_*`, +27–41 KB flash, +800 B stack per HTTPS
+  conn, deprecated CAs removed, FreeRTOS forced into flash, patches to
+  re-validate). CI pins v5.5.6; host floor 623.
+- **`docs/esp32/`**: the deployed part read from eFuses —
+  ESP32-WROOM-32E-N4, ESP32-D0WD-V3 **rev v3.1**, 40 MHz XTAL, XMC
+  (0x46) 4 MB flash — plus `fetch-docs.sh` and a page-cited
+  `REFERENCE.md` digest (TRM v5.9, datasheet v5.3, WROOM-32E v2.1,
+  errata v3.1, Xtensa ISA RM). PDFs are not committed.
+- `nvs_provision.py` accepts headscale `hskey-` keys
+  (`--allow-legacy-key` for pre-0.28 plaintext keys).
+- `/stats` buffer 640 → 768 B: with a 63-char hostname the reply could
+  exceed 640 B and was then silently not sent.
+- Docs: capver / floor / prologue mentions, `ARCHITECTURE.md`
+  re-register paragraph, stale `http2.Server.ServeConn` comments,
+  `wg_dataplane.h` (still described trombik/esp_wireguard).
+
+#### Upstream drift audit — verified no-impact items
+
+controlbase / controlhttp / ts2021 framing (fuzz tests only; client-side
+1 MiB body cap), `disco/` (unchanged; heartbeat 3 s, trust 6.5 s,
+session-active 45 s unchanged), `net/stun` (tests only; derper now
+replies from the request's address), DERP frames (`derp.go` unchanged;
+keepalive 60 s + re-jittered, unknown frames > 65 568 B close the conn —
+tinylink sends none), `/machine/register` + `/machine/map` JSON (only
+`StableTailnetID`), `watchdogTimeout` 120 s, map 404 = node deleted
+(already re-registers on 4xx), `types/key` NL→TL rename (wire prefixes
+`nlpub:` kept), wireguard-go bump (perf/metrics only, no per-peer PSK on
+the wire), peer relay (CallMeMaybeVia ignored as before), packet-parser
+hardening (constrains the advert: IHL 5, exact length — satisfied).
+headscale: net/http h2c front end (`62714564`: identical SETTINGS,
+MAX_FRAME 1 MiB, MCS 250, IWS 1 MiB, no idle timeout / server PING /
+idle GOAWAY; the server now waits for the client preface before its
+SETTINGS — nghttp2 sends the preface first), floor 116 checked before
+the register handler, same-NodeKey re-register still skips key
+validation, stopped sessions reset after 5 s only if we stop reading,
+`/machine/set-dns` (never called), CertDomains / https cap / logtail
+`Debug` (skipped), SSH policy changes (skipped), DERP admission still
+by NodeKey, no Retry-After on any path tinylink uses.
+
+#### Hardware (deployed sensor, app partition only; the 1.2.0 `ota_0` + `otadata` read back to `~/tinylink-backups/` first)
+
+`build_v556/tinylink.bin` written to 0x20000 at 460 800 baud, hash
+verified; `otadata` untouched (seq 1 → `ota_0`). Against
+controlplane.tailscale.com with capver **148** in the Noise prologue:
+
+- **180-s boot smoke:** `boots:1 panics:0 wdt:0`, register 200 at
+  +8.8 s, initial netmap at +11.2 s (body 25 971 B, 179/640 tokens,
+  4 peers, 28 DERP regions), DERP login at +13.6 s, WG session up at
+  +16.6 s (the known lost first INIT → one retry), rekey at +128.6 s,
+  telemetry every 5 s. One long-poll stream end at +54.9 s:
+  `tls_read_full failed: -1` = TCP FIN from the server, no GOAWAY, no
+  idle timeout; reconnected and re-parsed the full netmap 7 s later.
+- **30-min soak** (a fresh boot — opening the port resets this board):
+  `boots:1 panics:0 wdt:0 stream_ended:0`, 16 rekeys, 1 boot handshake
+  retry, 0 rx-stale / roams / DERP errors, 6 STUN re-probes, 361
+  telemetry datagrams, 33 keep-alive frames, 0 E-level lines; heap_free
+  ≥ 59 860 B, largest block ≥ 47 104 B. Stack HWMs unchanged from the
+  smoke (`tinylink_tlm` 572 B, `wifi` 616, `wg_rx` 2 052,
+  `tinylink_lp` 13 488 free).
+- The single FIN is not a capver-148 signal: none in the 30-min run,
+  and the 1.2.0 (capver 142) M16 soak saw two server-side stream ends
+  in 3.2 h. The multi-hour soak runs on 1.3.1, which carries all of
+  this code.
+- `/stats` could not be queried from the workstation: the single-peer
+  dataplane only holds a session with Servidor1 (by design).
+
 ### To-95 round (2026-09-04, part 3, branch `feat/to-95`)
 
 Closes every improvement-list item that needs neither router/admin
@@ -1031,7 +3813,7 @@ Measured impact (PR-D0 + PR-D1, esp32, IDF v5.5.4):
   total app .bin    +0.39 KiB  (1015145 → 1015533)
   bootloader.bin     0
 
-Smoke validated on hardware (30 min, INTELCOM-CARDONA WPA2+PMF):
+Smoke validated on hardware (30 min, the production WPA2+PMF AP):
   - 0 panics / asserts / WDT / xTaskCreate fails (3 prior soaks had
     the supervisor xTaskCreate fail; this one didn't)
   - derp supervisor task spawned t=5.9 s + login OK t=16.9 s on
@@ -1087,7 +3869,7 @@ telemetry @ 5 s, PR #75 `KeepAlive:true` confirmed on-wire). The
 round targets sdkconfig only — no `.c`/`.h` changes, no API surface
 change. Each PR was validated independently by a 60-120 s smoke
 (boot + register + initial netmap + ≥5 telemetry @ 5 s + 0 panic /
-assert / WDT) on the same INTELCOM-CARDONA WPA2+PMF AP, then
+assert / WDT) on the same production WPA2+PMF AP, then
 pushed.
 
 | PR (branch) | Δ flash app | Δ DRAM | Δ IRAM | Other |
@@ -1677,7 +4459,7 @@ each flash.
   `tools/test/test_disco_replay.c` covers first-arrival, immediate
   replay, distinct-non-collide, ring-buffer eviction, and reset
   semantics. On-device verified with 30 s of normal traffic
-  (peer 191.89.194.5:3176 + 192.168.1.38:41641 LAN endpoint,
+  (peer 203.0.113.5:3176 + 192.168.1.38:41641 LAN endpoint,
   ~2-3 PING→Pong/s, all unique txids → all unique nonces → zero false
   positives).
 - **`parse_keyed_hex` partial-write hardening (mapreq.c).** On a
@@ -1862,7 +4644,7 @@ each flash.
   catching both binding requests and responses (the prior shape only
   caught requests; a STUN response with byte 0 = 0x01 collided with
   WG `MSG_RESPONSE` and got DISCARDed). Verified on hardware: 7-min
-  capture shows `stun re-probe ok via wg socket: 190.109.12.37:53174`
+  capture shows `stun re-probe ok via wg socket: 198.51.100.37:53174`
   (the WG socket's actual port), 3 clean rekey cycles, 80 telemetry
   packets uninterrupted, 0 crashes. Removes the *"followup PR
   re-probes via wg socket"* TODO from `tinylink.c`.

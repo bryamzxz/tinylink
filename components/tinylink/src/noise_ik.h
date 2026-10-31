@@ -65,12 +65,44 @@ esp_err_t noise_ik_init(noise_ik_state_t *st,
 esp_err_t noise_ik_write_msg1(noise_ik_state_t *st,
                               uint8_t out[NOISE_IK_MSG1_LEN]);
 
+/* The DH work of msg1 done ahead of it (round 1.3.7, B2): ss = DH(s, rs)
+ * for the static pair — the same for every handshake to that server —
+ * and an ephemeral e with es = DH(e, rs), for exactly one handshake.
+ * Secrets: scrub with tl_secure_zero when done or stale. */
+typedef struct {
+    uint8_t ss[NOISE_DHLEN];
+    uint8_t e_priv[NOISE_DHLEN];
+    uint8_t e_pub[NOISE_DHLEN];
+    uint8_t es[NOISE_DHLEN];
+    bool    have_ss;
+    bool    have_e;
+} noise_ik_pre_t;
+
+/* Fill pre for (s_priv, rs): ss unless pre->have_ss, and a fresh e + es
+ * when want_e (unless pre->have_e). ESP_FAIL for a low-order rs. */
+esp_err_t noise_ik_precompute(noise_ik_pre_t *pre,
+                              const uint8_t s_priv[NOISE_DHLEN],
+                              const uint8_t rs[NOISE_DHLEN], bool want_e);
+
+/* noise_ik_write_msg1 taking ss and / or e + es from pre (computed for
+ * this state's s and rs — the caller's to match) instead of running
+ * their X25519: the same message. pre NULL = noise_ik_write_msg1. */
+esp_err_t noise_ik_write_msg1_pre(noise_ik_state_t *st,
+                                  uint8_t out[NOISE_IK_MSG1_LEN],
+                                  const noise_ik_pre_t *pre);
+
 /* Read the IK responder message (<- e, ee, se). After this returns
  * ESP_OK, k_send / k_recv are valid for subsequent transport encryption. */
 esp_err_t noise_ik_read_msg2(noise_ik_state_t *st,
                              const uint8_t in[NOISE_IK_MSG2_LEN]);
 
-/* Transport-mode encrypt/decrypt. Each direction has its own counter. */
+/* Transport-mode encrypt/decrypt. Each direction has its own counter.
+ * Both run on the in-tree ChaCha20-Poly1305 (crypto/chacha20poly1305.c,
+ * IRAM with CONFIG_TINYLINK_CRYPTO_IN_IRAM) with the ts2021 nonce
+ * 0^32 || BE64(n) — see noise_nonce() in noise_ik.c. noise_ik_decrypt
+ * checks the tag in constant time before writing any plaintext: on
+ * ESP_FAIL, out is untouched and n_recv does not advance. out may equal
+ * ciphertext (in place); partial overlap is not supported. */
 esp_err_t noise_ik_encrypt(noise_ik_state_t *st,
                            uint8_t *out, size_t out_max,
                            const uint8_t *plaintext, size_t plaintext_len,

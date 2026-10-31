@@ -6,11 +6,12 @@
 #include <string.h>
 
 #include "esp_log.h"
-#include "mbedtls/chachapoly.h"
 
 #include "blake2s.h"
+#include "chacha20poly1305.h"
 #include "curve25519.h"
 #include "hkdf_blake2s.h"
+#include "secure_zero.h"
 
 static const char *TAG = "noise_ik";
 
@@ -42,8 +43,8 @@ static esp_err_t mix_key(noise_ik_state_t *st,
     memcpy(st->k, new_k, NOISE_KEYLEN);
     st->have_k = true;
     st->n = 0;
-    memset(new_ck, 0, sizeof(new_ck));
-    memset(new_k, 0, sizeof(new_k));
+    tl_secure_zero(new_ck, sizeof(new_ck));
+    tl_secure_zero(new_k, sizeof(new_k));
     return ESP_OK;
 }
 
@@ -62,8 +63,14 @@ static esp_err_t mix_key(noise_ik_state_t *st,
  * Discovered 2026-05-02 on first hardware boot: first transport
  * record decrypted (n=0, both encodings produce all-zero counter
  * bytes), second one failed. Hex dumps confirmed the nonce
- * mismatch at counter=1. */
-static void noise_nonce(uint8_t out[12], uint64_t n)
+ * mismatch at counter=1.
+ *
+ * The 12 bytes are handed to the AEAD as an opaque RFC 8439 nonce
+ * (state words 13..15 = LE loads of bytes 0..3, 4..7, 8..11), exactly
+ * as mbedtls_chachapoly_* consumed them before round 1.3.2 — so the
+ * BE counter reaches the wire unchanged. Pinned against the pre-1.3.2
+ * mbedTLS path by tools/test/test_noise_ik.c. */
+static void noise_nonce(uint8_t out[CHACHA20POLY1305_NONCE_LEN], uint64_t n)
 {
     memset(out, 0, 4);
     for (int i = 0; i < 8; i++) {
@@ -78,24 +85,12 @@ static esp_err_t encrypt_and_hash(noise_ik_state_t *st,
 {
     if (out_max < plaintext_len + NOISE_TAGLEN) return ESP_ERR_INVALID_SIZE;
 
-    uint8_t nonce[12];
+    uint8_t nonce[CHACHA20POLY1305_NONCE_LEN];
     noise_nonce(nonce, st->n);
 
-    mbedtls_chachapoly_context cp;
-    mbedtls_chachapoly_init(&cp);
-    int rc = mbedtls_chachapoly_setkey(&cp, st->k);
-    if (rc == 0) {
-        rc = mbedtls_chachapoly_encrypt_and_tag(&cp, plaintext_len,
-                                                nonce,
-                                                st->h, NOISE_HASHLEN,
-                                                plaintext, out,
-                                                out + plaintext_len);
-    }
-    mbedtls_chachapoly_free(&cp);
-    if (rc != 0) {
-        ESP_LOGE(TAG, "chachapoly_encrypt failed: %d", rc);
-        return ESP_FAIL;
-    }
+    /* AAD = h. ciphertext || tag lands in out[0 .. plaintext_len + 16). */
+    chacha20poly1305_encrypt(out, plaintext, plaintext_len,
+                             st->h, NOISE_HASHLEN, st->k, nonce);
     if (mix_hash(st, out, plaintext_len + NOISE_TAGLEN) != ESP_OK) {
         return ESP_FAIL;
     }
@@ -112,22 +107,15 @@ static esp_err_t decrypt_and_hash(noise_ik_state_t *st,
     size_t plaintext_len = ciphertext_len - NOISE_TAGLEN;
     if (out_max < plaintext_len) return ESP_ERR_INVALID_SIZE;
 
-    uint8_t nonce[12];
+    uint8_t nonce[CHACHA20POLY1305_NONCE_LEN];
     noise_nonce(nonce, st->n);
 
-    mbedtls_chachapoly_context cp;
-    mbedtls_chachapoly_init(&cp);
-    int rc = mbedtls_chachapoly_setkey(&cp, st->k);
-    if (rc == 0) {
-        rc = mbedtls_chachapoly_auth_decrypt(&cp, plaintext_len,
-                                             nonce,
-                                             st->h, NOISE_HASHLEN,
-                                             ciphertext + plaintext_len,
-                                             ciphertext, out);
-    }
-    mbedtls_chachapoly_free(&cp);
-    if (rc != 0) {
-        ESP_LOGE(TAG, "chachapoly_decrypt failed: %d", rc);
+    /* Constant-time tag check before any plaintext is written; on
+     * failure out is untouched and neither h nor n moves. */
+    if (chacha20poly1305_decrypt(out, ciphertext, ciphertext_len,
+                                 st->h, NOISE_HASHLEN, st->k, nonce) != 0) {
+        /* %u, not %llu: newlib nano printf has no 64-bit conversions. */
+        ESP_LOGE(TAG, "handshake AEAD auth failed (n=%u)", (unsigned)st->n);
         return ESP_FAIL;
     }
     /* MixHash uses the ciphertext, not the plaintext. */
@@ -174,19 +162,56 @@ esp_err_t noise_ik_init(noise_ik_state_t *st,
     return ESP_OK;
 }
 
+esp_err_t noise_ik_precompute(noise_ik_pre_t *pre,
+                              const uint8_t s_priv[NOISE_DHLEN],
+                              const uint8_t rs[NOISE_DHLEN], bool want_e)
+{
+    if (pre == NULL || s_priv == NULL || rs == NULL) return ESP_ERR_INVALID_ARG;
+    if (!pre->have_ss) {
+        if (curve25519_dh(pre->ss, s_priv, rs) != 0) {
+            tl_secure_zero(pre->ss, sizeof(pre->ss));
+            return ESP_FAIL;
+        }
+        pre->have_ss = true;
+    }
+    if (want_e && !pre->have_e) {
+        if (curve25519_keypair(pre->e_priv, pre->e_pub) != 0 ||
+            curve25519_dh(pre->es, pre->e_priv, rs) != 0) {
+            tl_secure_zero(pre->e_priv, sizeof(pre->e_priv));
+            tl_secure_zero(pre->es, sizeof(pre->es));
+            return ESP_FAIL;
+        }
+        pre->have_e = true;
+    }
+    return ESP_OK;
+}
+
 esp_err_t noise_ik_write_msg1(noise_ik_state_t *st,
                               uint8_t out[NOISE_IK_MSG1_LEN])
+{
+    return noise_ik_write_msg1_pre(st, out, NULL);
+}
+
+esp_err_t noise_ik_write_msg1_pre(noise_ik_state_t *st,
+                                  uint8_t out[NOISE_IK_MSG1_LEN],
+                                  const noise_ik_pre_t *pre)
 {
     if (st == NULL || out == NULL) return ESP_ERR_INVALID_ARG;
 
     /* -> e */
-    if (curve25519_keypair(st->e_priv, st->e_pub) != 0) return ESP_FAIL;
+    uint8_t dh[NOISE_DHLEN];
+    if (pre != NULL && pre->have_e) {
+        memcpy(st->e_priv, pre->e_priv, NOISE_DHLEN);
+        memcpy(st->e_pub, pre->e_pub, NOISE_DHLEN);
+        memcpy(dh, pre->es, NOISE_DHLEN);
+    } else if (curve25519_keypair(st->e_priv, st->e_pub) != 0 ||
+               curve25519_dh(dh, st->e_priv, st->rs) != 0) {
+        return ESP_FAIL;
+    }
     memcpy(out, st->e_pub, NOISE_DHLEN);
     if (mix_hash(st, st->e_pub, NOISE_DHLEN) != ESP_OK) return ESP_FAIL;
 
     /* es: MixKey(DH(e, rs)) */
-    uint8_t dh[NOISE_DHLEN];
-    if (curve25519_dh(dh, st->e_priv, st->rs) != 0) return ESP_FAIL;
     if (mix_key(st, dh, NOISE_DHLEN) != ESP_OK) return ESP_FAIL;
 
     /* s: write EncryptAndHash(s_pub) — 48 bytes (32 + 16 tag). */
@@ -195,14 +220,18 @@ esp_err_t noise_ik_write_msg1(noise_ik_state_t *st,
                          st->s_pub, NOISE_DHLEN) != ESP_OK) return ESP_FAIL;
 
     /* ss: MixKey(DH(s, rs)) */
-    if (curve25519_dh(dh, st->s_priv, st->rs) != 0) return ESP_FAIL;
+    if (pre != NULL && pre->have_ss) {
+        memcpy(dh, pre->ss, NOISE_DHLEN);
+    } else if (curve25519_dh(dh, st->s_priv, st->rs) != 0) {
+        return ESP_FAIL;
+    }
     if (mix_key(st, dh, NOISE_DHLEN) != ESP_OK) return ESP_FAIL;
+    tl_secure_zero(dh, sizeof(dh));  /* last use; before the next fallible step */
 
     /* Empty payload → 16-byte auth tag at the tail. */
     if (encrypt_and_hash(st, out + NOISE_DHLEN + NOISE_DHLEN + NOISE_TAGLEN,
                          NOISE_TAGLEN, NULL, 0) != ESP_OK) return ESP_FAIL;
 
-    memset(dh, 0, sizeof(dh));
     return ESP_OK;
 }
 
@@ -223,6 +252,7 @@ esp_err_t noise_ik_read_msg2(noise_ik_state_t *st,
     /* se: MixKey(DH(s, re)) */
     if (curve25519_dh(dh, st->s_priv, st->re) != 0) return ESP_FAIL;
     if (mix_key(st, dh, NOISE_DHLEN) != ESP_OK) return ESP_FAIL;
+    tl_secure_zero(dh, sizeof(dh));  /* last use; the tag check may fail */
 
     /* Empty payload at in[32..48]: just the 16-byte tag. */
     uint8_t dummy[1] = {0};
@@ -237,8 +267,6 @@ esp_err_t noise_ik_read_msg2(noise_ik_state_t *st,
     st->n_send = 0;
     st->n_recv = 0;
     st->transport_ready = true;
-
-    memset(dh, 0, sizeof(dh));
     return ESP_OK;
 }
 
@@ -252,24 +280,13 @@ esp_err_t noise_ik_encrypt(noise_ik_state_t *st,
     if (plaintext == NULL && plaintext_len != 0) return ESP_ERR_INVALID_ARG;
     if (out_max < plaintext_len + NOISE_TAGLEN) return ESP_ERR_INVALID_SIZE;
 
-    uint8_t nonce[12];
+    uint8_t nonce[CHACHA20POLY1305_NONCE_LEN];
     noise_nonce(nonce, st->n_send);
 
-    mbedtls_chachapoly_context cp;
-    mbedtls_chachapoly_init(&cp);
-    int rc = mbedtls_chachapoly_setkey(&cp, st->k_send);
-    if (rc == 0) {
-        rc = mbedtls_chachapoly_encrypt_and_tag(&cp, plaintext_len,
-                                                nonce,
-                                                NULL, 0,
-                                                plaintext, out,
-                                                out + plaintext_len);
-    }
-    mbedtls_chachapoly_free(&cp);
-    if (rc != 0) {
-        ESP_LOGE(TAG, "transport encrypt failed: %d", rc);
-        return ESP_FAIL;
-    }
+    /* Transport records carry no AAD. Runs on the in-tree IRAM AEAD the
+     * WireGuard data plane uses (round 1.3.2; mbedTLS chachapoly before). */
+    chacha20poly1305_encrypt(out, plaintext, plaintext_len,
+                             NULL, 0, st->k_send, nonce);
     *out_len = plaintext_len + NOISE_TAGLEN;
     st->n_send++;
     return ESP_OK;
@@ -287,22 +304,13 @@ esp_err_t noise_ik_decrypt(noise_ik_state_t *st,
     size_t plaintext_len = ciphertext_len - NOISE_TAGLEN;
     if (out_max < plaintext_len) return ESP_ERR_INVALID_SIZE;
 
-    uint8_t nonce[12];
+    uint8_t nonce[CHACHA20POLY1305_NONCE_LEN];
     noise_nonce(nonce, st->n_recv);
 
-    mbedtls_chachapoly_context cp;
-    mbedtls_chachapoly_init(&cp);
-    int rc = mbedtls_chachapoly_setkey(&cp, st->k_recv);
-    if (rc == 0) {
-        rc = mbedtls_chachapoly_auth_decrypt(&cp, plaintext_len,
-                                             nonce,
-                                             NULL, 0,
-                                             ciphertext + plaintext_len,
-                                             ciphertext, out);
-    }
-    mbedtls_chachapoly_free(&cp);
-    if (rc != 0) {
-        ESP_LOGW(TAG, "transport decrypt failed: %d", rc);
+    if (chacha20poly1305_decrypt(out, ciphertext, ciphertext_len,
+                                 NULL, 0, st->k_recv, nonce) != 0) {
+        ESP_LOGW(TAG, "transport decrypt failed (n=%u)",
+                 (unsigned)st->n_recv);
         return ESP_FAIL;
     }
     *out_len = plaintext_len;

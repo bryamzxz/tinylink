@@ -31,6 +31,9 @@ implementation, which is the authoritative reference for wire format.
 | M14| Audit + optimization round (2026-09-04)       | done — endpoint-push stack overflow fixed (task removed, −12.6 KiB BSS), headscale `/key` capver gate, TSMP drop, DERP close race, Xtensa-tuned AEAD, backoff consolidation, provisioning contract, ASan CI. See "M14" + "Improvement list" below | v0.8   | landed   |
 | M15| Road-to-100 round (2026-09-04, part 2)        | done — netmap parsed one value at a time (−30 KiB BSS, no tailnet-size ceiling), task WDT for app tasks, capver 142, connect-path stack diet, DERP live relay switch, IP-change recycle + WiFi backoff, conn kept after register, flash trims, 3 new KAT suites, firmware 1.2.0 | v1.2   | landed   |
 | M16| To-95 round (2026-09-04, part 3)              | done — NTP-synced certificate date validation, `PeersRemoved` + delta merge, WG handshake lock + roam on authenticated packets, `/stats` over UDP, AEAD placement measured cold. Declared scope ≈ 95 %; the last 5 % is the owner checklist below | v1.2   | landed   |
+| M17| Upstream sync 1.3.0 (2026-10-28)              | done, HW smoke + 30-min soak clean — capver 148 (TSMP disco advert, exact Retry-After), headscale delta frames (expired/deleted self re-registers, peer NodeKey/DiscoKey rotation applied, patches by NodeID, removal-/DERPMap-only frames), ESP-IDF v5.5.6, `docs/esp32/`, hskey provisioning, firmware 1.3.0. See "M17" below | v1.3   | in review |
+| M18| Optimization round A 1.3.1 (2026-10-28)      | done, HW smoke clean (boot to WG 16.6 → 13.6 s), 6-h soak running — Kconfig items A1–A14 of `docs/rounds/2026-10-optimization-list.md` (A7 already covered by IDF), image −132 KB; see CHANGELOG | v1.3   | in progress |
+| M19| Optimization round B 1.3.2 (2026-10-28)      | done, HW smoke clean (WG-up − netmap 5.3 → 1.9 s, heap +14 KB), 6-h soak running — items B1–B21 of `docs/rounds/2026-10-optimization-list.md` except B18 (stack trims, after the soak); image −64 KB, static DRAM −12.3 KB; see CHANGELOG | v1.3   | in progress |
 | —  | Next rounds                                   | queued — see "Execution queue" below (M13 checklist 3–5 → task WDT → SNTP → buffer diet → /stats → OTA; eFuse encryption explicitly out) | —      | queued   |
 
 End-to-end verification on hardware (sensor-cali next to router,
@@ -38,7 +41,7 @@ Servidor1 WG peer with public IP):
 
 ```
 $ tailscale ping sensor-cali        # from Servidor1
-pong from sensor-cali (100.67.60.92) via 190.109.12.37:50582 in 403ms
+pong from sensor-cali (100.67.60.92) via 198.51.100.37:50582 in 403ms
 $ ping -c 10 100.67.60.92            # from Servidor1
 10 packets transmitted, 10 received, 0% packet loss, time 9008ms
 rtt min/avg/max/mdev = 48.916/93.805/141.008/28.296 ms
@@ -146,6 +149,41 @@ runs).
 Effort is rated as *small* (1-3 days), *medium* (1-2 weeks), or
 *large* (≥ 1 month) for one engineer working part-time. Dependencies
 are flagged because some items unblock others.
+
+### War hardening — assume everything fails (deferred, agreed 2026-10-29)
+
+Build tinylink as if it were going to war: every dependency is scarce
+or failing, and the failures are provoked on purpose instead of waited
+for. Prompted by the nightly 02:00 reboot of the collector — a 24/7
+server on general-purpose hardware at ~2 400 m — which on 1.3.2 cost a
+50.8-s outage (6.2 s after the peer was back) and drove `wg_rx` to its
+deepest stack path, one no smoke had exercised. Deferred by the owner:
+worth doing, but not now.
+
+1. **War matrix.** Every external dependency — control plane, DERP,
+   the peer, Wi-Fi, DNS, NTP — and every internal scarcity — heap,
+   flash / NVS wear, power (brown-out), clock, SRAM bit flips (no ECC;
+   the neutron flux at altitude is several times sea level) — with
+   today's behaviour, the evidence (test / log) and the gap.
+2. **Hermetic lab.** The firmware on Espressif's QEMU over its emulated
+   OpenCores Ethernet (`CONFIG_ETH_USE_OPENETH`), joined to a throwaway
+   tailnet on the dev box: headscale built from source (needs Go),
+   embedded DERP, a `tailscaled` peer. Everything killable at will
+   (control plane, DERP, the peer — the 02:00 reboot on demand — the
+   link via QEMU `set_link off`, DNS), clock skew, and scriptable so it
+   can run in CI. Option: a second phase against tailscale.com with a
+   dedicated test node (its own auth key).
+3. **In-firmware fault injection** behind a test-only Kconfig, compiled
+   out of production: drop / corrupt / reorder packets, cut TLS
+   mid-frame, fail `malloc` / `pbuf_alloc`, jump the clock.
+4. **Harden what breaks** — fix, test, commit per failure. Candidate
+   already known: periodic consistency check of the key material in RAM
+   against NVS (a bit flip in the WG private key today kills the tunnel
+   until the next reboot); a faster rekey cadence after a detected peer
+   restart (5 s → 2 s, like B7c), to be measured over several nights
+   with `peer_restart.py`.
+
+Effort: *large*. Depends on: the 1.3.x optimization rounds settling.
 
 ### Streaming JSON parser to eliminate `RESPONSE_BUF_SZ`
 
@@ -1065,6 +1103,33 @@ state after each round of 2026-09-04.
 
 ES: idem — inventario de mejoras y estimación de avance por área tras la
 ronda 2026-09-04; el detalle por ítem está en `CHANGELOG.md`.
+
+## M17 — Upstream sync 1.3.0 (2026-10-28)
+
+Owner goals: (1) bring tinylink up to tailscale `f7c1b8e52` / headscale
+`2d220b2e`; (2) "optimization to the absurd" for the ESP32 v1 — list
+first, rounds 1.3.x after. Working report with every finding and
+decision: `docs/rounds/2026-10-upstream-sync.md`; per-item detail in
+`CHANGELOG.md`.
+
+- [x] Capver **148** (= v1.104; owner rule: only even-minor releases),
+  143–148 honoured — **144** TSMP disco-key advert after every
+  handshake, **147** upstream's exact Retry-After rules.
+- [x] headscale: expired/deleted self node → re-register (was an endless
+  reconnect loop); peer NodeKey/DiscoKey rotation reaches the data plane
+  (was: DISCO dead after every peer tailscaled restart); patches applied
+  by NodeID; removal-/DERPMap-only frames no longer taken for
+  KeepAlives; over-cap deltas recycle for a full map.
+- [x] ESP-IDF v5.5.6 (stay on 5.5; v6.x rejected for now — see BUILDING).
+- [x] `docs/esp32/` — exact part identity + cited vendor digest.
+- [x] `nvs_provision.py` accepts headscale `hskey-` keys.
+- [x] **Hardware**: tailscale.com smoke (180 s) + 30-min soak for
+  capver 148 on the deployed sensor, 2026-10-28 — clean (CHANGELOG).
+- [ ] Headscale test list in the round report (delete / expire / peer
+  restart / peer re-auth / roam) — needs a headscale instance.
+- [ ] Deferred: apply *received* TSMP adverts (needs a stack-safe
+  context for X25519), home-DERP fallback when the preferred region
+  leaves the DERPMap, lazy early-payload read.
 
 ## Execution queue — next rounds (agreed 2026-07-16)
 

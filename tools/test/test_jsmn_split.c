@@ -23,6 +23,29 @@ static int count_members(const char *js, size_t len, int *last_rc)
     return n;
 }
 
+/* Where tl_jsplit_scan_* ends the value starting at js[0] (non-ws): the
+ * index just past it, or 0 if it fails / is unterminated. A scalar still
+ * open at the end of the text ends there, like tl_jsplit_value. */
+static size_t scan_end(const char *js, size_t len)
+{
+    tl_jsplit_scan_t s;
+    if (len == 0 || tl_jsplit_scan_begin(&s, js[0]) != TL_JSCAN_MORE) return 0;
+    for (size_t i = 1; i < len; i++) {
+        int r = tl_jsplit_scan_byte(&s, js[i]);
+        if (r == TL_JSCAN_ERR) return 0;
+        if (r == TL_JSCAN_END) return i + 1;
+        if (r == TL_JSCAN_END_BEFORE) return i;
+    }
+    return (s.mode == TL_JSCAN_SCALAR) ? len : 0;
+}
+
+static int scan_matches_value(const char *js, size_t len)
+{
+    size_t a = scan_end(js, len), b = tl_jsplit_value(js, len, 0);
+    if (a != b) printf("  scan %zu vs value %zu on \"%.*s\"\n", a, b, (int)len, js);
+    return a == b;
+}
+
 int main(void)
 {
     /* --- objects ------------------------------------------------- */
@@ -127,7 +150,7 @@ int main(void)
     /* --- a MapResponse-shaped document, split then re-split ------ */
     {
         const char *js =
-            "{\"Node\":{\"ID\":7,\"Addresses\":[\"100.67.60.92/32\"]},"
+            "{\"Node\":{\"ID\":7,\"Addresses\":[\"100.64.0.10/32\"]},"
             "\"PeersChanged\":[{\"ID\":1,\"Key\":\"nodekey:00\",\"Endpoints\":[\"1.1.1.1:1\",\"2.2.2.2:2\"]},"
                               "{\"ID\":2,\"Key\":\"nodekey:11\"}],"
             "\"DERPMap\":{\"Regions\":{\"1\":{\"RegionID\":1,\"Nodes\":[{\"HostName\":\"derp1\"}]},"
@@ -165,6 +188,50 @@ int main(void)
             }
         }
         CHECK("mapresponse/shape", ok && rc == 0 && peers == 2 && regions == 2 && patch_ident == 1);
+    }
+
+    /* --- tl_jsplit_scan_* (round 1.3.4, D2) ---------------------------
+     * The byte-at-a-time scanner must end every value exactly where
+     * tl_jsplit_value does, and fail exactly where it fails. */
+    {
+        static const char *cases[] = {
+            "\"abc\"", "\"a\\\"b\"", "\"a\\\\\"x", "\"unterminated", "\"esc at end\\",
+            "123,", "true}", "null]", "-1.5e3 ", "1\"x\"]", "x{\"a\":1}", ":1}",
+            "{}", "[]", "{\"a\":[1,2,{\"b\":\"]\"}]}", "{\"a\":1]", "[1}", "[[[", "{\"a\":",
+            "{\"k\\\"}\":1}rest", "[\"]\",\"[\"]", ",", "}", "]", "{\"a\":1}}", "a",
+        };
+        int ok = 1;
+        for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+            ok &= scan_matches_value(cases[i], strlen(cases[i]));
+        }
+        CHECK("scan/same-end-as-value", ok);
+    }
+    {
+        /* Depth: 64 levels end, 65 fail — the same bound. */
+        char deep[160]; size_t o = 0;
+        for (int i = 0; i < 64; i++) deep[o++] = '[';
+        for (int i = 0; i < 64; i++) deep[o++] = ']';
+        int ok = scan_matches_value(deep, o) && tl_jsplit_value(deep, o, 0) == o;
+        o = 0;
+        for (int i = 0; i < 65; i++) deep[o++] = '[';
+        for (int i = 0; i < 65; i++) deep[o++] = ']';
+        ok &= scan_matches_value(deep, o) && tl_jsplit_value(deep, o, 0) == 0;
+        CHECK("scan/depth-bound", ok);
+    }
+    {
+        /* 200 000 random strings over the characters that matter. */
+        static const char alpha[] = "{}[]\",:\\ \nab1";
+        unsigned seed = 12345; int ok = 1; char buf[48];
+        for (int t = 0; t < 200000 && ok; t++) {
+            size_t n = 1 + (size_t)((seed = seed * 1103515245u + 12345u) >> 16) % (sizeof(buf) - 1);
+            for (size_t i = 0; i < n; i++) {
+                seed = seed * 1103515245u + 12345u;
+                buf[i] = alpha[(seed >> 16) % (sizeof(alpha) - 1)];
+            }
+            if (tl_jsplit_is_ws(buf[0])) buf[0] = 'a';
+            ok &= scan_matches_value(buf, n);
+        }
+        CHECK("scan/random-vs-value", ok);
     }
 
     if (g_fail) { printf("\nFAIL\n"); return 1; }

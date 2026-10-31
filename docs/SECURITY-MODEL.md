@@ -72,33 +72,73 @@ The Tailscale auth key is **single-use by convention** — once
 `MachineAuthorized=true` returns, the auth key has done its job and
 should be revoked from the admin panel. Because the device persists its
 NodeKey, future re-registrations would require a new auth key flashed
-into NVS.
+into NVS. Since round 1.3.3 (B22) a reboot of an authorized node sends
+no auth key at all and does not read it out of NVS; it is only sent on
+the first registration and when control refuses the known node (deleted,
+expired, needs approval) — so a revoked or expired key costs nothing
+until then.
 
-## X25519 — constant-time donna (landed in PR #61)
+## X25519 — constant-time fiat-crypto field (round 1.3.3)
 
-`components/tinylink/src/crypto/curve25519.c` is now a thin shim over
-`agl/curve25519-donna` (BSD-3, Google, see `curve25519_donna.c`). Donna
-is the canonical constant-time 32-bit X25519 implementation. The
-MachineKey and NodeKey private keys are exercised on every Noise IK
-handshake and every WG `handshake_init` (DH e/s, s/s); under donna the
-scalar multiplication has data-independent timing in both the ladder
-and the limb arithmetic, eliminating the timing-channel that the
-previous TweetNaCl-derived reference left open.
+`components/tinylink/src/crypto/curve25519.c` is a thin shim over
+`curve25519_fiat32.c`: fiat-crypto's formally verified 32-bit Curve25519
+as carried by Linux (`lib/crypto/curve25519-fiat32.c`, "GPL-2.0 OR MIT",
+used here under MIT), with the field multiplication, squaring and
+×121666 rewritten for the Xtensa LX6. The MachineKey and NodeKey private
+keys are exercised on every Noise IK handshake and every WG
+`handshake_init` (DH e/s, s/s), the DISCO key on every uncached ping.
 
-API unchanged: `curve25519_scalarmult`, `curve25519_keypair`,
-`curve25519_dh`, `curve25519_derive_pub` all behave identically modulo
-internal timing. RFC 7748 §5.2 (two single-scalarmult vectors) + §6.1
-(DH round-trip Alice↔Bob) are verified in
-`tools/test/test_curve25519.c`; the full host KAT battery stays
-green (452 OK / 0 FAIL).
+From PR #61 to 1.3.2 the primitive was `agl/curve25519-donna`. Donna's
+C is constant-time, but on the LX6 — no carry flag — GCC compiles its
+int64 limb sums to `add; add; bgeu; addi`, a branch on the carry of
+secret-dependent data (finding S3 of the 2026-10 optimization list).
+Measured on the 1.3.2 firmware's compiled code (instruction-level
+simulation of the Xtensa objects): 162 `bgeu` sites executing 342 266
+times per scalarmult, and the instruction count varies with the scalar
+(by up to ~2 000 across seven random ones). fiat32's own u64 column
+sums would compile the same way. The rewrite never adds 64-bit values:
+each 32×32→64 product is split at bit 28 into two 32-bit column
+accumulators (`mull`, `muluh`, `src` with SAR = 28, `and`, `add`,
+`add`), and carries move between columns with 32-bit shifts; the bound
+analysis is in the file header.
 
-### Why donna, not mbedTLS
+Evidence, on the 1.3.3 firmware ELF:
+- static: the field functions (`fe_mul_impl`, `fe_sqr_impl`,
+  `fe_mul121666_impl`, `fe_add_impl`, `fe_sub_impl`, `fe_cswap`) contain
+  no conditional branch; the only branches left in the ladder and the
+  inversion are their fixed loop counters (9 sites), and `fe_mul_impl` /
+  `fe_sqr_impl` write SAR exactly once, before every `src`;
+- dynamic: run in the simulator over random and edge-case scalars and
+  points (zero, all-ones, u = 9, p − 1, non-canonical u), the X25519
+  executes the identical instruction sequence, the same memory addresses
+  and the same branch outcomes — 2 430 825 instructions every time.
+- not covered: MULL / MULUH latency is not documented as
+  operand-independent (`docs/esp32/REFERENCE.md`, "Multiplier timing is
+  unspecified"); `CONFIG_TINYLINK_BENCH_AEAD`'s X25519 timing probe
+  reports the cycle spread over eight inputs on the device.
+
+3.51 M → 2.43 M instructions per scalarmult, frame 2.7 → 0.85 KiB, and
+the named stack temporaries are scrubbed with `tl_secure_zero` (donna
+left its whole 2.7 KiB frame). Not every byte, though: compiler spills
+in `fe_tobytes`, the `fe_mul_impl` frame and `fe_sqr_impl`'s `e[10]` sit
+below the caller's stack pointer afterwards — the 1.3.3 review counted
+54 nonzero words after one scalarmult, one of them bytes 22..25 of the
+DH output, no scalar bits. Those bytes are overwritten by the task's
+next calls; scrubbing them would take a stack burn after every DH. API unchanged: `curve25519_scalarmult`, `curve25519_keypair`,
+`curve25519_dh`, `curve25519_derive_pub`. RFC 7748 §5.2 (two vectors,
+iterated 1 / 1 000 times; 1 000 000 on demand) and §6.1, 4 000 random
+cross-checks against donna (kept as the test oracle,
+`tools/test/ref/curve25519_donna.c`) and the field operations against
+an independent mod-p reference at their input bounds are in
+`tools/test/test_curve25519.c` / `test_x25519.c`.
+
+### Why vendored, not mbedTLS
 
 The same argument applies even more strongly to mbedTLS's curve25519
 path: it has not historically been written with the same constant-time
-discipline as donna, and on ESP32 the HW assistance is weaker than the
+discipline, and on ESP32 the HW assistance is weaker than the
 generic "mbedTLS uses HW MPI" narrative suggests. IDF source review
-(v5.5.4):
+(v5.5.4, re-checked unchanged in v5.5.6):
 
 - `port/mbedtls/esp_config.h` defines `MBEDTLS_MPI_MUL_MPI_ALT` only —
   there are **no** `_MXZ_ALT` hooks for the Montgomery-curve operations
@@ -110,9 +150,9 @@ generic "mbedTLS uses HW MPI" narrative suggests. IDF source review
   ESP32 RSA peripheral as "slow for public key operations". So `exp_mod`
   doesn't even hit hardware on ESP32.
 
-Net: mbedTLS X25519 on ESP32 would not be measurably faster than donna
-pure-C, and would cost `MBEDTLS_ECP_C` + `MBEDTLS_ECDH_C` flash + a
-non-constant-time risk profile. ChaCha20-Poly1305 stays on the
+Net: mbedTLS X25519 on ESP32 would not be measurably faster than the
+vendored pure C, and would cost `MBEDTLS_ECP_C` + `MBEDTLS_ECDH_C`
+flash + a non-constant-time risk profile. ChaCha20-Poly1305 stays on the
 in-tree vendored implementations because the ESP32's hardware AES
 accelerator is irrelevant to ChaCha and the implementations are
 already constant-time. BLAKE2s is small enough that vendoring is
@@ -154,6 +194,112 @@ cheaper than dragging in another dependency.
   function until the control-path watchdog happens to reboot the device
   (only if the wedge also starves the control stream) or a physical
   power-cycle.
+
+## Control transport and TLS sessions (round 1.3.5)
+
+- **ts2021 over plain HTTP :80, TLS :443 as the fallback**
+  (`ts2021_client.c`, `CONFIG_TINYLINK_CONTROL_PLAIN_HTTP`, default y),
+  as the upstream client does (`control/controlhttp/client.go`). Only
+  when the control key was pinned before the boot (NVS pin or compile-in
+  fallback, `control_key_pinned()`); the TOFU `/key` fetch and the rest
+  of a TOFU boot stay on TLS. Without TLS the server's identity rests on
+  Noise IK alone: msg2's tag is keyed by DH(e, rs) and DH(s, rs), so only
+  the holder of the pinned key's private half can produce it, and the
+  conn is not up before at least one transport record has opened under
+  the keys of that chain — an on-path attacker can refuse, redirect,
+  stall or garble :80 but not complete it. Every such failure (no 101, a
+  redirect, a fake 101, a forged or other-key msg2, an error frame, a
+  3-s connect / answer budget, a trickled header past its deadline)
+  falls back to :443 inside the same connect and, when :443 then works,
+  keeps the rest of the boot on :443 (RAM only); the control key is
+  never re-fetched over either port, so a genuine key rotation fails
+  both, as it failed on :443 before. What :80 gives up is the
+  confidentiality of the HTTP Upgrade request (host, path, the claimed
+  capability version and the base64 Noise msg1 — an ephemeral public key
+  and the machine key sealed under DH(e, rs)) and TLS's cover of record
+  sizes and timing, which Noise does not pad either way. Host tests:
+  `test_ts2021` (`d10_*`).
+- **TLS 1.2 session resumption** for the :443 control conn and DERP
+  (`tls_resume.c`, `CONFIG_MBEDTLS_CLIENT_SSL_SESSION_TICKETS`): one
+  session per server in RAM, never written to flash, dropped after 24 h
+  per master secret (TLS 1.2 resumption reuses it), on a failed connect,
+  or for a different host:port. A resumed handshake skips the chain
+  verify; the session it resumes came from a full handshake verified
+  under `MBEDTLS_SSL_VERIFY_REQUIRED` in the same boot, and a rejected
+  ticket is a full, fully verified handshake. Before the first NTP sync
+  a full handshake tolerates certificate dates (`tl_time.h`); a session
+  from that window can be resumed after the sync, i.e. it lives as long
+  as an open conn would have.
+- **Last-known server addresses** (`tl_addr.h`, NVS `tl_state/derp_node`
+  and `ctl_addr`): the control conn dials the address of the last conn
+  that came up, the DERP supervisor and the STUN probes the home DERP
+  node's IPv4 from the DERP map (which arrives over the Noise channel),
+  before any DNS. An address only decides where the SYN goes: on :80
+  the server must still complete Noise IK with the pinned key, on :443
+  and DERP the chain is verified against the host *name* (esp-tls
+  `common_name` → SNI + `mbedtls_ssl_set_hostname`), TLS sessions stay
+  keyed by name — and the DNS answers these replace were never
+  authenticated either. A stale or forged address (an attacker who can
+  write NVS can also replace the pinned key) can only fail the attempt,
+  which is retried by name in the same connect, with a 3-s budget per
+  step at the address up to the end of the Noise handshake / DERP
+  login; the `:80 off` latch is decided on the name's failure only, a
+  conn at the address that fails young sends the next dial to the name,
+  and the control address is first for 10 min after the boot or the
+  by-name conn that reached it (then the name is resolved again). The records' host names are checked for host-name bytes
+  on load (they reach the SNI and an HTTP Host header). STUN answers
+  were never authenticated (the transaction ID is the check, as before).
+  Host tests: `test_addr`, `test_ts2021` (`dns_*`).
+
+## Warm start (round 1.3.9)
+
+`CONFIG_TINYLINK_WARM_START` (default y) brings WireGuard up from the
+previous boot's netmap — our tailnet address and the target peer's
+NodeID, NodeKey, DiscoKey, endpoints and tailnet addresses, NVS
+`tl_state` / `warm_rec` (`src/tl_warm.h`) — once this boot's register
+has succeeded without the auth key, instead of after this boot's
+netmap. Until that netmap arrives the device trusts a binding — this
+NodeKey and this DiscoKey are the peer at that tailnet address — that
+an earlier, authenticated netmap gave it, possibly long ago. A peer key
+rotated or revoked since (the peer removed, its key leaked) is still
+used:
+
+- **NodeKey.** Whoever holds the old private key can answer the
+  handshake — via DERP, which routes by NodeKey — and then receives the
+  telemetry and can query `/stats` (`CONFIG_TINYLINK_STATS_PORT`, served
+  over the tunnel: counters, version, uptime).
+- **DiscoKey.** The relayed-DISCO gate and the direct path's admit the
+  cached DiscoKey: its holder gets pings answered, has the endpoints of
+  its CallMeMaybe punched (DISCO pings to addresses it names, at most
+  the endpoints one CMM carries) and can move our WireGuard endpoint
+  with a pong (traffic analysis or a dropped path; the frames stay
+  encrypted to the session, which needs the NodeKey).
+
+How long: until the netmap replaces the binding — normally seconds; at
+most `CONFIG_TINYLINK_WARM_START_MAX_S` (600 s) plus up to 60 s (the
+telemetry task's 60-s housekeeping checks the bound; without a telemetry
+task the long-poll checks it at every reconnect, up to a reconnect
+backoff or a control `Retry-After` later), after which the record
+is erased and the device restarts into a cold boot. Also not used: a
+record no netmap stood behind for 30 days (`written` is refreshed at
+most daily while it is current; before SNTP the floor clock gives a
+lower bound of the age, and a pending session ends once SNTP shows the
+record too old), a record written under another NodeKey or control key,
+a boot whose register needed the auth key (a new or re-created node),
+and a boot after a reset during a warm start before it settled (its
+netmap applied, the record for the next boot stored) or after one that
+hung (the record is erased; after two, the warm start stays off until a
+power cycle). No warm start
+without a register answered by the Noise-authenticated control plane.
+The netmap's own binding replaces the cached one in place (keys,
+endpoints, address; a peer entry without a DiscoKey clears the cached
+one — DISCO then runs as for a cold start from that netmap, i.e.
+permissive) or the device restarts cold (another peer, another
+self address, no peers, an expired or deleted node). Nothing else is
+skipped: tinylink enforces no packet filter (above). The record is
+checked only against corruption (strict decode); like every NVS key it
+is not protected against a physical attacker (out of scope). Host test:
+`test_warm`.
 
 ## Audit + optimization round (2026-09) — memory safety + upstream drift
 
@@ -293,7 +439,16 @@ threat-model record; the commit-level detail lives in `CHANGELOG.md`.
   `(recv_key, replay-window)` state — the classic `(key, nonce)`-reuse /
   replay-window corruption. With both the writer lock (#105) and this
   reader lock, the WGN-1 window is closed; the rx path is **no longer
-  unlocked**.
+  unlocked**. Since 1.3.3 (C2) the AEAD itself runs outside `g.lock`
+  and the same guarantee comes from tickets: under the lock,
+  `wg_transport_rx_begin` copies the receive key and the keypair
+  generation after the replay pre-check, the AEAD runs on that copy, and
+  `wg_transport_rx_commit` (locked again) refuses the ticket if a session
+  swap or scrub happened meanwhile, re-checks the window and only then
+  records the counter; TX reserves its counter together with a copy of
+  the send key from the same keypair (`wg_transport_tx_reserve`). No
+  AEAD reads `g.transport` while another task may rewrite it, and a
+  sealed frame never pairs a new key with an old counter.
 - **Relayed-DISCO sender gate (`knownPeerDiscoKey`).**
   `handle_disco_relayed` (`tinylink.c`) now drops a DERP-relayed
   `PING` / `PONG` / `CallMeMaybe` whose decrypted sender `DiscoKey` does
@@ -318,13 +473,14 @@ threat-model record; the commit-level detail lives in `CHANGELOG.md`.
 
 Done (host KATs in `tools/test`, run in CI plain and under ASan/UBSan):
 RFC 7693 BLAKE2s, RFC 7748 X25519, RFC 8439 ChaCha20 / Poly1305 /
-AEAD, the WireGuard handshake transcript, DISCO / STUN / DERP codecs.
+AEAD (incl. Appendix A.3 / A.5), the WireGuard handshake transcript,
+the ts2021 Noise IK transcript (`test_noise_ik`: handshake + transport
+records against an OpenSSL-based generator and an in-file responder;
+`make mbedtls-ref` re-runs it on the pre-1.3.2 mbedTLS-chachapoly
+`noise_ik.c`), DISCO / STUN / DERP codecs.
 
 Still open:
 
-- The ts2021 Noise IK transcript (`noise_ik.c`) end-to-end on the host —
-  today it is validated only by the live control plane accepting the
-  handshake.
 - Cross-check `TS2021_VERIFY` markers in
   `components/tinylink/src/ts2021_client.c` against the live Tailscale
   control plane source (see `PROTOCOL.md` for the exact files).
@@ -336,17 +492,28 @@ Distilled from the protocol research artifact §L.
 - **Validate peer public keys.** RFC 7748 §5 lists low-order points that,
   if accepted, leak your private key. The `curve25519_scalarmult` call
   rejects all-zero outputs in constant time; do not bypass that check.
-- **Nonce uniqueness across two AEAD contexts.** ts2021 (LE64 counter)
+- **Nonce uniqueness across two AEAD contexts.** ts2021 (4 zero bytes
+  || BE64 counter — Tailscale controlbase, not the Noise spec's LE64)
   and DISCO (24-byte random) have different nonce schemes. Force a
   rekey on every boot by zeroing all transport keys at startup; never
   reuse a counter across reboots.
 - **Secret-key scrubbing — sweep COMPLETE.** Every site that holds
-  secret key material now zeroes it with `tl_secure_zero` (a
-  `volatile`-pointer scrub the optimizer cannot elide), not plain
-  `memset`. This covers the WG session keys (`wg_netif.c`), the WG
-  handshake DH / chaining / tau / derived keys and `wg_handshake_scrub`
-  (`wg_handshake.c`), and the AEAD/KDF scratch in `salsa20.c`,
-  `hkdf_blake2s.c`, and `chacha20poly1305.c`. Public, non-secret values
+  secret key material now zeroes it with `tl_secure_zero` (memset plus
+  an empty asm that takes the buffer as input and clobbers memory — the
+  optimizer cannot elide it; inlined, so it runs from IRAM in the AEAD),
+  not plain `memset`. This covers the WG session keys and the decrypted
+  RX plaintext (`wg_netif.c`), the WG handshake DH / chaining / tau /
+  derived keys and `wg_handshake_scrub` (`wg_handshake.c`,
+  `wg_proto.c`), the Noise IK chaining key / k / DH outputs
+  (`noise_ik.c`), the NaCl-box shared key / keystream / Poly1305 state
+  (`nacl_box.c`), and the AEAD/KDF scratch in `salsa20.c`,
+  `hkdf_blake2s.c`, `blake2s.c` and `chacha20poly1305.c`. Known residue:
+  a `chacha20()` call longer than one block leaves its 208-B frame
+  below the caller's stack pointer with the 8 key words GCC spilled for
+  the feed-forward add (as 1.3.2 left key-derivable state there too);
+  the round-1.3.3 RX/TX tickets scrub their key copy but cannot reach
+  that callee frame. The same key lives in `g.transport` for the whole
+  session, so the extra exposure is nil against a RAM reader. Public, non-secret values
   (nonces, timestamps, on-wire message buffers) deliberately keep plain
   `memset` — scrubbing them buys nothing. The earlier state where WG
   session/handshake keys were torn down with a dead-code-eliminable
@@ -456,3 +623,12 @@ the optimizer, particularly after the AEAD perf sprint that added
   unchanged: 493 OK, 0 FAIL.
 
   Cost: +48 B flash on the ESP32 build; zero DRAM/IRAM change.
+
+**Round 1.3.3 re-check.** The review above read the X25519 of its time
+(TweetNaCl's `sel25519`); the donna that followed it reintroduced carry
+branches through int64 arithmetic (S3), closed by the fiat32 field —
+see [X25519](#x25519--constant-time-fiat-crypto-field-round-133). The
+ChaCha20 rewrite of the same round (C4) keeps the branch set listed
+above (lengths and buffer alignment only); its compiled AEAD over 1 500
+B executes the same instruction sequence and addresses for any key and
+plaintext (instruction-level simulation of the firmware ELF).

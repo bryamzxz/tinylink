@@ -1,0 +1,7 @@
+# A/B (round 1.3.7): the station stays awake 20 ms instead of 50 after each
+# frame it sends or receives under modem sleep (esp_wifi
+# esp_wifi_set_sleep_min_active_time, wifi_init.c). Every telemetry sample,
+# peer keepalive and TCP ACK keeps the radio in RX (~100 mA) for that
+# long. A reply arriving later waits at the AP for the next beacon
+# (≤ one DTIM interval).
+CONFIG_ESP_WIFI_SLP_DEFAULT_MIN_ACTIVE_TIME=20
