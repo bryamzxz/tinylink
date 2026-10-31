@@ -74,10 +74,15 @@ the sensor logs in CHANGELOG.md.
 ## Cryptography (post-quantum, before 2031)
 
 - **WireGuard cookie replies.** tinylink is initiator-only and drops
-  MessageCookieReply (`wg_netif.c`, mac2 always zero): a peer under
-  load, which answers INITs with a cookie until mac2 carries it, would
-  keep ignoring ours. Rare for a home peer; handling it needs
-  XChaCha20-Poly1305 (`hchacha20` is already in `crypto/chacha20.c`).
+  MessageCookieReply (`wg_netif.c`, mac2 always zero), silently: a peer
+  under load, which answers INITs with a cookie until mac2 carries it,
+  would keep ignoring ours. Handling it needs XChaCha20-Poly1305
+  (`hchacha20` is already in `crypto/chacha20.c`). At least count and
+  log the cookies first: in the 1.4.0 soak, during the collector's ISP
+  failover (its backup link at 2–4 s RTT), the peer answered our DISCO
+  pings but none of ~70 INITs for 9 min 15 s (rekey exhausted at
+  3 428 s, session up at 3 983 s; 105 telemetry samples lost). Cookies
+  would show as such a silence, and the log cannot tell.
 
 - **What RSA-first changes, and what it does not.** Since 1.3.8 the TLS
   client offers the ECDHE-RSA suites first (TLS 1.2), so the DERP and
