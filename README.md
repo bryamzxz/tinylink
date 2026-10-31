@@ -300,7 +300,8 @@ examples/              minimal register-only example
 | [`docs/PROTOCOL.md`](docs/PROTOCOL.md) | Clean-room wire-protocol map (ts2021, MapRequest, WG, DISCO, DERP, STUN) with upstream citations |
 | [`docs/BUILDING.md`](docs/BUILDING.md) | Environment setup, required IDF patches, build/flash/monitor, AEAD bench |
 | [`docs/PROVISIONING.md`](docs/PROVISIONING.md) | NVS credential provisioning (WiFi + auth key) |
-| [`docs/ROADMAP.md`](docs/ROADMAP.md) | Per-milestone breakdown M1–M13, open backlog, future directions |
+| [`docs/ROADMAP.md`](docs/ROADMAP.md) | Per-milestone breakdown M1–M26, future directions |
+| [`docs/BACKLOG.md`](docs/BACKLOG.md) | What is left after 1.4.0, the last release of this line |
 | [`docs/SECURITY-MODEL.md`](docs/SECURITY-MODEL.md) | Threat model + audit history |
 | [`CHANGELOG.md`](CHANGELOG.md) | Per-PR history of every round |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | Contribution guidelines |
